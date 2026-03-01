@@ -298,5 +298,4 @@
       padding-bottom: var(--space-lg);
     }
   }
-
 </style>

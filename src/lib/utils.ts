@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Profile } from "$lib/types";
+import type { Profile, PendingAttachment } from "$lib/types";
 
 const AVATAR_COLORS = [
   "#7c3aed",
@@ -219,6 +219,30 @@ export function setupInfiniteScroll(
   );
   observer.observe(sentinel);
   return () => observer.disconnect();
+}
+
+export async function uploadFiles(
+  files: FileList,
+): Promise<PendingAttachment[]> {
+  const results: PendingAttachment[] = [];
+  for (const file of files) {
+    const buffer = await file.arrayBuffer();
+    const data = Array.from(new Uint8Array(buffer));
+    const result: { hash: string; ticket: string } = await invoke(
+      "add_blob_bytes",
+      { data },
+    );
+    const previewUrl = URL.createObjectURL(file);
+    results.push({
+      hash: result.hash,
+      ticket: result.ticket,
+      mime_type: file.type || "application/octet-stream",
+      filename: file.name,
+      size: file.size,
+      previewUrl,
+    });
+  }
+  return results;
 }
 
 export function detectImageMime(data: Uint8Array): string {
