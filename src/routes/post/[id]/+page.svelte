@@ -1,40 +1,34 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Lightbox from "$lib/Lightbox.svelte";
   import PostCard from "$lib/PostCard.svelte";
   import ReplyComposer from "$lib/ReplyComposer.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import type { Post } from "$lib/types";
-  import { setupInfiniteScroll } from "$lib/utils";
+  import {
+    useNodeInit,
+    useEventListeners,
+    useInfiniteScroll,
+    useLightbox,
+  } from "$lib/composables.svelte";
 
   let postId: string = $derived(page.params.id ?? "");
-  let nodeId = $state("");
   let post = $state<Post | null>(null);
   let replies = $state<Post[]>([]);
-  let loading = $state(true);
-  let lightboxSrc = $state("");
-  let lightboxAlt = $state("");
-  let hasMore = $state(true);
-  let loadingMore = $state(false);
   let sentinel = $state<HTMLDivElement>(null!);
   let replySection = $state<HTMLDivElement>(null!);
 
   const blobs = createBlobCache();
   setBlobContext(blobs);
 
-  async function init() {
-    try {
-      nodeId = await invoke("get_node_id");
-      await loadPost();
-      await loadReplies();
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
-    }
-  }
+  const lightbox = useLightbox();
+
+  const node = useNodeInit(async () => {
+    await loadPost();
+    await loadReplies();
+  });
 
   async function loadPost() {
     post = await invoke("get_post", { id: postId });
@@ -48,69 +42,58 @@
         before: null,
       });
       replies = result;
-      hasMore = result.length >= 50;
+      scroll.setHasMore(result.length);
     } catch (e) {
       console.error("Failed to load replies:", e);
     }
   }
 
-  async function loadMoreReplies() {
-    if (loadingMore || !hasMore || replies.length === 0) return;
-    loadingMore = true;
-    try {
-      const oldest = replies[replies.length - 1];
-      const more: Post[] = await invoke("get_replies", {
-        targetPostId: postId,
-        limit: 50,
-        before: oldest.timestamp,
-      });
-      if (more.length === 0) {
-        hasMore = false;
-      } else {
-        replies = [...replies, ...more];
-        hasMore = more.length >= 50;
+  const scroll = useInfiniteScroll(
+    () => sentinel,
+    async () => {
+      try {
+        const oldest = replies[replies.length - 1];
+        const more: Post[] = await invoke("get_replies", {
+          targetPostId: postId,
+          limit: 50,
+          before: oldest.timestamp,
+        });
+        if (more.length === 0) {
+          scroll.setNoMore();
+        } else {
+          replies = [...replies, ...more];
+          scroll.setHasMore(more.length);
+        }
+      } catch (e) {
+        console.error("Failed to load more replies:", e);
       }
-    } catch (e) {
-      console.error("Failed to load more replies:", e);
-    }
-    loadingMore = false;
-  }
+    },
+    50,
+  );
 
   $effect(() => {
-    return setupInfiniteScroll(
-      sentinel,
-      () => hasMore,
-      () => loadingMore,
-      loadMoreReplies,
-    );
+    return scroll.setupEffect();
   });
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("feed-updated", () => {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "feed-updated": () => {
         loadReplies();
-      }),
-    );
+      },
+    });
     return () => {
       blobs.revokeAll();
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
     };
   });
 </script>
 
-{#if lightboxSrc}
-  <Lightbox
-    src={lightboxSrc}
-    alt={lightboxAlt}
-    onclose={() => {
-      lightboxSrc = "";
-    }}
-  />
+{#if lightbox.src}
+  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
 {/if}
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading thread...</p>
@@ -122,15 +105,12 @@
     <div class="parent-post">
       <PostCard
         {post}
-        {nodeId}
+        nodeId={node.nodeId}
         showReplyContext={true}
         onreply={() => {
           replySection?.scrollIntoView({ behavior: "smooth" });
         }}
-        onlightbox={(src, alt) => {
-          lightboxSrc = src;
-          lightboxAlt = alt;
-        }}
+        onlightbox={lightbox.open}
       />
     </div>
 
@@ -142,7 +122,7 @@
       <ReplyComposer
         replyToId={post.id}
         replyToAuthor={post.author}
-        {nodeId}
+        nodeId={node.nodeId}
         onsubmitted={loadReplies}
       />
     </div>
@@ -160,12 +140,9 @@
     {#each replies as reply (reply.id)}
       <PostCard
         post={reply}
-        {nodeId}
+        nodeId={node.nodeId}
         showReplyContext={false}
-        onlightbox={(src, alt) => {
-          lightboxSrc = src;
-          lightboxAlt = alt;
-        }}
+        onlightbox={lightbox.open}
       />
     {:else}
       {#if post}
@@ -174,9 +151,9 @@
     {/each}
   </div>
 
-  {#if hasMore && replies.length > 0}
+  {#if scroll.hasMore && replies.length > 0}
     <div bind:this={sentinel} class="sentinel">
-      {#if loadingMore}
+      {#if scroll.loadingMore}
         <span class="btn-spinner"></span> Loading...
       {/if}
     </div>

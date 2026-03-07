@@ -1,3 +1,4 @@
+use crate::commands::sync::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -7,9 +8,8 @@ use iroh_gossip::{
     api::{Event, GossipSender},
 };
 use iroh_social_types::{
-    GossipMessage, Interaction, Post, Profile, now_millis, parse_mentions, short_id,
-    user_feed_topic, validate_interaction, validate_post, validate_profile,
-    verify_interaction_signature, verify_post_signature,
+    GossipMessage, Interaction, Post, Profile, now_millis, short_id, user_feed_topic,
+    validate_profile,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -222,80 +222,25 @@ impl FeedManager {
                             );
                             match serde_json::from_slice(&msg.content) {
                                 Ok(GossipMessage::NewPost(post)) => {
-                                    if post.author == pk {
-                                        if let Err(reason) = validate_post(&post) {
-                                            log::error!(
-                                                "[gossip-rx] rejected post {} from {}: {reason}",
-                                                &post.id,
-                                                short_id(&pk)
-                                            );
-                                        } else if let Err(reason) = verify_post_signature(&post) {
-                                            log::error!(
-                                                "[gossip-rx] rejected post {} from {} (bad sig): {reason}",
-                                                &post.id,
-                                                short_id(&pk)
-                                            );
-                                        } else if storage.is_hidden(&pk).unwrap_or(false) {
-                                            log::info!(
-                                                "[gossip-rx] skipping post from muted/blocked {}",
-                                                short_id(&pk)
-                                            );
-                                        } else {
-                                            log::info!(
-                                                "[gossip-rx] new post {} from {} (sig verified)",
-                                                &post.id,
-                                                short_id(&pk)
-                                            );
-                                            if let Err(e) = storage.insert_post(&post) {
-                                                log::error!(
-                                                    "[gossip-rx] failed to store post: {e}"
-                                                );
-                                            }
-                                            if post.author != my_id {
-                                                if parse_mentions(&post.content).contains(&my_id) {
-                                                    let _ = storage.insert_notification(
-                                                        "mention",
-                                                        &post.author,
-                                                        None,
-                                                        Some(&post.id),
-                                                        post.timestamp,
-                                                    );
-                                                    let _ =
-                                                        app_handle.emit("mentioned-in-post", &post);
-                                                    let _ = app_handle
-                                                        .emit("notification-received", ());
-                                                }
-                                                if post.reply_to_author.as_deref() == Some(&my_id) {
-                                                    let _ = storage.insert_notification(
-                                                        "reply",
-                                                        &post.author,
-                                                        post.reply_to.as_deref(),
-                                                        Some(&post.id),
-                                                        post.timestamp,
-                                                    );
-                                                    let _ = app_handle
-                                                        .emit("notification-received", ());
-                                                }
-                                                if post.quote_of_author.as_deref() == Some(&my_id) {
-                                                    let _ = storage.insert_notification(
-                                                        "quote",
-                                                        &post.author,
-                                                        post.quote_of.as_deref(),
-                                                        Some(&post.id),
-                                                        post.timestamp,
-                                                    );
-                                                    let _ = app_handle
-                                                        .emit("notification-received", ());
-                                                }
-                                            }
-                                            let _ = app_handle.emit("feed-updated", ());
-                                        }
-                                    } else {
+                                    if post.author != pk {
                                         log::info!(
                                             "[gossip-rx] ignored post from {} (expected {})",
                                             short_id(&post.author),
                                             short_id(&pk)
                                         );
+                                    } else if storage.is_hidden(&pk).unwrap_or(false) {
+                                        log::info!(
+                                            "[gossip-rx] skipping post from muted/blocked {}",
+                                            short_id(&pk)
+                                        );
+                                    } else if process_incoming_post(
+                                        &storage,
+                                        &post,
+                                        "gossip-rx",
+                                        &my_id,
+                                        &app_handle,
+                                    ) {
+                                        let _ = app_handle.emit("feed-updated", ());
                                     }
                                 }
                                 Ok(GossipMessage::DeletePost { id, author }) => {
@@ -349,54 +294,24 @@ impl FeedManager {
                                     }
                                 }
                                 Ok(GossipMessage::NewInteraction(interaction)) => {
-                                    if interaction.author == pk {
-                                        if let Err(reason) = validate_interaction(&interaction) {
-                                            log::error!(
-                                                "[gossip-rx] rejected interaction {} from {}: {reason}",
-                                                &interaction.id,
-                                                short_id(&pk)
-                                            );
-                                        } else if let Err(reason) =
-                                            verify_interaction_signature(&interaction)
-                                        {
-                                            log::error!(
-                                                "[gossip-rx] rejected interaction {} from {} (bad sig): {reason}",
-                                                &interaction.id,
-                                                short_id(&pk)
-                                            );
-                                        } else if storage.is_hidden(&pk).unwrap_or(false) {
-                                            log::info!(
-                                                "[gossip-rx] skipping interaction from muted/blocked {}",
-                                                short_id(&pk)
-                                            );
-                                        } else {
-                                            log::info!(
-                                                "[gossip-rx] {:?} from {} on post {} (sig verified)",
-                                                interaction.kind,
-                                                short_id(&pk),
-                                                short_id(&interaction.target_post_id)
-                                            );
-                                            if let Err(e) = storage.save_interaction(&interaction) {
-                                                log::error!(
-                                                    "[gossip-rx] failed to store interaction: {e}"
-                                                );
-                                            }
-                                            if interaction.target_author == my_id
-                                                && interaction.author != my_id
-                                            {
-                                                let _ = storage.insert_notification(
-                                                    "like",
-                                                    &interaction.author,
-                                                    Some(&interaction.target_post_id),
-                                                    None,
-                                                    interaction.timestamp,
-                                                );
-                                                let _ =
-                                                    app_handle.emit("notification-received", ());
-                                            }
-                                            let _ = app_handle
-                                                .emit("interaction-received", &interaction);
-                                        }
+                                    if interaction.author != pk {
+                                        // Ignore interactions not from the expected author
+                                    } else if storage.is_hidden(&pk).unwrap_or(false) {
+                                        log::info!(
+                                            "[gossip-rx] skipping interaction from muted/blocked {}",
+                                            short_id(&pk)
+                                        );
+                                    } else {
+                                        process_incoming_interaction(
+                                            &storage,
+                                            &interaction,
+                                            &pk,
+                                            "gossip-rx",
+                                            &my_id,
+                                            &app_handle,
+                                        );
+                                        let _ =
+                                            app_handle.emit("interaction-received", &interaction);
                                     }
                                 }
                                 Ok(GossipMessage::DeleteInteraction { id, author }) => {

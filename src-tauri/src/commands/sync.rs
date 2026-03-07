@@ -7,6 +7,102 @@ use iroh_social_types::{
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+/// Validate, verify signature, and store a single incoming post.
+/// Returns `true` if the post was stored successfully.
+pub(crate) fn process_incoming_post(
+    storage: &Storage,
+    post: &iroh_social_types::Post,
+    label: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+) -> bool {
+    if let Err(reason) = validate_post(post) {
+        log::error!("[{label}] rejected post {}: {reason}", &post.id);
+        return false;
+    }
+    if let Err(reason) = verify_post_signature(post) {
+        log::error!("[{label}] rejected post {} (bad sig): {reason}", &post.id);
+        return false;
+    }
+    if let Err(e) = storage.insert_post(post) {
+        log::error!("[{label}] failed to store post: {e}");
+        return false;
+    }
+    if post.author != my_id {
+        if parse_mentions(&post.content).contains(&my_id.to_string()) {
+            let _ = storage.insert_notification(
+                "mention",
+                &post.author,
+                None,
+                Some(&post.id),
+                post.timestamp,
+            );
+            let _ = app_handle.emit("mentioned-in-post", post);
+            let _ = app_handle.emit("notification-received", ());
+        }
+        if post.reply_to_author.as_deref() == Some(my_id) {
+            let _ = storage.insert_notification(
+                "reply",
+                &post.author,
+                post.reply_to.as_deref(),
+                Some(&post.id),
+                post.timestamp,
+            );
+            let _ = app_handle.emit("notification-received", ());
+        }
+        if post.quote_of_author.as_deref() == Some(my_id) {
+            let _ = storage.insert_notification(
+                "quote",
+                &post.author,
+                post.quote_of.as_deref(),
+                Some(&post.id),
+                post.timestamp,
+            );
+            let _ = app_handle.emit("notification-received", ());
+        }
+    }
+    true
+}
+
+/// Validate, verify signature, and store a single incoming interaction.
+pub(crate) fn process_incoming_interaction(
+    storage: &Storage,
+    interaction: &iroh_social_types::Interaction,
+    expected_author: &str,
+    label: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+) {
+    if interaction.author != expected_author {
+        return;
+    }
+    if let Err(reason) = validate_interaction(interaction) {
+        log::error!(
+            "[{label}] rejected interaction {}: {reason}",
+            &interaction.id
+        );
+        return;
+    }
+    if let Err(reason) = verify_interaction_signature(interaction) {
+        log::error!(
+            "[{label}] rejected interaction {} (bad sig): {reason}",
+            &interaction.id
+        );
+        return;
+    }
+    let _ = storage.save_interaction(interaction);
+    if interaction.target_author == my_id && interaction.author != my_id {
+        let _ = storage.insert_notification(
+            "like",
+            &interaction.author,
+            Some(&interaction.target_post_id),
+            None,
+            interaction.timestamp,
+        );
+        let _ = app_handle.emit("notification-received", ());
+    }
+}
+
 /// Validate and store posts/interactions/profile from a sync result.
 /// Returns the number of posts actually stored.
 pub(crate) fn process_sync_result(
@@ -19,52 +115,9 @@ pub(crate) fn process_sync_result(
 ) -> usize {
     let mut stored = 0;
     for post in &result.posts {
-        if let Err(reason) = validate_post(post) {
-            log::error!("[{label}] rejected post {}: {reason}", &post.id);
-            continue;
+        if process_incoming_post(storage, post, label, my_id, app_handle) {
+            stored += 1;
         }
-        if let Err(reason) = verify_post_signature(post) {
-            log::error!("[{label}] rejected post {} (bad sig): {reason}", &post.id);
-            continue;
-        }
-        if let Err(e) = storage.insert_post(post) {
-            log::error!("[{label}] failed to store post: {e}");
-            continue;
-        }
-        if post.author != my_id {
-            if parse_mentions(&post.content).contains(&my_id.to_string()) {
-                let _ = storage.insert_notification(
-                    "mention",
-                    &post.author,
-                    None,
-                    Some(&post.id),
-                    post.timestamp,
-                );
-                let _ = app_handle.emit("mentioned-in-post", post);
-                let _ = app_handle.emit("notification-received", ());
-            }
-            if post.reply_to_author.as_deref() == Some(my_id) {
-                let _ = storage.insert_notification(
-                    "reply",
-                    &post.author,
-                    post.reply_to.as_deref(),
-                    Some(&post.id),
-                    post.timestamp,
-                );
-                let _ = app_handle.emit("notification-received", ());
-            }
-            if post.quote_of_author.as_deref() == Some(my_id) {
-                let _ = storage.insert_notification(
-                    "quote",
-                    &post.author,
-                    post.quote_of.as_deref(),
-                    Some(&post.id),
-                    post.timestamp,
-                );
-                let _ = app_handle.emit("notification-received", ());
-            }
-        }
-        stored += 1;
     }
     if let Some(profile) = &result.profile
         && let Err(e) = storage.save_profile(pubkey, profile)
@@ -72,22 +125,7 @@ pub(crate) fn process_sync_result(
         log::error!("[{label}] failed to store profile: {e}");
     }
     for interaction in &result.interactions {
-        if interaction.author == pubkey
-            && validate_interaction(interaction).is_ok()
-            && verify_interaction_signature(interaction).is_ok()
-        {
-            let _ = storage.save_interaction(interaction);
-            if interaction.target_author == my_id && interaction.author != my_id {
-                let _ = storage.insert_notification(
-                    "like",
-                    &interaction.author,
-                    Some(&interaction.target_post_id),
-                    None,
-                    interaction.timestamp,
-                );
-                let _ = app_handle.emit("notification-received", ());
-            }
-        }
+        process_incoming_interaction(storage, interaction, pubkey, label, my_id, app_handle);
     }
     stored
 }

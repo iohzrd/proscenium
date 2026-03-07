@@ -1,7 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Lightbox from "$lib/Lightbox.svelte";
   import QrModal from "$lib/QrModal.svelte";
@@ -19,31 +18,30 @@
     SyncResult,
     SyncStatus,
   } from "$lib/types";
-  import { shortId, copyToClipboard, setupInfiniteScroll } from "$lib/utils";
+  import { shortId } from "$lib/utils";
+  import {
+    useToast,
+    useCopyFeedback,
+    useNodeInit,
+    useEventListeners,
+    useInfiniteScroll,
+    useDeleteConfirm,
+    useLightbox,
+  } from "$lib/composables.svelte";
 
   let pubkey: string = $derived(page.params.pubkey ?? "");
-  let nodeId = $state("");
   let profile = $state<Profile | null>(null);
   let posts = $state<Post[]>([]);
-  let loading = $state(true);
   let isFollowing = $state(false);
   let toggling = $state(false);
-  let copyFeedback = $state(false);
-  let hasMore = $state(true);
-  let loadingMore = $state(false);
   let replyingTo = $state<Post | null>(null);
   let quotingPost = $state<Post | null>(null);
-  let lightboxSrc = $state("");
-  let lightboxAlt = $state("");
-  let toastMessage = $state("");
-  let toastType = $state<"error" | "success">("error");
   let sentinel = $state<HTMLDivElement>(null!);
   let mediaFilter = $state("all");
   let syncStatus = $state<SyncStatus | null>(null);
   let remoteTotal = $state<number | null>(null);
   let fetchingRemote = $state(false);
   let peerOffline = $state(false);
-  let pendingDeleteId = $state<string | null>(null);
   let isMuted = $state(false);
   let isBlocked = $state(false);
   let togglingMute = $state(false);
@@ -63,57 +61,57 @@
   const blobs = createBlobCache();
   setBlobContext(blobs);
 
-  function showToast(message: string, type: "error" | "success" = "error") {
-    toastMessage = message;
-    toastType = type;
-    setTimeout(() => (toastMessage = ""), 4000);
-  }
+  const toast = useToast();
+  const copyFb = useCopyFeedback();
+  const lightbox = useLightbox();
+  const del = useDeleteConfirm(async (id) => {
+    try {
+      await invoke("delete_post", { id });
+      await reloadPosts();
+    } catch (e) {
+      toast.show("Failed to delete post");
+      console.error("Failed to delete post:", e);
+    }
+  });
 
-  let isSelf = $derived(pubkey === nodeId);
+  const node = useNodeInit(async (nid) => {
+    if (pubkey === nid) {
+      const myProfile: Profile | null = await invoke("get_my_profile");
+      profile = myProfile;
+    } else {
+      profile = await invoke("get_remote_profile", { pubkey });
+    }
+
+    const allPosts: Post[] = await invoke("get_user_posts", {
+      pubkey,
+      limit: 20,
+      before: null,
+      mediaFilter: mediaFilter === "all" ? null : mediaFilter,
+    });
+    posts = allPosts;
+    scroll.setHasMore(allPosts.length);
+
+    const follows: FollowEntry[] = await invoke("get_follows");
+    isFollowing = follows.some((f) => f.pubkey === pubkey);
+
+    if (pubkey !== nid) {
+      isMuted = await invoke("is_muted", { pubkey });
+      isBlocked = await invoke("is_blocked", { pubkey });
+    }
+
+    if (pubkey !== nid) {
+      try {
+        syncStatus = await invoke("get_sync_status", { pubkey });
+      } catch {
+        // sync status is informational
+      }
+    }
+  });
+
+  let isSelf = $derived(pubkey === node.nodeId);
   let displayName = $derived(
     profile?.display_name || (isSelf ? "You" : shortId(pubkey)),
   );
-
-  async function init() {
-    try {
-      nodeId = await invoke("get_node_id");
-      if (isSelf) {
-        const myProfile: Profile | null = await invoke("get_my_profile");
-        profile = myProfile;
-      } else {
-        profile = await invoke("get_remote_profile", { pubkey });
-      }
-
-      const allPosts: Post[] = await invoke("get_user_posts", {
-        pubkey,
-        limit: 20,
-        before: null,
-        mediaFilter: mediaFilter === "all" ? null : mediaFilter,
-      });
-      posts = allPosts;
-      hasMore = allPosts.length >= 20;
-
-      const follows: FollowEntry[] = await invoke("get_follows");
-      isFollowing = follows.some((f) => f.pubkey === pubkey);
-
-      if (!isSelf) {
-        isMuted = await invoke("is_muted", { pubkey });
-        isBlocked = await invoke("is_blocked", { pubkey });
-      }
-
-      if (!isSelf) {
-        try {
-          syncStatus = await invoke("get_sync_status", { pubkey });
-        } catch {
-          // sync status is informational
-        }
-      }
-
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
-    }
-  }
 
   async function reloadPosts() {
     try {
@@ -124,7 +122,7 @@
         mediaFilter: mediaFilter === "all" ? null : mediaFilter,
       });
       posts = newPosts;
-      hasMore = newPosts.length >= 20;
+      scroll.setHasMore(newPosts.length);
     } catch (e) {
       console.error("Failed to reload posts:", e);
     }
@@ -142,31 +140,32 @@
     }
   }
 
-  async function loadMore() {
-    if (loadingMore || !hasMore || posts.length === 0) return;
-    loadingMore = true;
-    try {
-      const oldest = posts[posts.length - 1];
-      const olderPosts: Post[] = await invoke("get_user_posts", {
-        pubkey,
-        limit: 20,
-        before: oldest.timestamp,
-        mediaFilter: mediaFilter === "all" ? null : mediaFilter,
-      });
-      if (olderPosts.length > 0) {
-        posts = [...posts, ...olderPosts];
-        hasMore = olderPosts.length >= 20;
-      } else if (!isSelf && !peerOffline && mediaFilter === "all") {
-        await fetchFromRemote();
-      } else {
-        hasMore = false;
+  const scroll = useInfiniteScroll(
+    () => sentinel,
+    async () => {
+      try {
+        const oldest = posts[posts.length - 1];
+        const olderPosts: Post[] = await invoke("get_user_posts", {
+          pubkey,
+          limit: 20,
+          before: oldest.timestamp,
+          mediaFilter: mediaFilter === "all" ? null : mediaFilter,
+        });
+        if (olderPosts.length > 0) {
+          posts = [...posts, ...olderPosts];
+          scroll.setHasMore(olderPosts.length);
+        } else if (!isSelf && !peerOffline && mediaFilter === "all") {
+          await fetchFromRemote();
+        } else {
+          scroll.setNoMore();
+        }
+      } catch (e) {
+        toast.show("Failed to load more posts");
+        console.error("Failed to load more:", e);
       }
-    } catch (e) {
-      showToast("Failed to load more posts");
-      console.error("Failed to load more:", e);
-    }
-    loadingMore = false;
-  }
+    },
+    20,
+  );
 
   async function fetchFromRemote() {
     fetchingRemote = true;
@@ -179,10 +178,10 @@
         posts = [...posts, ...result.posts];
         syncStatus = await invoke("get_sync_status", { pubkey });
       }
-      hasMore = false;
+      scroll.setNoMore();
     } catch {
       peerOffline = true;
-      hasMore = false;
+      scroll.setNoMore();
     }
     fetchingRemote = false;
   }
@@ -198,7 +197,7 @@
         isFollowing = true;
       }
     } catch (e) {
-      showToast(`Failed to ${isFollowing ? "unfollow" : "follow"}`);
+      toast.show(`Failed to ${isFollowing ? "unfollow" : "follow"}`);
       console.error("Toggle follow failed:", e);
     }
     toggling = false;
@@ -215,7 +214,7 @@
         isMuted = true;
       }
     } catch (e) {
-      showToast("Failed to toggle mute");
+      toast.show("Failed to toggle mute");
       console.error("Toggle mute failed:", e);
     }
     togglingMute = false;
@@ -233,53 +232,22 @@
         isFollowing = false;
       }
     } catch (e) {
-      showToast("Failed to toggle block");
+      toast.show("Failed to toggle block");
       console.error("Toggle block failed:", e);
     }
     togglingBlock = false;
   }
 
-  async function copyNodeId() {
-    await copyToClipboard(pubkey);
-    copyFeedback = true;
-    setTimeout(() => (copyFeedback = false), 1500);
-  }
-
-  function confirmDelete(id: string) {
-    pendingDeleteId = id;
-  }
-
-  async function executeDelete() {
-    if (!pendingDeleteId) return;
-    try {
-      await invoke("delete_post", { id: pendingDeleteId });
-      await reloadPosts();
-    } catch (e) {
-      showToast("Failed to delete post");
-      console.error("Failed to delete post:", e);
-    }
-    pendingDeleteId = null;
-  }
-
-  function cancelDelete() {
-    pendingDeleteId = null;
-  }
-
   function handleGlobalKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
-      if (pendingDeleteId) cancelDelete();
+      if (del.pendingId) del.cancel();
       else if (editingProfile) editingProfile = false;
       else if (showQr) showQr = false;
     }
   }
 
   $effect(() => {
-    return setupInfiniteScroll(
-      sentinel,
-      () => hasMore,
-      () => loadingMore,
-      loadMore,
-    );
+    return scroll.setupEffect();
   });
 
   let filterInitialized = false;
@@ -290,29 +258,25 @@
       return;
     }
     posts = [];
-    hasMore = true;
     reloadPosts();
   });
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("feed-updated", () => {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "feed-updated": () => {
         reloadPosts();
-      }),
-    );
-    unlisteners.push(
-      listen("profile-updated", (event) => {
-        if (event.payload === pubkey) {
+      },
+      "profile-updated": (payload) => {
+        if (payload === pubkey) {
           reloadProfile();
         }
-      }),
-    );
+      },
+    });
     window.addEventListener("keydown", handleGlobalKey);
     return () => {
       blobs.revokeAll();
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
       window.removeEventListener("keydown", handleGlobalKey);
     };
   });
@@ -322,17 +286,11 @@
   <QrModal nodeId={pubkey} onclose={() => (showQr = false)} />
 {/if}
 
-{#if lightboxSrc}
-  <Lightbox
-    src={lightboxSrc}
-    alt={lightboxAlt}
-    onclose={() => {
-      lightboxSrc = "";
-    }}
-  />
+{#if lightbox.src}
+  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
 {/if}
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading profile...</p>
@@ -349,7 +307,7 @@
       onsaved={async () => {
         editingProfile = false;
         await reloadProfile();
-        showToast("Profile saved", "success");
+        toast.show("Profile saved", "success");
       }}
       oncancel={() => (editingProfile = false)}
     />
@@ -382,8 +340,11 @@
 
   <div class="id-row">
     <code>{pubkey}</code>
-    <button class="btn-elevated copy-btn" onclick={copyNodeId}>
-      {copyFeedback ? "Copied!" : "Copy ID"}
+    <button
+      class="btn-elevated copy-btn"
+      onclick={() => copyFb.copy(pubkey, "pubkey")}
+    >
+      {copyFb.feedback === "pubkey" ? "Copied!" : "Copy ID"}
     </button>
     <button class="btn-elevated copy-btn" onclick={() => (showQr = true)}
       >QR</button
@@ -441,7 +402,9 @@
   </div>
 
   <h3 class="section-title">
-    Posts{posts.length > 0 ? ` (${posts.length}${hasMore ? "+" : ""})` : ""}
+    Posts{posts.length > 0
+      ? ` (${posts.length}${scroll.hasMore ? "+" : ""})`
+      : ""}
     {#if syncStatus && !isSelf}
       <span class="sync-info">
         {syncStatus.local_count}{remoteTotal != null ? ` / ${remoteTotal}` : ""} synced
@@ -449,36 +412,33 @@
     {/if}
   </h3>
 
-  {#if pendingDeleteId}
-    <DeleteConfirmModal onconfirm={executeDelete} oncancel={cancelDelete} />
+  {#if del.pendingId}
+    <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
   {/if}
 
   <div class="feed">
     {#each posts as post (post.id)}
       <PostCard
         {post}
-        {nodeId}
+        nodeId={node.nodeId}
         showAuthor={false}
         showDelete={isSelf}
         onreply={(p) => {
           replyingTo = replyingTo?.id === p.id ? null : p;
           quotingPost = null;
         }}
-        ondelete={confirmDelete}
+        ondelete={del.confirm}
         onquote={(p) => {
           quotingPost = quotingPost?.id === p.id ? null : p;
           replyingTo = null;
         }}
-        onlightbox={(src, alt) => {
-          lightboxSrc = src;
-          lightboxAlt = alt;
-        }}
+        onlightbox={lightbox.open}
       />
       {#if replyingTo?.id === post.id}
         <ReplyComposer
           replyToId={post.id}
           replyToAuthor={post.author}
-          {nodeId}
+          nodeId={node.nodeId}
           onsubmitted={() => {
             replyingTo = null;
             reloadPosts();
@@ -489,7 +449,7 @@
       {#if quotingPost?.id === post.id}
         <QuoteComposer
           quotedPost={post}
-          {nodeId}
+          nodeId={node.nodeId}
           onsubmitted={() => {
             quotingPost = null;
             reloadPosts();
@@ -502,9 +462,9 @@
     {/each}
   </div>
 
-  {#if hasMore && posts.length > 0}
+  {#if scroll.hasMore && posts.length > 0}
     <div bind:this={sentinel} class="sentinel">
-      {#if loadingMore}
+      {#if scroll.loadingMore}
         <span class="btn-spinner"></span>
         {#if fetchingRemote}
           Fetching from peer...
@@ -515,14 +475,14 @@
     </div>
   {/if}
 
-  {#if peerOffline && !hasMore && posts.length > 0}
+  {#if peerOffline && !scroll.hasMore && posts.length > 0}
     <p class="offline-notice">End of cached posts -- peer is offline</p>
   {/if}
 {/if}
 
-{#if toastMessage}
-  <div class="toast" class:error={toastType === "error"}>
-    {toastMessage}
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
   </div>
 {/if}
 

@@ -525,7 +525,7 @@ fn ratchet_header_to_wire(header: &RatchetHeader) -> RatchetHeaderWire {
 }
 
 fn wire_to_ratchet_header(wire: &RatchetHeaderWire) -> anyhow::Result<RatchetHeader> {
-    let bytes = hex::decode(&wire.dh_public).map_err(|e| anyhow::anyhow!(e))?;
+    let bytes = hex::decode(&wire.dh_public)?;
     let dh_public: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid dh_public length"))?;
@@ -534,20 +534,4 @@ fn wire_to_ratchet_header(wire: &RatchetHeaderWire) -> anyhow::Result<RatchetHea
         message_number: wire.message_number,
         previous_chain_length: wire.previous_chain_length,
     })
-}
-
-mod hex {
-    pub fn encode(bytes: impl AsRef<[u8]>) -> String {
-        bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    pub fn decode(s: &str) -> Result<Vec<u8>, String> {
-        if !s.len().is_multiple_of(2) {
-            return Err("odd length hex string".to_string());
-        }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("invalid hex: {e}")))
-            .collect()
-    }
 }

@@ -3,6 +3,7 @@
   import type { Post } from "$lib/types";
   import { shortId, getDisplayName } from "$lib/utils";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
+  import { useMentionAutocomplete } from "$lib/composables.svelte";
 
   let {
     quotedPost,
@@ -18,9 +19,13 @@
 
   let content = $state("");
   let posting = $state(false);
-  let mentionQuery = $state("");
-  let mentionActive = $state(false);
   let mentionAutocomplete: MentionAutocomplete;
+
+  const mention = useMentionAutocomplete(
+    () => content,
+    (v) => (content = v),
+    ".quote-composer textarea",
+  );
 
   let preview = $derived(
     quotedPost.content.length > 120
@@ -46,37 +51,6 @@
       console.error("Failed to post quote:", e);
     }
     posting = false;
-  }
-
-  function handleMentionInput(e: Event) {
-    const textarea = e.target as HTMLTextAreaElement;
-    const cursorPos = textarea.selectionStart;
-    const textBeforeCursor = textarea.value.slice(0, cursorPos);
-    const match = textBeforeCursor.match(/@(\w*)$/);
-    if (match) {
-      mentionActive = true;
-      mentionQuery = match[1];
-    } else {
-      mentionActive = false;
-      mentionQuery = "";
-    }
-  }
-
-  function insertMention(pubkey: string) {
-    const textarea = document.querySelector(
-      ".quote-composer textarea",
-    ) as HTMLTextAreaElement;
-    const cursorPos = textarea.selectionStart;
-    const textBeforeCursor = content.slice(0, cursorPos);
-    const textAfterCursor = content.slice(cursorPos);
-    const match = textBeforeCursor.match(/@(\w*)$/);
-    if (match) {
-      const beforeMention = textBeforeCursor.slice(0, match.index);
-      content = `${beforeMention}@${pubkey} ${textAfterCursor}`;
-    }
-    mentionActive = false;
-    mentionQuery = "";
-    textarea.focus();
   }
 
   function handleKey(e: KeyboardEvent) {
@@ -105,10 +79,10 @@
   </div>
   <MentionAutocomplete
     bind:this={mentionAutocomplete}
-    query={mentionQuery}
+    query={mention.query}
     selfId={nodeId}
-    visible={mentionActive}
-    onselect={insertMention}
+    visible={mention.active}
+    onselect={mention.insertMention}
   />
   <textarea
     class="textarea-base"
@@ -116,7 +90,7 @@
     placeholder="Add your commentary (optional)..."
     rows="2"
     onkeydown={handleKey}
-    oninput={handleMentionInput}
+    oninput={mention.handleInput}
   ></textarea>
   <div class="composer-actions">
     <button class="btn-cancel" onclick={oncancel}>Cancel</button>

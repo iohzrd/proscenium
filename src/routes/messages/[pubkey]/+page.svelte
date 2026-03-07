@@ -1,7 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Avatar from "$lib/Avatar.svelte";
   import MessageComposer from "$lib/MessageComposer.svelte";
@@ -17,13 +16,12 @@
   } from "$lib/utils";
   import { createBlobCache } from "$lib/blobs";
   import { hapticNotification } from "$lib/haptics";
+  import { useNodeInit, useEventListeners } from "$lib/composables.svelte";
 
   let pubkey: string = $derived(page.params.pubkey ?? "");
-  let nodeId = $state("");
   let peerName = $state("");
   let peerProfile = $state<Profile | null>(null);
   let messages = $state<StoredMessage[]>([]);
-  let loading = $state(true);
   let hasMore = $state(true);
   let loadingMore = $state(false);
   let messagesContainer = $state<HTMLDivElement>(null!);
@@ -41,42 +39,36 @@
 
   const blobs = createBlobCache();
 
-  async function init() {
+  const node = useNodeInit(async (nid) => {
+    peerName = await getDisplayName(pubkey, nid);
     try {
-      nodeId = await invoke("get_node_id");
-      peerName = await getDisplayName(pubkey, nodeId);
-      try {
-        peerProfile = await invoke("get_remote_profile", { pubkey });
-      } catch {
-        // peer profile may not be available
-      }
-      const msgs: StoredMessage[] = await invoke("get_dm_messages", {
-        peerPubkey: pubkey,
-        limit: 50,
-        before: null,
-      });
-      messages = msgs;
-      hasMore = msgs.length >= 50;
-      loading = false;
-
-      await invoke("mark_dm_read", { peerPubkey: pubkey });
-
-      // Send read receipts for unread incoming messages
-      for (const msg of msgs) {
-        if (msg.from_pubkey !== nodeId && !msg.read) {
-          invoke("send_dm_signal", {
-            to: pubkey,
-            signalType: "read",
-            messageId: msg.id,
-          }).catch(() => {});
-        }
-      }
-
-      requestAnimationFrame(() => scrollToBottom());
+      peerProfile = await invoke("get_remote_profile", { pubkey });
     } catch {
-      setTimeout(init, 500);
+      // peer profile may not be available
     }
-  }
+    const msgs: StoredMessage[] = await invoke("get_dm_messages", {
+      peerPubkey: pubkey,
+      limit: 50,
+      before: null,
+    });
+    messages = msgs;
+    hasMore = msgs.length >= 50;
+
+    await invoke("mark_dm_read", { peerPubkey: pubkey });
+
+    // Send read receipts for unread incoming messages
+    for (const msg of msgs) {
+      if (msg.from_pubkey !== nid && !msg.read) {
+        invoke("send_dm_signal", {
+          to: pubkey,
+          signalType: "read",
+          messageId: msg.id,
+        }).catch(() => {});
+      }
+    }
+
+    requestAnimationFrame(() => scrollToBottom());
+  });
 
   function scrollToBottom() {
     if (messagesContainer) {
@@ -226,11 +218,10 @@
   });
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("dm-received", (event) => {
-        const payload = event.payload as {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "dm-received": (raw) => {
+        const payload = raw as {
           from: string;
           message: StoredMessage;
         };
@@ -247,11 +238,9 @@
             requestAnimationFrame(() => scrollToBottom());
           }
         }
-      }),
-    );
-    unlisteners.push(
-      listen("dm-delivered", (event) => {
-        const payload = event.payload as { message_id: string };
+      },
+      "dm-delivered": (raw) => {
+        const payload = raw as { message_id: string };
         messages = messages.map((m) =>
           m.id === payload.message_id ? { ...m, delivered: true } : m,
         );
@@ -260,11 +249,9 @@
         retryingIds.delete(payload.message_id);
         failedIds = new Set(failedIds);
         retryingIds = new Set(retryingIds);
-      }),
-    );
-    unlisteners.push(
-      listen("typing-indicator", (event) => {
-        const payload = event.payload as { peer: string };
+      },
+      "typing-indicator": (raw) => {
+        const payload = raw as { peer: string };
         if (payload.peer === pubkey) {
           peerTyping = true;
           if (typingTimeout) clearTimeout(typingTimeout);
@@ -272,26 +259,24 @@
             peerTyping = false;
           }, 4000);
         }
-      }),
-    );
-    unlisteners.push(
-      listen("dm-read", (event) => {
-        const payload = event.payload as { message_id: string };
+      },
+      "dm-read": (raw) => {
+        const payload = raw as { message_id: string };
         messages = messages.map((m) =>
           m.id === payload.message_id ? { ...m, read: true } : m,
         );
-      }),
-    );
+      },
+    });
     return () => {
       if (typingTimeout) clearTimeout(typingTimeout);
       blobs.revokeAll();
       composer?.revokeAttachments();
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
     };
   });
 </script>
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading conversation...</p>
@@ -330,9 +315,10 @@
         {/if}
         <div
           class="message-row"
-          class:sent={msg.from_pubkey === nodeId}
-          class:received={msg.from_pubkey !== nodeId}
-          class:failed-msg={msg.from_pubkey === nodeId && failedIds.has(msg.id)}
+          class:sent={msg.from_pubkey === node.nodeId}
+          class:received={msg.from_pubkey !== node.nodeId}
+          class:failed-msg={msg.from_pubkey === node.nodeId &&
+            failedIds.has(msg.id)}
         >
           <div class="message-bubble">
             {#if msg.media && msg.media.length > 0}
@@ -376,7 +362,7 @@
             {/if}
             <div class="message-meta">
               <span class="message-time">{formatTime(msg.timestamp)}</span>
-              {#if msg.from_pubkey === nodeId}
+              {#if msg.from_pubkey === node.nodeId}
                 {#if msg.read}
                   <span class="delivery-status read" title="Read">Read</span>
                 {:else if msg.delivered}

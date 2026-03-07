@@ -1,3 +1,4 @@
+use iroh_social_types::now_millis;
 use rusqlite::params;
 
 use super::Storage;
@@ -14,10 +15,7 @@ impl Storage {
             db.execute("DELETE FROM bookmarks WHERE post_id=?1", params![post_id])?;
             Ok(false)
         } else {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
+            let now = now_millis() as i64;
             db.execute(
                 "INSERT INTO bookmarks (post_id, created_at) VALUES (?1, ?2)",
                 params![post_id, now],
@@ -38,10 +36,7 @@ impl Storage {
 
     pub fn mute_user(&self, pubkey: &str) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_millis() as i64;
         db.execute(
             "INSERT OR IGNORE INTO mutes (pubkey, created_at) VALUES (?1, ?2)",
             params![pubkey, now],
@@ -78,10 +73,7 @@ impl Storage {
 
     pub fn block_user(&self, pubkey: &str) -> anyhow::Result<()> {
         let db = self.db.lock().unwrap();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
+        let now = now_millis() as i64;
         db.execute(
             "INSERT OR IGNORE INTO blocks (pubkey, created_at) VALUES (?1, ?2)",
             params![pubkey, now],

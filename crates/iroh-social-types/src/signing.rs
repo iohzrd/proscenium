@@ -33,34 +33,18 @@ fn interaction_signing_bytes(interaction: &Interaction) -> Vec<u8> {
 }
 
 fn signature_to_hex(sig: &Signature) -> String {
-    let bytes = sig.to_bytes();
-    let mut hex = String::with_capacity(128);
-    for b in &bytes {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    hex
+    hex::encode(sig.to_bytes())
 }
 
-fn hex_to_signature(hex: &str) -> Result<Signature, String> {
-    if hex.len() != 128 {
-        return Err(format!("invalid signature hex length: {}", hex.len()));
+fn hex_to_signature(hex_str: &str) -> Result<Signature, String> {
+    if hex_str.len() != 128 {
+        return Err(format!("invalid signature hex length: {}", hex_str.len()));
     }
-    let mut bytes = [0u8; 64];
-    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-        let hi = hex_digit(chunk[0])?;
-        let lo = hex_digit(chunk[1])?;
-        bytes[i] = (hi << 4) | lo;
-    }
-    Ok(Signature::from_bytes(&bytes))
-}
-
-fn hex_digit(b: u8) -> Result<u8, String> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(format!("invalid hex digit: {}", b as char)),
-    }
+    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
+    let arr: [u8; 64] = bytes
+        .try_into()
+        .map_err(|_| "invalid signature length".to_string())?;
+    Ok(Signature::from_bytes(&arr))
 }
 
 /// Sign a Post in place using the given secret key.

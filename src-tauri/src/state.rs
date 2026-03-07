@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 pub struct AppState {
     pub endpoint: Endpoint,
+    /// Kept alive to maintain protocol handler registrations (DM, blobs, etc.)
     #[allow(dead_code)]
     pub router: Router,
     pub blobs: BlobsProtocol,

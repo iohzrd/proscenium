@@ -1,28 +1,25 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
   import Avatar from "$lib/Avatar.svelte";
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
   import type { FollowEntry, FollowerEntry } from "$lib/types";
+  import { shortId, getDisplayName, getCachedAvatarTicket } from "$lib/utils";
   import {
-    shortId,
-    getDisplayName,
-    getCachedAvatarTicket,
-    copyToClipboard,
-  } from "$lib/utils";
+    useNodeInit,
+    useEventListeners,
+    useCopyFeedback,
+  } from "$lib/composables.svelte";
 
   let follows = $state<FollowEntry[]>([]);
   let followers = $state<FollowerEntry[]>([]);
   let mutedPubkeys = $state<string[]>([]);
   let blockedPubkeys = $state<string[]>([]);
   let newPubkey = $state("");
-  let loading = $state(true);
   let status = $state("");
   let addingFollow = $state(false);
-  let copyFeedback = $state("");
   let pendingUnfollowPubkey = $state<string | null>(null);
   let activeTab = $state<"following" | "followers">("following");
   let editingAlias = $state<string | null>(null);
@@ -30,26 +27,16 @@
   const isMobile = platform() === "android" || platform() === "ios";
   let showScanner = $state(false);
 
-  async function copyWithFeedback(text: string, label: string) {
-    await copyToClipboard(text);
-    copyFeedback = label;
-    setTimeout(() => (copyFeedback = ""), 1500);
-  }
+  const copyFb = useCopyFeedback();
 
-  async function init() {
-    try {
-      await invoke("get_node_id"); // wait for node ready
-      await Promise.all([
-        loadFollows(),
-        loadFollowers(),
-        loadMuted(),
-        loadBlocked(),
-      ]);
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
-    }
-  }
+  const node = useNodeInit(async () => {
+    await Promise.all([
+      loadFollows(),
+      loadFollowers(),
+      loadMuted(),
+      loadBlocked(),
+    ]);
+  });
 
   async function loadFollows() {
     try {
@@ -167,29 +154,25 @@
   }
 
   onMount(() => {
-    init();
-
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("follower-changed", () => {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "follower-changed": () => {
         loadFollowers();
-      }),
-    );
-    unlisteners.push(
-      listen("new-follower", () => {
+      },
+      "new-follower": () => {
         loadFollowers();
-      }),
-    );
+      },
+    });
 
     window.addEventListener("keydown", handleGlobalKey);
     return () => {
       window.removeEventListener("keydown", handleGlobalKey);
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
     };
   });
 </script>
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading...</p>
@@ -308,9 +291,9 @@
             </button>
             <button
               class="btn-elevated"
-              onclick={() => copyWithFeedback(f.pubkey, f.pubkey)}
+              onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
             >
-              {copyFeedback === f.pubkey ? "Copied!" : "Copy"}
+              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy"}
             </button>
             <button
               class="btn-moderation danger"
@@ -384,9 +367,9 @@
           <div class="follow-actions">
             <button
               class="btn-elevated"
-              onclick={() => copyWithFeedback(f.pubkey, f.pubkey)}
+              onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
             >
-              {copyFeedback === f.pubkey ? "Copied!" : "Copy"}
+              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy"}
             </button>
           </div>
         </div>

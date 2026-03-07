@@ -1,6 +1,5 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import PostCard from "$lib/PostCard.svelte";
   import Lightbox from "$lib/Lightbox.svelte";
@@ -8,16 +7,16 @@
   import Timeago from "$lib/Timeago.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import type { AppNotification, Post } from "$lib/types";
-  import { setupInfiniteScroll, getDisplayName, shortId } from "$lib/utils";
+  import { getDisplayName, shortId } from "$lib/utils";
+  import {
+    useNodeInit,
+    useEventListeners,
+    useInfiniteScroll,
+    useLightbox,
+  } from "$lib/composables.svelte";
 
-  let nodeId = $state("");
   let notifications = $state<AppNotification[]>([]);
-  let loading = $state(true);
-  let hasMore = $state(true);
-  let loadingMore = $state(false);
   let sentinel = $state<HTMLDivElement>(null!);
-  let lightboxSrc = $state("");
-  let lightboxAlt = $state("");
   let filter = $state("all");
   let postCache = $state<Record<string, Post>>({});
   let nameCache = $state<Record<string, string>>({});
@@ -34,6 +33,8 @@
   const blobs = createBlobCache();
   setBlobContext(blobs);
 
+  const lightbox = useLightbox();
+
   let filtered = $derived(
     filter === "all"
       ? notifications
@@ -42,7 +43,7 @@
 
   async function resolveName(pubkey: string): Promise<string> {
     if (nameCache[pubkey]) return nameCache[pubkey];
-    const name = await getDisplayName(pubkey, nodeId);
+    const name = await getDisplayName(pubkey, node.nodeId);
     nameCache = { ...nameCache, [pubkey]: name };
     return name;
   }
@@ -72,16 +73,10 @@
     await Promise.all([...postPromises, ...namePromises]);
   }
 
-  async function init() {
-    try {
-      nodeId = await invoke("get_node_id");
-      await loadNotifications();
-      await invoke("mark_notifications_read");
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
-    }
-  }
+  const node = useNodeInit(async () => {
+    await loadNotifications();
+    await invoke("mark_notifications_read");
+  });
 
   async function loadNotifications() {
     try {
@@ -89,34 +84,35 @@
         limit: 30,
       });
       notifications = result;
-      hasMore = result.length >= 30;
+      scroll.setHasMore(result.length);
       await fetchPostsForNotifications(result);
     } catch (e) {
       console.error("Failed to load notifications:", e);
     }
   }
 
-  async function loadMore() {
-    if (loadingMore || !hasMore || notifications.length === 0) return;
-    loadingMore = true;
-    try {
-      const oldest = notifications[notifications.length - 1];
-      const more: AppNotification[] = await invoke("get_notifications", {
-        limit: 30,
-        before: oldest.timestamp,
-      });
-      if (more.length === 0) {
-        hasMore = false;
-      } else {
-        notifications = [...notifications, ...more];
-        hasMore = more.length >= 30;
-        await fetchPostsForNotifications(more);
+  const scroll = useInfiniteScroll(
+    () => sentinel,
+    async () => {
+      try {
+        const oldest = notifications[notifications.length - 1];
+        const more: AppNotification[] = await invoke("get_notifications", {
+          limit: 30,
+          before: oldest.timestamp,
+        });
+        if (more.length === 0) {
+          scroll.setNoMore();
+        } else {
+          notifications = [...notifications, ...more];
+          scroll.setHasMore(more.length);
+          await fetchPostsForNotifications(more);
+        }
+      } catch (e) {
+        console.error("Failed to load more notifications:", e);
       }
-    } catch (e) {
-      console.error("Failed to load more notifications:", e);
-    }
-    loadingMore = false;
-  }
+    },
+    30,
+  );
 
   function postForNotification(n: AppNotification): Post | undefined {
     if (n.kind === "like") {
@@ -143,44 +139,30 @@
   }
 
   $effect(() => {
-    return setupInfiniteScroll(
-      sentinel,
-      () => hasMore,
-      () => loadingMore,
-      loadMore,
-    );
+    return scroll.setupEffect();
   });
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("notification-received", () => {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "notification-received": () => {
         loadNotifications();
         invoke("mark_notifications_read");
-      }),
-    );
-    unlisteners.push(
-      listen("mentioned-in-post", () => {
+      },
+      "mentioned-in-post": () => {
         loadNotifications();
         invoke("mark_notifications_read");
-      }),
-    );
+      },
+    });
     return () => {
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
       blobs.revokeAll();
     };
   });
 </script>
 
-{#if lightboxSrc}
-  <Lightbox
-    src={lightboxSrc}
-    alt={lightboxAlt}
-    onclose={() => {
-      lightboxSrc = "";
-    }}
-  />
+{#if lightbox.src}
+  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
 {/if}
 
 <h2 class="page-title">Notifications</h2>
@@ -197,7 +179,7 @@
   {/each}
 </div>
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading notifications...</p>
@@ -234,14 +216,7 @@
           >
         {:else if post}
           <div class="notif-post">
-            <PostCard
-              {post}
-              {nodeId}
-              onlightbox={(src, alt) => {
-                lightboxSrc = src;
-                lightboxAlt = alt;
-              }}
-            />
+            <PostCard {post} nodeId={node.nodeId} onlightbox={lightbox.open} />
           </div>
         {:else}
           <p class="notif-deleted">Post no longer available</p>
@@ -250,9 +225,9 @@
     {/each}
   </div>
 
-  {#if hasMore && notifications.length > 0}
+  {#if scroll.hasMore && notifications.length > 0}
     <div bind:this={sentinel} class="sentinel">
-      {#if loadingMore}
+      {#if scroll.loadingMore}
         <span class="btn-spinner"></span> Loading...
       {/if}
     </div>

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+hex = "0.4"
 iroh = "0.96"
 serde = { workspace = true }
 serde_json = { workspace = true }
