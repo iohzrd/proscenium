@@ -5,6 +5,19 @@ use super::Storage;
 const PUSH_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 impl Storage {
+    /// Enqueue a profile-only push (both post_id and interaction_id NULL).
+    pub fn enqueue_push_profile(&self, recipient: &str) -> anyhow::Result<()> {
+        let now = iroh_social_types::now_millis();
+        let expires_at = now + PUSH_TTL_MS;
+        self.with_db(|db| {
+            db.execute(
+                "INSERT INTO push_outbox (recipient, created_at, expires_at) VALUES (?1, ?2, ?3)",
+                params![recipient, now as i64, expires_at as i64],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn enqueue_push_post(&self, recipient: &str, post_id: &str) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis();
         let expires_at = now + PUSH_TTL_MS;
@@ -44,6 +57,21 @@ impl Storage {
                 peers.push(row.get(0)?);
             }
             Ok(peers)
+        })
+    }
+
+    /// Get profile-only push entries (both post_id and interaction_id NULL).
+    pub fn get_pending_push_profile_ids(&self, recipient: &str) -> anyhow::Result<Vec<i64>> {
+        self.with_db(|db| {
+            let mut stmt = db.prepare(
+                "SELECT id FROM push_outbox WHERE recipient=?1 AND post_id IS NULL AND interaction_id IS NULL AND attempts < max_attempts",
+            )?;
+            let mut rows = stmt.query(params![recipient])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+            }
+            Ok(ids)
         })
     }
 

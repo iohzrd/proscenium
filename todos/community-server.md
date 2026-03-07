@@ -1033,11 +1033,11 @@ New social feature for Listed users requiring follow approval.
 
 Wire up the full visibility model across gossip, sync, and transitions.
 
-- [ ] Update sync handler: Listed restricts to followers, Private restricts to mutuals
-- [ ] Update client settings UI: handle visibility change transitions
-- [ ] Handle visibility change ordering (broadcast ProfileUpdate via gossip before stopping topic)
-- [ ] Auto-unregister from servers when switching to Private
-- [ ] Proactively notify peers of visibility changes via available delivery mechanism
+- [x] Update sync handler: Listed restricts to followers, Private restricts to mutuals (already implemented)
+- [x] Update client settings UI: handle visibility change transitions (FeedManager.handle_visibility_change)
+- [x] Handle visibility change ordering (broadcast ProfileUpdate via gossip before stopping topic)
+- [ ] Auto-unregister from servers when switching to Private (deferred to Phase 3 server work)
+- [x] Proactively notify peers of visibility changes via push outbox profile delivery
 
 ### Phase 3: Server Core
 

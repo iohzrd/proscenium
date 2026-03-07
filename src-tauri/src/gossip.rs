@@ -76,10 +76,49 @@ impl FeedManager {
         }
     }
 
-    pub async fn start_own_feed(&mut self) -> anyhow::Result<()> {
-        let visibility = self.my_visibility();
-        if visibility != Visibility::Public {
-            log::info!("[gossip] skipping own feed topic (visibility={visibility})");
+    /// Handle a visibility transition. Must be called BEFORE saving the new
+    /// visibility to the database so that `broadcast_profile` can still reach
+    /// gossip subscribers when downgrading from Public.
+    pub async fn handle_visibility_change(
+        &mut self,
+        old: Visibility,
+        new: Visibility,
+        profile: &Profile,
+    ) -> anyhow::Result<()> {
+        if old == new {
+            return Ok(());
+        }
+
+        log::info!("[visibility] transitioning {old} -> {new}");
+
+        match (old, new) {
+            (Visibility::Public, _) => {
+                // Broadcast profile update via gossip before stopping feed
+                self.broadcast_profile(profile).await?;
+                self.stop_own_feed();
+            }
+            (_, Visibility::Public) => {
+                // Start gossip feed, then broadcast
+                self.start_own_feed_unconditional().await?;
+                self.broadcast_profile(profile).await?;
+            }
+            _ => {
+                // Listed <-> Private: both use push, just broadcast profile via push
+                // (push_recipients will reflect new visibility after DB save)
+            }
+        }
+
+        Ok(())
+    }
+
+    fn stop_own_feed(&mut self) {
+        if self.my_sender.take().is_some() {
+            log::info!("[gossip] stopped own feed topic");
+        }
+    }
+
+    async fn start_own_feed_unconditional(&mut self) -> anyhow::Result<()> {
+        if self.my_sender.is_some() {
             return Ok(());
         }
 
@@ -91,7 +130,6 @@ impl FeedManager {
         let (sender, receiver) = topic_handle.split();
         self.my_sender = Some(sender);
 
-        // Listen for neighbors joining/leaving our own feed topic (followers)
         let storage = self.storage.clone();
         let app_handle = self.app_handle.clone();
         tokio::spawn(async move {
@@ -146,6 +184,15 @@ impl FeedManager {
         Ok(())
     }
 
+    pub async fn start_own_feed(&mut self) -> anyhow::Result<()> {
+        let visibility = self.my_visibility();
+        if visibility != Visibility::Public {
+            log::info!("[gossip] skipping own feed topic (visibility={visibility})");
+            return Ok(());
+        }
+        self.start_own_feed_unconditional().await
+    }
+
     pub async fn broadcast_profile(&self, profile: &Profile) -> anyhow::Result<()> {
         if let Some(sender) = self.my_sender.as_ref() {
             let msg = GossipMessage::ProfileUpdate(profile.clone());
@@ -153,7 +200,23 @@ impl FeedManager {
             sender.broadcast(Bytes::from(payload)).await?;
             log::info!("[gossip] broadcast profile: {}", profile.display_name);
         } else {
-            log::info!("[push] profile update will be included in next push cycle");
+            let recipients = self.push_recipients();
+            for recipient in &recipients {
+                if let Err(e) = self.storage.enqueue_push_profile(recipient) {
+                    log::error!(
+                        "[push] failed to enqueue profile push for {}: {e}",
+                        short_id(recipient)
+                    );
+                }
+            }
+            if recipients.is_empty() {
+                log::info!("[push] no recipients for profile push");
+            } else {
+                log::info!(
+                    "[push] enqueued profile push for {} recipients",
+                    recipients.len()
+                );
+            }
         }
         Ok(())
     }

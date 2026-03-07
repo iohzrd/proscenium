@@ -3,11 +3,13 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import { copyToClipboard, detectImageMime } from "$lib/utils";
+  import type { Visibility } from "$lib/types";
 
   let step = $state(0);
   let nodeId = $state("");
   let displayName = $state("");
   let bio = $state("");
+  let visibility = $state<Visibility>("public");
   let avatarPreview = $state<string | null>(null);
   let avatarHash = $state<string | null>(null);
   let avatarTicket = $state<string | null>(null);
@@ -15,6 +17,28 @@
   let uploading = $state(false);
   let copyFeedback = $state(false);
   let fileInput = $state<HTMLInputElement>(null!);
+
+  const visibilityOptions: {
+    value: Visibility;
+    label: string;
+    hint: string;
+  }[] = [
+    {
+      value: "public",
+      label: "Public",
+      hint: "Anyone can see your posts and sync your profile.",
+    },
+    {
+      value: "listed",
+      label: "Listed",
+      hint: "Profile discoverable, but posts only shared with approved followers.",
+    },
+    {
+      value: "private",
+      label: "Private",
+      hint: "Only mutual follows can see your posts. Invisible to servers.",
+    },
+  ];
 
   onMount(async () => {
     try {
@@ -69,7 +93,7 @@
         bio: bio.trim(),
         avatarHash,
         avatarTicket,
-        visibility: "public",
+        visibility,
       });
       goto("/");
     } catch (e) {
@@ -155,6 +179,27 @@
           maxlength="300"
         ></textarea>
       </label>
+
+      <div class="field">
+        <span class="field-label">Visibility</span>
+        <div class="visibility-options">
+          {#each visibilityOptions as opt}
+            <label
+              class="visibility-option"
+              class:selected={visibility === opt.value}
+            >
+              <input
+                type="radio"
+                name="visibility"
+                value={opt.value}
+                bind:group={visibility}
+              />
+              <span class="visibility-label">{opt.label}</span>
+              <span class="visibility-hint">{opt.hint}</span>
+            </label>
+          {/each}
+        </div>
+      </div>
 
       <div class="actions">
         <button class="secondary-btn" onclick={() => (step = 0)}>Back</button>
@@ -325,5 +370,54 @@
   .secondary-btn:hover {
     color: var(--accent-light);
     border-color: var(--accent);
+  }
+
+  .visibility-options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .visibility-option {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    text-align: left;
+    transition:
+      border-color var(--transition-normal),
+      background var(--transition-normal);
+  }
+
+  .visibility-option:hover {
+    border-color: var(--border-hover);
+  }
+
+  .visibility-option.selected {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+  }
+
+  .visibility-option input[type="radio"] {
+    accent-color: var(--accent);
+    margin: 0;
+  }
+
+  .visibility-label {
+    font-size: var(--text-base);
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .visibility-hint {
+    width: 100%;
+    font-size: var(--text-sm);
+    color: var(--text-tertiary);
+    padding-left: 1.5rem;
   }
 </style>

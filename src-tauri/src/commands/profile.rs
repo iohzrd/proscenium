@@ -25,20 +25,37 @@ pub async fn save_my_profile(
     visibility: String,
 ) -> Result<(), String> {
     let node_id = state.endpoint.id().to_string();
-    let visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
+    let new_visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
     let profile = Profile {
         display_name: display_name.clone(),
         bio: bio.clone(),
         avatar_hash,
         avatar_ticket,
-        visibility,
+        visibility: new_visibility,
     };
     validate_profile(&profile)?;
+
+    let old_visibility = state
+        .storage
+        .get_visibility(&node_id)
+        .unwrap_or(Visibility::Public);
+
+    let mut feed = state.feed.lock().await;
+
+    if old_visibility != new_visibility {
+        // Handle gossip feed start/stop BEFORE saving new visibility
+        feed.handle_visibility_change(old_visibility, new_visibility, &profile)
+            .await
+            .str_err()?;
+        log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
+    }
+
     state.storage.save_profile(&node_id, &profile).str_err()?;
-    log::info!("[profile] saved profile: {display_name} (visibility={visibility})");
-    let feed = state.feed.lock().await;
+    log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
+
+    // Broadcast profile update (gossip for Public, push outbox for Listed/Private)
     feed.broadcast_profile(&profile).await.str_err()?;
-    log::info!("[profile] broadcast profile update");
+
     Ok(())
 }
 

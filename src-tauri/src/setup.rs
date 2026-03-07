@@ -404,6 +404,9 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         Err(_) => continue,
                     };
 
+                    let profile_entries = push_storage
+                        .get_pending_push_profile_ids(&peer)
+                        .unwrap_or_default();
                     let post_entries = push_storage
                         .get_pending_push_post_ids(&peer)
                         .unwrap_or_default();
@@ -411,7 +414,10 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         .get_pending_push_interaction_ids(&peer)
                         .unwrap_or_default();
 
-                    if post_entries.is_empty() && interaction_entries.is_empty() {
+                    if profile_entries.is_empty()
+                        && post_entries.is_empty()
+                        && interaction_entries.is_empty()
+                    {
                         continue;
                     }
 
@@ -435,26 +441,39 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         interaction_outbox_ids.push(*outbox_id);
                     }
 
+                    // Include profile if there are profile-only entries
+                    let profile = if !profile_entries.is_empty() {
+                        push_storage.get_profile(&push_my_id).ok().flatten()
+                    } else {
+                        None
+                    };
+
                     let msg = iroh_social_types::PushMessage {
                         author: push_my_id.clone(),
                         posts,
                         interactions,
-                        profile: None,
+                        profile,
                     };
 
-                    let all_ids: Vec<i64> = post_outbox_ids
+                    let mut all_ids: Vec<i64> = post_outbox_ids
                         .iter()
                         .chain(interaction_outbox_ids.iter())
                         .copied()
                         .collect();
+                    all_ids.extend_from_slice(&profile_entries);
 
                     match push::push_to_peer(&push_ep, target, &msg).await {
                         Ok(ack) => {
                             log::info!(
-                                "[push-outbox] delivered {} posts, {} interactions to {}",
+                                "[push-outbox] delivered {} posts, {} interactions to {}{}",
                                 ack.received_post_ids.len(),
                                 ack.received_interaction_ids.len(),
-                                short_id(&peer)
+                                short_id(&peer),
+                                if profile_entries.is_empty() {
+                                    ""
+                                } else {
+                                    " (+ profile)"
+                                },
                             );
                             let _ = push_storage.remove_push_outbox_entries(&all_ids);
                         }
