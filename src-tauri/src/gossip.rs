@@ -8,7 +8,7 @@ use iroh_gossip::{
     api::{Event, GossipSender},
 };
 use iroh_social_types::{
-    GossipMessage, Interaction, Post, Profile, now_millis, short_id, user_feed_topic,
+    GossipMessage, Interaction, Post, Profile, Visibility, now_millis, short_id, user_feed_topic,
     validate_profile,
 };
 use std::collections::HashMap;
@@ -42,7 +42,47 @@ impl FeedManager {
         }
     }
 
+    fn my_visibility(&self) -> Visibility {
+        let my_id = self.endpoint.id().to_string();
+        self.storage
+            .get_visibility(&my_id)
+            .unwrap_or(Visibility::Public)
+    }
+
+    /// Get the list of recipients for direct push based on visibility.
+    /// Listed: all followers. Private: only mutuals.
+    fn push_recipients(&self) -> Vec<String> {
+        let visibility = self.my_visibility();
+        match visibility {
+            Visibility::Public => vec![],
+            Visibility::Listed => self
+                .storage
+                .get_followers()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| f.pubkey)
+                .collect(),
+            Visibility::Private => {
+                let followers = self.storage.get_followers().unwrap_or_default();
+                let follows = self.storage.get_follows().unwrap_or_default();
+                let follow_set: std::collections::HashSet<&str> =
+                    follows.iter().map(|f| f.pubkey.as_str()).collect();
+                followers
+                    .into_iter()
+                    .filter(|f| follow_set.contains(f.pubkey.as_str()))
+                    .map(|f| f.pubkey)
+                    .collect()
+            }
+        }
+    }
+
     pub async fn start_own_feed(&mut self) -> anyhow::Result<()> {
+        let visibility = self.my_visibility();
+        if visibility != Visibility::Public {
+            log::info!("[gossip] skipping own feed topic (visibility={visibility})");
+            return Ok(());
+        }
+
         let my_id = self.endpoint.id().to_string();
         let topic = user_feed_topic(&my_id);
         log::info!("[gossip] starting own feed topic for {}", short_id(&my_id));
@@ -107,82 +147,107 @@ impl FeedManager {
     }
 
     pub async fn broadcast_profile(&self, profile: &Profile) -> anyhow::Result<()> {
-        let sender = self
-            .my_sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("own feed not started"))?;
-
-        let msg = GossipMessage::ProfileUpdate(profile.clone());
-        let payload = serde_json::to_vec(&msg)?;
-        sender.broadcast(Bytes::from(payload)).await?;
-        log::info!("[gossip] broadcast profile: {}", profile.display_name);
-
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::ProfileUpdate(profile.clone());
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!("[gossip] broadcast profile: {}", profile.display_name);
+        } else {
+            log::info!("[push] profile update will be included in next push cycle");
+        }
         Ok(())
     }
 
     pub async fn broadcast_post(&self, post: &Post) -> anyhow::Result<()> {
-        let sender = self
-            .my_sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("own feed not started"))?;
-
-        let msg = GossipMessage::NewPost(post.clone());
-        let payload = serde_json::to_vec(&msg)?;
-        sender.broadcast(Bytes::from(payload)).await?;
-        log::info!("[gossip] broadcast post {}", &post.id);
-
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::NewPost(post.clone());
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!("[gossip] broadcast post {}", &post.id);
+        } else {
+            // Enqueue to push outbox for each recipient
+            let recipients = self.push_recipients();
+            for recipient in &recipients {
+                if let Err(e) = self.storage.enqueue_push_post(recipient, &post.id) {
+                    log::error!(
+                        "[push] failed to enqueue post {} for {}: {e}",
+                        &post.id,
+                        short_id(recipient)
+                    );
+                }
+            }
+            log::info!(
+                "[push] enqueued post {} for {} recipients",
+                &post.id,
+                recipients.len()
+            );
+        }
         Ok(())
     }
 
     pub async fn broadcast_delete(&self, id: &str, author: &str) -> anyhow::Result<()> {
-        let sender = self
-            .my_sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("own feed not started"))?;
-
-        let msg = GossipMessage::DeletePost {
-            id: id.to_string(),
-            author: author.to_string(),
-        };
-        let payload = serde_json::to_vec(&msg)?;
-        sender.broadcast(Bytes::from(payload)).await?;
-        log::info!("[gossip] broadcast delete {id}");
-
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::DeletePost {
+                id: id.to_string(),
+                author: author.to_string(),
+            };
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!("[gossip] broadcast delete {id}");
+        } else {
+            // Deletes for push-based delivery: remove from outbox if pending
+            log::info!("[push] delete post {id} (pending pushes will skip missing post)");
+        }
         Ok(())
     }
 
     pub async fn broadcast_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {
-        let sender = self
-            .my_sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("own feed not started"))?;
-
-        let msg = GossipMessage::NewInteraction(interaction.clone());
-        let payload = serde_json::to_vec(&msg)?;
-        sender.broadcast(Bytes::from(payload)).await?;
-        log::info!(
-            "[gossip] broadcast {:?} on post {}",
-            interaction.kind,
-            &interaction.target_post_id
-        );
-
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::NewInteraction(interaction.clone());
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!(
+                "[gossip] broadcast {:?} on post {}",
+                interaction.kind,
+                &interaction.target_post_id
+            );
+        } else {
+            let recipients = self.push_recipients();
+            for recipient in &recipients {
+                if let Err(e) = self
+                    .storage
+                    .enqueue_push_interaction(recipient, &interaction.id)
+                {
+                    log::error!(
+                        "[push] failed to enqueue interaction {} for {}: {e}",
+                        &interaction.id,
+                        short_id(recipient)
+                    );
+                }
+            }
+            log::info!(
+                "[push] enqueued interaction {} for {} recipients",
+                &interaction.id,
+                recipients.len()
+            );
+        }
         Ok(())
     }
 
     pub async fn broadcast_delete_interaction(&self, id: &str, author: &str) -> anyhow::Result<()> {
-        let sender = self
-            .my_sender
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("own feed not started"))?;
-
-        let msg = GossipMessage::DeleteInteraction {
-            id: id.to_string(),
-            author: author.to_string(),
-        };
-        let payload = serde_json::to_vec(&msg)?;
-        sender.broadcast(Bytes::from(payload)).await?;
-        log::info!("[gossip] broadcast delete interaction {id}");
-
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::DeleteInteraction {
+                id: id.to_string(),
+                author: author.to_string(),
+            };
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!("[gossip] broadcast delete interaction {id}");
+        } else {
+            log::info!(
+                "[push] delete interaction {id} (pending pushes will skip missing interaction)"
+            );
+        }
         Ok(())
     }
 

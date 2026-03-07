@@ -21,6 +21,19 @@ impl Storage {
         })
     }
 
+    pub fn get_interaction_by_id(&self, id: &str) -> anyhow::Result<Option<Interaction>> {
+        self.with_db(|db| {
+            let mut stmt = db.prepare(
+                "SELECT id, author, kind, target_post_id, target_author, timestamp, signature FROM interactions WHERE id=?1",
+            )?;
+            let mut rows = stmt.query(params![id])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(Self::row_to_interaction(row)?)),
+                None => Ok(None),
+            }
+        })
+    }
+
     pub fn save_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {
         let kind_str = match interaction.kind {
             InteractionKind::Like => "Like",

@@ -1,15 +1,9 @@
 use crate::storage::Storage;
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId,
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler},
-};
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
 use iroh_social_types::{
-    Interaction, Post, Profile, SyncFrame, SyncMode, SyncRequest, SyncSummary, Visibility, short_id,
+    Interaction, PEER_ALPN, PeerRequest, Post, Profile, SyncFrame, SyncMode, SyncRequest,
+    SyncSummary, Visibility, short_id,
 };
-use std::sync::Arc;
-
-pub use iroh_social_types::SYNC_ALPN;
 
 const BATCH_SIZE: usize = 200;
 
@@ -45,238 +39,202 @@ async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Opt
     Ok(Some(buf))
 }
 
-#[derive(Debug, Clone)]
-pub struct SyncHandler {
-    storage: Arc<Storage>,
-    node_id: String,
-}
-
-impl SyncHandler {
-    pub fn new(storage: Arc<Storage>, node_id: String) -> Self {
-        Self { storage, node_id }
+/// Server-side sync handler, dispatched from the unified PeerHandler.
+/// The initial PeerRequest::Sync has already been read; `send` is the response side
+/// of the first bi-stream, and `conn` is available for opening additional streams.
+pub async fn handle_sync(
+    storage: &Storage,
+    node_id: &str,
+    remote_str: &str,
+    conn: &Connection,
+    mut send: iroh::endpoint::SendStream,
+    req: SyncRequest,
+) -> Result<(), AcceptError> {
+    // Enforce visibility-based sync access control
+    let visibility = storage
+        .get_visibility(node_id)
+        .unwrap_or(Visibility::Public);
+    match visibility {
+        Visibility::Public => {} // anyone can sync
+        Visibility::Listed => {
+            if !storage.is_follower(remote_str).unwrap_or(false) {
+                log::warn!(
+                    "[sync-server] rejecting non-follower {} (listed profile)",
+                    short_id(remote_str)
+                );
+                return Err(AcceptError::from_err(std::io::Error::other("listed")));
+            }
+        }
+        Visibility::Private => {
+            if !storage.is_mutual(remote_str).unwrap_or(false) {
+                log::warn!(
+                    "[sync-server] rejecting non-mutual {} (private profile)",
+                    short_id(remote_str)
+                );
+                return Err(AcceptError::from_err(std::io::Error::other("private")));
+            }
+        }
     }
-}
 
-impl ProtocolHandler for SyncHandler {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let remote = conn.remote_id();
-        let remote_str = remote.to_string();
-        log::info!("[sync-server] incoming sync from {}", short_id(&remote_str));
+    let map_err = |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
 
-        // Reject blocked peers
-        if self.storage.is_blocked(&remote_str).unwrap_or(false) {
-            log::warn!(
-                "[sync-server] rejecting blocked peer {}",
-                short_id(&remote_str)
-            );
-            return Err(AcceptError::from_err(std::io::Error::other("blocked")));
-        }
+    let server_post_count = storage
+        .count_posts_by_author(&req.author)
+        .map_err(map_err)?;
+    let server_interaction_count = storage
+        .count_interactions_by_author(&req.author)
+        .map_err(map_err)?;
+    let posts_after_count = if req.newest_timestamp > 0 {
+        storage
+            .count_posts_after(&req.author, req.newest_timestamp)
+            .map_err(map_err)?
+    } else {
+        server_post_count
+    };
+    let interactions_after_count = if req.newest_interaction_timestamp > 0 {
+        storage
+            .count_interactions_after(&req.author, req.newest_interaction_timestamp)
+            .map_err(map_err)?
+    } else {
+        server_interaction_count
+    };
 
-        // Enforce visibility-based sync access control
-        let visibility = self
-            .storage
-            .get_visibility(&self.node_id)
-            .unwrap_or(Visibility::Public);
-        match visibility {
-            Visibility::Public => {} // anyone can sync
-            Visibility::Listed => {
-                if !self.storage.is_follower(&remote_str).unwrap_or(false) {
-                    log::warn!(
-                        "[sync-server] rejecting non-follower {} (listed profile)",
-                        short_id(&remote_str)
-                    );
-                    return Err(AcceptError::from_err(std::io::Error::other("listed")));
-                }
-            }
-            Visibility::Private => {
-                if !self.storage.is_mutual(&remote_str).unwrap_or(false) {
-                    log::warn!(
-                        "[sync-server] rejecting non-mutual {} (private profile)",
-                        short_id(&remote_str)
-                    );
-                    return Err(AcceptError::from_err(std::io::Error::other("private")));
-                }
-            }
-        }
+    // Determine sync mode
+    let posts_match = req.post_count == server_post_count;
+    let interactions_match = req.interaction_count == server_interaction_count;
+    let mode = if posts_match && interactions_match {
+        SyncMode::UpToDate
+    } else if server_post_count >= req.post_count
+        && (server_post_count - req.post_count) == posts_after_count
+    {
+        SyncMode::TimestampCatchUp
+    } else {
+        SyncMode::NeedIdDiff
+    };
 
-        let (mut send, mut recv) = conn.accept_bi().await?;
+    let profile = storage.get_profile(node_id).ok().flatten();
 
-        // Read Phase 1 request
-        let req_bytes = recv
-            .read_to_end(65_536)
+    log::info!(
+        "[sync-server] author={}, client=({}/{}/ts={}/its={}), server=({}/{}/after={}/iafter={}), mode={:?}",
+        short_id(&req.author),
+        req.post_count,
+        req.interaction_count,
+        req.newest_timestamp,
+        req.newest_interaction_timestamp,
+        server_post_count,
+        server_interaction_count,
+        posts_after_count,
+        interactions_after_count,
+        mode,
+    );
+
+    let summary = SyncSummary {
+        server_post_count,
+        server_interaction_count,
+        posts_after_count,
+        interactions_after_count,
+        mode,
+        profile,
+    };
+    let summary_bytes = serde_json::to_vec(&summary).map_err(AcceptError::from_err)?;
+
+    // Send Phase 1 summary
+    send.write_all(&summary_bytes)
+        .await
+        .map_err(AcceptError::from_err)?;
+    send.finish().map_err(AcceptError::from_err)?;
+
+    if mode == SyncMode::UpToDate {
+        conn.closed().await;
+        return Ok(());
+    }
+
+    // Phase 2 or 3: Open a new bi-stream for streaming data.
+    let (mut data_send, mut data_recv) = conn.accept_bi().await?;
+
+    let known_ids: Vec<String> = if mode == SyncMode::NeedIdDiff {
+        let ids_bytes = data_recv
+            .read_to_end(5_000_000)
             .await
             .map_err(AcceptError::from_err)?;
-        let req: SyncRequest = serde_json::from_slice(&req_bytes).map_err(AcceptError::from_err)?;
+        serde_json::from_slice(&ids_bytes).map_err(AcceptError::from_err)?
+    } else {
+        Vec::new()
+    };
 
-        let map_err =
-            |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
-
-        let server_post_count = self
-            .storage
-            .count_posts_by_author(&req.author)
-            .map_err(map_err)?;
-        let server_interaction_count = self
-            .storage
-            .count_interactions_by_author(&req.author)
-            .map_err(map_err)?;
-        let posts_after_count = if req.newest_timestamp > 0 {
-            self.storage
-                .count_posts_after(&req.author, req.newest_timestamp)
-                .map_err(map_err)?
-        } else {
-            server_post_count
-        };
-        let interactions_after_count = if req.newest_interaction_timestamp > 0 {
-            self.storage
-                .count_interactions_after(&req.author, req.newest_interaction_timestamp)
-                .map_err(map_err)?
-        } else {
-            server_interaction_count
+    // Stream posts
+    let mut offset = 0;
+    let mut total_sent = 0u64;
+    loop {
+        let batch = match mode {
+            SyncMode::TimestampCatchUp => storage
+                .get_posts_after(&req.author, req.newest_timestamp, BATCH_SIZE, offset)
+                .map_err(map_err)?,
+            SyncMode::NeedIdDiff => storage
+                .get_posts_not_in(&req.author, &known_ids, BATCH_SIZE, offset)
+                .map_err(map_err)?,
+            SyncMode::UpToDate => break,
         };
 
-        // Determine sync mode
-        let posts_match = req.post_count == server_post_count;
-        let interactions_match = req.interaction_count == server_interaction_count;
-        let mode = if posts_match && interactions_match {
-            SyncMode::UpToDate
-        } else if server_post_count >= req.post_count
-            && (server_post_count - req.post_count) == posts_after_count
-        {
-            // All missing posts are newer than client's newest -- pure catch-up
-            SyncMode::TimestampCatchUp
-        } else {
-            // Gap detected (missing posts in the middle or deletions) -- need ID diff
-            SyncMode::NeedIdDiff
-        };
-
-        let profile = self.storage.get_profile(&self.node_id).ok().flatten();
-
-        log::info!(
-            "[sync-server] author={}, client=({}/{}/ts={}/its={}), server=({}/{}/after={}/iafter={}), mode={:?}",
-            short_id(&req.author),
-            req.post_count,
-            req.interaction_count,
-            req.newest_timestamp,
-            req.newest_interaction_timestamp,
-            server_post_count,
-            server_interaction_count,
-            posts_after_count,
-            interactions_after_count,
-            mode,
-        );
-
-        let summary = SyncSummary {
-            server_post_count,
-            server_interaction_count,
-            posts_after_count,
-            interactions_after_count,
-            mode,
-            profile,
-        };
-        let summary_bytes = serde_json::to_vec(&summary).map_err(AcceptError::from_err)?;
-
-        // Send Phase 1 summary
-        send.write_all(&summary_bytes)
-            .await
-            .map_err(AcceptError::from_err)?;
-        send.finish().map_err(AcceptError::from_err)?;
-
-        if mode == SyncMode::UpToDate {
-            conn.closed().await;
-            return Ok(());
+        if batch.is_empty() {
+            break;
         }
 
-        // Phase 2 or 3: Open a new bi-stream for streaming data.
-        // The client will send back on the recv side (known_ids for NeedIdDiff, or empty finish for TimestampCatchUp).
-        let (mut data_send, mut data_recv) = conn.accept_bi().await?;
+        total_sent += batch.len() as u64;
+        offset += batch.len();
 
-        let known_ids: Vec<String> = if mode == SyncMode::NeedIdDiff {
-            // Read known IDs from client
-            let ids_bytes = data_recv
-                .read_to_end(5_000_000)
-                .await
-                .map_err(AcceptError::from_err)?;
-            serde_json::from_slice(&ids_bytes).map_err(AcceptError::from_err)?
-        } else {
-            Vec::new()
-        };
+        let frame = SyncFrame::Posts(batch);
+        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
+        write_frame(&mut data_send, &frame_bytes).await?;
+    }
 
-        // Stream posts
-        let mut offset = 0;
-        let mut total_sent = 0u64;
+    // Stream interactions
+    if !interactions_match {
+        let interaction_catchup = server_interaction_count >= req.interaction_count
+            && (server_interaction_count - req.interaction_count) == interactions_after_count;
+
+        let mut ioffset = 0;
         loop {
-            let batch = match mode {
-                SyncMode::TimestampCatchUp => self
-                    .storage
-                    .get_posts_after(&req.author, req.newest_timestamp, BATCH_SIZE, offset)
-                    .map_err(map_err)?,
-                SyncMode::NeedIdDiff => self
-                    .storage
-                    .get_posts_not_in(&req.author, &known_ids, BATCH_SIZE, offset)
-                    .map_err(map_err)?,
-                SyncMode::UpToDate => break,
+            let batch = if interaction_catchup {
+                storage
+                    .get_interactions_after(
+                        &req.author,
+                        req.newest_interaction_timestamp,
+                        BATCH_SIZE,
+                        ioffset,
+                    )
+                    .map_err(map_err)?
+            } else {
+                storage
+                    .get_interactions_paged(&req.author, BATCH_SIZE, ioffset)
+                    .map_err(map_err)?
             };
 
             if batch.is_empty() {
                 break;
             }
 
-            total_sent += batch.len() as u64;
-            offset += batch.len();
+            ioffset += batch.len();
 
-            let frame = SyncFrame::Posts(batch);
+            let frame = SyncFrame::Interactions(batch);
             let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
             write_frame(&mut data_send, &frame_bytes).await?;
         }
-
-        // Stream interactions (smart: timestamp catch-up or full)
-        if !interactions_match {
-            let interaction_catchup = server_interaction_count >= req.interaction_count
-                && (server_interaction_count - req.interaction_count) == interactions_after_count;
-
-            let mut ioffset = 0;
-            loop {
-                let batch = if interaction_catchup {
-                    self.storage
-                        .get_interactions_after(
-                            &req.author,
-                            req.newest_interaction_timestamp,
-                            BATCH_SIZE,
-                            ioffset,
-                        )
-                        .map_err(map_err)?
-                } else {
-                    self.storage
-                        .get_interactions_paged(&req.author, BATCH_SIZE, ioffset)
-                        .map_err(map_err)?
-                };
-
-                if batch.is_empty() {
-                    break;
-                }
-
-                ioffset += batch.len();
-
-                let frame = SyncFrame::Interactions(batch);
-                let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-                write_frame(&mut data_send, &frame_bytes).await?;
-            }
-        }
-
-        // End-of-stream marker
-        write_frame(&mut data_send, &[]).await?;
-        data_send.finish().map_err(AcceptError::from_err)?;
-
-        log::info!(
-            "[sync-server] streamed {} posts to {} (mode={:?})",
-            total_sent,
-            short_id(&remote.to_string()),
-            mode,
-        );
-
-        conn.closed().await;
-        Ok(())
     }
+
+    // End-of-stream marker
+    write_frame(&mut data_send, &[]).await?;
+    data_send.finish().map_err(AcceptError::from_err)?;
+
+    log::info!(
+        "[sync-server] streamed {} posts to {} (mode={:?})",
+        total_sent,
+        short_id(remote_str),
+        mode,
+    );
+
+    conn.closed().await;
+    Ok(())
 }
 
 /// Result returned from a sync operation.
@@ -301,7 +259,7 @@ pub async fn sync_from_peer(
         short_id(author)
     );
     let start = std::time::Instant::now();
-    let conn = match endpoint.connect(addr, SYNC_ALPN).await {
+    let conn = match endpoint.connect(addr, PEER_ALPN).await {
         Ok(c) => {
             log::info!(
                 "[sync-client] connected to {} in {:.1}s",
@@ -320,7 +278,7 @@ pub async fn sync_from_peer(
         }
     };
 
-    // Phase 1: Send summary request
+    // Phase 1: Send PeerRequest::Sync
     let (mut send, mut recv) = conn.open_bi().await?;
 
     let post_count = storage.count_posts_by_author(author).unwrap_or(0);
@@ -335,7 +293,8 @@ pub async fn sync_from_peer(
         newest_timestamp,
         newest_interaction_timestamp,
     };
-    let req_bytes = serde_json::to_vec(&req)?;
+    let peer_req = PeerRequest::Sync(req);
+    let req_bytes = serde_json::to_vec(&peer_req)?;
     send.write_all(&req_bytes).await?;
     send.finish()?;
 
@@ -368,7 +327,6 @@ pub async fn sync_from_peer(
     let (mut data_send, mut data_recv) = conn.open_bi().await?;
 
     if summary.mode == SyncMode::NeedIdDiff {
-        // Send known IDs
         let known_ids = storage.get_post_ids_by_author(author).unwrap_or_default();
         let ids_bytes = serde_json::to_vec(&known_ids)?;
         data_send.write_all(&ids_bytes).await?;
@@ -389,7 +347,7 @@ pub async fn sync_from_peer(
                     }
                 }
             }
-            Ok(None) => break, // End of stream
+            Ok(None) => break,
             Err(e) => {
                 log::error!(
                     "[sync-client] frame read error from {}: {e:?}",

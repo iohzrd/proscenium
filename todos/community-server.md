@@ -102,13 +102,13 @@ Maximum privacy. No server-side presence at all:
 Listed and Private users bypass gossip and push posts directly to their audience. A dedicated ALPN keeps this separate from sync:
 
 ```
-ALPN: b"iroh-social/push/1"
+ALPN: b"iroh-social/peer/1"
 ```
 
 ```
 Author                           Follower/Mutual
   |                                    |
-  |-- [PUSH_ALPN] QUIC connection ---> |
+  |-- [PEER_ALPN] QUIC connection ---> |
   |-- PushMessage (length-prefixed) -->|
   |<-- PushAck ------- ---------------|
   |                                    |
@@ -119,7 +119,7 @@ Author                           Follower/Mutual
 ```rust
 // In iroh-social-types/src/protocol.rs (shared crate)
 
-pub const PUSH_ALPN: &[u8] = b"iroh-social/push/1";
+pub const PEER_ALPN: &[u8] = b"iroh-social/peer/1";
 
 /// Pushed from author to follower/mutual.
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,7 +165,7 @@ CREATE INDEX idx_push_outbox_recipient ON push_outbox(recipient);
 
 #### Push handler on recipient side
 
-The client registers a `ProtocolHandler` for `PUSH_ALPN` alongside the existing `SyncHandler`. When a connection arrives:
+All peer-to-peer protocols (sync, push, follow requests) use a single unified `PEER_ALPN` (`b"iroh-social/peer/1"`). The `PeerHandler` reads a `PeerRequest` enum as the first message and dispatches to the appropriate handler. When a connection arrives:
 
 1. Read the length-prefixed `PushMessage`.
 2. Validate `author` matches the connection's `remote_id()`.
@@ -187,7 +187,7 @@ ALPN: b"iroh-social/follow-request/1"
 ```rust
 // In iroh-social-types/src/protocol.rs (shared crate)
 
-pub const FOLLOW_REQUEST_ALPN: &[u8] = b"iroh-social/follow-request/1";
+pub const PEER_ALPN: &[u8] = b"iroh-social/follow-request/1";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FollowRequest {
@@ -206,7 +206,7 @@ pub enum FollowResponse {
 
 #### Flow
 
-1. **Requester** opens a QUIC connection on `FOLLOW_REQUEST_ALPN` to the Listed user.
+1. **Requester** opens a QUIC connection on `PEER_ALPN` to the Listed user.
 2. Sends a signed `FollowRequest`.
 3. **Listed user's client** validates the signature, stores the request in a `follow_requests` table, and emits a notification.
 4. Responds immediately with `FollowResponse::Pending`.
@@ -252,7 +252,7 @@ iroh-social/
       src/
         lib.rs
         types.rs                  # Post, Profile, Visibility, MediaAttachment, Interaction, FollowEntry, FollowerEntry
-        protocol.rs               # GossipMessage, SyncRequest/SyncSummary/SyncFrame, SYNC_ALPN, PUSH_ALPN, FOLLOW_REQUEST_ALPN, user_feed_topic(), PushMessage/PushAck, FollowRequest/FollowResponse
+        protocol.rs               # GossipMessage, PEER_ALPN, PeerRequest/PeerResponse, SyncRequest/SyncSummary/SyncFrame, PushMessage/PushAck, FollowRequest/FollowResponse, user_feed_topic()
         signing.rs                # sign_post(), verify_post_signature(), sign_interaction(), verify_interaction_signature()
         validation.rs             # validate_post(), validate_interaction(), validate_profile(), constants
         dm.rs                     # DmHandshake, EncryptedEnvelope, DirectMessage, DM_ALPN, etc.
@@ -281,9 +281,9 @@ iroh-social/
 
 ### Shared crate status
 
-The types crate contains: `types.rs` (Post, Profile, MediaAttachment, Interaction, FollowEntry, FollowerEntry), `protocol.rs` (GossipMessage with NewPost/DeletePost/ProfileUpdate/NewInteraction/DeleteInteraction, SyncRequest/SyncSummary/SyncFrame with Posts/Interactions variants, SYNC_ALPN `b"iroh-social/sync/3"`, user_feed_topic()), `signing.rs` (sign_post, verify_post_signature, sign_interaction, verify_interaction_signature -- `signature_to_hex` and `hex_to_signature` are currently private, need to be made `pub` for registration.rs), `validation.rs` (validate_post, validate_interaction, validate_profile, parse_mentions), and `dm.rs`.
+The types crate contains: `types.rs` (Post, Profile, MediaAttachment, Interaction, FollowEntry, FollowerEntry), `protocol.rs` (GossipMessage with NewPost/DeletePost/ProfileUpdate/NewInteraction/DeleteInteraction, SyncRequest/SyncSummary/SyncFrame with Posts/Interactions variants, PEER_ALPN `b"iroh-social/peer/1"`, user_feed_topic()), `signing.rs` (sign_post, verify_post_signature, sign_interaction, verify_interaction_signature -- `signature_to_hex` and `hex_to_signature` are currently private, need to be made `pub` for registration.rs), `validation.rs` (validate_post, validate_interaction, validate_profile, parse_mentions), and `dm.rs`.
 
-New modules to add: `registration.rs` (registration signing/verification) and new types/ALPNs in `protocol.rs` (PushMessage/PushAck/PUSH_ALPN, FollowRequest/FollowResponse/FOLLOW_REQUEST_ALPN).
+New modules to add: `registration.rs` (registration signing/verification) and new types in `protocol.rs` (PeerRequest/PeerResponse, PushMessage/PushAck, FollowRequest/FollowResponse). All use the single unified `PEER_ALPN`.
 
 ---
 
@@ -431,7 +431,7 @@ Both mechanisms are needed for completeness:
 
 **Important:** Listed users do not broadcast via gossip (they use direct push to followers), so there is no gossip topic to subscribe to. The server only receives profile updates from Listed users via the HTTP API.
 
-**Sync (historical catch-up):** Uses the same `SYNC_ALPN` (`b"iroh-social/sync/3"`) protocol and shared types (`SyncRequest`, `SyncSummary`, `SyncFrame`) from the types crate. The server implements its own sync client (it cannot reuse the Tauri-specific code directly, but the protocol is identical). The `SyncSummary` includes the user's `Profile`, which the server uses to update the registrations table. Triggered on:
+**Sync (historical catch-up):** Uses the same `PEER_ALPN` (`b"iroh-social/peer/1"`) protocol and shared types (`SyncRequest`, `SyncSummary`, `SyncFrame`) from the types crate. The server implements its own sync client (it cannot reuse the Tauri-specific code directly, but the protocol is identical). The `SyncSummary` includes the user's `Profile`, which the server uses to update the registrations table. Triggered on:
 
 - Server startup (sync all Public registered users)
 - New Public user registration (sync their history immediately)
@@ -828,8 +828,8 @@ CREATE TABLE IF NOT EXISTS follow_requests (
 The client adapts its post delivery mechanism based on the user's visibility setting:
 
 - **Public**: Broadcasts posts via gossip (current behavior). Registers with servers normally.
-- **Listed**: Does not start a gossip topic. On post creation, iterates over approved followers and pushes posts directly via QUIC (PUSH_ALPN). Registers with servers as "listed" (profile only). Enables the follow requests UI. Uses `PUT /api/v1/register` to push profile changes to servers.
-- **Private**: Does not start a gossip topic. On post creation, pushes directly to mutuals only via PUSH_ALPN. Cannot register with servers. Hides the "Register" button in the servers UI.
+- **Listed**: Does not start a gossip topic. On post creation, iterates over approved followers and pushes posts directly via QUIC (PEER_ALPN). Registers with servers as "listed" (profile only). Enables the follow requests UI. Uses `PUT /api/v1/register` to push profile changes to servers.
+- **Private**: Does not start a gossip topic. On post creation, pushes directly to mutuals only via PEER_ALPN. Cannot register with servers. Hides the "Register" button in the servers UI.
 
 When the user changes visibility in settings, the client:
 
@@ -946,7 +946,7 @@ iroh-social-server [OPTIONS]
 ## Design Notes
 
 - `RegistrationPayload.visibility` uses the `Visibility` enum with serde string serialization, not a raw String, for type safety.
-- Push protocol (`PUSH_ALPN`) needs per-peer rate limiting on the handler side to prevent spam.
+- Push protocol (`PEER_ALPN`) needs per-peer rate limiting on the handler side to prevent spam.
 - `PushMessage` has max batch sizes: 50 posts, 200 interactions per message.
 - Push outbox retries are capped at 100 attempts or 7 days TTL. Old entries are pruned.
 - Follow requests auto-expire after 30 days if not approved/denied.
@@ -1016,20 +1016,20 @@ No new features, just the foundational type change.
 
 New direct delivery mechanism for Listed/Private users who bypass gossip.
 
-- [ ] Add `PushMessage`, `PushAck`, `PUSH_ALPN` to `protocol.rs`
+- [x] Add `PushMessage`, `PushAck`, `PeerRequest`, `PeerResponse` to `protocol.rs`
 - [ ] Add `push_outbox` table via migration (with `max_attempts` column, default 100)
-- [ ] Implement push handler (`ProtocolHandler` for `PUSH_ALPN`) on client with per-peer rate limiting
-- [ ] Implement push outbox background task with retry, backoff, max attempts (100), and TTL (7 days)
-- [ ] Add max batch size constant for PushMessage (e.g., 50 posts, 200 interactions)
-- [ ] Update `FeedManager`: Public broadcasts via gossip, Listed/Private enqueue to push outbox instead
+- [x] Implement push handling in unified `PeerHandler` with per-peer rate limiting
+- [x] Implement push outbox background task with retry, backoff, max attempts (100), and TTL (7 days)
+- [x] Add max batch size constant for PushMessage (e.g., 50 posts, 200 interactions)
+- [x] Update `FeedManager`: Public broadcasts via gossip, Listed/Private enqueue to push outbox instead
 
 ### Phase 2c: Follow Requests
 
 New social feature for Listed users requiring follow approval.
 
-- [ ] Add `FollowRequest`, `FollowResponse`, `FOLLOW_REQUEST_ALPN` to `protocol.rs`
+- [ ] Add `FollowRequest`, `FollowResponse`, `PEER_ALPN` to `protocol.rs`
 - [ ] Add `follow_requests` table via migration (with `expires_at` column, default 30 days)
-- [ ] Implement follow request handler (`ProtocolHandler` for `FOLLOW_REQUEST_ALPN`) on client
+- [ ] Implement follow request handler (`ProtocolHandler` for `PEER_ALPN`) on client
 - [ ] Build `/follow-requests` page for Listed users
 - [ ] Auto-expire pending follow requests after 30 days
 

@@ -2,13 +2,15 @@ use crate::commands::sync::process_sync_result;
 use crate::constants::*;
 use crate::dm::DmHandler;
 use crate::gossip::FeedManager;
+use crate::peer::PeerHandler;
+use crate::push;
 use crate::state::AppState;
 use crate::storage::Storage;
 use crate::sync;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
-use iroh_social_types::{DM_ALPN, short_id};
+use iroh_social_types::{DM_ALPN, PEER_ALPN, short_id};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
@@ -139,7 +141,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             .alpns(vec![
                 iroh_blobs::ALPN.to_vec(),
                 iroh_gossip::ALPN.to_vec(),
-                sync::SYNC_ALPN.to_vec(),
+                PEER_ALPN.to_vec(),
                 DM_ALPN.to_vec(),
             ])
             .bind()
@@ -179,18 +181,19 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         log::info!("[setup] gossip started");
 
         let node_id_str = endpoint.id().to_string();
-        let sync_handler = sync::SyncHandler::new(storage_clone.clone(), node_id_str.clone());
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
             secret_key_bytes,
             endpoint.id().to_string(),
         );
+        let peer_handler =
+            PeerHandler::new(storage_clone.clone(), node_id_str.clone(), handle.clone());
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs.clone())
             .accept(iroh_gossip::ALPN, gossip.clone())
-            .accept(sync::SYNC_ALPN, sync_handler)
+            .accept(PEER_ALPN, peer_handler)
             .accept(DM_ALPN, dm_handler.clone())
             .spawn();
         log::info!("[setup] router spawned");
@@ -377,6 +380,106 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         }
                         _ => {}
                     }
+                }
+            }
+        });
+
+        // Push outbox flush task
+        let push_ep = endpoint.clone();
+        let push_storage = storage_clone.clone();
+        let push_my_id = endpoint.id().to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL).await;
+                let peers = match push_storage.get_push_outbox_peers() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("[push-outbox] failed to get peers: {e}");
+                        continue;
+                    }
+                };
+                for peer in peers {
+                    let target: iroh::EndpointId = match peer.parse() {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+
+                    let post_entries = push_storage
+                        .get_pending_push_post_ids(&peer)
+                        .unwrap_or_default();
+                    let interaction_entries = push_storage
+                        .get_pending_push_interaction_ids(&peer)
+                        .unwrap_or_default();
+
+                    if post_entries.is_empty() && interaction_entries.is_empty() {
+                        continue;
+                    }
+
+                    let mut posts = Vec::new();
+                    let mut post_outbox_ids = Vec::new();
+                    for (outbox_id, post_id) in &post_entries {
+                        if let Ok(Some(post)) = push_storage.get_post_by_id(post_id) {
+                            posts.push(post);
+                        }
+                        post_outbox_ids.push(*outbox_id);
+                    }
+
+                    let mut interactions = Vec::new();
+                    let mut interaction_outbox_ids = Vec::new();
+                    for (outbox_id, interaction_id) in &interaction_entries {
+                        if let Ok(Some(interaction)) =
+                            push_storage.get_interaction_by_id(interaction_id)
+                        {
+                            interactions.push(interaction);
+                        }
+                        interaction_outbox_ids.push(*outbox_id);
+                    }
+
+                    let msg = iroh_social_types::PushMessage {
+                        author: push_my_id.clone(),
+                        posts,
+                        interactions,
+                        profile: None,
+                    };
+
+                    let all_ids: Vec<i64> = post_outbox_ids
+                        .iter()
+                        .chain(interaction_outbox_ids.iter())
+                        .copied()
+                        .collect();
+
+                    match push::push_to_peer(&push_ep, target, &msg).await {
+                        Ok(ack) => {
+                            log::info!(
+                                "[push-outbox] delivered {} posts, {} interactions to {}",
+                                ack.received_post_ids.len(),
+                                ack.received_interaction_ids.len(),
+                                short_id(&peer)
+                            );
+                            let _ = push_storage.remove_push_outbox_entries(&all_ids);
+                        }
+                        Err(e) => {
+                            log::error!("[push-outbox] failed to push to {}: {e}", short_id(&peer));
+                            let _ = push_storage.mark_push_attempted(&all_ids);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Push outbox prune task
+        let prune_storage = storage_clone.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(PUSH_OUTBOX_PRUNE_INTERVAL).await;
+                match prune_storage.prune_expired_push_entries() {
+                    Ok(count) if count > 0 => {
+                        log::info!("[push-outbox] pruned {count} expired entries");
+                    }
+                    Err(e) => {
+                        log::error!("[push-outbox] prune error: {e}");
+                    }
+                    _ => {}
                 }
             }
         });

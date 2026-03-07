@@ -17,6 +17,10 @@ pub const DRIP_IDLE_INTERVAL: Duration = Duration::from_secs(120);
 // DM outbox
 pub const OUTBOX_FLUSH_INTERVAL: Duration = Duration::from_secs(15);
 
+// Push outbox
+pub const PUSH_OUTBOX_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+pub const PUSH_OUTBOX_PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+
 // Android network monitoring
 #[cfg(target_os = "android")]
 pub const ANDROID_NET_INTERVAL: Duration = Duration::from_secs(30);

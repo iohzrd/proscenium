@@ -19,10 +19,61 @@ pub fn user_feed_topic(pubkey: &str) -> TopicId {
     TopicId::from_bytes(hasher.finalize().into())
 }
 
-pub const SYNC_ALPN: &[u8] = b"iroh-social/sync/3";
+/// Single ALPN for all peer-to-peer protocol messages (sync, push, follow requests).
+pub const PEER_ALPN: &[u8] = b"iroh-social/peer/1";
+
+pub const MAX_PUSH_POSTS: usize = 50;
+pub const MAX_PUSH_INTERACTIONS: usize = 200;
+
+/// First message sent on a peer connection to identify intent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PeerRequest {
+    Sync(SyncRequest),
+    Push(PushMessage),
+    FollowRequest(FollowRequest),
+}
+
+/// Response sent back depending on the request type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PeerResponse {
+    SyncSummary(SyncSummary),
+    PushAck(PushAck),
+    FollowResponse(FollowResponse),
+}
+
+/// Pushed from author to follower/mutual.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushMessage {
+    pub author: String,
+    pub posts: Vec<Post>,
+    pub interactions: Vec<Interaction>,
+    pub profile: Option<Profile>,
+}
+
+/// Acknowledgment from recipient.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushAck {
+    pub received_post_ids: Vec<String>,
+    pub received_interaction_ids: Vec<String>,
+}
+
+/// Follow request from one user to another (for Listed visibility).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowRequest {
+    pub requester: String,
+    pub timestamp: u64,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FollowResponse {
+    Approved,
+    Denied,
+    Pending,
+}
 
 /// Phase 1: Client sends summary of what it has for an author.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncRequest {
     pub author: String,
     pub post_count: u64,
@@ -34,7 +85,7 @@ pub struct SyncRequest {
 }
 
 /// Phase 1: Server responds with its counts and whether timestamp catch-up suffices.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncSummary {
     pub server_post_count: u64,
     pub server_interaction_count: u64,

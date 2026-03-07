@@ -5,6 +5,7 @@ mod moderation;
 mod notifications;
 mod posts;
 mod profiles;
+mod push;
 mod social;
 
 use rusqlite::{Connection, params};
@@ -85,6 +86,10 @@ impl Storage {
         (
             "010_visibility",
             include_str!("../../migrations/010_visibility.sql"),
+        ),
+        (
+            "011_push_outbox",
+            include_str!("../../migrations/011_push_outbox.sql"),
         ),
     ];
 

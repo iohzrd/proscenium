@@ -1,0 +1,174 @@
+use crate::commands::sync::{process_incoming_interaction, process_incoming_post};
+use crate::storage::Storage;
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
+use iroh_social_types::{
+    MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,
+    Visibility, short_id, validate_profile,
+};
+use tauri::{AppHandle, Emitter};
+
+/// Server-side push handler, dispatched from the unified PeerHandler.
+/// The initial PeerRequest::Push has already been read and parsed.
+pub async fn handle_push(
+    storage: &Storage,
+    node_id: &str,
+    remote_str: &str,
+    app_handle: &AppHandle,
+    mut send: iroh::endpoint::SendStream,
+    msg: PushMessage,
+    conn: &Connection,
+) -> Result<(), AcceptError> {
+    // Verify the sender is someone we expect content from
+    let my_visibility = storage
+        .get_visibility(node_id)
+        .unwrap_or(Visibility::Public);
+
+    let allowed = match my_visibility {
+        Visibility::Public | Visibility::Listed => {
+            storage.is_follower(remote_str).unwrap_or(false)
+                || storage
+                    .get_follows()
+                    .map(|f| f.iter().any(|e| e.pubkey == remote_str))
+                    .unwrap_or(false)
+        }
+        Visibility::Private => storage.is_mutual(remote_str).unwrap_or(false),
+    };
+
+    if !allowed {
+        log::warn!(
+            "[push-rx] rejecting push from {} (not authorized)",
+            short_id(remote_str)
+        );
+        return Err(AcceptError::from_err(std::io::Error::other("unauthorized")));
+    }
+
+    // Validate author matches remote peer
+    if msg.author != remote_str {
+        log::warn!(
+            "[push-rx] author mismatch: msg.author={}, remote={}",
+            short_id(&msg.author),
+            short_id(remote_str)
+        );
+        return Err(AcceptError::from_err(std::io::Error::other(
+            "author mismatch",
+        )));
+    }
+
+    // Enforce batch size limits
+    if msg.posts.len() > MAX_PUSH_POSTS {
+        log::warn!(
+            "[push-rx] too many posts: {} (max {})",
+            msg.posts.len(),
+            MAX_PUSH_POSTS
+        );
+        return Err(AcceptError::from_err(std::io::Error::other(
+            "too many posts",
+        )));
+    }
+    if msg.interactions.len() > MAX_PUSH_INTERACTIONS {
+        log::warn!(
+            "[push-rx] too many interactions: {} (max {})",
+            msg.interactions.len(),
+            MAX_PUSH_INTERACTIONS
+        );
+        return Err(AcceptError::from_err(std::io::Error::other(
+            "too many interactions",
+        )));
+    }
+
+    let mut received_post_ids = Vec::new();
+    let mut received_interaction_ids = Vec::new();
+
+    // Process posts
+    for post in &msg.posts {
+        if post.author != remote_str {
+            continue;
+        }
+        if storage.is_hidden(remote_str).unwrap_or(false) {
+            continue;
+        }
+        if process_incoming_post(storage, post, "push-rx", node_id, app_handle) {
+            received_post_ids.push(post.id.clone());
+        }
+    }
+
+    // Process interactions
+    for interaction in &msg.interactions {
+        if interaction.author != remote_str {
+            continue;
+        }
+        if storage.is_hidden(remote_str).unwrap_or(false) {
+            continue;
+        }
+        process_incoming_interaction(
+            storage,
+            interaction,
+            remote_str,
+            "push-rx",
+            node_id,
+            app_handle,
+        );
+        received_interaction_ids.push(interaction.id.clone());
+    }
+
+    // Process profile update
+    if let Some(profile) = &msg.profile {
+        if let Err(reason) = validate_profile(profile) {
+            log::error!(
+                "[push-rx] rejected profile from {}: {reason}",
+                short_id(remote_str)
+            );
+        } else if let Err(e) = storage.save_profile(remote_str, profile) {
+            log::error!("[push-rx] failed to store profile: {e}");
+        } else {
+            let _ = app_handle.emit("profile-updated", remote_str);
+        }
+    }
+
+    if !received_post_ids.is_empty() || !received_interaction_ids.is_empty() {
+        let _ = app_handle.emit("feed-updated", ());
+    }
+
+    log::info!(
+        "[push-rx] processed {} posts, {} interactions from {}",
+        received_post_ids.len(),
+        received_interaction_ids.len(),
+        short_id(remote_str)
+    );
+
+    // Send ack
+    let ack = PushAck {
+        received_post_ids,
+        received_interaction_ids,
+    };
+    let ack_bytes = serde_json::to_vec(&ack).map_err(AcceptError::from_err)?;
+    send.write_all(&ack_bytes)
+        .await
+        .map_err(AcceptError::from_err)?;
+    send.finish().map_err(AcceptError::from_err)?;
+
+    conn.closed().await;
+    Ok(())
+}
+
+/// Send a PushMessage to a remote peer.
+pub async fn push_to_peer(
+    endpoint: &Endpoint,
+    target: EndpointId,
+    msg: &PushMessage,
+) -> anyhow::Result<PushAck> {
+    let addr = EndpointAddr::from(target);
+    let conn = endpoint.connect(addr, PEER_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let peer_req = PeerRequest::Push(msg.clone());
+    let msg_bytes = serde_json::to_vec(&peer_req)?;
+    send.write_all(&msg_bytes).await?;
+    send.finish()?;
+
+    let ack_bytes = recv.read_to_end(1_000_000).await?;
+    let ack: PushAck = serde_json::from_slice(&ack_bytes)?;
+
+    conn.close(0u32.into(), b"done");
+    Ok(ack)
+}

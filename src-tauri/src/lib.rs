@@ -4,6 +4,8 @@ mod crypto;
 mod dm;
 mod ext;
 mod gossip;
+mod peer;
+mod push;
 mod setup;
 mod state;
 mod storage;
