@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import type { Profile } from "$lib/types";
+  import type { Profile, Visibility } from "$lib/types";
   import { avatarColor, getInitials, detectImageMime } from "$lib/utils";
 
   let {
@@ -21,21 +21,43 @@
   let editAvatarHash = $state<string | null>(profile.avatar_hash);
   let editAvatarTicket = $state<string | null>(profile.avatar_ticket);
   let editAvatarPreview = $state<string | null>(null);
-  let editIsPrivate = $state(profile.is_private);
+  let editVisibility = $state<Visibility>(profile.visibility);
   let savedDisplayName = profile.display_name;
   let savedBio = profile.bio;
   let savedAvatarHash = profile.avatar_hash;
-  let savedIsPrivate = profile.is_private;
+  let savedVisibility = profile.visibility;
   let saving = $state(false);
   let uploading = $state(false);
   let fileInput = $state<HTMLInputElement>(null!);
   let errorMessage = $state("");
 
+  const visibilityOptions: {
+    value: Visibility;
+    label: string;
+    hint: string;
+  }[] = [
+    {
+      value: "public",
+      label: "Public",
+      hint: "Anyone can see your posts and sync your profile.",
+    },
+    {
+      value: "listed",
+      label: "Listed",
+      hint: "Your profile is discoverable, but posts are only shared with approved followers.",
+    },
+    {
+      value: "private",
+      label: "Private",
+      hint: "Only mutual follows can see your posts. You are invisible to servers.",
+    },
+  ];
+
   let isDirty = $derived(
     editDisplayName !== savedDisplayName ||
       editBio !== savedBio ||
       editAvatarHash !== savedAvatarHash ||
-      editIsPrivate !== savedIsPrivate,
+      editVisibility !== savedVisibility,
   );
 
   async function loadAvatarPreview(ticket: string) {
@@ -93,7 +115,7 @@
         bio: editBio,
         avatarHash: editAvatarHash,
         avatarTicket: editAvatarTicket,
-        isPrivate: editIsPrivate,
+        visibility: editVisibility,
       });
       onsaved();
     } catch (err) {
@@ -164,19 +186,24 @@
   </div>
 
   <div class="field">
-    <span class="field-label">Privacy</span>
-    <label class="toggle-row">
-      <span class="toggle-switch" class:on={editIsPrivate}>
-        <input type="checkbox" bind:checked={editIsPrivate} />
-        <span class="toggle-track">
-          <span class="toggle-thumb"></span>
-        </span>
-      </span>
-      <span class="toggle-text">Private profile</span>
-    </label>
-    <p class="field-hint">
-      When enabled, only followers can sync your posts and profile.
-    </p>
+    <span class="field-label">Visibility</span>
+    <div class="visibility-options">
+      {#each visibilityOptions as opt}
+        <label
+          class="visibility-option"
+          class:selected={editVisibility === opt.value}
+        >
+          <input
+            type="radio"
+            name="visibility"
+            value={opt.value}
+            bind:group={editVisibility}
+          />
+          <span class="visibility-label">{opt.label}</span>
+          <span class="visibility-hint">{opt.hint}</span>
+        </label>
+      {/each}
+    </div>
   </div>
 
   {#if errorMessage}
@@ -269,7 +296,7 @@
     background: var(--color-error-light-bg);
   }
 
-  .edit-form input:not([type="checkbox"]),
+  .edit-form input:not([type="checkbox"]):not([type="radio"]),
   .edit-form textarea {
     width: 100%;
     background: var(--bg-deep);
@@ -283,76 +310,57 @@
     resize: vertical;
   }
 
-  .edit-form input:not([type="checkbox"]):focus,
+  .edit-form input:not([type="checkbox"]):not([type="radio"]):focus,
   .edit-form textarea:focus {
     border-color: var(--accent-medium);
   }
 
-  .toggle-row {
+  .visibility-options {
     display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .visibility-option {
+    display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg-deep);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
     cursor: pointer;
-  }
-
-  .toggle-switch {
-    position: relative;
-    flex-shrink: 0;
-  }
-
-  .toggle-switch input {
-    position: absolute;
-    opacity: 0;
-    width: 0;
-    height: 0;
-  }
-
-  .toggle-track {
-    display: block;
-    width: 40px;
-    height: 22px;
-    background: var(--bg-elevated);
-    border-radius: var(--radius-pill);
-    transition: background var(--transition-normal);
-  }
-
-  .toggle-switch input:focus-visible + .toggle-track {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-
-  .toggle-switch.on .toggle-track {
-    background: var(--accent);
-  }
-
-  .toggle-thumb {
-    display: block;
-    width: 16px;
-    height: 16px;
-    background: var(--text-secondary);
-    border-radius: 50%;
-    position: relative;
-    top: 3px;
-    left: 3px;
     transition:
-      transform var(--transition-normal),
+      border-color var(--transition-normal),
       background var(--transition-normal);
   }
 
-  .toggle-switch.on .toggle-thumb {
-    transform: translateX(18px);
-    background: var(--text-primary);
+  .visibility-option:hover {
+    border-color: var(--border-hover);
   }
 
-  .toggle-text {
+  .visibility-option.selected {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+  }
+
+  .visibility-option input[type="radio"] {
+    accent-color: var(--accent);
+    margin: 0;
+  }
+
+  .visibility-label {
     font-size: var(--text-base);
+    font-weight: 600;
     color: var(--text-primary);
   }
 
-  .field-hint {
-    margin: 0.25rem 0 0;
+  .visibility-hint {
+    width: 100%;
     font-size: var(--text-sm);
     color: var(--text-tertiary);
+    padding-left: 1.5rem;
   }
 
   .edit-error {

@@ -1,12 +1,43 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Visibility {
+    #[default]
+    Public,
+    Listed,
+    Private,
+}
+
+impl std::fmt::Display for Visibility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Visibility::Public => write!(f, "public"),
+            Visibility::Listed => write!(f, "listed"),
+            Visibility::Private => write!(f, "private"),
+        }
+    }
+}
+
+impl std::str::FromStr for Visibility {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "public" => Ok(Visibility::Public),
+            "listed" => Ok(Visibility::Listed),
+            "private" => Ok(Visibility::Private),
+            other => Err(format!("unknown visibility: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub display_name: String,
     pub bio: String,
     pub avatar_hash: Option<String>,
     pub avatar_ticket: Option<String>,
-    pub is_private: bool,
+    pub visibility: Visibility,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

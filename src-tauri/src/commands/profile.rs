@@ -1,6 +1,6 @@
 use crate::ext::ResultExt;
 use crate::state::{AppState, NodeStatus};
-use iroh_social_types::{Profile, validate_profile};
+use iroh_social_types::{Profile, Visibility, validate_profile};
 use std::sync::Arc;
 use tauri::State;
 
@@ -22,19 +22,20 @@ pub async fn save_my_profile(
     bio: String,
     avatar_hash: Option<String>,
     avatar_ticket: Option<String>,
-    is_private: bool,
+    visibility: String,
 ) -> Result<(), String> {
     let node_id = state.endpoint.id().to_string();
+    let visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
     let profile = Profile {
         display_name: display_name.clone(),
         bio: bio.clone(),
         avatar_hash,
         avatar_ticket,
-        is_private,
+        visibility,
     };
     validate_profile(&profile)?;
     state.storage.save_profile(&node_id, &profile).str_err()?;
-    log::info!("[profile] saved profile: {display_name} (private={is_private})");
+    log::info!("[profile] saved profile: {display_name} (visibility={visibility})");
     let feed = state.feed.lock().await;
     feed.broadcast_profile(&profile).await.str_err()?;
     log::info!("[profile] broadcast profile update");

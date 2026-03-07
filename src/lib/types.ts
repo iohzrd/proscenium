@@ -28,12 +28,14 @@ export interface PendingAttachment {
   previewUrl: string;
 }
 
+export type Visibility = "public" | "listed" | "private";
+
 export interface Profile {
   display_name: string;
   bio: string;
   avatar_hash: string | null;
   avatar_ticket: string | null;
-  is_private: boolean;
+  visibility: Visibility;
 }
 
 export interface FollowEntry {

@@ -32,11 +32,11 @@ fn interaction_signing_bytes(interaction: &Interaction) -> Vec<u8> {
     .expect("json serialization should not fail")
 }
 
-fn signature_to_hex(sig: &Signature) -> String {
+pub fn signature_to_hex(sig: &Signature) -> String {
     hex::encode(sig.to_bytes())
 }
 
-fn hex_to_signature(hex_str: &str) -> Result<Signature, String> {
+pub fn hex_to_signature(hex_str: &str) -> Result<Signature, String> {
     if hex_str.len() != 128 {
         return Err(format!("invalid signature hex length: {}", hex_str.len()));
     }

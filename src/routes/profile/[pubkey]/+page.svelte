@@ -318,8 +318,10 @@
       />
       <div class="profile-info">
         <h2>{displayName}</h2>
-        {#if profile?.is_private}
-          <span class="private-badge">Private profile</span>
+        {#if profile?.visibility && profile.visibility !== "public"}
+          <span class="visibility-badge"
+            >{profile.visibility === "private" ? "Private" : "Listed"}</span
+          >
         {/if}
         {#if profile?.bio}
           <p class="bio">{profile.bio}</p>
@@ -472,7 +474,7 @@
     font-size: var(--text-base);
   }
 
-  .private-badge {
+  .visibility-badge {
     display: inline-block;
     font-size: var(--text-sm);
     color: var(--color-warning);

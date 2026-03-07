@@ -5,7 +5,7 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use iroh_social_types::{
-    Interaction, Post, Profile, SyncFrame, SyncMode, SyncRequest, SyncSummary, short_id,
+    Interaction, Post, Profile, SyncFrame, SyncMode, SyncRequest, SyncSummary, Visibility, short_id,
 };
 use std::sync::Arc;
 
@@ -72,18 +72,31 @@ impl ProtocolHandler for SyncHandler {
             return Err(AcceptError::from_err(std::io::Error::other("blocked")));
         }
 
-        // Reject non-followers when profile is private
-        if self
+        // Enforce visibility-based sync access control
+        let visibility = self
             .storage
-            .is_private_profile(&self.node_id)
-            .unwrap_or(false)
-            && !self.storage.is_follower(&remote_str).unwrap_or(false)
-        {
-            log::warn!(
-                "[sync-server] rejecting non-follower {} (private profile)",
-                short_id(&remote_str)
-            );
-            return Err(AcceptError::from_err(std::io::Error::other("private")));
+            .get_visibility(&self.node_id)
+            .unwrap_or(Visibility::Public);
+        match visibility {
+            Visibility::Public => {} // anyone can sync
+            Visibility::Listed => {
+                if !self.storage.is_follower(&remote_str).unwrap_or(false) {
+                    log::warn!(
+                        "[sync-server] rejecting non-follower {} (listed profile)",
+                        short_id(&remote_str)
+                    );
+                    return Err(AcceptError::from_err(std::io::Error::other("listed")));
+                }
+            }
+            Visibility::Private => {
+                if !self.storage.is_mutual(&remote_str).unwrap_or(false) {
+                    log::warn!(
+                        "[sync-server] rejecting non-mutual {} (private profile)",
+                        short_id(&remote_str)
+                    );
+                    return Err(AcceptError::from_err(std::io::Error::other("private")));
+                }
+            }
         }
 
         let (mut send, mut recv) = conn.accept_bi().await?;

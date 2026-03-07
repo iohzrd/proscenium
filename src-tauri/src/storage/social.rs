@@ -1,19 +1,21 @@
-use iroh_social_types::{FollowEntry, FollowerEntry};
+use iroh_social_types::{FollowEntry, FollowerEntry, Visibility};
 use rusqlite::params;
 
 use super::Storage;
 
 impl Storage {
-    pub fn is_private_profile(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub fn get_visibility(&self, pubkey: &str) -> anyhow::Result<Visibility> {
         self.with_db(|db| {
-            let result: Option<i32> = db
+            let result: Option<String> = db
                 .query_row(
-                    "SELECT is_private FROM profiles WHERE pubkey=?1",
+                    "SELECT visibility FROM profiles WHERE pubkey=?1",
                     params![pubkey],
                     |row| row.get(0),
                 )
                 .ok();
-            Ok(result.unwrap_or(0) != 0)
+            Ok(result
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(Visibility::Public))
         })
     }
 
@@ -117,6 +119,22 @@ impl Storage {
                 });
             }
             Ok(followers)
+        })
+    }
+
+    pub fn is_mutual(&self, pubkey: &str) -> anyhow::Result<bool> {
+        self.with_db(|db| {
+            let is_follower: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            let is_following: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM follows WHERE pubkey=?1",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            Ok(is_follower && is_following)
         })
     }
 }

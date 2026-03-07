@@ -82,6 +82,10 @@ impl Storage {
             "009_notifications",
             include_str!("../../migrations/009_notifications.sql"),
         ),
+        (
+            "010_visibility",
+            include_str!("../../migrations/010_visibility.sql"),
+        ),
     ];
 
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
