@@ -5,7 +5,11 @@
   import PersonItem from "$lib/PersonItem.svelte";
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
-  import type { FollowEntry, FollowerEntry } from "$lib/types";
+  import type {
+    FollowEntry,
+    FollowerEntry,
+    FollowRequestEntry,
+  } from "$lib/types";
   import {
     useNodeInit,
     useEventListeners,
@@ -14,13 +18,15 @@
 
   let follows = $state<FollowEntry[]>([]);
   let followers = $state<FollowerEntry[]>([]);
+  let followRequests = $state<FollowRequestEntry[]>([]);
+  let pendingRequestCount = $state(0);
   let mutedPubkeys = $state<string[]>([]);
   let blockedPubkeys = $state<string[]>([]);
   let newPubkey = $state("");
   let status = $state("");
   let addingFollow = $state(false);
   let pendingUnfollowPubkey = $state<string | null>(null);
-  let activeTab = $state<"following" | "followers">("following");
+  let activeTab = $state<"following" | "followers" | "requests">("following");
   let editingAlias = $state<string | null>(null);
   let aliasInput = $state("");
   const isMobile = platform() === "android" || platform() === "ios";
@@ -32,6 +38,7 @@
     await Promise.all([
       loadFollows(),
       loadFollowers(),
+      loadFollowRequests(),
       loadMuted(),
       loadBlocked(),
     ]);
@@ -66,6 +73,42 @@
       blockedPubkeys = await invoke("get_blocked_pubkeys");
     } catch (e) {
       console.error("Failed to load blocked:", e);
+    }
+  }
+
+  async function loadFollowRequests() {
+    try {
+      followRequests = await invoke("get_follow_requests");
+      pendingRequestCount = followRequests.filter(
+        (r) => r.status === "pending",
+      ).length;
+    } catch (e) {
+      console.error("Failed to load follow requests:", e);
+    }
+  }
+
+  async function approveRequest(pubkey: string) {
+    try {
+      await invoke("approve_follow_request", { pubkey });
+      await loadFollowRequests();
+      await loadFollowers();
+      hapticImpact("light");
+      status = "Approved!";
+      setTimeout(() => (status = ""), 2000);
+    } catch (e) {
+      status = `Error: ${e}`;
+    }
+  }
+
+  async function denyRequest(pubkey: string) {
+    try {
+      await invoke("deny_follow_request", { pubkey });
+      await loadFollowRequests();
+      hapticImpact("light");
+      status = "Denied";
+      setTimeout(() => (status = ""), 2000);
+    } catch (e) {
+      status = `Error: ${e}`;
     }
   }
 
@@ -161,6 +204,9 @@
       "new-follower": () => {
         loadFollowers();
       },
+      "follow-request-received": () => {
+        loadFollowRequests();
+      },
     });
 
     window.addEventListener("keydown", handleGlobalKey);
@@ -191,6 +237,16 @@
       onclick={() => (activeTab = "followers")}
     >
       Followers ({followers.length})
+    </button>
+    <button
+      class="tab"
+      class:active={activeTab === "requests"}
+      onclick={() => (activeTab = "requests")}
+    >
+      Requests
+      {#if pendingRequestCount > 0}
+        <span class="request-badge">{pendingRequestCount}</span>
+      {/if}
     </button>
   </div>
 
@@ -324,7 +380,7 @@
         </div>
       </div>
     {/if}
-  {:else}
+  {:else if activeTab === "followers"}
     <div class="follow-list">
       {#each followers as f (f.pubkey)}
         <PersonItem
@@ -347,6 +403,57 @@
         </p>
       {/each}
     </div>
+  {:else if activeTab === "requests"}
+    {#if status}
+      <p class="status">{status}</p>
+    {/if}
+
+    <div class="follow-list">
+      {#each followRequests.filter((r) => r.status === "pending") as req (req.pubkey)}
+        <PersonItem pubkey={req.pubkey}>
+          {#snippet actions()}
+            <button
+              class="btn-approve"
+              onclick={() => approveRequest(req.pubkey)}
+            >
+              Approve
+            </button>
+            <button
+              class="btn-moderation danger"
+              onclick={() => denyRequest(req.pubkey)}
+            >
+              Deny
+            </button>
+          {/snippet}
+        </PersonItem>
+      {:else}
+        <p class="empty">No pending follow requests.</p>
+      {/each}
+    </div>
+
+    {#if followRequests.some((r) => r.status !== "pending")}
+      <details class="moderation-section">
+        <summary class="moderation-header resolved">
+          Resolved ({followRequests.filter((r) => r.status !== "pending")
+            .length})
+        </summary>
+        <div class="follow-list">
+          {#each followRequests.filter((r) => r.status !== "pending") as req (req.pubkey)}
+            <PersonItem pubkey={req.pubkey}>
+              {#snippet actions()}
+                <span
+                  class="request-status"
+                  class:approved={req.status === "approved"}
+                  class:denied={req.status === "denied"}
+                >
+                  {req.status}
+                </span>
+              {/snippet}
+            </PersonItem>
+          {/each}
+        </div>
+      </details>
+    {/if}
   {/if}
 
   {#if mutedPubkeys.length > 0}
@@ -519,5 +626,49 @@
 
   .alias-input {
     margin-bottom: 1rem;
+  }
+
+  .btn-approve {
+    background: var(--color-success, #22c55e);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 0.35rem 0.75rem;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .btn-approve:hover {
+    filter: brightness(1.1);
+  }
+
+  .request-badge {
+    background: var(--accent);
+    color: var(--text-on-accent);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 0.1rem 0.45rem;
+    margin-left: 0.35rem;
+    vertical-align: middle;
+  }
+
+  .request-status {
+    font-size: var(--text-sm);
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+
+  .request-status.approved {
+    color: var(--color-success, #22c55e);
+  }
+
+  .request-status.denied {
+    color: var(--color-error-light, #ef4444);
+  }
+
+  .moderation-header.resolved {
+    color: var(--text-secondary);
   }
 </style>

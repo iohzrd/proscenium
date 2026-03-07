@@ -104,6 +104,11 @@ pub fn run() {
             unblock_user,
             is_blocked,
             get_blocked_pubkeys,
+            get_follow_requests,
+            get_pending_follow_request_count,
+            approve_follow_request,
+            deny_follow_request,
+            send_follow_request_to_peer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

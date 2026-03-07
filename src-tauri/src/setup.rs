@@ -484,6 +484,23 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
+        // Follow request expiry task
+        let follow_req_storage = storage_clone.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FOLLOW_REQUEST_PRUNE_INTERVAL).await;
+                match follow_req_storage.prune_expired_follow_requests() {
+                    Ok(count) if count > 0 => {
+                        log::info!("[follow-req] pruned {count} expired requests");
+                    }
+                    Err(e) => {
+                        log::error!("[follow-req] prune error: {e}");
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         let state = Arc::new(AppState {
             endpoint,
             router,

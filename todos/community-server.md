@@ -99,7 +99,7 @@ Maximum privacy. No server-side presence at all:
 
 ### Direct Push Protocol
 
-Listed and Private users bypass gossip and push posts directly to their audience. A dedicated ALPN keeps this separate from sync:
+Listed and Private users bypass gossip and push posts directly to their audience. Push uses the unified peer ALPN:
 
 ```
 ALPN: b"iroh-social/peer/1"
@@ -176,18 +176,14 @@ All peer-to-peer protocols (sync, push, follow requests) use a single unified `P
 
 ### Follow Requests (Listed visibility)
 
-Listed users require explicit approval before a peer becomes an approved follower. A dedicated ALPN handles this:
-
-```
-ALPN: b"iroh-social/follow-request/1"
-```
+Listed users require explicit approval before a peer becomes an approved follower. Follow requests use the unified peer ALPN (`PeerRequest::FollowRequest`):
 
 #### Wire types
 
 ```rust
 // In iroh-social-types/src/protocol.rs (shared crate)
 
-pub const PEER_ALPN: &[u8] = b"iroh-social/follow-request/1";
+pub const PEER_ALPN: &[u8] = b"iroh-social/peer/1";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FollowRequest {
@@ -955,7 +951,7 @@ iroh-social-server [OPTIONS]
 - `DELETE /api/v1/register` uses POST with `action: "unregister"` internally (some HTTP clients strip DELETE bodies).
 - Listed users update server profiles via both `PUT /api/v1/register` (HTTP to server) and direct push `PushMessage` with `profile` field (to followers) -- both happen on profile change.
 - Media: the HTTP API returns blob hashes and tickets. Clients fetch media via iroh-blobs directly from peers. The server does not proxy media.
-- Sync ALPN stays at `sync/3` for visibility-aware restrictions (no backward compat per project rules).
+- All peer operations (sync, push, follow requests) use a single unified ALPN `b"iroh-social/peer/1"` with `PeerRequest`/`PeerResponse` dispatch.
 
 ---
 
@@ -1017,7 +1013,7 @@ No new features, just the foundational type change.
 New direct delivery mechanism for Listed/Private users who bypass gossip.
 
 - [x] Add `PushMessage`, `PushAck`, `PeerRequest`, `PeerResponse` to `protocol.rs`
-- [ ] Add `push_outbox` table via migration (with `max_attempts` column, default 100)
+- [x] Add `push_outbox` table via migration (with `max_attempts` column, default 100)
 - [x] Implement push handling in unified `PeerHandler` with per-peer rate limiting
 - [x] Implement push outbox background task with retry, backoff, max attempts (100), and TTL (7 days)
 - [x] Add max batch size constant for PushMessage (e.g., 50 posts, 200 interactions)
@@ -1027,11 +1023,11 @@ New direct delivery mechanism for Listed/Private users who bypass gossip.
 
 New social feature for Listed users requiring follow approval.
 
-- [ ] Add `FollowRequest`, `FollowResponse`, `PEER_ALPN` to `protocol.rs`
-- [ ] Add `follow_requests` table via migration (with `expires_at` column, default 30 days)
-- [ ] Implement follow request handler (`ProtocolHandler` for `PEER_ALPN`) on client
-- [ ] Build `/follow-requests` page for Listed users
-- [ ] Auto-expire pending follow requests after 30 days
+- [x] Add `FollowRequest`, `FollowResponse`, `PEER_ALPN` to `protocol.rs`
+- [x] Add `follow_requests` table via migration (with `expires_at` column, default 30 days)
+- [x] Implement follow request handler (`ProtocolHandler` for `PEER_ALPN`) on client
+- [x] Build follow requests UI in `/follows` page (Requests tab)
+- [x] Auto-expire pending follow requests after 30 days
 
 ### Phase 2d: Visibility-Aware Delivery
 

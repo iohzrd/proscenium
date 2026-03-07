@@ -1,4 +1,5 @@
 mod crypto;
+pub(crate) mod follow_requests;
 mod interactions;
 mod messaging;
 mod moderation;
@@ -90,6 +91,10 @@ impl Storage {
         (
             "011_push_outbox",
             include_str!("../../migrations/011_push_outbox.sql"),
+        ),
+        (
+            "012_follow_requests",
+            include_str!("../../migrations/012_follow_requests.sql"),
         ),
     ];
 

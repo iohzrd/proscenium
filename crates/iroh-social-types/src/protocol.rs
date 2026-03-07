@@ -1,4 +1,6 @@
+use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::types::{Interaction, Post, Profile};
+use iroh::{PublicKey, SecretKey};
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,4 +117,33 @@ pub enum SyncMode {
 pub enum SyncFrame {
     Posts(Vec<Post>),
     Interactions(Vec<Interaction>),
+}
+
+/// Canonical bytes for signing a follow request.
+fn follow_request_signing_bytes(requester: &str, timestamp: u64) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "requester": requester,
+        "timestamp": timestamp,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Sign a follow request.
+pub fn sign_follow_request(requester: &str, timestamp: u64, secret_key: &SecretKey) -> String {
+    let bytes = follow_request_signing_bytes(requester, timestamp);
+    let sig = secret_key.sign(&bytes);
+    signature_to_hex(&sig)
+}
+
+/// Verify a follow request's signature.
+pub fn verify_follow_request(req: &FollowRequest) -> Result<(), String> {
+    let sig = hex_to_signature(&req.signature)?;
+    let pubkey: PublicKey = req
+        .requester
+        .parse()
+        .map_err(|e| format!("invalid requester pubkey: {e}"))?;
+    let bytes = follow_request_signing_bytes(&req.requester, req.timestamp);
+    pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "follow request signature verification failed".to_string())
 }

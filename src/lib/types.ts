@@ -87,6 +87,14 @@ export interface AppNotification {
   read: boolean;
 }
 
+export interface FollowRequestEntry {
+  pubkey: string;
+  timestamp: number;
+  status: "pending" | "approved" | "denied";
+  created_at: number;
+  expires_at: number;
+}
+
 export interface SyncResult {
   posts: Post[];
   remote_total: number;
