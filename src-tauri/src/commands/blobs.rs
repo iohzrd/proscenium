@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::AppState;
 use iroh_blobs::{HashAndFormat, ticket::BlobTicket};
 use iroh_social_types::MAX_BLOB_SIZE;
@@ -17,11 +18,7 @@ pub async fn add_blob(
         ));
     }
 
-    let tag = state
-        .store
-        .add_slice(content.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
+    let tag = state.store.add_slice(content.as_bytes()).await.str_err()?;
 
     let addr = state.endpoint.addr();
     let ticket = BlobTicket::new(addr, tag.hash, tag.format);
@@ -35,7 +32,7 @@ pub async fn add_blob(
 
 #[tauri::command]
 pub async fn fetch_blob(state: State<'_, Arc<AppState>>, ticket: String) -> Result<String, String> {
-    let ticket: BlobTicket = ticket.parse().map_err(|e| format!("{e}"))?;
+    let ticket: BlobTicket = ticket.parse().str_err()?;
     let store = state.store.clone();
     let endpoint = state.endpoint.clone();
     let blobs = state.blobs.clone();
@@ -44,26 +41,23 @@ pub async fn fetch_blob(state: State<'_, Arc<AppState>>, ticket: String) -> Resu
     let conn = endpoint
         .connect(ticket.addr().clone(), iroh_blobs::ALPN)
         .await
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
 
     let hash_and_format: HashAndFormat = ticket.hash_and_format();
     blobs
         .remote()
         .fetch(conn, hash_and_format)
         .await
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
 
-    let bytes = store
-        .get_bytes(ticket.hash())
-        .await
-        .map_err(|e| e.to_string())?;
+    let bytes = store.get_bytes(ticket.hash()).await.str_err()?;
 
     log::info!(
         "[blob] fetched text blob {} ({} bytes)",
         ticket.hash(),
         bytes.len()
     );
-    String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string())
+    String::from_utf8(bytes.to_vec()).str_err()
 }
 
 #[tauri::command]
@@ -80,11 +74,7 @@ pub async fn add_blob_bytes(
     }
 
     let size = data.len();
-    let tag = state
-        .store
-        .add_slice(&data)
-        .await
-        .map_err(|e| e.to_string())?;
+    let tag = state.store.add_slice(&data).await.str_err()?;
 
     let addr = state.endpoint.addr();
     let ticket = BlobTicket::new(addr, tag.hash, tag.format);
@@ -101,7 +91,7 @@ pub async fn fetch_blob_bytes(
     state: State<'_, Arc<AppState>>,
     ticket: String,
 ) -> Result<Vec<u8>, String> {
-    let ticket: BlobTicket = ticket.parse().map_err(|e| format!("{e}"))?;
+    let ticket: BlobTicket = ticket.parse().str_err()?;
     let store = state.store.clone();
     let endpoint = state.endpoint.clone();
     let blobs = state.blobs.clone();
@@ -114,19 +104,16 @@ pub async fn fetch_blob_bytes(
     let conn = endpoint
         .connect(ticket.addr().clone(), iroh_blobs::ALPN)
         .await
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
 
     let hash_and_format: HashAndFormat = ticket.hash_and_format();
     blobs
         .remote()
         .fetch(conn, hash_and_format)
         .await
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
 
-    let bytes = store
-        .get_bytes(ticket.hash())
-        .await
-        .map_err(|e| e.to_string())?;
+    let bytes = store.get_bytes(ticket.hash()).await.str_err()?;
 
     log::info!(
         "[blob] fetched {} from remote ({} bytes)",

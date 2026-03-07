@@ -1,116 +1,92 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Lightbox from "$lib/Lightbox.svelte";
-  import PostCard from "$lib/PostCard.svelte";
-  import ReplyComposer from "$lib/ReplyComposer.svelte";
-  import QuoteComposer from "$lib/QuoteComposer.svelte";
+  import PostFeed from "$lib/PostFeed.svelte";
   import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import PostComposer from "$lib/PostComposer.svelte";
-  import { platform } from "@tauri-apps/plugin-os";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import { hapticImpact } from "$lib/haptics";
   import type { Post } from "$lib/types";
+  import { shortId, seedOwnProfile, evictDisplayName } from "$lib/utils";
   import {
-    shortId,
-    seedOwnProfile,
-    evictDisplayName,
-    copyToClipboard,
-    setupInfiniteScroll,
-  } from "$lib/utils";
+    useToast,
+    useCopyFeedback,
+    useNodeInit,
+    useEventListeners,
+    useInfiniteScroll,
+    useDeleteConfirm,
+    useLightbox,
+    usePullToRefresh,
+  } from "$lib/composables.svelte";
 
-  const isMobile = platform() === "android" || platform() === "ios";
-
-  let nodeId = $state("");
-  let loading = $state(true);
   let syncing = $state(false);
   let posts = $state<Post[]>([]);
-  let copyFeedback = $state("");
-  let pendingDeleteId = $state<string | null>(null);
   let showScrollTop = $state(false);
-  let toastMessage = $state("");
-  let toastType = $state<"error" | "success">("error");
-  let loadingMore = $state(false);
-  let hasMore = $state(true);
-  let replyingTo = $state<Post | null>(null);
-  let quotingPost = $state<Post | null>(null);
-  let lightboxSrc = $state("");
-  let lightboxAlt = $state("");
   let sentinel = $state<HTMLDivElement>(null!);
   let syncFailures = $state<string[]>([]);
   let showSyncDetails = $state(false);
-  // Pull-to-refresh
-  let pullStartY = 0;
-  let pullDistance = $state(0);
-  let isPulling = $state(false);
-  let pullTriggered = $state(false);
-  const PULL_THRESHOLD = 80;
 
   const blobs = createBlobCache();
   setBlobContext(blobs);
 
-  function showToast(message: string, type: "error" | "success" = "error") {
-    toastMessage = message;
-    toastType = type;
-    setTimeout(() => (toastMessage = ""), 4000);
-  }
-
-  async function copyWithFeedback(text: string, label: string) {
-    await copyToClipboard(text);
-    copyFeedback = label;
-    setTimeout(() => (copyFeedback = ""), 1500);
-  }
-
-  async function init() {
+  const toast = useToast();
+  const copyFb = useCopyFeedback();
+  const lightbox = useLightbox();
+  const del = useDeleteConfirm(async (id) => {
     try {
-      nodeId = await invoke("get_node_id");
-      const profile = await invoke("get_my_profile");
-      if (!profile) {
-        goto("/welcome");
-        return;
-      }
-      await seedOwnProfile(nodeId);
+      await invoke("delete_post", { id });
       await loadFeed();
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
+    } catch (e) {
+      toast.show("Failed to delete post");
+      console.error("Failed to delete post:", e);
     }
-  }
+  });
+
+  const node = useNodeInit(async (nid) => {
+    const profile = await invoke("get_my_profile");
+    if (!profile) {
+      goto("/welcome");
+      return;
+    }
+    await seedOwnProfile(nid);
+    await loadFeed();
+  });
 
   async function loadFeed() {
     try {
       const newPosts: Post[] = await invoke("get_feed", { limit: 20 });
       posts = newPosts;
-      hasMore = newPosts.length >= 20;
+      scroll.setHasMore(newPosts.length);
     } catch (e) {
-      showToast("Failed to load feed");
+      toast.show("Failed to load feed");
       console.error("Failed to load feed:", e);
     }
   }
 
-  async function loadMore() {
-    if (loadingMore || !hasMore || posts.length === 0) return;
-    loadingMore = true;
-    try {
-      const oldest = posts[posts.length - 1];
-      const olderPosts: Post[] = await invoke("get_feed", {
-        limit: 20,
-        before: oldest.timestamp,
-      });
-      if (olderPosts.length === 0) {
-        hasMore = false;
-      } else {
-        posts = [...posts, ...olderPosts];
-        hasMore = olderPosts.length >= 20;
+  const scroll = useInfiniteScroll(
+    () => sentinel,
+    async () => {
+      try {
+        const oldest = posts[posts.length - 1];
+        const olderPosts: Post[] = await invoke("get_feed", {
+          limit: 20,
+          before: oldest.timestamp,
+        });
+        if (olderPosts.length === 0) {
+          scroll.setNoMore();
+        } else {
+          posts = [...posts, ...olderPosts];
+          scroll.setHasMore(olderPosts.length);
+        }
+      } catch (e) {
+        toast.show("Failed to load more posts");
+        console.error("Failed to load more:", e);
       }
-    } catch (e) {
-      showToast("Failed to load more posts");
-      console.error("Failed to load more:", e);
-    }
-    loadingMore = false;
-  }
+    },
+    20,
+  );
 
   async function syncAll() {
     syncing = true;
@@ -131,41 +107,26 @@
       }
       syncFailures = failed;
       if (failed.length > 0 && failed.length < follows.length) {
-        showToast(`Synced, but ${failed.length} peer(s) unreachable`);
+        toast.show(`Synced, but ${failed.length} peer(s) unreachable`);
       } else if (failed.length > 0 && failed.length === follows.length) {
-        showToast("Could not reach any peers");
+        toast.show("Could not reach any peers");
       }
       await loadFeed();
     } catch (e) {
-      showToast("Sync failed");
+      toast.show("Sync failed");
       console.error("Failed to sync:", e);
     }
     syncing = false;
   }
 
-  function confirmDelete(id: string) {
-    pendingDeleteId = id;
-  }
-
-  async function executeDelete() {
-    if (!pendingDeleteId) return;
-    try {
-      await invoke("delete_post", { id: pendingDeleteId });
-      await loadFeed();
-    } catch (e) {
-      showToast("Failed to delete post");
-      console.error("Failed to delete post:", e);
-    }
-    pendingDeleteId = null;
-  }
-
-  function cancelDelete() {
-    pendingDeleteId = null;
-  }
+  const pull = usePullToRefresh(async () => {
+    hapticImpact("medium");
+    await syncAll();
+  });
 
   function handleGlobalKey(e: KeyboardEvent) {
-    if (e.key === "Escape" && pendingDeleteId) {
-      cancelDelete();
+    if (e.key === "Escape" && del.pendingId) {
+      del.cancel();
     }
   }
 
@@ -175,35 +136,6 @@
 
   function handleScroll() {
     showScrollTop = window.scrollY > 400;
-  }
-
-  function handleTouchStart(e: TouchEvent) {
-    if (window.scrollY === 0 && !syncing) {
-      pullStartY = e.touches[0].clientY;
-      isPulling = true;
-    }
-  }
-
-  function handleTouchMove(e: TouchEvent) {
-    if (!isPulling) return;
-    const delta = e.touches[0].clientY - pullStartY;
-    if (delta > 0) {
-      pullDistance = Math.min(delta * 0.5, 120);
-      pullTriggered = pullDistance >= PULL_THRESHOLD;
-    } else {
-      pullDistance = 0;
-      isPulling = false;
-    }
-  }
-
-  async function handleTouchEnd() {
-    if (isPulling && pullTriggered && !syncing) {
-      hapticImpact("medium");
-      await syncAll();
-    }
-    pullDistance = 0;
-    isPulling = false;
-    pullTriggered = false;
   }
 
   // Visibility-aware auto-sync
@@ -231,29 +163,21 @@
   }
 
   $effect(() => {
-    return setupInfiniteScroll(
-      sentinel,
-      () => hasMore,
-      () => loadingMore,
-      loadMore,
-    );
+    return scroll.setupEffect();
   });
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("feed-updated", () => {
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "feed-updated": () => {
         loadFeed();
-      }),
-    );
-    unlisteners.push(
-      listen("profile-updated", (event) => {
-        const pubkey = event.payload as string;
+      },
+      "profile-updated": (payload) => {
+        const pubkey = payload as string;
         evictDisplayName(pubkey);
         loadFeed();
-      }),
-    );
+      },
+    });
     window.addEventListener("scroll", handleScroll);
     window.addEventListener("keydown", handleGlobalKey);
     document.addEventListener("visibilitychange", handleVisibility);
@@ -263,23 +187,17 @@
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("keydown", handleGlobalKey);
       window.removeEventListener("scroll", handleScroll);
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
       blobs.revokeAll();
     };
   });
 </script>
 
-{#if lightboxSrc}
-  <Lightbox
-    src={lightboxSrc}
-    alt={lightboxAlt}
-    onclose={() => {
-      lightboxSrc = "";
-    }}
-  />
+{#if lightbox.src}
+  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
 {/if}
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Starting node...</p>
@@ -287,97 +205,59 @@
 {:else}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    ontouchstart={handleTouchStart}
-    ontouchmove={handleTouchMove}
-    ontouchend={handleTouchEnd}
-    style="transform: translateY({pullDistance}px); transition: {isPulling
+    ontouchstart={pull.handleTouchStart}
+    ontouchmove={pull.handleTouchMove}
+    ontouchend={pull.handleTouchEnd}
+    style="transform: translateY({pull.pullDistance}px); transition: {pull.isPulling
       ? 'none'
       : 'transform 0.3s ease-out'};"
   >
-    {#if pullDistance > 0}
-      <div class="pull-indicator" style="height: {pullDistance}px;">
+    {#if pull.pullDistance > 0}
+      <div class="pull-indicator" style="height: {pull.pullDistance}px;">
         <div
           class="pull-arrow"
-          class:ready={pullTriggered}
-          style="transform: rotate({pullDistance * 3}deg);"
+          class:ready={pull.pullTriggered}
+          style="transform: rotate({pull.pullDistance * 3}deg);"
         >
           &#8635;
         </div>
         <span class="pull-text">
-          {pullTriggered ? "Release to refresh" : "Pull to refresh"}
+          {pull.pullTriggered ? "Release to refresh" : "Pull to refresh"}
         </span>
       </div>
     {/if}
     <div class="node-id">
       <span class="label">You</span>
-      <code>{shortId(nodeId)}</code>
+      <code>{shortId(node.nodeId)}</code>
       <button
         class="btn-elevated copy-btn"
-        onclick={() => copyWithFeedback(nodeId, "node-id")}
+        onclick={() => copyFb.copy(node.nodeId, "node-id")}
       >
-        {copyFeedback === "node-id" ? "Copied!" : "Copy ID"}
+        {copyFb.feedback === "node-id" ? "Copied!" : "Copy ID"}
       </button>
     </div>
 
-    <PostComposer {nodeId} onsubmitted={loadFeed} />
+    <PostComposer nodeId={node.nodeId} onsubmitted={loadFeed} />
 
-    {#if pendingDeleteId}
-      <DeleteConfirmModal onconfirm={executeDelete} oncancel={cancelDelete} />
+    {#if del.pendingId}
+      <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
     {/if}
 
     <hr class="divider" />
 
-    <div class="feed">
-      {#each posts as post (post.id)}
-        <PostCard
-          {post}
-          {nodeId}
-          showDelete={true}
-          onreply={(p) => {
-            replyingTo = replyingTo?.id === p.id ? null : p;
-            quotingPost = null;
-          }}
-          ondelete={confirmDelete}
-          onquote={(p) => {
-            quotingPost = quotingPost?.id === p.id ? null : p;
-            replyingTo = null;
-          }}
-          onlightbox={(src, alt) => {
-            lightboxSrc = src;
-            lightboxAlt = alt;
-          }}
-        />
-        {#if replyingTo?.id === post.id}
-          <ReplyComposer
-            replyToId={post.id}
-            replyToAuthor={post.author}
-            {nodeId}
-            onsubmitted={() => {
-              replyingTo = null;
-              loadFeed();
-            }}
-            oncancel={() => (replyingTo = null)}
-          />
-        {/if}
-        {#if quotingPost?.id === post.id}
-          <QuoteComposer
-            quotedPost={post}
-            {nodeId}
-            onsubmitted={() => {
-              quotingPost = null;
-              loadFeed();
-            }}
-            oncancel={() => (quotingPost = null)}
-          />
-        {/if}
-      {:else}
-        <p class="empty">No posts yet. Write something or follow someone!</p>
-      {/each}
-    </div>
+    <PostFeed
+      {posts}
+      nodeId={node.nodeId}
+      showDelete={true}
+      emptyMessage="No posts yet. Write something or follow someone!"
+      onreload={loadFeed}
+      ondelete={del.confirm}
+      onlightbox={lightbox.open}
+    />
 
-    {#if hasMore && posts.length > 0}
+    {#if scroll.hasMore && posts.length > 0}
       <div bind:this={sentinel} class="sentinel">
-        {#if loadingMore}
+        {#if scroll.loadingMore}
           <span class="btn-spinner"></span> Loading...
         {/if}
       </div>
@@ -412,9 +292,9 @@
   </div>
 {/if}
 
-{#if toastMessage}
-  <div class="toast" class:error={toastType === "error"}>
-    {toastMessage}
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
   </div>
 {/if}
 

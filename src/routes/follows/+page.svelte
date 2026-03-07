@@ -2,11 +2,10 @@
   import { invoke } from "@tauri-apps/api/core";
   import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
-  import Avatar from "$lib/Avatar.svelte";
+  import PersonItem from "$lib/PersonItem.svelte";
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
   import type { FollowEntry, FollowerEntry } from "$lib/types";
-  import { shortId, getDisplayName, getCachedAvatarTicket } from "$lib/utils";
   import {
     useNodeInit,
     useEventListeners,
@@ -260,25 +259,8 @@
 
     <div class="follow-list">
       {#each follows as f (f.pubkey)}
-        <div class="follow-item">
-          <a href="/profile/{f.pubkey}" class="follow-info">
-            {#await getDisplayName(f.pubkey, "") then name}
-              <Avatar
-                pubkey={f.pubkey}
-                {name}
-                ticket={getCachedAvatarTicket(f.pubkey)}
-              />
-              <div class="follow-identity">
-                {#if f.alias}
-                  <span class="display-name">{f.alias}</span>
-                {:else if name !== shortId(f.pubkey)}
-                  <span class="display-name">{name}</span>
-                {/if}
-                <code>{shortId(f.pubkey)}</code>
-              </div>
-            {/await}
-          </a>
-          <div class="follow-actions">
+        <PersonItem pubkey={f.pubkey} alias={f.alias}>
+          {#snippet actions()}
             <button
               class="btn-elevated"
               onclick={(e) => {
@@ -301,8 +283,8 @@
             >
               Unfollow
             </button>
-          </div>
-        </div>
+          {/snippet}
+        </PersonItem>
       {:else}
         <p class="empty">
           Not following anyone yet. Paste a Node ID above to follow someone!
@@ -345,34 +327,20 @@
   {:else}
     <div class="follow-list">
       {#each followers as f (f.pubkey)}
-        <div class="follow-item">
-          <a href="/profile/{f.pubkey}" class="follow-info">
-            {#await getDisplayName(f.pubkey, "") then name}
-              <Avatar
-                pubkey={f.pubkey}
-                {name}
-                ticket={getCachedAvatarTicket(f.pubkey)}
-              />
-              <div class="follow-identity">
-                {#if name !== shortId(f.pubkey)}
-                  <span class="display-name">{name}</span>
-                {/if}
-                <code>{shortId(f.pubkey)}</code>
-                <span class="online-status" class:online={f.is_online}>
-                  {f.is_online ? "online" : "offline"}
-                </span>
-              </div>
-            {/await}
-          </a>
-          <div class="follow-actions">
+        <PersonItem
+          pubkey={f.pubkey}
+          showOnlineStatus={true}
+          isOnline={f.is_online}
+        >
+          {#snippet actions()}
             <button
               class="btn-elevated"
               onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
             >
               {copyFb.feedback === f.pubkey ? "Copied!" : "Copy"}
             </button>
-          </div>
-        </div>
+          {/snippet}
+        </PersonItem>
       {:else}
         <p class="empty">
           No followers yet. Share your Node ID for others to follow you!
@@ -388,31 +356,16 @@
       </summary>
       <div class="follow-list">
         {#each mutedPubkeys as pubkey (pubkey)}
-          <div class="follow-item">
-            <a href="/profile/{pubkey}" class="follow-info">
-              {#await getDisplayName(pubkey, "") then name}
-                <Avatar
-                  {pubkey}
-                  {name}
-                  ticket={getCachedAvatarTicket(pubkey)}
-                />
-                <div class="follow-identity">
-                  {#if name !== shortId(pubkey)}
-                    <span class="display-name">{name}</span>
-                  {/if}
-                  <code>{shortId(pubkey)}</code>
-                </div>
-              {/await}
-            </a>
-            <div class="follow-actions">
+          <PersonItem {pubkey}>
+            {#snippet actions()}
               <button
                 class="btn-moderation warn"
                 onclick={() => unmute(pubkey)}
               >
                 Unmute
               </button>
-            </div>
-          </div>
+            {/snippet}
+          </PersonItem>
         {/each}
       </div>
     </details>
@@ -425,31 +378,16 @@
       </summary>
       <div class="follow-list">
         {#each blockedPubkeys as pubkey (pubkey)}
-          <div class="follow-item">
-            <a href="/profile/{pubkey}" class="follow-info">
-              {#await getDisplayName(pubkey, "") then name}
-                <Avatar
-                  {pubkey}
-                  {name}
-                  ticket={getCachedAvatarTicket(pubkey)}
-                />
-                <div class="follow-identity">
-                  {#if name !== shortId(pubkey)}
-                    <span class="display-name">{name}</span>
-                  {/if}
-                  <code>{shortId(pubkey)}</code>
-                </div>
-              {/await}
-            </a>
-            <div class="follow-actions">
+          <PersonItem {pubkey}>
+            {#snippet actions()}
               <button
                 class="btn-moderation danger"
                 onclick={() => unblock(pubkey)}
               >
                 Unblock
               </button>
-            </div>
-          </div>
+            {/snippet}
+          </PersonItem>
         {/each}
       </div>
     </details>
@@ -485,15 +423,6 @@
   .tab.active {
     color: var(--accent-medium);
     border-bottom-color: var(--accent-medium);
-  }
-
-  .online-status {
-    font-size: var(--text-sm);
-    color: var(--text-tertiary);
-  }
-
-  .online-status.online {
-    color: var(--color-success);
   }
 
   .add-follow {
@@ -540,60 +469,6 @@
 
   .scan-btn:hover {
     background: var(--bg-elevated-hover);
-  }
-
-  .follow-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-2xl);
-    padding: 0.75rem 1rem;
-    margin-bottom: 0.5rem;
-    transition: border-color var(--transition-normal);
-  }
-
-  .follow-item:hover {
-    border-color: var(--border-hover);
-  }
-
-  .follow-info {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    text-decoration: none;
-    color: inherit;
-    flex: 1;
-    min-width: 0;
-  }
-
-  .follow-info:hover .display-name {
-    text-decoration: underline;
-  }
-
-  .follow-identity {
-    display: flex;
-    flex-direction: column;
-    gap: 0.1rem;
-  }
-
-  .display-name {
-    font-weight: 600;
-    color: var(--accent-light);
-    font-size: var(--text-base);
-  }
-
-  code {
-    color: var(--color-link);
-    font-size: var(--text-base);
-  }
-
-  .follow-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-shrink: 0;
   }
 
   .status {

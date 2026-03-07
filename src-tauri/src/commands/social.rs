@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::AppState;
 use iroh_social_types::{FollowEntry, FollowerEntry, now_millis, short_id};
 use std::sync::Arc;
@@ -21,20 +22,18 @@ pub async fn follow_user(
         alias: None,
         followed_at: now_millis(),
     };
-    state.storage.follow(&entry).map_err(|e| e.to_string())?;
+    state.storage.follow(&entry).str_err()?;
 
     {
         let mut feed = state.feed.lock().await;
-        feed.follow_user(pubkey.clone())
-            .await
-            .map_err(|e| e.to_string())?;
+        feed.follow_user(pubkey.clone()).await.str_err()?;
     }
     log::info!("[follow] subscribed to gossip for {}", short_id(&pubkey));
 
     log::info!("[follow] syncing posts from {}...", short_id(&pubkey));
     let endpoint = state.endpoint.clone();
     let storage = state.storage.clone();
-    let target: iroh::EndpointId = pubkey.parse().map_err(|e| format!("{e}"))?;
+    let target: iroh::EndpointId = pubkey.parse().str_err()?;
     match crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey).await {
         Ok(result) => {
             let stored = process_sync_result(
@@ -67,7 +66,7 @@ pub async fn follow_user(
 #[tauri::command]
 pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Result<(), String> {
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
-    state.storage.unfollow(&pubkey).map_err(|e| e.to_string())?;
+    state.storage.unfollow(&pubkey).str_err()?;
     let mut feed = state.feed.lock().await;
     feed.unfollow_user(&pubkey);
     log::info!("[follow] unfollowed {}", short_id(&pubkey));
@@ -83,15 +82,15 @@ pub async fn update_follow_alias(
     state
         .storage
         .update_follow_alias(&pubkey, alias.as_deref())
-        .map_err(|e| e.to_string())
+        .str_err()
 }
 
 #[tauri::command]
 pub async fn get_follows(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowEntry>, String> {
-    state.storage.get_follows().map_err(|e| e.to_string())
+    state.storage.get_follows().str_err()
 }
 
 #[tauri::command]
 pub async fn get_followers(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowerEntry>, String> {
-    state.storage.get_followers().map_err(|e| e.to_string())
+    state.storage.get_followers().str_err()
 }

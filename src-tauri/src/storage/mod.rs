@@ -95,6 +95,14 @@ impl Storage {
         })
     }
 
+    pub(crate) fn with_db<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let db = self.db.lock().unwrap();
+        f(&db)
+    }
+
     fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (

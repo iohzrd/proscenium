@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::{AppState, FrontendSyncResult, SyncStatus};
 use crate::storage::Storage;
 use iroh_social_types::{
@@ -138,12 +139,12 @@ pub async fn sync_posts(
 ) -> Result<FrontendSyncResult, String> {
     let endpoint = state.endpoint.clone();
     let storage = state.storage.clone();
-    let target: iroh::EndpointId = pubkey.parse().map_err(|e| format!("{e}"))?;
+    let target: iroh::EndpointId = pubkey.parse().str_err()?;
 
     let my_id = state.endpoint.id().to_string();
     let result = crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey)
         .await
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
 
     let stored = process_sync_result(&storage, &pubkey, &result, "sync", &my_id, &app_handle);
     log::info!(
@@ -164,10 +165,7 @@ pub async fn get_sync_status(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> Result<SyncStatus, String> {
-    let local_count = state
-        .storage
-        .count_posts_by_author(&pubkey)
-        .map_err(|e| e.to_string())?;
+    let local_count = state.storage.count_posts_by_author(&pubkey).str_err()?;
     Ok(SyncStatus { local_count })
 }
 

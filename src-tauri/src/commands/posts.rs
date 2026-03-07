@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::{AppState, generate_id};
 use crate::storage::FeedQuery;
 use iroh::SecretKey;
@@ -37,19 +38,14 @@ pub async fn create_post(
     let sk = SecretKey::from_bytes(&state.secret_key_bytes);
     sign_post(&mut post, &sk);
 
-    state
-        .storage
-        .insert_post(&post)
-        .map_err(|e| e.to_string())?;
+    state.storage.insert_post(&post).str_err()?;
     log::info!(
         "[post] created post {} ({} media attachments)",
         &post.id,
         media_count
     );
     let feed = state.feed.lock().await;
-    feed.broadcast_post(&post)
-        .await
-        .map_err(|e| e.to_string())?;
+    feed.broadcast_post(&post).await.str_err()?;
     log::info!("[post] broadcast post {}", &post.id);
 
     Ok(post)
@@ -59,10 +55,7 @@ pub async fn create_post(
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     let my_id = state.endpoint.id().to_string();
 
-    let post = state
-        .storage
-        .get_post_by_id(&id)
-        .map_err(|e| e.to_string())?;
+    let post = state.storage.get_post_by_id(&id).str_err()?;
     match post {
         Some(post) if post.author == my_id => {}
         Some(_) => {
@@ -73,12 +66,10 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
         }
     }
 
-    let removed = state.storage.delete_post(&id).map_err(|e| e.to_string())?;
+    let removed = state.storage.delete_post(&id).str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
     let feed = state.feed.lock().await;
-    feed.broadcast_delete(&id, &my_id)
-        .await
-        .map_err(|e| e.to_string())?;
+    feed.broadcast_delete(&id, &my_id).await.str_err()?;
     log::info!("[post] broadcast delete {id}");
 
     Ok(())
@@ -94,7 +85,7 @@ pub async fn get_feed(
         limit: limit.unwrap_or(DEFAULT_FEED_LIMIT),
         before,
     };
-    let posts = state.storage.get_feed(&q).map_err(|e| e.to_string())?;
+    let posts = state.storage.get_feed(&q).str_err()?;
     log::info!("[feed] loaded {} posts", posts.len());
     Ok(posts)
 }
@@ -115,12 +106,12 @@ pub async fn get_user_posts(
             before,
             media_filter.as_deref(),
         )
-        .map_err(|e| e.to_string())
+        .str_err()
 }
 
 #[tauri::command]
 pub async fn get_post(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Post>, String> {
-    state.storage.get_post_by_id(&id).map_err(|e| e.to_string())
+    state.storage.get_post_by_id(&id).str_err()
 }
 
 #[tauri::command]
@@ -137,5 +128,5 @@ pub async fn get_replies(
             limit.unwrap_or(DEFAULT_REPLY_LIMIT) as usize,
             before,
         )
-        .map_err(|e| e.to_string())
+        .str_err()
 }

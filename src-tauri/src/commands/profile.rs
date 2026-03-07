@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::{AppState, NodeStatus};
 use iroh_social_types::{Profile, validate_profile};
 use std::sync::Arc;
@@ -11,10 +12,7 @@ pub async fn get_node_id(state: State<'_, Arc<AppState>>) -> Result<String, Stri
 #[tauri::command]
 pub async fn get_my_profile(state: State<'_, Arc<AppState>>) -> Result<Option<Profile>, String> {
     let node_id = state.endpoint.id().to_string();
-    state
-        .storage
-        .get_profile(&node_id)
-        .map_err(|e| e.to_string())
+    state.storage.get_profile(&node_id).str_err()
 }
 
 #[tauri::command]
@@ -35,15 +33,10 @@ pub async fn save_my_profile(
         is_private,
     };
     validate_profile(&profile)?;
-    state
-        .storage
-        .save_profile(&node_id, &profile)
-        .map_err(|e| e.to_string())?;
+    state.storage.save_profile(&node_id, &profile).str_err()?;
     log::info!("[profile] saved profile: {display_name} (private={is_private})");
     let feed = state.feed.lock().await;
-    feed.broadcast_profile(&profile)
-        .await
-        .map_err(|e| e.to_string())?;
+    feed.broadcast_profile(&profile).await.str_err()?;
     log::info!("[profile] broadcast profile update");
     Ok(())
 }
@@ -53,10 +46,7 @@ pub async fn get_remote_profile(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> Result<Option<Profile>, String> {
-    state
-        .storage
-        .get_profile(&pubkey)
-        .map_err(|e| e.to_string())
+    state.storage.get_profile(&pubkey).str_err()
 }
 
 #[tauri::command]

@@ -5,108 +5,118 @@ use super::Storage;
 
 impl Storage {
     pub fn is_private_profile(&self, pubkey: &str) -> anyhow::Result<bool> {
-        let db = self.db.lock().unwrap();
-        let result: Option<i32> = db
-            .query_row(
-                "SELECT is_private FROM profiles WHERE pubkey=?1",
-                params![pubkey],
-                |row| row.get(0),
-            )
-            .ok();
-        Ok(result.unwrap_or(0) != 0)
+        self.with_db(|db| {
+            let result: Option<i32> = db
+                .query_row(
+                    "SELECT is_private FROM profiles WHERE pubkey=?1",
+                    params![pubkey],
+                    |row| row.get(0),
+                )
+                .ok();
+            Ok(result.unwrap_or(0) != 0)
+        })
     }
 
     pub fn is_follower(&self, pubkey: &str) -> anyhow::Result<bool> {
-        let db = self.db.lock().unwrap();
-        let exists: bool = db.query_row(
-            "SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1",
-            params![pubkey],
-            |row| row.get(0),
-        )?;
-        Ok(exists)
+        self.with_db(|db| {
+            let exists: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            Ok(exists)
+        })
     }
 
     pub fn follow(&self, entry: &FollowEntry) -> anyhow::Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "INSERT INTO follows (pubkey, alias, followed_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(pubkey) DO UPDATE SET alias=?2, followed_at=?3",
-            params![entry.pubkey, entry.alias, entry.followed_at as i64],
-        )?;
-        Ok(())
+        self.with_db(|db| {
+            db.execute(
+                "INSERT INTO follows (pubkey, alias, followed_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(pubkey) DO UPDATE SET alias=?2, followed_at=?3",
+                params![entry.pubkey, entry.alias, entry.followed_at as i64],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn update_follow_alias(&self, pubkey: &str, alias: Option<&str>) -> anyhow::Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "UPDATE follows SET alias=?2 WHERE pubkey=?1",
-            params![pubkey, alias],
-        )?;
-        Ok(())
+        self.with_db(|db| {
+            db.execute(
+                "UPDATE follows SET alias=?2 WHERE pubkey=?1",
+                params![pubkey, alias],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn unfollow(&self, pubkey: &str) -> anyhow::Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute("DELETE FROM follows WHERE pubkey=?1", params![pubkey])?;
-        Ok(())
+        self.with_db(|db| {
+            db.execute("DELETE FROM follows WHERE pubkey=?1", params![pubkey])?;
+            Ok(())
+        })
     }
 
     pub fn get_follows(&self) -> anyhow::Result<Vec<FollowEntry>> {
-        let db = self.db.lock().unwrap();
-        let mut stmt =
-            db.prepare("SELECT pubkey, alias, followed_at FROM follows ORDER BY followed_at DESC")?;
-        let mut rows = stmt.query([])?;
-        let mut follows = Vec::new();
-        while let Some(row) = rows.next()? {
-            follows.push(FollowEntry {
-                pubkey: row.get(0)?,
-                alias: row.get(1)?,
-                followed_at: row.get::<_, i64>(2)? as u64,
-            });
-        }
-        Ok(follows)
+        self.with_db(|db| {
+            let mut stmt = db.prepare(
+                "SELECT pubkey, alias, followed_at FROM follows ORDER BY followed_at DESC",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut follows = Vec::new();
+            while let Some(row) = rows.next()? {
+                follows.push(FollowEntry {
+                    pubkey: row.get(0)?,
+                    alias: row.get(1)?,
+                    followed_at: row.get::<_, i64>(2)? as u64,
+                });
+            }
+            Ok(follows)
+        })
     }
 
     pub fn upsert_follower(&self, pubkey: &str, now: u64) -> anyhow::Result<bool> {
-        let db = self.db.lock().unwrap();
-        let existing: bool = db.query_row(
-            "SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1",
-            params![pubkey],
-            |row| row.get(0),
-        )?;
-        db.execute(
-            "INSERT INTO followers (pubkey, first_seen, last_seen, is_online)
-             VALUES (?1, ?2, ?2, 1)
-             ON CONFLICT(pubkey) DO UPDATE SET last_seen=?2, is_online=1",
-            params![pubkey, now as i64],
-        )?;
-        Ok(!existing)
+        self.with_db(|db| {
+            let existing: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            db.execute(
+                "INSERT INTO followers (pubkey, first_seen, last_seen, is_online)
+                 VALUES (?1, ?2, ?2, 1)
+                 ON CONFLICT(pubkey) DO UPDATE SET last_seen=?2, is_online=1",
+                params![pubkey, now as i64],
+            )?;
+            Ok(!existing)
+        })
     }
 
     pub fn set_follower_offline(&self, pubkey: &str) -> anyhow::Result<()> {
-        let db = self.db.lock().unwrap();
-        db.execute(
-            "UPDATE followers SET is_online=0 WHERE pubkey=?1",
-            params![pubkey],
-        )?;
-        Ok(())
+        self.with_db(|db| {
+            db.execute(
+                "UPDATE followers SET is_online=0 WHERE pubkey=?1",
+                params![pubkey],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn get_followers(&self) -> anyhow::Result<Vec<FollowerEntry>> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db.prepare(
-            "SELECT pubkey, first_seen, last_seen, is_online FROM followers ORDER BY last_seen DESC",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut followers = Vec::new();
-        while let Some(row) = rows.next()? {
-            followers.push(FollowerEntry {
-                pubkey: row.get(0)?,
-                first_seen: row.get::<_, i64>(1)? as u64,
-                last_seen: row.get::<_, i64>(2)? as u64,
-                is_online: row.get::<_, i32>(3)? != 0,
-            });
-        }
-        Ok(followers)
+        self.with_db(|db| {
+            let mut stmt = db.prepare(
+                "SELECT pubkey, first_seen, last_seen, is_online FROM followers ORDER BY last_seen DESC",
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut followers = Vec::new();
+            while let Some(row) = rows.next()? {
+                followers.push(FollowerEntry {
+                    pubkey: row.get(0)?,
+                    first_seen: row.get::<_, i64>(1)? as u64,
+                    last_seen: row.get::<_, i64>(2)? as u64,
+                    is_online: row.get::<_, i32>(3)? != 0,
+                });
+            }
+            Ok(followers)
+        })
     }
 }

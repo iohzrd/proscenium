@@ -1,3 +1,4 @@
+use crate::ext::ResultExt;
 use crate::state::AppState;
 use crate::storage::Storage;
 use iroh_social_types::{
@@ -89,10 +90,7 @@ pub async fn send_dm(
 pub async fn get_conversations(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<ConversationMeta>, String> {
-    let convos = state
-        .storage
-        .get_conversations()
-        .map_err(|e| e.to_string())?;
+    let convos = state.storage.get_conversations().str_err()?;
     log::info!("[dm-cmd] get_conversations: {} conversations", convos.len());
     Ok(convos)
 }
@@ -109,7 +107,7 @@ pub async fn get_dm_messages(
     let msgs = state
         .storage
         .get_dm_messages(&conv_id, limit.unwrap_or(DEFAULT_DM_LIMIT), before)
-        .map_err(|e| e.to_string())?;
+        .str_err()?;
     log::info!(
         "[dm-cmd] get_dm_messages: peer={}, conv={}, {} messages",
         short_id(&peer_pubkey),
@@ -128,7 +126,7 @@ pub async fn mark_dm_read(
     state
         .storage
         .mark_conversation_read(&peer_pubkey, &my_id)
-        .map_err(|e| e.to_string())
+        .str_err()
 }
 
 #[tauri::command]
@@ -136,19 +134,13 @@ pub async fn delete_dm_message(
     state: State<'_, Arc<AppState>>,
     message_id: String,
 ) -> Result<(), String> {
-    state
-        .storage
-        .delete_dm_message(&message_id)
-        .map_err(|e| e.to_string())?;
+    state.storage.delete_dm_message(&message_id).str_err()?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn flush_dm_outbox(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
-    let peers = state
-        .storage
-        .get_all_outbox_peers()
-        .map_err(|e| e.to_string())?;
+    let peers = state.storage.get_all_outbox_peers().str_err()?;
     let endpoint = state.endpoint.clone();
     let dm_handler = state.dm.clone();
 
@@ -175,10 +167,7 @@ pub async fn flush_dm_outbox(state: State<'_, Arc<AppState>>) -> Result<serde_js
 
 #[tauri::command]
 pub async fn get_unread_dm_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
-    state
-        .storage
-        .get_total_unread_count()
-        .map_err(|e| e.to_string())
+    state.storage.get_total_unread_count().str_err()
 }
 
 #[tauri::command]

@@ -1,4 +1,5 @@
 use crate::constants::DEFAULT_NOTIFICATION_LIMIT;
+use crate::ext::ResultExt;
 use crate::state::AppState;
 use crate::storage::Notification;
 use std::sync::Arc;
@@ -13,21 +14,15 @@ pub async fn get_notifications(
     state
         .storage
         .get_notifications(limit.unwrap_or(DEFAULT_NOTIFICATION_LIMIT), before)
-        .map_err(|e| e.to_string())
+        .str_err()
 }
 
 #[tauri::command]
 pub async fn get_unread_notification_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
-    state
-        .storage
-        .get_unread_notification_count()
-        .map_err(|e| e.to_string())
+    state.storage.get_unread_notification_count().str_err()
 }
 
 #[tauri::command]
 pub async fn mark_notifications_read(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state
-        .storage
-        .mark_notifications_read()
-        .map_err(|e| e.to_string())
+    state.storage.mark_notifications_read().str_err()
 }

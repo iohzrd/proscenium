@@ -5,9 +5,7 @@
   import Lightbox from "$lib/Lightbox.svelte";
   import QrModal from "$lib/QrModal.svelte";
   import Avatar from "$lib/Avatar.svelte";
-  import PostCard from "$lib/PostCard.svelte";
-  import ReplyComposer from "$lib/ReplyComposer.svelte";
-  import QuoteComposer from "$lib/QuoteComposer.svelte";
+  import PostFeed from "$lib/PostFeed.svelte";
   import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import ProfileEditor from "$lib/ProfileEditor.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
@@ -34,8 +32,6 @@
   let posts = $state<Post[]>([]);
   let isFollowing = $state(false);
   let toggling = $state(false);
-  let replyingTo = $state<Post | null>(null);
-  let quotingPost = $state<Post | null>(null);
   let sentinel = $state<HTMLDivElement>(null!);
   let mediaFilter = $state("all");
   let syncStatus = $state<SyncStatus | null>(null);
@@ -416,51 +412,16 @@
     <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
   {/if}
 
-  <div class="feed">
-    {#each posts as post (post.id)}
-      <PostCard
-        {post}
-        nodeId={node.nodeId}
-        showAuthor={false}
-        showDelete={isSelf}
-        onreply={(p) => {
-          replyingTo = replyingTo?.id === p.id ? null : p;
-          quotingPost = null;
-        }}
-        ondelete={del.confirm}
-        onquote={(p) => {
-          quotingPost = quotingPost?.id === p.id ? null : p;
-          replyingTo = null;
-        }}
-        onlightbox={lightbox.open}
-      />
-      {#if replyingTo?.id === post.id}
-        <ReplyComposer
-          replyToId={post.id}
-          replyToAuthor={post.author}
-          nodeId={node.nodeId}
-          onsubmitted={() => {
-            replyingTo = null;
-            reloadPosts();
-          }}
-          oncancel={() => (replyingTo = null)}
-        />
-      {/if}
-      {#if quotingPost?.id === post.id}
-        <QuoteComposer
-          quotedPost={post}
-          nodeId={node.nodeId}
-          onsubmitted={() => {
-            quotingPost = null;
-            reloadPosts();
-          }}
-          oncancel={() => (quotingPost = null)}
-        />
-      {/if}
-    {:else}
-      <p class="empty">No posts from this user yet.</p>
-    {/each}
-  </div>
+  <PostFeed
+    {posts}
+    nodeId={node.nodeId}
+    showAuthor={false}
+    showDelete={isSelf}
+    emptyMessage="No posts from this user yet."
+    onreload={reloadPosts}
+    ondelete={del.confirm}
+    onlightbox={lightbox.open}
+  />
 
   {#if scroll.hasMore && posts.length > 0}
     <div bind:this={sentinel} class="sentinel">

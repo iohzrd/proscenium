@@ -2,6 +2,7 @@ mod commands;
 mod constants;
 mod crypto;
 mod dm;
+mod ext;
 mod gossip;
 mod setup;
 mod state;
