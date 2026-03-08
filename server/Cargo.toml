@@ -26,3 +26,5 @@ bytes = "1"
 futures-lite = "2"
 log = "0.4"
 getrandom = "0.3"
+maud = { version = "0.26", features = ["axum"] }
+regex = "1"

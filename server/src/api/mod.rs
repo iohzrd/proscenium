@@ -29,6 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(posts::routes())
         .merge(feed::routes())
         .merge(trending::routes())
+        .merge(crate::web::routes())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

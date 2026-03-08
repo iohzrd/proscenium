@@ -5,6 +5,7 @@ mod ingestion;
 mod node;
 mod storage;
 mod trending;
+mod web;
 
 use clap::Parser;
 use std::path::PathBuf;

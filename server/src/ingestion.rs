@@ -212,6 +212,7 @@ impl IngestionManager {
         let addr = EndpointAddr::from(target);
         let conn = endpoint.connect(addr, PEER_ALPN).await?;
 
+        // Phase 1: Send sync request, read summary
         let (mut send, mut recv) = conn.open_bi().await?;
         let request = PeerRequest::Sync(SyncRequest {
             author: pubkey.to_string(),
@@ -221,17 +222,12 @@ impl IngestionManager {
             newest_interaction_timestamp: last_interaction_ts.unwrap_or(0),
         });
         let request_bytes = serde_json::to_vec(&request)?;
-        send.write_all(&(request_bytes.len() as u32).to_be_bytes())
-            .await?;
         send.write_all(&request_bytes).await?;
+        send.finish()?;
 
-        // Read SyncSummary
-        let mut len_buf = [0u8; 4];
-        recv.read_exact(&mut len_buf).await?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut buf = vec![0u8; len];
-        recv.read_exact(&mut buf).await?;
-        let summary: iroh_social_types::SyncSummary = serde_json::from_slice(&buf)?;
+        let summary_bytes = recv.read_to_end(65_536).await?;
+        let summary: iroh_social_types::SyncSummary =
+            serde_json::from_slice(&summary_bytes)?;
 
         if let Some(profile) = &summary.profile
             && validate_profile(profile).is_ok()
@@ -244,7 +240,10 @@ impl IngestionManager {
             return Ok((0, 0));
         }
 
-        let (_send2, mut recv2) = conn.open_bi().await?;
+        let (mut send2, mut recv2) = conn.open_bi().await?;
+        // Must finish send side to trigger accept_bi() on the peer
+        // (QUIC streams are lazy - peer won't see the stream until data/FIN is sent)
+        send2.finish()?;
 
         let mut post_count = 0usize;
         let mut interaction_count = 0usize;
