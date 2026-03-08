@@ -111,6 +111,44 @@ export interface ConversationMeta {
   unread_count: number;
 }
 
+export interface ServerEntry {
+  url: string;
+  name: string;
+  description: string;
+  node_id: string;
+  registered_at: number | null;
+  visibility: string;
+  added_at: number;
+  last_synced_at: number | null;
+}
+
+export interface ServerInfo {
+  name: string;
+  description: string;
+  version: string;
+  node_id: string;
+  registered_users: number;
+  total_posts: number;
+  uptime_seconds: number;
+  registration_open: boolean;
+}
+
+export interface ServerFeedPost {
+  id: string;
+  author: string;
+  content: string;
+  timestamp: number;
+  reply_to: string | null;
+  media_hashes: string | null;
+  signature: string | null;
+}
+
+export interface TrendingHashtag {
+  tag: string;
+  post_count: number;
+  computed_at: number;
+}
+
 export interface StoredMessage {
   id: string;
   conversation_id: string;

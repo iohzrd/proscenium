@@ -7,6 +7,7 @@ mod notifications;
 mod posts;
 mod profiles;
 mod push;
+pub(crate) mod servers;
 mod social;
 
 use rusqlite::{Connection, params};
@@ -95,6 +96,10 @@ impl Storage {
         (
             "012_follow_requests",
             include_str!("../../migrations/012_follow_requests.sql"),
+        ),
+        (
+            "013_servers",
+            include_str!("../../migrations/013_servers.sql"),
         ),
     ];
 

@@ -13,7 +13,7 @@
 
   let moreOpen = $state(false);
 
-  const moreRoutes = ["/follows", "/settings"];
+  const moreRoutes = ["/follows", "/servers", "/settings"];
   let moreActive = $derived(moreRoutes.includes(currentPath));
 
   function toggleMore(e: Event) {
@@ -91,6 +91,14 @@
       >
         <Icon name="users" size={18} />
         <span>Follows</span>
+      </a>
+      <a
+        href="/servers"
+        class:active={currentPath === "/servers"}
+        onclick={closeMore}
+      >
+        <Icon name="server" size={18} />
+        <span>Servers</span>
       </a>
       <a
         href="/settings"

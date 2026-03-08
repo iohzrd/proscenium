@@ -3215,6 +3215,7 @@ dependencies = [
  "iroh-gossip",
  "iroh-social-types",
  "log",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
  "serde_json",

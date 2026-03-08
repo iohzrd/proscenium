@@ -28,6 +28,7 @@ iroh-blobs = { version = "0.98", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
 iroh-social-types = { path = "../crates/iroh-social-types" }
 log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

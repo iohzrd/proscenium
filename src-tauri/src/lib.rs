@@ -109,6 +109,14 @@ pub fn run() {
             approve_follow_request,
             deny_follow_request,
             send_follow_request_to_peer,
+            add_server,
+            remove_server,
+            list_servers,
+            refresh_server_info,
+            register_with_server,
+            unregister_from_server,
+            server_get_feed,
+            server_get_trending,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

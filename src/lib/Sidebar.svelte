@@ -44,6 +44,10 @@
       <Icon name="users" />
       <span class="nav-label">Follows</span>
     </a>
+    <a href="/servers" class:active={currentPath === "/servers"}>
+      <Icon name="server" />
+      <span class="nav-label">Servers</span>
+    </a>
     {#if nodeId}
       <a
         href="/profile/{nodeId}"
