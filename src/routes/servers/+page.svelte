@@ -226,18 +226,27 @@
               onclick={() => registerWithServer(selectedServer!.url, "public")}
               disabled={registeringServer === selectedServer.url}
             >
-              {registeringServer === selectedServer.url
-                ? "..."
-                : "Register (Public)"}
+              {registeringServer === selectedServer.url ? "..." : "Public"}
             </button>
             <button
               class="btn-secondary"
               onclick={() => registerWithServer(selectedServer!.url, "listed")}
               disabled={registeringServer === selectedServer.url}
             >
-              Register (Listed)
+              Listed
+            </button>
+            <button
+              class="btn-secondary"
+              onclick={() => registerWithServer(selectedServer!.url, "private")}
+              disabled={registeringServer === selectedServer.url}
+            >
+              Private
             </button>
           </div>
+          <p class="visibility-hint">
+            Public: profile and posts visible to all. Listed: profile visible,
+            posts only to followers. Private: invisible on server.
+          </p>
         {:else}
           <p class="registration-closed">Registration closed</p>
         {/if}
@@ -581,6 +590,13 @@
 
   .btn-secondary:hover:not(:disabled) {
     color: var(--accent-light);
+  }
+
+  .visibility-hint {
+    font-size: var(--text-xs);
+    color: var(--text-muted);
+    margin: 0;
+    width: 100%;
   }
 
   .btn-danger {
