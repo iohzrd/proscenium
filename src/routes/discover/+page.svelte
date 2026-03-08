@@ -136,8 +136,8 @@
     <Icon name="compass" size={48} />
     <h2>No servers added</h2>
     <p>
-      Add a community server in the <a href="/servers">Servers</a> page to discover
-      users and content.
+      Add a community server in <a href="/settings">Settings</a> to discover users
+      and content.
     </p>
   </div>
 {:else}
