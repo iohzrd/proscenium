@@ -237,6 +237,146 @@ pub async fn server_get_trending(
         .map_err(|e| format!("failed to parse trending: {e}"))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerUser {
+    pub pubkey: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_hash: Option<String>,
+    pub visibility: String,
+    pub registered_at: i64,
+    pub post_count: i64,
+    pub latest_post_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSearchResponse {
+    pub users: Vec<ServerUser>,
+    pub total: usize,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSearchPost {
+    pub id: String,
+    pub author: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub media_json: Option<String>,
+    pub reply_to: Option<String>,
+    pub reply_to_author: Option<String>,
+    pub quote_of: Option<String>,
+    pub quote_of_author: Option<String>,
+    pub signature: String,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostSearchResponse {
+    pub posts: Vec<ServerSearchPost>,
+    pub total: i64,
+    pub query: String,
+}
+
+#[tauri::command]
+pub async fn server_search_users(
+    url: String,
+    query: String,
+    limit: Option<i64>,
+) -> Result<UserSearchResponse, String> {
+    let endpoint = format!(
+        "{url}/api/v1/users/search?q={}&limit={}",
+        urlencoding::encode(&query),
+        limit.unwrap_or(20)
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&endpoint)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("user search failed: {}", resp.status()));
+    }
+
+    resp.json::<UserSearchResponse>()
+        .await
+        .map_err(|e| format!("failed to parse user search: {e}"))
+}
+
+#[tauri::command]
+pub async fn server_search_posts(
+    url: String,
+    query: String,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<PostSearchResponse, String> {
+    let mut endpoint = format!(
+        "{url}/api/v1/posts/search?q={}&limit={}",
+        urlencoding::encode(&query),
+        limit.unwrap_or(20)
+    );
+    if let Some(o) = offset {
+        endpoint.push_str(&format!("&offset={o}"));
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&endpoint)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("post search failed: {}", resp.status()));
+    }
+
+    resp.json::<PostSearchResponse>()
+        .await
+        .map_err(|e| format!("failed to parse post search: {e}"))
+}
+
+#[tauri::command]
+pub async fn server_list_users(
+    url: String,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<UserSearchResponse, String> {
+    let endpoint = format!(
+        "{url}/api/v1/users?limit={}&offset={}",
+        limit.unwrap_or(20),
+        offset.unwrap_or(0)
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(&endpoint)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("user list failed: {}", resp.status()));
+    }
+
+    let list: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("failed to parse user list: {e}"))?;
+
+    let users: Vec<ServerUser> =
+        serde_json::from_value(list.get("users").cloned().unwrap_or_default())
+            .map_err(|e| format!("failed to parse users: {e}"))?;
+
+    Ok(UserSearchResponse {
+        total: users.len(),
+        users,
+        query: String::new(),
+    })
+}
+
 async fn fetch_server_info_inner(url: &str) -> Result<ServerInfo, String> {
     let client = reqwest::Client::new();
     let resp = client

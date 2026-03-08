@@ -40,13 +40,13 @@
         <span class="unread-badge">{unreadDmCount}</span>
       {/if}
     </a>
+    <a href="/discover" class:active={currentPath === "/discover"}>
+      <Icon name="compass" />
+      <span class="nav-label">Discover</span>
+    </a>
     <a href="/follows" class:active={currentPath === "/follows"}>
       <Icon name="users" />
       <span class="nav-label">Follows</span>
-    </a>
-    <a href="/servers" class:active={currentPath === "/servers"}>
-      <Icon name="server" />
-      <span class="nav-label">Servers</span>
     </a>
     {#if nodeId}
       <a

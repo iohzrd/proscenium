@@ -13,8 +13,11 @@
 
   let moreOpen = $state(false);
 
-  const moreRoutes = ["/follows", "/servers", "/settings"];
-  let moreActive = $derived(moreRoutes.includes(currentPath));
+  let moreActive = $derived(
+    currentPath === "/follows" ||
+      currentPath === "/settings" ||
+      (!!nodeId && currentPath === `/profile/${nodeId}`),
+  );
 
   function toggleMore(e: Event) {
     e.preventDefault();
@@ -62,16 +65,14 @@
     </span>
     <span class="tab-label">Messages</span>
   </a>
-  {#if nodeId}
-    <a
-      href="/profile/{nodeId}"
-      class:active={currentPath === `/profile/${nodeId}`}
-      onclick={closeMore}
-    >
-      <Icon name="user" size={22} />
-      <span class="tab-label">Profile</span>
-    </a>
-  {/if}
+  <a
+    href="/discover"
+    class:active={currentPath === "/discover"}
+    onclick={closeMore}
+  >
+    <Icon name="compass" size={22} />
+    <span class="tab-label">Discover</span>
+  </a>
   <button
     class="tab-btn"
     class:active={moreActive}
@@ -84,6 +85,16 @@
 
   {#if moreOpen}
     <div class="more-menu">
+      {#if nodeId}
+        <a
+          href="/profile/{nodeId}"
+          class:active={currentPath === `/profile/${nodeId}`}
+          onclick={closeMore}
+        >
+          <Icon name="user" size={18} />
+          <span>Profile</span>
+        </a>
+      {/if}
       <a
         href="/follows"
         class:active={currentPath === "/follows"}
@@ -91,14 +102,6 @@
       >
         <Icon name="users" size={18} />
         <span>Follows</span>
-      </a>
-      <a
-        href="/servers"
-        class:active={currentPath === "/servers"}
-        onclick={closeMore}
-      >
-        <Icon name="server" size={18} />
-        <span>Servers</span>
       </a>
       <a
         href="/settings"

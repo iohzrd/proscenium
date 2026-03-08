@@ -149,6 +149,43 @@ export interface TrendingHashtag {
   computed_at: number;
 }
 
+export interface ServerUser {
+  pubkey: string;
+  display_name: string | null;
+  bio: string | null;
+  avatar_hash: string | null;
+  visibility: string;
+  registered_at: number;
+  post_count: number;
+  latest_post_at: number | null;
+}
+
+export interface UserSearchResponse {
+  users: ServerUser[];
+  total: number;
+  query: string;
+}
+
+export interface ServerSearchPost {
+  id: string;
+  author: string;
+  content: string;
+  timestamp: number;
+  media_json: string | null;
+  reply_to: string | null;
+  reply_to_author: string | null;
+  quote_of: string | null;
+  quote_of_author: string | null;
+  signature: string;
+  indexed_at: number;
+}
+
+export interface PostSearchResponse {
+  posts: ServerSearchPost[];
+  total: number;
+  query: string;
+}
+
 export interface StoredMessage {
   id: string;
   conversation_id: string;

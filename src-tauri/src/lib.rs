@@ -117,6 +117,9 @@ pub fn run() {
             unregister_from_server,
             server_get_feed,
             server_get_trending,
+            server_search_users,
+            server_search_posts,
+            server_list_users,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

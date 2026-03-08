@@ -45,6 +45,15 @@
     <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
     <line x1="6" y1="6" x2="6.01" y2="6" />
     <line x1="6" y1="18" x2="6.01" y2="18" />
+  {:else if name === "compass"}
+    <circle cx="12" cy="12" r="10" />
+    <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76" />
+  {:else if name === "search"}
+    <circle cx="11" cy="11" r="8" />
+    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+  {:else if name === "x"}
+    <line x1="18" y1="6" x2="6" y2="18" />
+    <line x1="6" y1="6" x2="18" y2="18" />
   {:else if name === "more-horizontal"}
     <circle cx="12" cy="12" r="1" />
     <circle cx="19" cy="12" r="1" />
