@@ -99,6 +99,17 @@ impl Storage {
         })
     }
 
+    pub fn delete_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
+        self.with_db(|db| {
+            db.execute(
+                "DELETE FROM notifications WHERE post_id IN (SELECT id FROM posts WHERE author=?1) OR target_post_id IN (SELECT id FROM posts WHERE author=?1)",
+                params![author],
+            )?;
+            let count = db.execute("DELETE FROM posts WHERE author=?1", params![author])?;
+            Ok(count as u64)
+        })
+    }
+
     pub fn delete_repost_by_target(
         &self,
         author: &str,

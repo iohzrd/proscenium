@@ -131,6 +131,7 @@ export interface ServerInfo {
   total_posts: number;
   uptime_seconds: number;
   registration_open: boolean;
+  retention_days: number;
 }
 
 export interface ServerFeedPost {

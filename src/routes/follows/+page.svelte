@@ -301,7 +301,9 @@
           role="dialog"
           aria-label="Confirm unfollow"
         >
-          <p>Unfollow this user? You will stop receiving their posts.</p>
+          <p>
+            Unfollow this user? Their posts will be deleted from your device.
+          </p>
           <div class="modal-actions">
             <button class="modal-cancel" onclick={cancelUnfollow}>Cancel</button
             >

@@ -44,12 +44,12 @@ A brain dump of every possible feature, improvement, and direction for Iroh Soci
 
 ## Community and Discovery
 
-- **Community server** -- see dedicated design doc
+- **Discovery server** -- see dedicated design doc
 - **User search** -- search by display name or pubkey (local + server-assisted)
 - **Suggested follows** -- "friends of friends" discovery from your follow graph
 - **Who to follow** -- recommend accounts based on shared follows
 - **Explore page** -- trending posts, trending tags, popular accounts (server-powered)
-- **User directories** -- browse registered users on a community server
+- **User directories** -- browse registered users on a discovery server
 - **Invite links** -- generate a shareable link containing your node ID + relay info
 - **QR codes** -- display/scan QR code to follow someone in person
 - **Follow requests** -- optional approval before someone can follow you
@@ -98,7 +98,7 @@ A brain dump of every possible feature, improvement, and direction for Iroh Soci
 - **Multiple identities** -- switch between different keypairs/personas in one app
 - **Account export/import** -- export full account (keys, follows, posts) as encrypted file
 - **Account migration** -- move identity to new keypair with signed migration notice
-- **Profile badges** -- visual indicators (early adopter, community server admin, etc.)
+- **Profile badges** -- visual indicators (early adopter, discovery server admin, etc.)
 - **Activity status** -- show online/offline/away status (opt-in)
 - **Profile analytics** -- view stats on your own posts (local counts of interactions received)
 
@@ -134,7 +134,7 @@ A brain dump of every possible feature, improvement, and direction for Iroh Soci
 - **Spam filtering** -- heuristic spam detection (repeated content, rapid posting)
 - **Proof of work** -- require small PoW for posting to deter spam (opt-in per server)
 - **Rate limiting** -- local rate limit on outgoing posts to prevent accidents
-- **Content reporting** -- report posts to community server moderators
+- **Content reporting** -- report posts to discovery server moderators
 - **Moderation tools** -- server-side moderation (hide posts, ban users from server index)
 - **Allowlist mode** -- only accept connections/messages from followed users
 
@@ -196,7 +196,7 @@ A brain dump of every possible feature, improvement, and direction for Iroh Soci
 - **AppImage** -- portable Linux binary
 - **Homebrew formula** -- install via Homebrew on macOS
 - **Windows installer** -- MSI/NSIS installer for Windows
-- **One-click server deploy** -- DigitalOcean / Vultr / Linode marketplace images for community server
+- **One-click server deploy** -- DigitalOcean / Vultr / Linode marketplace images for discovery server
 - **Auto-updates** -- check for and install updates (Tauri updater plugin)
 - **Web client** -- browser-based client connecting to a local or remote node
 - **PWA** -- progressive web app version for lightweight access

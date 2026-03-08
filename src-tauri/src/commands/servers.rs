@@ -19,6 +19,8 @@ pub struct ServerInfo {
     pub total_posts: i64,
     pub uptime_seconds: u64,
     pub registration_open: bool,
+    #[serde(default)]
+    pub retention_days: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,7 +143,12 @@ pub async fn register_with_server(
     state
         .storage
         .mark_server_registered(&url, &vis.to_string())
-        .str_err()
+        .str_err()?;
+
+    // Auto-sync profile to the server after registration
+    let _ = sync_profile_inner(&state, &url).await;
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -375,6 +382,80 @@ pub async fn server_list_users(
         users,
         query: String::new(),
     })
+}
+
+#[tauri::command]
+pub async fn sync_profile_to_server(
+    state: State<'_, Arc<AppState>>,
+    url: String,
+) -> Result<(), String> {
+    sync_profile_inner(&state, &url).await
+}
+
+pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), String> {
+    let pubkey = state.endpoint.id().to_string();
+    let secret_key = SecretKey::from_bytes(&state.secret_key_bytes);
+
+    let profile = state
+        .storage
+        .get_profile(&pubkey)
+        .str_err()?
+        .ok_or("no profile to sync")?;
+
+    let vis = state
+        .storage
+        .get_server(url)
+        .str_err()?
+        .map(|s| s.visibility)
+        .unwrap_or_else(|| "public".to_string());
+
+    let payload = RegistrationPayload {
+        pubkey: pubkey.clone(),
+        server_url: url.to_string(),
+        timestamp: now_millis(),
+        visibility: vis.parse().unwrap_or_default(),
+        action: None,
+    };
+    let signature = sign_registration(&payload, &secret_key);
+
+    #[derive(Serialize)]
+    struct ProfileUpdate {
+        pubkey: String,
+        server_url: String,
+        timestamp: u64,
+        visibility: String,
+        display_name: Option<String>,
+        bio: Option<String>,
+        avatar_hash: Option<String>,
+        signature: String,
+    }
+
+    let update = ProfileUpdate {
+        pubkey,
+        server_url: url.to_string(),
+        timestamp: payload.timestamp,
+        visibility: vis,
+        display_name: Some(profile.display_name).filter(|s| !s.is_empty()),
+        bio: Some(profile.bio).filter(|s| !s.is_empty()),
+        avatar_hash: profile.avatar_hash,
+        signature,
+    };
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("{url}/api/v1/register"))
+        .json(&update)
+        .send()
+        .await
+        .map_err(|e| format!("profile sync failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("profile sync failed ({status}): {body}"));
+    }
+
+    Ok(())
 }
 
 async fn fetch_server_info_inner(url: &str) -> Result<ServerInfo, String> {

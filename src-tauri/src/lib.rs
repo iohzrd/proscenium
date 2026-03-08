@@ -120,6 +120,7 @@ pub fn run() {
             server_search_users,
             server_search_posts,
             server_list_users,
+            sync_profile_to_server,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

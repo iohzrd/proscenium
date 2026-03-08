@@ -268,6 +268,14 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn prune_old_posts(&self, before_ms: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM posts WHERE timestamp < ?1")
+            .bind(before_ms)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn delete_post(&self, id: &str, author: &str) -> anyhow::Result<bool> {
         let result = sqlx::query("DELETE FROM posts WHERE id = ?1 AND author = ?2")
             .bind(id)

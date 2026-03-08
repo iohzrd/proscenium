@@ -69,7 +69,11 @@ pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> R
     state.storage.unfollow(&pubkey).str_err()?;
     let mut feed = state.feed.lock().await;
     feed.unfollow_user(&pubkey);
-    log::info!("[follow] unfollowed {}", short_id(&pubkey));
+    let deleted = state.storage.delete_posts_by_author(&pubkey).unwrap_or(0);
+    log::info!(
+        "[follow] unfollowed {}, deleted {deleted} posts",
+        short_id(&pubkey)
+    );
     Ok(())
 }
 

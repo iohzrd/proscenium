@@ -186,6 +186,14 @@
     toggling = true;
     try {
       if (isFollowing) {
+        if (
+          !confirm(
+            "Unfollow this user? Their posts will be deleted from your device.",
+          )
+        ) {
+          toggling = false;
+          return;
+        }
         await invoke("unfollow_user", { pubkey });
         isFollowing = false;
       } else {

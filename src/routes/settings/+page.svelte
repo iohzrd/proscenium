@@ -75,7 +75,7 @@
 </section>
 
 <section class="settings-section">
-  <h3>Community Servers</h3>
+  <h3>Discovery Servers</h3>
   <div class="server-add-row">
     <input
       class="input-base server-input"

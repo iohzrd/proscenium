@@ -33,6 +33,9 @@ pub struct LimitsConfig {
     pub max_registered_users: u32,
     #[serde(default = "default_max_posts")]
     pub max_posts_per_user: u32,
+    /// How long to keep posts (in days). 0 means keep forever.
+    #[serde(default)]
+    pub retention_days: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +92,7 @@ impl Default for LimitsConfig {
         Self {
             max_registered_users: default_max_users(),
             max_posts_per_user: default_max_posts(),
+            retention_days: 0,
         }
     }
 }

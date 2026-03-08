@@ -1,3 +1,4 @@
+use crate::commands::servers::sync_profile_inner;
 use crate::ext::ResultExt;
 use crate::state::{AppState, NodeStatus};
 use iroh_social_types::{Profile, Visibility, validate_profile};
@@ -55,6 +56,15 @@ pub async fn save_my_profile(
 
     // Broadcast profile update (gossip for Public, push outbox for Listed/Private)
     feed.broadcast_profile(&profile).await.str_err()?;
+
+    // Sync profile to all registered discovery servers
+    if let Ok(servers) = state.storage.get_servers() {
+        for server in servers {
+            if server.registered_at.is_some() {
+                let _ = sync_profile_inner(&state, &server.url).await;
+            }
+        }
+    }
 
     Ok(())
 }

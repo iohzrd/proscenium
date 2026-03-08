@@ -1,4 +1,4 @@
-# Community Server - Design Document
+# Discovery Server - Design Document
 
 A self-hosted, headless server binary that provides aggregation, discovery, search, and trending for the Iroh Social P2P network. Users opt in by registering with a server -- the server never scrapes or indexes without consent. The server respects a three-tier visibility model: Public users get full indexing, Listed users get profile-only presence for discoverability, and Private users have no server-side footprint at all.
 
@@ -23,7 +23,7 @@ A self-hosted, headless server binary that provides aggregation, discovery, sear
 
 ```
                          +--------------------+
-                         | Community Server   |
+                         | Discovery Server   |
                          | (headless binary)  |
                          |                    |
   Users opt-in           | - Iroh node        |   HTTP API
@@ -48,7 +48,7 @@ Key principle: **the server is an overlay, not a replacement**. The P2P layer re
 
 ## Visibility Model
 
-User profiles have a `visibility` field (replacing the old boolean `is_private`) that controls how their content is distributed and what the community server stores. Three levels:
+User profiles have a `visibility` field (replacing the old boolean `is_private`) that controls how their content is distributed and what the discovery server stores. Three levels:
 
 ### Visibility Levels
 
@@ -76,11 +76,11 @@ pub enum Visibility {
 
 ### Public (default)
 
-Full participation in the network. Posts are broadcast via gossip to anyone subscribed to the user's topic. Sync is open to any peer. If registered with a community server, the server subscribes to the gossip topic, syncs history, indexes all posts, and includes them in search, feeds, and trending.
+Full participation in the network. Posts are broadcast via gossip to anyone subscribed to the user's topic. Sync is open to any peer. If registered with a discovery server, the server subscribes to the gossip topic, syncs history, indexes all posts, and includes them in search, feeds, and trending.
 
 ### Listed
 
-The "locked account" model (similar to Twitter/X private accounts). The user's profile (display name, bio, avatar) is stored by the community server and appears in user search and the directory, so people can discover and send follow requests. However:
+The "locked account" model (similar to Twitter/X private accounts). The user's profile (display name, bio, avatar) is stored by the discovery server and appears in user search and the directory, so people can discover and send follow requests. However:
 
 - **No post ingestion.** The server does not subscribe to the user's gossip topic and does not sync or store any posts or interactions. The user appears in search results but with no post content.
 - **Follow requests.** New followers must send a follow request that the user explicitly approves before the follower receives any content. (This makes follow requests a natural dependency of the Listed visibility tier.)

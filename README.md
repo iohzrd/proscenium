@@ -4,7 +4,7 @@ A decentralized peer-to-peer social network built with [Iroh](https://iroh.compu
 
 Successor to [follow](https://github.com/iohzrd/follow) and [identia](https://github.com/iohzrd/identia), rebuilt on iroh's QUIC transport with end-to-end encrypted messaging.
 
-Every user runs their own node. Posts, profiles, and follows are stored locally. Peers exchange data directly -- no central server, no accounts, no passwords. Optional community servers provide discovery, search, and trending without compromising the P2P foundation.
+Every user runs their own node. Posts, profiles, and follows are stored locally. Peers exchange data directly -- no central server, no accounts, no passwords. Optional discovery servers provide search, trending, and user directories without compromising the P2P foundation.
 
 ## How It Works
 
@@ -43,7 +43,7 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Connection status indicator (relay + peer count)
 - Confirmation dialogs for destructive actions
 - Dark theme UI
-- Community server integration (discover users, search posts, trending hashtags)
+- Discovery server integration (find users, search posts, trending hashtags)
 - Server management in settings (add/remove servers, register with visibility levels)
 
 **Backend state model:** Only the `FeedManager` (which manages gossip subscriptions) is behind a mutex. All other state -- the Iroh endpoint, blob store, database -- is accessed lock-free, so blob fetches and feed queries never block each other.
@@ -122,9 +122,9 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 - QR code scanning uses `tauri-plugin-barcode-scanner` which requires the CAMERA permission (declared in the manifest)
 - Deep links use the `iroh-social://` scheme
 
-## Community Server
+## Discovery Server
 
-A self-hosted, headless server binary (`server/`) that adds opt-in aggregation, discovery, full-text search, and trending to the P2P network. Users register with a server by signing a cryptographic proof of identity. The server subscribes to their gossip topics and indexes their posts in SQLite with FTS5, exposing an HTTP API for search, trending hashtags, user directory, and aggregated feeds.
+A self-hosted, headless server binary (`server/`) that adds opt-in aggregation, search, and trending to the P2P network. Users register with a server by signing a cryptographic proof of identity. The server subscribes to their gossip topics and indexes their posts in SQLite with FTS5, exposing an HTTP API for search, trending hashtags, user directory, and aggregated feeds.
 
 The server is an overlay -- the P2P layer remains the foundation. Users who never connect to a server lose nothing.
 
@@ -170,7 +170,7 @@ See [todos/community-server.md](todos/community-server.md) for the full design d
 
 ## Direct Messaging
 
-End-to-end encrypted direct messaging over a custom QUIC protocol (`iroh-social/dm/1`). E2E encryption uses X25519 key exchange derived from each user's existing ed25519 identity, with a Noise IK handshake for session establishment and a Double Ratchet for per-message forward secrecy. Messages are encrypted such that only the two participants can read them -- not relay servers, not community servers, not anyone.
+End-to-end encrypted direct messaging over a custom QUIC protocol (`iroh-social/dm/1`). E2E encryption uses X25519 key exchange derived from each user's existing ed25519 identity, with a Noise IK handshake for session establishment and a Double Ratchet for per-message forward secrecy. Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
 
 - Noise IK + Double Ratchet (Signal Protocol pattern) with ChaCha20-Poly1305
 - Typing indicators (debounced, sent over encrypted channel)

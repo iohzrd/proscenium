@@ -205,6 +205,14 @@
           <span class="stat-value">v{serverInfo.version}</span>
           <span class="stat-label">Version</span>
         </div>
+        <div class="stat">
+          <span class="stat-value">
+            {serverInfo.retention_days > 0
+              ? `${serverInfo.retention_days}d`
+              : "Forever"}
+          </span>
+          <span class="stat-label">Retention</span>
+        </div>
       </div>
 
       <div class="registration-section">
@@ -365,7 +373,7 @@
       </div>
     {:else}
       <p class="empty">
-        No servers added yet. Add a community server URL above to get started.
+        No servers added yet. Add a discovery server URL above to get started.
       </p>
     {/each}
   </div>

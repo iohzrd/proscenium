@@ -18,7 +18,7 @@ This design is inspired by Keybase's per-device key model, Matrix's cross-signin
 - [Device Revocation](#device-revocation)
 - [Storage](#storage)
 - [Client Integration](#client-integration)
-- [Community Server Considerations](#community-server-considerations)
+- [Discovery Server Considerations](#discovery-server-considerations)
 - [Implementation Roadmap](#implementation-roadmap)
 
 ---
@@ -1263,7 +1263,7 @@ let router = Router::builder(endpoint.clone())
 
 ### SyncHandler Update (Peer Sync)
 
-The existing `SyncHandler` (for peer sync on `SYNC_ALPN`) must be updated to accept sync requests where `SyncRequest.author` matches this device's **linked identity pubkey**, not just its own NodeId. A secondary device's NodeId differs from the identity pubkey, but it stores posts with `author: <identity_pubkey>` (received via device sync). This allows peers and community servers to sync a user's posts from any of their devices as a fallback when the primary is offline.
+The existing `SyncHandler` (for peer sync on `SYNC_ALPN`) must be updated to accept sync requests where `SyncRequest.author` matches this device's **linked identity pubkey**, not just its own NodeId. A secondary device's NodeId differs from the identity pubkey, but it stores posts with `author: <identity_pubkey>` (received via device sync). This allows peers and discovery servers to sync a user's posts from any of their devices as a fallback when the primary is offline.
 
 ### Tauri Commands
 
@@ -1353,9 +1353,9 @@ interface DeviceInfo {
 
 ---
 
-## Community Server Considerations
+## Discovery Server Considerations
 
-The community server (see `todos/community-server.md`) is an aggregation overlay that subscribes to users' gossip topics and indexes their posts. Linked devices affect the server in several ways:
+The discovery server (see `todos/community-server.md`) is an aggregation overlay that subscribes to users' gossip topics and indexes their posts. Linked devices affect the server in several ways:
 
 ### Server Must Handle Device Gossip Variants
 
@@ -1376,7 +1376,7 @@ If the certificate is not yet cached (e.g., the server started after the announc
 
 ### Registration Remains Identity-Key-Only
 
-Server registration requires the identity key signature, so only the primary device can register or unregister with a community server. Secondary devices inherit the registration -- the server ingests and verifies posts from any authorized device of a registered identity.
+Server registration requires the identity key signature, so only the primary device can register or unregister with a discovery server. Secondary devices inherit the registration -- the server ingests and verifies posts from any authorized device of a registered identity.
 
 ### Post and Interaction Schema
 

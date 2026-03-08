@@ -14,6 +14,7 @@ struct ServerInfo {
     total_posts: i64,
     uptime_seconds: u64,
     registration_open: bool,
+    retention_days: u64,
 }
 
 async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
@@ -30,6 +31,7 @@ async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
         total_posts,
         uptime_seconds: uptime,
         registration_open: state.config.server.registration_open,
+        retention_days: state.config.limits.retention_days,
     })
 }
 

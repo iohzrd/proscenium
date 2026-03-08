@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "iroh-social-server", about = "Iroh Social community server")]
+#[command(name = "iroh-social-server", about = "Iroh Social discovery server")]
 struct Cli {
     /// Config file path
     #[arg(short, long, default_value = "config.toml")]
@@ -75,6 +75,27 @@ async fn main() -> anyhow::Result<()> {
         config.trending.window_hours,
     );
     tracing::info!("trending computation task started");
+
+    if config.limits.retention_days > 0 {
+        let retention_days = config.limits.retention_days;
+        let prune_storage = storage.clone();
+        tokio::spawn(async move {
+            let interval = tokio::time::Duration::from_secs(3600);
+            loop {
+                tokio::time::sleep(interval).await;
+                let cutoff_ms =
+                    iroh_social_types::now_millis() - (retention_days * 24 * 60 * 60 * 1000);
+                match prune_storage.prune_old_posts(cutoff_ms as i64).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("pruned {n} posts older than {retention_days} days"),
+                    Err(e) => tracing::error!("post pruning failed: {e}"),
+                }
+            }
+        });
+        tracing::info!("post retention: {retention_days} days (pruning hourly)");
+    } else {
+        tracing::info!("post retention: unlimited");
+    }
 
     let listen_addr = if let Some(port) = cli.port {
         format!("0.0.0.0:{port}")

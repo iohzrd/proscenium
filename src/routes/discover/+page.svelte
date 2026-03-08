@@ -10,6 +10,7 @@
     TrendingHashtag,
     UserSearchResponse,
     PostSearchResponse,
+    FollowEntry,
   } from "$lib/types";
 
   type Tab = "users" | "posts" | "trending";
@@ -19,13 +20,19 @@
   let activeTab = $state<Tab>("users");
   let searchQuery = $state("");
   let searching = $state(false);
+  let nodeId = $state("");
 
   let users = $state<ServerUser[]>([]);
   let posts = $state<ServerSearchPost[]>([]);
   let trending = $state<TrendingHashtag[]>([]);
   let loadingTrending = $state(false);
+  let followedPubkeys = $state<Set<string>>(new Set());
+  let togglingFollow = $state<string | null>(null);
 
   const node = useNodeInit(async () => {
+    nodeId = await invoke<string>("get_node_id");
+    const follows: FollowEntry[] = await invoke("get_follows");
+    followedPubkeys = new Set(follows.map((f) => f.pubkey));
     servers = await invoke("list_servers");
     if (servers.length > 0) {
       activeServer = servers[0];
@@ -113,6 +120,38 @@
     }
   }
 
+  async function toggleFollow(pubkey: string) {
+    togglingFollow = pubkey;
+    try {
+      if (followedPubkeys.has(pubkey)) {
+        if (
+          !confirm(
+            "Unfollow this user? Their posts will be deleted from your device.",
+          )
+        ) {
+          togglingFollow = null;
+          return;
+        }
+        await invoke("unfollow_user", { pubkey });
+        followedPubkeys = new Set(
+          [...followedPubkeys].filter((p) => p !== pubkey),
+        );
+      } else {
+        await invoke("follow_user", { pubkey });
+        followedPubkeys = new Set([...followedPubkeys, pubkey]);
+      }
+    } catch (e) {
+      console.error("Follow toggle failed:", e);
+    }
+    togglingFollow = null;
+  }
+
+  function searchTag(tag: string) {
+    searchQuery = `#${tag}`;
+    activeTab = "posts";
+    search();
+  }
+
   function shortId(id: string): string {
     return id.length > 12 ? id.slice(0, 6) + ".." + id.slice(-4) : id;
   }
@@ -136,7 +175,7 @@
     <Icon name="compass" size={48} />
     <h2>No servers added</h2>
     <p>
-      Add a community server in <a href="/settings">Settings</a> to discover users
+      Add a discovery server in <a href="/settings">Settings</a> to discover users
       and content.
     </p>
   </div>
@@ -212,24 +251,41 @@
       {#if users.length > 0}
         <div class="user-list">
           {#each users as user (user.pubkey)}
-            <a href="/profile/{user.pubkey}" class="user-card">
-              <div class="user-avatar">
-                <Icon name="user" size={24} />
-              </div>
-              <div class="user-info">
-                <span class="user-name">
-                  {user.display_name || shortId(user.pubkey)}
-                </span>
-                <span class="user-pubkey">{shortId(user.pubkey)}</span>
-                {#if user.bio}
-                  <span class="user-bio">{user.bio}</span>
-                {/if}
-              </div>
-              <div class="user-stats">
-                <span class="user-stat">{user.post_count} posts</span>
-                <span class="user-visibility">{user.visibility}</span>
-              </div>
-            </a>
+            <div class="user-card">
+              <a href="/profile/{user.pubkey}" class="user-card-link">
+                <div class="user-avatar">
+                  <Icon name="user" size={24} />
+                </div>
+                <div class="user-info">
+                  <span class="user-name">
+                    {user.display_name || shortId(user.pubkey)}
+                  </span>
+                  <span class="user-pubkey">{shortId(user.pubkey)}</span>
+                  {#if user.bio}
+                    <span class="user-bio">{user.bio}</span>
+                  {/if}
+                </div>
+                <div class="user-stats">
+                  <span class="user-stat">{user.post_count} posts</span>
+                </div>
+              </a>
+              {#if user.pubkey !== nodeId}
+                <button
+                  class="follow-btn"
+                  class:following={followedPubkeys.has(user.pubkey)}
+                  onclick={() => toggleFollow(user.pubkey)}
+                  disabled={togglingFollow === user.pubkey}
+                >
+                  {#if togglingFollow === user.pubkey}
+                    ...
+                  {:else if followedPubkeys.has(user.pubkey)}
+                    Following
+                  {:else}
+                    Follow
+                  {/if}
+                </button>
+              {/if}
+            </div>
           {/each}
         </div>
       {:else}
@@ -263,13 +319,13 @@
       {:else if trending.length > 0}
         <div class="trending-list">
           {#each trending as t, i (t.tag)}
-            <div class="trending-item">
+            <button class="trending-item" onclick={() => searchTag(t.tag)}>
               <span class="trending-rank">{i + 1}</span>
               <div class="trending-info">
                 <span class="trending-tag">#{t.tag}</span>
                 <span class="trending-count">{t.post_count} posts</span>
               </div>
-            </div>
+            </button>
           {/each}
         </div>
       {:else}
@@ -429,18 +485,60 @@
   .user-card {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.5rem;
     background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 0.75rem 1rem;
-    text-decoration: none;
-    color: inherit;
     transition: border-color var(--transition-fast);
   }
 
   .user-card:hover {
     border-color: var(--accent-medium);
+  }
+
+  .user-card-link {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    text-decoration: none;
+    color: inherit;
+    min-width: 0;
+  }
+
+  .follow-btn {
+    background: var(--accent);
+    color: var(--text-on-accent);
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 0.35rem 0.75rem;
+    font-size: var(--text-sm);
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    font-family: inherit;
+    flex-shrink: 0;
+  }
+
+  .follow-btn:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+
+  .follow-btn.following {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+  }
+
+  .follow-btn.following:hover:not(:disabled) {
+    color: var(--color-error, #ef4444);
+    border-color: var(--color-error, #ef4444);
+  }
+
+  .follow-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
   }
 
   .user-avatar {
@@ -490,20 +588,12 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 0.15rem;
     flex-shrink: 0;
   }
 
   .user-stat {
     font-size: var(--text-xs);
     color: var(--text-muted);
-  }
-
-  .user-visibility {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--accent-light);
-    text-transform: capitalize;
   }
 
   .post-list {
@@ -560,6 +650,15 @@
     border: 1px solid var(--border);
     border-radius: var(--radius-lg);
     padding: 0.75rem 1rem;
+    cursor: pointer;
+    font-family: inherit;
+    text-align: left;
+    width: 100%;
+    transition: border-color var(--transition-fast);
+  }
+
+  .trending-item:hover {
+    border-color: var(--accent-medium);
   }
 
   .trending-rank {
