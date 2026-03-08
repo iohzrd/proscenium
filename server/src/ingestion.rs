@@ -32,40 +32,88 @@ impl IngestionManager {
     }
 
     pub async fn subscribe(self: &Arc<Self>, pubkey: &str) -> anyhow::Result<()> {
-        let mut subs = self.subscriptions.lock().await;
-        if subs.contains_key(pubkey) {
-            return Ok(());
+        // Check if already subscribed without holding lock during network calls
+        {
+            let subs = self.subscriptions.lock().await;
+            if subs.contains_key(pubkey) {
+                return Ok(());
+            }
         }
 
         let topic = user_feed_topic(pubkey);
         let bootstrap: EndpointId = pubkey.parse()?;
+        // Subscribe outside the lock to avoid holding mutex across await
         let topic_handle = self.gossip.subscribe(topic, vec![bootstrap]).await?;
         let (_sender, receiver) = topic_handle.split();
 
+        let gossip = self.gossip.clone();
         let storage = self.storage.clone();
         let pk = pubkey.to_string();
         let handle = tokio::spawn(async move {
             tracing::info!("[ingestion] listening on gossip for {}", short_id(&pk));
+            let mut _sender_hold = _sender;
             let mut receiver = receiver;
+            let mut backoff = 1u64;
+
             loop {
-                match receiver.try_next().await {
-                    Ok(Some(event)) => {
-                        if let iroh_gossip::api::Event::Received(msg) = &event {
-                            Self::process_gossip_message(&storage, &pk, &msg.content).await;
+                // Process events until stream ends or errors
+                loop {
+                    match receiver.try_next().await {
+                        Ok(Some(event)) => {
+                            if let iroh_gossip::api::Event::Received(msg) = &event {
+                                Self::process_gossip_message(&storage, &pk, &msg.content).await;
+                            }
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                "[ingestion] gossip stream ended for {}, will reconnect",
+                                short_id(&pk)
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[ingestion] gossip error for {}: {e}, will reconnect",
+                                short_id(&pk)
+                            );
+                            break;
                         }
                     }
-                    Ok(None) => {
-                        tracing::info!("[ingestion] gossip stream ended for {}", short_id(&pk));
-                        break;
-                    }
-                    Err(e) => {
-                        tracing::error!("[ingestion] gossip error for {}: {e}", short_id(&pk));
-                        break;
+                }
+
+                // Reconnect with exponential backoff
+                loop {
+                    tracing::info!(
+                        "[ingestion] reconnecting to {} in {backoff}s",
+                        short_id(&pk)
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                    match gossip.subscribe(topic, vec![bootstrap]).await {
+                        Ok(new_handle) => {
+                            let (new_sender, new_receiver) = new_handle.split();
+                            _sender_hold = new_sender;
+                            receiver = new_receiver;
+                            backoff = 1;
+                            tracing::info!(
+                                "[ingestion] reconnected to gossip for {}",
+                                short_id(&pk)
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "[ingestion] failed to resubscribe to {}: {e}",
+                                short_id(&pk)
+                            );
+                            backoff = (backoff * 2).min(60);
+                        }
                     }
                 }
             }
         });
 
+        // Re-acquire lock to insert the handle
+        let mut subs = self.subscriptions.lock().await;
         subs.insert(pubkey.to_string(), handle);
         tracing::info!("[ingestion] subscribed to {}", short_id(pubkey));
         Ok(())
@@ -204,6 +252,22 @@ impl IngestionManager {
         storage: &Storage,
         pubkey: &str,
     ) -> anyhow::Result<(usize, usize)> {
+        // Wrap the entire sync operation in a timeout to prevent hung peers
+        // from blocking the sync loop indefinitely
+        const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        tokio::time::timeout(
+            SYNC_TIMEOUT,
+            Self::sync_from_peer_inner(endpoint, storage, pubkey),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("sync timed out after {}s", SYNC_TIMEOUT.as_secs()))?
+    }
+
+    async fn sync_from_peer_inner(
+        endpoint: &Endpoint,
+        storage: &Storage,
+        pubkey: &str,
+    ) -> anyhow::Result<(usize, usize)> {
         let target: EndpointId = pubkey.parse()?;
 
         let last_post_ts = storage.get_last_post_timestamp(pubkey).await?;
@@ -226,8 +290,7 @@ impl IngestionManager {
         send.finish()?;
 
         let summary_bytes = recv.read_to_end(65_536).await?;
-        let summary: iroh_social_types::SyncSummary =
-            serde_json::from_slice(&summary_bytes)?;
+        let summary: iroh_social_types::SyncSummary = serde_json::from_slice(&summary_bytes)?;
 
         if let Some(profile) = &summary.profile
             && validate_profile(profile).is_ok()

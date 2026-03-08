@@ -14,15 +14,29 @@ use iroh_social_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// Sent by gossip tasks when their stream dies, so the reconnect loop can restart them.
+pub enum ReconnectRequest {
+    OwnFeed { attempt: u32 },
+    Follow { pubkey: String, attempt: u32 },
+}
+
+fn backoff_secs(attempt: u32) -> u64 {
+    // 5, 10, 20, 40, 60, 60, ...
+    (5 * 2u64.pow(attempt)).min(60)
+}
 
 pub struct FeedManager {
     pub gossip: Gossip,
     pub endpoint: Endpoint,
-    pub my_sender: Option<GossipSender>,
-    pub subscriptions: HashMap<String, (GossipSender, JoinHandle<()>)>,
+    my_sender: Option<GossipSender>,
+    own_feed_handle: Option<JoinHandle<()>>,
+    pub subscriptions: HashMap<String, JoinHandle<()>>,
     pub storage: Arc<Storage>,
     pub app_handle: AppHandle,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
 }
 
 impl FeedManager {
@@ -31,14 +45,17 @@ impl FeedManager {
         endpoint: Endpoint,
         storage: Arc<Storage>,
         app_handle: AppHandle,
+        reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
     ) -> Self {
         Self {
             gossip,
             endpoint,
             my_sender: None,
+            own_feed_handle: None,
             subscriptions: HashMap::new(),
             storage,
             app_handle,
+            reconnect_tx,
         }
     }
 
@@ -112,13 +129,19 @@ impl FeedManager {
     }
 
     fn stop_own_feed(&mut self) {
-        if self.my_sender.take().is_some() {
+        if let Some(handle) = self.own_feed_handle.take() {
+            handle.abort();
+            self.my_sender = None;
             log::info!("[gossip] stopped own feed topic");
         }
     }
 
     async fn start_own_feed_unconditional(&mut self) -> anyhow::Result<()> {
-        if self.my_sender.is_some() {
+        if self
+            .own_feed_handle
+            .as_ref()
+            .is_some_and(|h| !h.is_finished())
+        {
             return Ok(());
         }
 
@@ -132,7 +155,8 @@ impl FeedManager {
 
         let storage = self.storage.clone();
         let app_handle = self.app_handle.clone();
-        tokio::spawn(async move {
+        let reconnect_tx = self.reconnect_tx.clone();
+        let handle = tokio::spawn(async move {
             log::info!("[gossip-own] listener started for own feed neighbors");
             let mut receiver = receiver;
             loop {
@@ -169,7 +193,7 @@ impl FeedManager {
                         _ => {}
                     },
                     Ok(None) => {
-                        log::info!("[gossip-own] own feed stream ended");
+                        log::warn!("[gossip-own] own feed stream ended");
                         break;
                     }
                     Err(e) => {
@@ -178,9 +202,11 @@ impl FeedManager {
                     }
                 }
             }
-            log::info!("[gossip-own] own feed listener stopped");
+            // Task died naturally -- request reconnection
+            let _ = reconnect_tx.send(ReconnectRequest::OwnFeed { attempt: 0 });
         });
 
+        self.own_feed_handle = Some(handle);
         Ok(())
     }
 
@@ -336,140 +362,29 @@ impl FeedManager {
         let pk = pubkey.clone();
         let my_id = self.endpoint.id().to_string();
         let app_handle = self.app_handle.clone();
+        let reconnect_tx = self.reconnect_tx.clone();
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
+            let _sender_hold = sender;
             let mut receiver = receiver;
             loop {
                 match receiver.try_next().await {
                     Ok(Some(event)) => match &event {
                         Event::Received(msg) => {
-                            log::info!(
-                                "[gossip-rx] received {} bytes from {}",
-                                msg.content.len(),
-                                short_id(&pk)
+                            Self::handle_follow_message(
+                                &storage,
+                                &pk,
+                                &my_id,
+                                &app_handle,
+                                &msg.content,
                             );
-                            match serde_json::from_slice(&msg.content) {
-                                Ok(GossipMessage::NewPost(post)) => {
-                                    if post.author != pk {
-                                        log::info!(
-                                            "[gossip-rx] ignored post from {} (expected {})",
-                                            short_id(&post.author),
-                                            short_id(&pk)
-                                        );
-                                    } else if storage.is_hidden(&pk).unwrap_or(false) {
-                                        log::info!(
-                                            "[gossip-rx] skipping post from muted/blocked {}",
-                                            short_id(&pk)
-                                        );
-                                    } else if process_incoming_post(
-                                        &storage,
-                                        &post,
-                                        "gossip-rx",
-                                        &my_id,
-                                        &app_handle,
-                                    ) {
-                                        let _ = app_handle.emit("feed-updated", ());
-                                    }
-                                }
-                                Ok(GossipMessage::DeletePost { id, author }) => {
-                                    if author == pk {
-                                        // Verify the stored post belongs to this author
-                                        match storage.get_post_by_id(&id) {
-                                            Ok(Some(post)) if post.author == pk => {
-                                                log::info!(
-                                                    "[gossip-rx] delete post {id} from {}",
-                                                    short_id(&pk)
-                                                );
-                                                if let Err(e) = storage.delete_post(&id) {
-                                                    log::error!(
-                                                        "[gossip-rx] failed to delete post: {e}"
-                                                    );
-                                                }
-                                                let _ = app_handle.emit("feed-updated", ());
-                                            }
-                                            Ok(Some(_)) => {
-                                                log::error!(
-                                                    "[gossip-rx] rejected delete for {id}: author mismatch"
-                                                );
-                                            }
-                                            Ok(None) => {
-                                                // Post not in our DB; ignore
-                                            }
-                                            Err(e) => {
-                                                log::error!(
-                                                    "[gossip-rx] failed to look up post {id}: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(GossipMessage::ProfileUpdate(profile)) => {
-                                    if let Err(reason) = validate_profile(&profile) {
-                                        log::error!(
-                                            "[gossip-rx] rejected profile from {}: {reason}",
-                                            short_id(&pk)
-                                        );
-                                    } else {
-                                        log::info!(
-                                            "[gossip-rx] profile update from {}: {}",
-                                            short_id(&pk),
-                                            profile.display_name
-                                        );
-                                        if let Err(e) = storage.save_profile(&pk, &profile) {
-                                            log::error!("[gossip-rx] failed to store profile: {e}");
-                                        }
-                                        let _ = app_handle.emit("profile-updated", &pk);
-                                    }
-                                }
-                                Ok(GossipMessage::NewInteraction(interaction)) => {
-                                    if interaction.author != pk {
-                                        // Ignore interactions not from the expected author
-                                    } else if storage.is_hidden(&pk).unwrap_or(false) {
-                                        log::info!(
-                                            "[gossip-rx] skipping interaction from muted/blocked {}",
-                                            short_id(&pk)
-                                        );
-                                    } else {
-                                        process_incoming_interaction(
-                                            &storage,
-                                            &interaction,
-                                            &pk,
-                                            "gossip-rx",
-                                            &my_id,
-                                            &app_handle,
-                                        );
-                                        let _ =
-                                            app_handle.emit("interaction-received", &interaction);
-                                    }
-                                }
-                                Ok(GossipMessage::DeleteInteraction { id, author }) => {
-                                    if author == pk {
-                                        log::info!(
-                                            "[gossip-rx] delete interaction {id} from {}",
-                                            short_id(&pk)
-                                        );
-                                        if let Err(e) = storage.delete_interaction(&id, &author) {
-                                            log::error!(
-                                                "[gossip-rx] failed to delete interaction: {e}"
-                                            );
-                                        }
-                                        let _ = app_handle.emit(
-                                            "interaction-deleted",
-                                            serde_json::json!({ "id": id, "author": author }),
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("[gossip-rx] failed to parse message: {e}");
-                                }
-                            }
                         }
                         other => {
                             log::info!("[gossip-rx] event from {}: {other:?}", short_id(&pk));
                         }
                     },
                     Ok(None) => {
-                        log::info!("[gossip-rx] stream ended for {}", short_id(&pk));
+                        log::warn!("[gossip-rx] stream ended for {}", short_id(&pk));
                         break;
                     }
                     Err(e) => {
@@ -478,17 +393,171 @@ impl FeedManager {
                     }
                 }
             }
-            log::info!("[gossip-rx] listener stopped for {}", short_id(&pk));
+            // Task died naturally -- request reconnection
+            let _ = reconnect_tx.send(ReconnectRequest::Follow {
+                pubkey: pk,
+                attempt: 0,
+            });
         });
 
-        self.subscriptions.insert(pubkey, (sender, handle));
+        self.subscriptions.insert(pubkey, handle);
         Ok(())
     }
 
+    fn handle_follow_message(
+        storage: &Storage,
+        pk: &str,
+        my_id: &str,
+        app_handle: &AppHandle,
+        content: &Bytes,
+    ) {
+        log::info!(
+            "[gossip-rx] received {} bytes from {}",
+            content.len(),
+            short_id(pk)
+        );
+        match serde_json::from_slice(content) {
+            Ok(GossipMessage::NewPost(post)) => {
+                if post.author != pk {
+                    log::info!(
+                        "[gossip-rx] ignored post from {} (expected {})",
+                        short_id(&post.author),
+                        short_id(pk)
+                    );
+                } else if storage.is_hidden(pk).unwrap_or(false) {
+                    log::info!(
+                        "[gossip-rx] skipping post from muted/blocked {}",
+                        short_id(pk)
+                    );
+                } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle) {
+                    let _ = app_handle.emit("feed-updated", ());
+                }
+            }
+            Ok(GossipMessage::DeletePost { id, author }) => {
+                if author == pk {
+                    match storage.get_post_by_id(&id) {
+                        Ok(Some(post)) if post.author == pk => {
+                            log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
+                            if let Err(e) = storage.delete_post(&id) {
+                                log::error!("[gossip-rx] failed to delete post: {e}");
+                            }
+                            let _ = app_handle.emit("feed-updated", ());
+                        }
+                        Ok(Some(_)) => {
+                            log::error!("[gossip-rx] rejected delete for {id}: author mismatch");
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::error!("[gossip-rx] failed to look up post {id}: {e}");
+                        }
+                    }
+                }
+            }
+            Ok(GossipMessage::ProfileUpdate(profile)) => {
+                if let Err(reason) = validate_profile(&profile) {
+                    log::error!(
+                        "[gossip-rx] rejected profile from {}: {reason}",
+                        short_id(pk)
+                    );
+                } else {
+                    log::info!(
+                        "[gossip-rx] profile update from {}: {}",
+                        short_id(pk),
+                        profile.display_name
+                    );
+                    if let Err(e) = storage.save_profile(pk, &profile) {
+                        log::error!("[gossip-rx] failed to store profile: {e}");
+                    }
+                    let _ = app_handle.emit("profile-updated", pk);
+                }
+            }
+            Ok(GossipMessage::NewInteraction(interaction)) => {
+                if interaction.author != pk {
+                    // Ignore interactions not from the expected author
+                } else if storage.is_hidden(pk).unwrap_or(false) {
+                    log::info!(
+                        "[gossip-rx] skipping interaction from muted/blocked {}",
+                        short_id(pk)
+                    );
+                } else {
+                    process_incoming_interaction(
+                        storage,
+                        &interaction,
+                        pk,
+                        "gossip-rx",
+                        my_id,
+                        app_handle,
+                    );
+                    let _ = app_handle.emit("interaction-received", &interaction);
+                }
+            }
+            Ok(GossipMessage::DeleteInteraction { id, author }) => {
+                if author == pk {
+                    log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
+                    if let Err(e) = storage.delete_interaction(&id, &author) {
+                        log::error!("[gossip-rx] failed to delete interaction: {e}");
+                    }
+                    let _ = app_handle.emit(
+                        "interaction-deleted",
+                        serde_json::json!({ "id": id, "author": author }),
+                    );
+                }
+            }
+            Err(e) => {
+                log::error!("[gossip-rx] failed to parse message: {e}");
+            }
+        }
+    }
+
     pub fn unfollow_user(&mut self, pubkey: &str) {
-        if let Some((_sender, handle)) = self.subscriptions.remove(pubkey) {
+        if let Some(handle) = self.subscriptions.remove(pubkey) {
             log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
             handle.abort();
+        }
+    }
+}
+
+/// Reconnection loop: receives notifications from dead gossip tasks and restarts them.
+pub async fn gossip_reconnect_loop(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ReconnectRequest>,
+    feed: Arc<Mutex<FeedManager>>,
+    tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
+) {
+    while let Some(req) = rx.recv().await {
+        match req {
+            ReconnectRequest::OwnFeed { attempt } => {
+                let delay = backoff_secs(attempt);
+                log::info!("[reconnect] own feed died, restarting in {delay}s (attempt {attempt})");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                let mut fm = feed.lock().await;
+                fm.own_feed_handle = None;
+                fm.my_sender = None;
+                if let Err(e) = fm.start_own_feed().await {
+                    log::error!("[reconnect] own feed restart failed: {e}");
+                    drop(fm);
+                    let _ = tx.send(ReconnectRequest::OwnFeed {
+                        attempt: attempt + 1,
+                    });
+                }
+            }
+            ReconnectRequest::Follow { pubkey, attempt } => {
+                let delay = backoff_secs(attempt);
+                log::info!(
+                    "[reconnect] {} died, restarting in {delay}s (attempt {attempt})",
+                    short_id(&pubkey)
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                let mut fm = feed.lock().await;
+                fm.subscriptions.remove(&pubkey);
+                if let Err(e) = fm.follow_user(pubkey.clone()).await {
+                    log::error!("[reconnect] {} restart failed: {e}", short_id(&pubkey));
+                    drop(fm);
+                    let _ = tx.send(ReconnectRequest::Follow {
+                        pubkey,
+                        attempt: attempt + 1,
+                    });
+                }
+            }
         }
     }
 }

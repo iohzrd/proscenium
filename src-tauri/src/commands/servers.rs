@@ -29,9 +29,13 @@ pub struct ServerFeedPost {
     pub author: String,
     pub content: String,
     pub timestamp: i64,
+    pub media_json: Option<String>,
     pub reply_to: Option<String>,
-    pub media_hashes: Option<String>,
-    pub signature: Option<String>,
+    pub reply_to_author: Option<String>,
+    pub quote_of: Option<String>,
+    pub quote_of_author: Option<String>,
+    pub signature: String,
+    pub indexed_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

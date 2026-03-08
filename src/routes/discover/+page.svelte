@@ -28,6 +28,11 @@
   let loadingTrending = $state(false);
   let followedPubkeys = $state<Set<string>>(new Set());
   let togglingFollow = $state<string | null>(null);
+  let userNames = $derived(
+    new Map(
+      users.map((u) => [u.pubkey, u.display_name || shortId(u.pubkey)]),
+    ),
+  );
 
   const node = useNodeInit(async () => {
     nodeId = await invoke<string>("get_node_id");
@@ -52,6 +57,23 @@
       users = resp.users;
     } catch (e) {
       console.error("Failed to load users:", e);
+    }
+    searching = false;
+  }
+
+  async function loadPosts() {
+    if (!activeServer) return;
+    // Ensure user names are loaded for display
+    if (users.length === 0) await loadUsers();
+    searching = true;
+    try {
+      const resp: { posts: ServerSearchPost[] } = await invoke(
+        "server_get_feed",
+        { url: activeServer.url, limit: 50 },
+      );
+      posts = resp.posts;
+    } catch (e) {
+      console.error("Failed to load feed:", e);
     }
     searching = false;
   }
@@ -110,6 +132,8 @@
     activeTab = tab;
     if (tab === "users" && users.length === 0 && !searchQuery.trim()) {
       await loadUsers();
+    } else if (tab === "posts" && posts.length === 0 && !searchQuery.trim()) {
+      await loadPosts();
     }
   }
 
@@ -298,7 +322,7 @@
             <div class="feed-post">
               <div class="post-meta">
                 <a href="/profile/{post.author}" class="post-author">
-                  {shortId(post.author)}
+                  {userNames.get(post.author) || shortId(post.author)}
                 </a>
                 <span class="post-time">{formatTime(post.timestamp)}</span>
               </div>

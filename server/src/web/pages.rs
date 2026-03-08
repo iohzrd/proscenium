@@ -12,7 +12,11 @@ use crate::storage::{PostStats, StoredPost, UserInfo};
 
 // --- Helpers ---
 
-fn render_post(post: &StoredPost, author_info: Option<&UserInfo>, stats: Option<&PostStats>) -> maud::Markup {
+fn render_post(
+    post: &StoredPost,
+    author_info: Option<&UserInfo>,
+    stats: Option<&PostStats>,
+) -> maud::Markup {
     let display_name = author_info
         .and_then(|u| u.display_name.as_deref())
         .filter(|n| !n.is_empty());

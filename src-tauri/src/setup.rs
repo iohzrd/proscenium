@@ -198,11 +198,14 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             .spawn();
         log::info!("[setup] router spawned");
 
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let reconnect_tx_loop = reconnect_tx.clone();
         let mut feed = FeedManager::new(
             gossip,
             endpoint.clone(),
             storage_clone.clone(),
             handle.clone(),
+            reconnect_tx,
         );
 
         if let Err(e) = feed.start_own_feed().await {
@@ -529,6 +532,13 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             feed: Arc::new(Mutex::new(feed)),
             dm: dm_handler,
             secret_key_bytes,
+        });
+
+        // Gossip reconnection loop: restarts dead gossip tasks on demand
+        let reconnect_feed = state.feed.clone();
+        tokio::spawn(async move {
+            crate::gossip::gossip_reconnect_loop(reconnect_rx, reconnect_feed, reconnect_tx_loop)
+                .await;
         });
 
         handle.manage(state);
