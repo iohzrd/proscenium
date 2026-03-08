@@ -4,7 +4,7 @@ A decentralized peer-to-peer social network built with [Iroh](https://iroh.compu
 
 Successor to [follow](https://github.com/iohzrd/follow) and [identia](https://github.com/iohzrd/identia), rebuilt on iroh's QUIC transport with end-to-end encrypted messaging.
 
-Every user runs their own node. Posts, profiles, and follows are stored locally. Peers exchange data directly -- no central server, no accounts, no passwords.
+Every user runs their own node. Posts, profiles, and follows are stored locally. Peers exchange data directly -- no central server, no accounts, no passwords. Optional community servers provide discovery, search, and trending without compromising the P2P foundation.
 
 ## How It Works
 
@@ -43,6 +43,8 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Connection status indicator (relay + peer count)
 - Confirmation dialogs for destructive actions
 - Dark theme UI
+- Community server integration (discover users, search posts, trending hashtags)
+- Server management in settings (add/remove servers, register with visibility levels)
 
 **Backend state model:** Only the `FeedManager` (which manages gossip subscriptions) is behind a mutex. All other state -- the Iroh endpoint, blob store, database -- is accessed lock-free, so blob fetches and feed queries never block each other.
 
@@ -120,13 +122,51 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 - QR code scanning uses `tauri-plugin-barcode-scanner` which requires the CAMERA permission (declared in the manifest)
 - Deep links use the `iroh-social://` scheme
 
-## Community Server (Planned)
+## Community Server
 
-A self-hosted, headless server binary that adds opt-in aggregation, discovery, full-text search, and trending to the P2P network. Users register with a server by signing a cryptographic proof of identity. The server subscribes to their gossip topics and indexes their posts in SQLite with FTS5, exposing an HTTP API for search, trending hashtags, user directory, and aggregated feeds.
+A self-hosted, headless server binary (`server/`) that adds opt-in aggregation, discovery, full-text search, and trending to the P2P network. Users register with a server by signing a cryptographic proof of identity. The server subscribes to their gossip topics and indexes their posts in SQLite with FTS5, exposing an HTTP API for search, trending hashtags, user directory, and aggregated feeds.
 
 The server is an overlay -- the P2P layer remains the foundation. Users who never connect to a server lose nothing.
 
-See [todos/community-server.md](todos/community-server.md) for the full design document and implementation roadmap.
+### Running
+
+```bash
+cargo build --release --manifest-path server/Cargo.toml
+./server/target/release/iroh-social-server
+```
+
+The server listens on port 3000 by default. Configuration is via environment variables (`IROH_SOCIAL_PORT`, `IROH_SOCIAL_DB_PATH`).
+
+### Deploying
+
+A deploy script is provided for uploading to a remote server:
+
+```bash
+scripts/deploy-server.sh
+```
+
+This builds a static musl binary, uploads it via scp, and restarts the systemd service.
+
+### API
+
+- `GET /api/v1/info` -- Server info (name, version, user/post counts)
+- `POST /api/v1/register` -- Register with signed cryptographic proof
+- `DELETE /api/v1/register` -- Unregister
+- `GET /api/v1/feed` -- Aggregated post feed
+- `GET /api/v1/trending` -- Trending hashtags
+- `GET /api/v1/users` -- User directory
+- `GET /api/v1/users/search?q=` -- Search users
+- `GET /api/v1/posts/search?q=` -- Full-text post search
+
+### Registration Visibility
+
+Users choose a visibility level when registering:
+
+- **Public** -- Profile and posts visible to all
+- **Listed** -- Profile visible in directory, posts only to followers
+- **Private** -- Registered but invisible on server
+
+See [todos/community-server.md](todos/community-server.md) for the full design document.
 
 ## Direct Messaging
 
