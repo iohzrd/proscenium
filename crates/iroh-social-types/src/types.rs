@@ -50,6 +50,15 @@ pub struct MediaAttachment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub image: Option<String>,
+    pub site_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Post {
     pub id: String,
     pub author: String,

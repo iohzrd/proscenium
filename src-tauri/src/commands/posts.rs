@@ -2,7 +2,7 @@ use crate::ext::ResultExt;
 use crate::state::{AppState, generate_id};
 use crate::storage::FeedQuery;
 use iroh::SecretKey;
-use iroh_social_types::{MediaAttachment, Post, now_millis, sign_post, validate_post};
+use iroh_social_types::{LinkPreview, MediaAttachment, Post, now_millis, sign_post, validate_post};
 use std::sync::Arc;
 use tauri::State;
 
@@ -129,4 +129,16 @@ pub async fn get_replies(
             before,
         )
         .str_err()
+}
+
+#[tauri::command]
+pub async fn fetch_link_previews(content: String) -> Result<Vec<LinkPreview>, String> {
+    let urls = crate::og::extract_urls(&content);
+    let mut previews = Vec::new();
+    for url in &urls {
+        if let Some(preview) = crate::og::get_link_preview(url).await {
+            previews.push(preview);
+        }
+    }
+    Ok(previews)
 }

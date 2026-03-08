@@ -6,6 +6,14 @@ export interface MediaAttachment {
   size: number;
 }
 
+export interface LinkPreview {
+  url: string;
+  title: string | null;
+  description: string | null;
+  image: string | null;
+  site_name: string | null;
+}
+
 export interface Post {
   id: string;
   author: string;

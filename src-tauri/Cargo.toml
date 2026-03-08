@@ -22,31 +22,33 @@ chacha20poly1305 = "0.10"
 curve25519-dalek = { version = "4", default-features = false }
 futures-lite = "2"
 getrandom = "0.4.1"
+hex = "0.4.3"
 hkdf = "0.12"
 iroh = "0.96"
 iroh-blobs = { version = "0.98", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
 iroh-social-types = { path = "../crates/iroh-social-types" }
 log = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-urlencoding = "2"
+regex = "1"
+reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
+scraper = "0.25.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 snow = "0.10"
 tauri = { version = "2", features = [] }
 tauri-plugin-deep-link = "2"
+tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
-tauri-plugin-single-instance = "2"
-tauri-plugin-log = "2"
 tauri-plugin-os = "2"
+tauri-plugin-single-instance = "2"
 tokio = { version = "1", features = ["full"] }
+urlencoding = "2"
 uuid = { version = "1", features = ["v4"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = "1"
-hex = "0.4.3"
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"

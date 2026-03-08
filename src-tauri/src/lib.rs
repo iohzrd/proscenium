@@ -4,6 +4,7 @@ mod crypto;
 mod dm;
 mod ext;
 mod gossip;
+mod og;
 mod peer;
 mod push;
 mod setup;
@@ -121,6 +122,7 @@ pub fn run() {
             server_search_posts,
             server_list_users,
             sync_profile_to_server,
+            fetch_link_previews,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
