@@ -58,6 +58,14 @@ pub struct StoredInteraction {
     pub indexed_at: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PostStats {
+    pub likes: i64,
+    pub reposts: i64,
+    pub replies: i64,
+    pub quotes: i64,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct TrendingHashtag {
     pub tag: String,
@@ -481,6 +489,61 @@ impl Storage {
         .fetch_one(&self.pool)
         .await?;
         Ok(count.0)
+    }
+
+    /// Get interaction counts (likes, reposts) and reply/quote counts for a batch of posts.
+    pub async fn get_post_stats_batch(
+        &self,
+        post_ids: &[(String, String)], // (author, post_id)
+    ) -> anyhow::Result<std::collections::HashMap<String, PostStats>> {
+        let mut stats = std::collections::HashMap::new();
+        if post_ids.is_empty() {
+            return Ok(stats);
+        }
+
+        // Interaction counts (likes, reposts) grouped by target post
+        for (author, post_id) in post_ids {
+            let rows: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT kind, COUNT(*) FROM interactions WHERE target_author = ?1 AND target_post_id = ?2 GROUP BY kind",
+            )
+            .bind(author)
+            .bind(post_id)
+            .fetch_all(&self.pool)
+            .await?;
+
+            let reply_count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM posts WHERE reply_to = ?1 AND reply_to_author = ?2",
+            )
+            .bind(post_id)
+            .bind(author)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let quote_count: (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM posts WHERE quote_of = ?1 AND quote_of_author = ?2",
+            )
+            .bind(post_id)
+            .bind(author)
+            .fetch_one(&self.pool)
+            .await?;
+
+            let mut ps = PostStats::default();
+            for (kind, count) in &rows {
+                match kind.as_str() {
+                    "Like" => ps.likes = *count,
+                    "Repost" => ps.reposts = *count,
+                    _ => {}
+                }
+            }
+            ps.replies = reply_count.0;
+            ps.quotes = quote_count.0;
+
+            if ps.likes > 0 || ps.reposts > 0 || ps.replies > 0 || ps.quotes > 0 {
+                stats.insert(post_id.clone(), ps);
+            }
+        }
+
+        Ok(stats)
     }
 
     // --- Users ---

@@ -239,6 +239,15 @@ footer {
     margin-bottom: 0.3rem;
 }
 
+.post-stats {
+    display: flex;
+    gap: 1.25rem;
+    margin-top: 0.5rem;
+    color: var(--text-dim);
+    font-size: 0.8rem;
+}
+.post-stats .stat { color: var(--text-faint); }
+
 /* Profile */
 .profile-header {
     padding: 1.5rem 0;

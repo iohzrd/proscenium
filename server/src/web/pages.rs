@@ -8,11 +8,11 @@ use axum::routing::get;
 use maud::html;
 use serde::Deserialize;
 
-use crate::storage::{StoredPost, UserInfo};
+use crate::storage::{PostStats, StoredPost, UserInfo};
 
 // --- Helpers ---
 
-fn render_post(post: &StoredPost, author_info: Option<&UserInfo>) -> maud::Markup {
+fn render_post(post: &StoredPost, author_info: Option<&UserInfo>, stats: Option<&PostStats>) -> maud::Markup {
     let display_name = author_info
         .and_then(|u| u.display_name.as_deref())
         .filter(|n| !n.is_empty());
@@ -58,6 +58,24 @@ fn render_post(post: &StoredPost, author_info: Option<&UserInfo>) -> maud::Marku
             @if !post.content.is_empty() {
                 p.post-content { (layout::render_content(&post.content)) }
             }
+            @if let Some(s) = stats {
+                @if s.likes > 0 || s.reposts > 0 || s.replies > 0 || s.quotes > 0 {
+                    div.post-stats {
+                        @if s.replies > 0 {
+                            span.stat { (s.replies) " replies" }
+                        }
+                        @if s.quotes > 0 {
+                            span.stat { (s.quotes) " quotes" }
+                        }
+                        @if s.reposts > 0 {
+                            span.stat { (s.reposts) " reposts" }
+                        }
+                        @if s.likes > 0 {
+                            span.stat { (s.likes) " likes" }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -80,6 +98,7 @@ async fn feed_page(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let author_map = build_author_map(&state, &posts).await;
+    let stats_map = build_stats_map(&state, &posts).await;
     let server_name = &state.config.server.name;
     let oldest_ts = posts.last().map(|p| p.timestamp);
 
@@ -89,7 +108,7 @@ async fn feed_page(
             p.empty { "No posts yet. Be the first!" }
         } @else {
             @for post in &posts {
-                (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref())))
+                (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref()), stats_map.get(&post.id)))
             }
             @if let Some(ts) = oldest_ts {
                 a.load-more href=(format!("/?before={ts}")) { "Load older posts" }
@@ -126,6 +145,7 @@ async fn user_page(
         vec![]
     };
 
+    let stats_map = build_stats_map(&state, &posts).await;
     let oldest_ts = posts.last().map(|p| p.timestamp);
     let server_name = &state.config.server.name;
     let display = user
@@ -156,7 +176,7 @@ async fn user_page(
             p.empty { "No posts yet." }
         } @else {
             @for post in &posts {
-                (render_post(post, Some(&user)))
+                (render_post(post, Some(&user), stats_map.get(&post.id)))
             }
             @if let Some(ts) = oldest_ts {
                 a.load-more href=(format!("/user/{}?before={ts}", pubkey)) { "Load older posts" }
@@ -195,8 +215,10 @@ async fn post_page(
         .filter(|n| !n.is_empty())
         .unwrap_or("Anonymous");
 
+    let post_stats = build_stats_map(&state, std::slice::from_ref(&post)).await;
+
     let content = html! {
-        (render_post(&post, user.as_ref()))
+        (render_post(&post, user.as_ref(), post_stats.get(&post.id)))
         div.post-meta {
             span { "Posted " (layout::format_time(post.timestamp)) }
         }
@@ -229,6 +251,7 @@ async fn trending_page(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
         let author_map = build_author_map(&state, &posts).await;
+        let stats_map = build_stats_map(&state, &posts).await;
 
         let content = html! {
             h1.section-title { "#" (tag) }
@@ -236,7 +259,7 @@ async fn trending_page(
                 p.empty { "No posts found with this tag." }
             } @else {
                 @for post in &posts {
-                    (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref())))
+                    (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref()), stats_map.get(&post.id)))
                 }
             }
         };
@@ -374,4 +397,19 @@ async fn build_author_map(
         map.insert(post.author.clone(), info);
     }
     map
+}
+
+async fn build_stats_map(
+    state: &AppState,
+    posts: &[StoredPost],
+) -> std::collections::HashMap<String, PostStats> {
+    let post_ids: Vec<(String, String)> = posts
+        .iter()
+        .map(|p| (p.author.clone(), p.id.clone()))
+        .collect();
+    state
+        .storage
+        .get_post_stats_batch(&post_ids)
+        .await
+        .unwrap_or_default()
 }
