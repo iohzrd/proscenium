@@ -29,9 +29,7 @@
   let followedPubkeys = $state<Set<string>>(new Set());
   let togglingFollow = $state<string | null>(null);
   let userNames = $derived(
-    new Map(
-      users.map((u) => [u.pubkey, u.display_name || shortId(u.pubkey)]),
-    ),
+    new Map(users.map((u) => [u.pubkey, u.display_name || shortId(u.pubkey)])),
   );
 
   const node = useNodeInit(async () => {
