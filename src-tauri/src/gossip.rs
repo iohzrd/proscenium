@@ -10,7 +10,7 @@ use iroh_gossip::{
 use iroh_social_types::{
     GossipMessage, Interaction, Post, Profile, Visibility, now_millis, short_id, user_feed_topic,
     validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
-    verify_profile_signature,
+    verify_linked_devices_announcement, verify_profile_signature,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -357,6 +357,24 @@ impl FeedManager {
         Ok(())
     }
 
+    pub async fn broadcast_linked_devices(
+        &self,
+        announcement: &iroh_social_types::LinkedDevicesAnnouncement,
+    ) -> anyhow::Result<()> {
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::LinkedDevices(announcement.clone());
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!(
+                "[gossip] broadcast device announcement v{}",
+                announcement.version
+            );
+        } else {
+            log::info!("[gossip] no gossip sender, skipping device announcement broadcast");
+        }
+        Ok(())
+    }
+
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
@@ -594,6 +612,41 @@ impl FeedManager {
                         "interaction-deleted",
                         serde_json::json!({ "id": id, "author": author }),
                     );
+                }
+            }
+            Ok(GossipMessage::LinkedDevices(announcement)) => {
+                if announcement.master_pubkey != pk {
+                    log::warn!(
+                        "[gossip-rx] ignoring device announcement from {} (expected {})",
+                        short_id(&announcement.master_pubkey),
+                        short_id(pk)
+                    );
+                    return;
+                }
+                // Verify the announcement signature and delegation chain
+                if let Err(reason) = verify_linked_devices_announcement(&announcement) {
+                    log::warn!(
+                        "[gossip-rx] bad device announcement from {}: {reason}",
+                        short_id(pk)
+                    );
+                    return;
+                }
+                // Skip stale announcements
+                let cached_version = storage
+                    .get_peer_announcement_version(pk)
+                    .unwrap_or(None)
+                    .unwrap_or(0);
+                if announcement.version <= cached_version {
+                    return;
+                }
+                log::info!(
+                    "[gossip-rx] device announcement from {} v{} ({} devices)",
+                    short_id(pk),
+                    announcement.version,
+                    announcement.devices.len()
+                );
+                if let Err(e) = storage.cache_peer_device_announcement(pk, &announcement) {
+                    log::error!("[gossip-rx] failed to cache device announcement: {e}");
                 }
             }
             Err(e) => {

@@ -108,10 +108,16 @@ impl Storage {
         .execute(&pool)
         .await?;
 
-        let migrations: &[(&str, &str)] = &[(
-            "002_delegations",
-            include_str!("../migrations/002_delegations.sql"),
-        )];
+        let migrations: &[(&str, &str)] = &[
+            (
+                "002_delegations",
+                include_str!("../migrations/002_delegations.sql"),
+            ),
+            (
+                "003_peer_device_announcements",
+                include_str!("../migrations/003_peer_device_announcements.sql"),
+            ),
+        ];
 
         for (name, sql) in migrations {
             let applied: bool =
@@ -840,6 +846,58 @@ impl Storage {
                 .bind(master_pubkey)
                 .fetch_optional(&self.pool)
                 .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Cache a peer's device announcement (from gossip LinkedDevices messages).
+    pub async fn cache_peer_device_announcement(
+        &self,
+        master_pubkey: &str,
+        announcement_json: &str,
+        version: i64,
+        transport_node_ids: &[String],
+    ) -> anyhow::Result<()> {
+        let now = iroh_social_types::now_millis() as i64;
+        let transport_json = serde_json::to_string(transport_node_ids)?;
+
+        sqlx::query(
+            "INSERT INTO peer_device_announcements (master_pubkey, announcement_json, version, cached_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(master_pubkey) DO UPDATE SET
+                announcement_json = ?2,
+                version = ?3,
+                cached_at = ?4",
+        )
+        .bind(master_pubkey)
+        .bind(announcement_json)
+        .bind(version)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        // Also update transport_node_ids_json in peer_delegations
+        sqlx::query(
+            "UPDATE peer_delegations SET transport_node_ids_json = ?2 WHERE master_pubkey = ?1",
+        )
+        .bind(master_pubkey)
+        .bind(&transport_json)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Get the cached device announcement version for a peer.
+    pub async fn get_peer_announcement_version(
+        &self,
+        master_pubkey: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT version FROM peer_device_announcements WHERE master_pubkey = ?1",
+        )
+        .bind(master_pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|r| r.0))
     }
 

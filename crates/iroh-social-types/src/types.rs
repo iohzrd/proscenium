@@ -93,6 +93,19 @@ pub enum InteractionKind {
     Like,
 }
 
+/// A device in a linked devices announcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    /// The device's iroh transport NodeId.
+    pub node_id: String,
+    /// Human-readable device name.
+    pub device_name: String,
+    /// Whether this is the primary device (created the signing key).
+    pub is_primary: bool,
+    /// When this device was added (Unix timestamp ms).
+    pub added_at: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowEntry {
     pub pubkey: String,

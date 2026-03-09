@@ -9,7 +9,8 @@ use iroh_social_types::{
     GossipMessage, Interaction, PEER_ALPN, PeerRequest, Post, SyncRequest, short_id,
     user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
-    verify_interaction_signature, verify_post_signature, verify_profile_signature,
+    verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
+    verify_profile_signature,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -264,6 +265,50 @@ impl IngestionManager {
                     short_id(&author)
                 );
             }
+            Ok(GossipMessage::LinkedDevices(announcement)) => {
+                if announcement.master_pubkey != topic_owner {
+                    return;
+                }
+                if let Err(reason) = verify_linked_devices_announcement(&announcement) {
+                    tracing::warn!(
+                        "[ingestion] bad device announcement from {}: {reason}",
+                        short_id(topic_owner)
+                    );
+                    return;
+                }
+                // Skip stale announcements
+                let cached_version = storage
+                    .get_peer_announcement_version(topic_owner)
+                    .await
+                    .unwrap_or(None);
+                if cached_version.is_some_and(|v| announcement.version as i64 <= v) {
+                    return;
+                }
+                let transport_ids: Vec<String> = announcement
+                    .devices
+                    .iter()
+                    .map(|d| d.node_id.clone())
+                    .collect();
+                let announcement_json = serde_json::to_string(&announcement).unwrap_or_default();
+                if let Err(e) = storage
+                    .cache_peer_device_announcement(
+                        topic_owner,
+                        &announcement_json,
+                        announcement.version as i64,
+                        &transport_ids,
+                    )
+                    .await
+                {
+                    tracing::error!("[ingestion] failed to cache device announcement: {e}");
+                } else {
+                    tracing::info!(
+                        "[ingestion] cached device announcement for {} v{} ({} devices)",
+                        short_id(topic_owner),
+                        announcement.version,
+                        announcement.devices.len()
+                    );
+                }
+            }
             Err(e) => {
                 tracing::warn!("[ingestion] failed to parse gossip message: {e}");
             }
@@ -478,6 +523,30 @@ impl IngestionManager {
                         if last_int.is_none_or(|prev| ts > prev) {
                             last_int = Some(ts);
                         }
+                    }
+                }
+                Ok(iroh_social_types::SyncFrame::DeviceAnnouncements(announcements)) => {
+                    for announcement in &announcements {
+                        if announcement.master_pubkey != pubkey {
+                            continue;
+                        }
+                        if verify_linked_devices_announcement(announcement).is_err() {
+                            continue;
+                        }
+                        let transport_ids: Vec<String> = announcement
+                            .devices
+                            .iter()
+                            .map(|d| d.node_id.clone())
+                            .collect();
+                        let json = serde_json::to_string(announcement).unwrap_or_default();
+                        let _ = storage
+                            .cache_peer_device_announcement(
+                                pubkey,
+                                &json,
+                                announcement.version as i64,
+                                &transport_ids,
+                            )
+                            .await;
                     }
                 }
                 Err(e) => {

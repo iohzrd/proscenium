@@ -1,3 +1,5 @@
+use crate::delegation::verify_delegation;
+use crate::protocol::LinkedDevicesAnnouncement;
 use crate::types::{Interaction, Post, Profile};
 use iroh::{PublicKey, SecretKey, Signature};
 
@@ -178,4 +180,54 @@ pub fn verify_delete_interaction_signature(
     signer_pubkey
         .verify(&bytes, &sig)
         .map_err(|_| "delete interaction signature verification failed".to_string())
+}
+
+/// Produce the canonical bytes for signing a LinkedDevicesAnnouncement.
+/// Excludes `signature` to avoid circular dependency.
+fn linked_devices_signing_bytes(announcement: &LinkedDevicesAnnouncement) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "master_pubkey": announcement.master_pubkey,
+        "devices": announcement.devices,
+        "version": announcement.version,
+        "timestamp": announcement.timestamp,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Sign a LinkedDevicesAnnouncement in place using the given signing key.
+pub fn sign_linked_devices_announcement(
+    announcement: &mut LinkedDevicesAnnouncement,
+    secret_key: &SecretKey,
+) {
+    let bytes = linked_devices_signing_bytes(announcement);
+    let sig = secret_key.sign(&bytes);
+    announcement.signature = signature_to_hex(&sig);
+}
+
+/// Verify a LinkedDevicesAnnouncement.
+/// 1. Verifies the delegation (master key signed the signing key binding).
+/// 2. Verifies the announcement signature against the signing key from the delegation.
+/// 3. Checks that the delegation's master_pubkey matches the announcement's master_pubkey.
+pub fn verify_linked_devices_announcement(
+    announcement: &LinkedDevicesAnnouncement,
+) -> Result<(), String> {
+    // Verify the delegation chain
+    verify_delegation(&announcement.delegation)?;
+
+    // Check master pubkey consistency
+    if announcement.delegation.master_pubkey != announcement.master_pubkey {
+        return Err("announcement master_pubkey does not match delegation".to_string());
+    }
+
+    // Verify announcement signature against signing key
+    let signer: PublicKey = announcement
+        .delegation
+        .signing_pubkey
+        .parse()
+        .map_err(|e| format!("invalid signing pubkey in delegation: {e}"))?;
+    let sig = hex_to_signature(&announcement.signature)?;
+    let bytes = linked_devices_signing_bytes(announcement);
+    signer
+        .verify(&bytes, &sig)
+        .map_err(|_| "linked devices announcement signature verification failed".to_string())
 }

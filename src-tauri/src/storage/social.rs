@@ -1,4 +1,4 @@
-use iroh_social_types::{FollowEntry, FollowerEntry, Visibility};
+use iroh_social_types::{FollowEntry, FollowerEntry, Visibility, now_millis};
 use rusqlite::params;
 
 use super::Storage;
@@ -31,11 +31,12 @@ impl Storage {
     }
 
     pub fn follow(&self, entry: &FollowEntry) -> anyhow::Result<()> {
+        let now = now_millis() as i64;
         self.with_db(|db| {
             db.execute(
-                "INSERT INTO follows (pubkey, alias, followed_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(pubkey) DO UPDATE SET alias=?2, followed_at=?3",
-                params![entry.pubkey, entry.alias, entry.followed_at as i64],
+                "INSERT INTO follows (pubkey, alias, followed_at, state, last_changed_at) VALUES (?1, ?2, ?3, 'active', ?4)
+                 ON CONFLICT(pubkey) DO UPDATE SET alias=?2, followed_at=?3, state='active', last_changed_at=?4",
+                params![entry.pubkey, entry.alias, entry.followed_at as i64, now],
             )?;
             Ok(())
         })
@@ -52,8 +53,12 @@ impl Storage {
     }
 
     pub fn unfollow(&self, pubkey: &str) -> anyhow::Result<()> {
+        let now = now_millis() as i64;
         self.with_db(|db| {
-            db.execute("DELETE FROM follows WHERE pubkey=?1", params![pubkey])?;
+            db.execute(
+                "UPDATE follows SET state='removed', last_changed_at=?2 WHERE pubkey=?1",
+                params![pubkey, now],
+            )?;
             Ok(())
         })
     }
@@ -61,7 +66,7 @@ impl Storage {
     pub fn get_follows(&self) -> anyhow::Result<Vec<FollowEntry>> {
         self.with_db(|db| {
             let mut stmt = db.prepare(
-                "SELECT pubkey, alias, followed_at FROM follows ORDER BY followed_at DESC",
+                "SELECT pubkey, alias, followed_at FROM follows WHERE state='active' ORDER BY followed_at DESC",
             )?;
             let mut rows = stmt.query([])?;
             let mut follows = Vec::new();
@@ -130,7 +135,7 @@ impl Storage {
                 |row| row.get(0),
             )?;
             let is_following: bool = db.query_row(
-                "SELECT COUNT(*) > 0 FROM follows WHERE pubkey=?1",
+                "SELECT COUNT(*) > 0 FROM follows WHERE pubkey=?1 AND state='active'",
                 params![pubkey],
                 |row| row.get(0),
             )?;

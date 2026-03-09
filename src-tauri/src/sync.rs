@@ -345,6 +345,25 @@ pub async fn sync_from_peer(
                     SyncFrame::Interactions(interactions) => {
                         all_interactions.extend(interactions);
                     }
+                    SyncFrame::DeviceAnnouncements(announcements) => {
+                        for announcement in announcements {
+                            if announcement.master_pubkey != author {
+                                continue;
+                            }
+                            if iroh_social_types::verify_linked_devices_announcement(&announcement)
+                                .is_err()
+                            {
+                                continue;
+                            }
+                            if let Err(e) =
+                                storage.cache_peer_device_announcement(author, &announcement)
+                            {
+                                log::error!(
+                                    "[sync-client] failed to cache device announcement: {e}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Ok(None) => break,

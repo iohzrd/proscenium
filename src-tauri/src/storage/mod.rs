@@ -1,6 +1,7 @@
 mod crypto;
 pub(crate) mod follow_requests;
 mod interactions;
+mod linked_devices;
 mod messaging;
 mod moderation;
 mod notifications;
@@ -105,6 +106,14 @@ impl Storage {
         (
             "014_peer_delegations",
             include_str!("../../migrations/014_peer_delegations.sql"),
+        ),
+        (
+            "015_profile_signature",
+            include_str!("../../migrations/015_profile_signature.sql"),
+        ),
+        (
+            "016_linked_devices",
+            include_str!("../../migrations/016_linked_devices.sql"),
         ),
     ];
 

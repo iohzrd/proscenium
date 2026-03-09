@@ -11,8 +11,8 @@ use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
-    DM_ALPN, PEER_ALPN, derive_signing_key, derive_transport_key, now_millis, short_id,
-    sign_delegation,
+    DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_signing_key,
+    derive_transport_key, now_millis, short_id, sign_delegation, sign_linked_devices_announcement,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
@@ -281,6 +281,42 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
                 log::info!("[setup] broadcast profile: {}", profile.display_name);
+            }
+        }
+
+        // Register this device and broadcast single-device announcement
+        {
+            let now = now_millis();
+            if let Err(e) = storage_clone.upsert_linked_device(
+                &transport_node_id,
+                "Primary Device",
+                true,
+                true,
+                now,
+            ) {
+                log::error!("[setup] failed to register own device: {e}");
+            }
+
+            let signing_sk = SecretKey::from_bytes(&signing_secret_key_bytes);
+            let mut announcement = LinkedDevicesAnnouncement {
+                master_pubkey: master_pubkey_clone.clone(),
+                delegation: delegation_clone.clone(),
+                devices: vec![DeviceEntry {
+                    node_id: transport_node_id.clone(),
+                    device_name: "Primary Device".to_string(),
+                    is_primary: true,
+                    added_at: now,
+                }],
+                version: 1,
+                timestamp: now,
+                signature: String::new(),
+            };
+            sign_linked_devices_announcement(&mut announcement, &signing_sk);
+
+            if let Err(e) = feed.broadcast_linked_devices(&announcement).await {
+                log::error!("[setup] failed to broadcast device announcement: {e}");
+            } else {
+                log::info!("[setup] broadcast single-device announcement");
             }
         }
 

@@ -1,10 +1,28 @@
 use crate::delegation::SigningKeyDelegation;
 use crate::signing::{hex_to_signature, signature_to_hex};
-use crate::types::{Interaction, Post, Profile};
+use crate::types::{DeviceEntry, Interaction, Post, Profile};
 use iroh::{PublicKey, SecretKey};
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Signed announcement listing all of a user's linked devices.
+/// Signed by the signing key (NOT master key), verified via the included delegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedDevicesAnnouncement {
+    /// The user's permanent identity (master public key).
+    pub master_pubkey: String,
+    /// Current signing key delegation (signed by master key).
+    pub delegation: SigningKeyDelegation,
+    /// All currently active devices.
+    pub devices: Vec<DeviceEntry>,
+    /// Monotonically increasing version number.
+    pub version: u64,
+    /// When this announcement was created (Unix timestamp ms).
+    pub timestamp: u64,
+    /// Ed25519 signature from signing key over canonical bytes.
+    pub signature: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
@@ -21,6 +39,7 @@ pub enum GossipMessage {
         author: String,
         signature: String,
     },
+    LinkedDevices(LinkedDevicesAnnouncement),
 }
 
 /// Response to an IdentityRequest. Contains everything a peer needs
@@ -147,6 +166,7 @@ pub enum SyncMode {
 pub enum SyncFrame {
     Posts(Vec<Post>),
     Interactions(Vec<Interaction>),
+    DeviceAnnouncements(Vec<LinkedDevicesAnnouncement>),
 }
 
 /// Canonical bytes for signing a follow request.
