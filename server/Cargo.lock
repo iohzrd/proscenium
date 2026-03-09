@@ -2031,6 +2031,7 @@ name = "iroh-social-types"
 version = "0.1.40"
 dependencies = [
  "hex",
+ "hkdf",
  "iroh",
  "iroh-gossip",
  "serde",

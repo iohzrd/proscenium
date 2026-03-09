@@ -17,6 +17,8 @@ pub struct Registration {
     pub avatar_hash: Option<String>,
     pub visibility: String,
     pub is_active: i64,
+    pub transport_node_id: Option<String>,
+    pub delegation_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -29,6 +31,7 @@ pub struct UserInfo {
     pub registered_at: i64,
     pub post_count: i64,
     pub latest_post_at: Option<i64>,
+    pub transport_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -95,6 +98,40 @@ impl Storage {
         let migration_sql = include_str!("../migrations/001_initial.sql");
         sqlx::raw_sql(migration_sql).execute(&pool).await?;
 
+        // Run numbered migrations
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        let migrations: &[(&str, &str)] = &[(
+            "002_delegations",
+            include_str!("../migrations/002_delegations.sql"),
+        )];
+
+        for (name, sql) in migrations {
+            let applied: bool =
+                sqlx::query_scalar("SELECT COUNT(*) > 0 FROM schema_migrations WHERE name = ?1")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await?;
+
+            if !applied {
+                tracing::info!("[storage] applying migration: {name}");
+                sqlx::raw_sql(sql).execute(&pool).await?;
+                sqlx::query(
+                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, strftime('%s', 'now'))",
+                )
+                .bind(name)
+                .execute(&pool)
+                .await?;
+            }
+        }
+
         Ok(Self { pool })
     }
 
@@ -105,6 +142,8 @@ impl Storage {
         pubkey: &str,
         visibility: &str,
         profile: Option<&Profile>,
+        transport_node_id: Option<&str>,
+        delegation_json: Option<&str>,
     ) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis() as i64;
         let (display_name, bio, avatar_hash) = match profile {
@@ -117,15 +156,17 @@ impl Storage {
         };
 
         sqlx::query(
-            "INSERT INTO registrations (pubkey, registered_at, last_seen, display_name, bio, avatar_hash, visibility, is_active)
-             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 1)
+            "INSERT INTO registrations (pubkey, registered_at, last_seen, display_name, bio, avatar_hash, visibility, is_active, transport_node_id, delegation_json)
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
              ON CONFLICT(pubkey) DO UPDATE SET
                 last_seen = ?2,
                 display_name = COALESCE(?3, display_name),
                 bio = COALESCE(?4, bio),
                 avatar_hash = COALESCE(?5, avatar_hash),
                 visibility = ?6,
-                is_active = 1",
+                is_active = 1,
+                transport_node_id = COALESCE(?7, transport_node_id),
+                delegation_json = COALESCE(?8, delegation_json)",
         )
         .bind(pubkey)
         .bind(now)
@@ -133,8 +174,26 @@ impl Storage {
         .bind(bio)
         .bind(avatar_hash)
         .bind(visibility)
+        .bind(transport_node_id)
+        .bind(delegation_json)
         .execute(&self.pool)
         .await?;
+
+        // Also cache the delegation for ingestion verification
+        if let (Some(delegation_json), Some(transport_node_id)) =
+            (delegation_json, transport_node_id)
+            && let Ok(delegation) =
+                serde_json::from_str::<iroh_social_types::UserKeyDelegation>(delegation_json)
+        {
+            let _ = self
+                .cache_peer_delegation(
+                    pubkey,
+                    &delegation.user_pubkey,
+                    delegation_json,
+                    Some(transport_node_id),
+                )
+                .await;
+        }
 
         Ok(())
     }
@@ -592,6 +651,7 @@ impl Storage {
                 registered_at: reg.registered_at,
                 post_count,
                 latest_post_at,
+                transport_node_id: reg.transport_node_id,
             });
         }
 
@@ -619,6 +679,7 @@ impl Storage {
                 registered_at: reg.registered_at,
                 post_count: 0,
                 latest_post_at: None,
+                transport_node_id: reg.transport_node_id,
             })
             .collect();
         Ok(users)
@@ -654,6 +715,7 @@ impl Storage {
             registered_at: reg.registered_at,
             post_count,
             latest_post_at,
+            transport_node_id: reg.transport_node_id,
         }))
     }
 
@@ -736,5 +798,73 @@ impl Storage {
                 .fetch_optional(&self.pool)
                 .await?;
         Ok(row.and_then(|r| r.0).map(|ts| ts as u64))
+    }
+
+    // --- Peer Delegations ---
+
+    /// Cache a peer's delegation for ingestion signature verification.
+    pub async fn cache_peer_delegation(
+        &self,
+        master_pubkey: &str,
+        user_pubkey: &str,
+        delegation_json: &str,
+        transport_node_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = iroh_social_types::now_millis() as i64;
+        sqlx::query(
+            "INSERT INTO peer_delegations (master_pubkey, user_pubkey, delegation_json, transport_node_id, cached_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(master_pubkey) DO UPDATE SET
+                user_pubkey = ?2,
+                delegation_json = ?3,
+                transport_node_id = COALESCE(?4, transport_node_id),
+                cached_at = ?5",
+        )
+        .bind(master_pubkey)
+        .bind(user_pubkey)
+        .bind(delegation_json)
+        .bind(transport_node_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the cached user pubkey for a peer (the key that signs their content).
+    pub async fn get_peer_user_pubkey(
+        &self,
+        master_pubkey: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT user_pubkey FROM peer_delegations WHERE master_pubkey = ?1")
+                .bind(master_pubkey)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    /// Get the transport NodeId for a registered user.
+    pub async fn get_transport_node_id(
+        &self,
+        master_pubkey: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Check peer_delegations first (more reliable), then fall back to registrations
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT transport_node_id FROM peer_delegations WHERE master_pubkey = ?1",
+        )
+        .bind(master_pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some((Some(node_id),)) = row {
+            return Ok(Some(node_id));
+        }
+
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT transport_node_id FROM registrations WHERE pubkey = ?1 AND is_active = 1",
+        )
+        .bind(master_pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.0))
     }
 }

@@ -18,7 +18,8 @@ pub async fn create_post(
     quote_of: Option<String>,
     quote_of_author: Option<String>,
 ) -> Result<Post, String> {
-    let author = state.endpoint.id().to_string();
+    // author = master pubkey (permanent identity)
+    let author = state.master_pubkey.clone();
     let media_count = media.as_ref().map_or(0, |m| m.len());
     let mut post = Post {
         id: generate_id(),
@@ -35,7 +36,8 @@ pub async fn create_post(
 
     validate_post(&post)?;
 
-    let sk = SecretKey::from_bytes(&state.secret_key_bytes);
+    // Sign with user key (not master key)
+    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
     sign_post(&mut post, &sk);
 
     state.storage.insert_post(&post).str_err()?;
@@ -53,11 +55,11 @@ pub async fn create_post(
 
 #[tauri::command]
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let my_id = state.endpoint.id().to_string();
+    let my_id = &state.master_pubkey;
 
     let post = state.storage.get_post_by_id(&id).str_err()?;
     match post {
-        Some(post) if post.author == my_id => {}
+        Some(post) if post.author == *my_id => {}
         Some(_) => {
             return Err("cannot delete posts authored by other users".to_string());
         }
@@ -69,7 +71,7 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
     let removed = state.storage.delete_post(&id).str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
     let feed = state.feed.lock().await;
-    feed.broadcast_delete(&id, &my_id).await.str_err()?;
+    feed.broadcast_delete(&id, my_id).await.str_err()?;
     log::info!("[post] broadcast delete {id}");
 
     Ok(())

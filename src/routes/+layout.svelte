@@ -54,10 +54,12 @@
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "iroh-social:") return;
-      if (parsed.hostname === "profile") {
+      if (parsed.hostname === "profile" || parsed.hostname === "user") {
         const id = parsed.pathname.slice(1);
         if (id) {
-          goto(`/profile/${id}`);
+          const transport = parsed.searchParams.get("transport");
+          const query = transport ? `?transport=${transport}` : "";
+          goto(`/profile/${id}${query}`);
         }
       }
     } catch {

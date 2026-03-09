@@ -30,7 +30,10 @@ fn backoff_secs(attempt: u32) -> u64 {
 
 pub struct FeedManager {
     pub gossip: Gossip,
+    #[allow(dead_code)]
     pub endpoint: Endpoint,
+    /// The permanent identity (master public key).
+    pub master_pubkey: String,
     my_sender: Option<GossipSender>,
     own_feed_handle: Option<JoinHandle<()>>,
     pub subscriptions: HashMap<String, JoinHandle<()>>,
@@ -43,6 +46,7 @@ impl FeedManager {
     pub fn new(
         gossip: Gossip,
         endpoint: Endpoint,
+        master_pubkey: String,
         storage: Arc<Storage>,
         app_handle: AppHandle,
         reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
@@ -50,6 +54,7 @@ impl FeedManager {
         Self {
             gossip,
             endpoint,
+            master_pubkey,
             my_sender: None,
             own_feed_handle: None,
             subscriptions: HashMap::new(),
@@ -60,9 +65,8 @@ impl FeedManager {
     }
 
     fn my_visibility(&self) -> Visibility {
-        let my_id = self.endpoint.id().to_string();
         self.storage
-            .get_visibility(&my_id)
+            .get_visibility(&self.master_pubkey)
             .unwrap_or(Visibility::Public)
     }
 
@@ -145,7 +149,7 @@ impl FeedManager {
             return Ok(());
         }
 
-        let my_id = self.endpoint.id().to_string();
+        let my_id = self.master_pubkey.clone();
         let topic = user_feed_topic(&my_id);
         log::info!("[gossip] starting own feed topic for {}", short_id(&my_id));
 
@@ -340,27 +344,45 @@ impl FeedManager {
         Ok(())
     }
 
-    pub async fn follow_user(&mut self, pubkey: String) -> anyhow::Result<()> {
+    /// Subscribe to a user's gossip feed topic.
+    /// `pubkey` is the master pubkey (permanent identity).
+    /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
+    pub async fn follow_user(
+        &mut self,
+        pubkey: String,
+        transport_node_ids: &[String],
+    ) -> anyhow::Result<()> {
         if self.subscriptions.contains_key(&pubkey) {
             log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
             return Ok(());
         }
 
         let topic = user_feed_topic(&pubkey);
-        let bootstrap: EndpointId = pubkey.parse().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let bootstrap: Vec<EndpointId> = transport_node_ids
+            .iter()
+            .filter_map(|id| id.parse().ok())
+            .collect();
+
+        if bootstrap.is_empty() {
+            anyhow::bail!(
+                "no valid transport NodeIds for gossip bootstrap of {}",
+                short_id(&pubkey)
+            );
+        }
 
         log::info!(
-            "[gossip] subscribing to {} (topic: {})",
+            "[gossip] subscribing to {} with {} bootstrap nodes (topic: {})",
             short_id(&pubkey),
+            bootstrap.len(),
             &format!("{:?}", topic)[..12]
         );
-        let topic_handle = self.gossip.subscribe(topic, vec![bootstrap]).await?;
+        let topic_handle = self.gossip.subscribe(topic, bootstrap).await?;
         let (sender, receiver) = topic_handle.split();
         log::info!("[gossip] subscribed to {}", short_id(&pubkey));
 
         let storage = self.storage.clone();
         let pk = pubkey.clone();
-        let my_id = self.endpoint.id().to_string();
+        let my_id = self.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
         let reconnect_tx = self.reconnect_tx.clone();
         let handle = tokio::spawn(async move {
@@ -549,7 +571,21 @@ pub async fn gossip_reconnect_loop(
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 let mut fm = feed.lock().await;
                 fm.subscriptions.remove(&pubkey);
-                if let Err(e) = fm.follow_user(pubkey.clone()).await {
+                let node_ids = fm
+                    .storage
+                    .get_peer_transport_node_ids(&pubkey)
+                    .unwrap_or_default();
+                if node_ids.is_empty() {
+                    log::error!(
+                        "[reconnect] no cached transport NodeIds for {}, cannot restart",
+                        short_id(&pubkey)
+                    );
+                    drop(fm);
+                    let _ = tx.send(ReconnectRequest::Follow {
+                        pubkey,
+                        attempt: attempt + 1,
+                    });
+                } else if let Err(e) = fm.follow_user(pubkey.clone(), &node_ids).await {
                     log::error!("[reconnect] {} restart failed: {e}", short_id(&pubkey));
                     drop(fm);
                     let _ = tx.send(ReconnectRequest::Follow {

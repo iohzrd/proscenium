@@ -87,9 +87,34 @@ async fn get_user(
     Ok(Json(user))
 }
 
+#[derive(Serialize)]
+struct DevicesResponse {
+    master_pubkey: String,
+    transport_node_ids: Vec<String>,
+}
+
+async fn get_devices(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<DevicesResponse>, StatusCode> {
+    let transport_node_id = state
+        .storage
+        .get_transport_node_id(&pubkey)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let transport_node_ids = transport_node_id.into_iter().collect();
+
+    Ok(Json(DevicesResponse {
+        master_pubkey: pubkey,
+        transport_node_ids,
+    }))
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/v1/users", get(list_users))
         .route("/api/v1/users/search", get(search_users))
         .route("/api/v1/users/{pubkey}", get(get_user))
+        .route("/api/v1/users/{pubkey}/devices", get(get_devices))
 }

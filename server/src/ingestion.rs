@@ -2,6 +2,7 @@ use crate::node::Node;
 use crate::storage::Storage;
 use bytes::Bytes;
 use futures_lite::StreamExt;
+use iroh::PublicKey;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
@@ -41,9 +42,27 @@ impl IngestionManager {
         }
 
         let topic = user_feed_topic(pubkey);
-        let bootstrap: EndpointId = pubkey.parse()?;
+
+        // Resolve transport NodeId from storage (registration or delegation cache)
+        let bootstrap: Vec<EndpointId> =
+            if let Ok(Some(node_id)) = self.storage.get_transport_node_id(pubkey).await {
+                match node_id.parse() {
+                    Ok(eid) => vec![eid],
+                    Err(_) => vec![],
+                }
+            } else {
+                vec![]
+            };
+
+        if bootstrap.is_empty() {
+            anyhow::bail!(
+                "no transport NodeId known for {}, cannot subscribe to gossip",
+                short_id(pubkey)
+            );
+        }
+
         // Subscribe outside the lock to avoid holding mutex across await
-        let topic_handle = self.gossip.subscribe(topic, vec![bootstrap]).await?;
+        let topic_handle = self.gossip.subscribe(topic, bootstrap.clone()).await?;
         let (_sender, receiver) = topic_handle.split();
 
         let gossip = self.gossip.clone();
@@ -88,7 +107,7 @@ impl IngestionManager {
                         short_id(&pk)
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    match gossip.subscribe(topic, vec![bootstrap]).await {
+                    match gossip.subscribe(topic, bootstrap.clone()).await {
                         Ok(new_handle) => {
                             let (new_sender, new_receiver) = new_handle.split();
                             _sender_hold = new_sender;
@@ -197,7 +216,30 @@ impl IngestionManager {
             tracing::warn!("[ingestion] rejected post {}: {reason}", &post.id);
             return;
         }
-        if let Err(reason) = verify_post_signature(post) {
+        // Look up the user key from the delegation cache
+        let signer: PublicKey = match storage.get_peer_user_pubkey(&post.author).await {
+            Ok(Some(user_pubkey)) => match user_pubkey.parse() {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::warn!(
+                        "[ingestion] bad user pubkey in delegation for {}: {e}",
+                        short_id(&post.author)
+                    );
+                    return;
+                }
+            },
+            _ => {
+                // No delegation cached -- fall back to author as signer (backward compat)
+                match post.author.parse() {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        tracing::warn!("[ingestion] bad author pubkey on post {}: {e}", &post.id);
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(reason) = verify_post_signature(post, &signer) {
             tracing::warn!("[ingestion] bad signature on post {}: {reason}", &post.id);
             return;
         }
@@ -224,7 +266,33 @@ impl IngestionManager {
             );
             return;
         }
-        if let Err(reason) = verify_interaction_signature(interaction) {
+        // Look up the user key from the delegation cache
+        let signer: PublicKey = match storage.get_peer_user_pubkey(&interaction.author).await {
+            Ok(Some(user_pubkey)) => match user_pubkey.parse() {
+                Ok(pk) => pk,
+                Err(e) => {
+                    tracing::warn!(
+                        "[ingestion] bad user pubkey in delegation for {}: {e}",
+                        short_id(&interaction.author)
+                    );
+                    return;
+                }
+            },
+            _ => {
+                // No delegation cached -- fall back to author as signer (backward compat)
+                match interaction.author.parse() {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        tracing::warn!(
+                            "[ingestion] bad author pubkey on interaction {}: {e}",
+                            &interaction.id
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+        if let Err(reason) = verify_interaction_signature(interaction, &signer) {
             tracing::warn!(
                 "[ingestion] bad signature on interaction {}: {reason}",
                 &interaction.id
@@ -268,7 +336,12 @@ impl IngestionManager {
         storage: &Storage,
         pubkey: &str,
     ) -> anyhow::Result<(usize, usize)> {
-        let target: EndpointId = pubkey.parse()?;
+        // Resolve transport NodeId from storage
+        let node_id = storage
+            .get_transport_node_id(pubkey)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no transport NodeId for {}", short_id(pubkey)))?;
+        let target: EndpointId = node_id.parse()?;
 
         let last_post_ts = storage.get_last_post_timestamp(pubkey).await?;
         let last_interaction_ts = storage.get_last_interaction_timestamp(pubkey).await?;

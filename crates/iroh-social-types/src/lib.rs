@@ -1,3 +1,4 @@
+pub mod delegation;
 pub mod dm;
 pub mod protocol;
 pub mod registration;
@@ -5,6 +6,7 @@ pub mod signing;
 pub mod types;
 pub mod validation;
 
+pub use delegation::*;
 pub use dm::*;
 pub use protocol::*;
 pub use registration::*;

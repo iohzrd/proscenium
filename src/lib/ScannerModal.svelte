@@ -2,8 +2,13 @@
   import { onMount } from "svelte";
   import { hapticNotification } from "$lib/haptics";
 
+  interface ScannedResult {
+    pubkey: string;
+    transportNodeId?: string;
+  }
+
   interface Props {
-    onscanned: (nodeId: string) => void;
+    onscanned: (result: ScannedResult) => void;
     onclose: () => void;
   }
 
@@ -13,23 +18,26 @@
   let scanning = $state(true);
   let cancelFn: (() => Promise<void>) | null = null;
 
-  function parseNodeIdFromUrl(url: string): string | null {
+  function parseFromUrl(url: string): ScannedResult | null {
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "iroh-social:") return null;
-      if (parsed.hostname !== "user") return null;
-      const nodeId = parsed.pathname.slice(1);
-      return nodeId || null;
+      const host = parsed.hostname;
+      if (host !== "user" && host !== "profile") return null;
+      const pubkey = parsed.pathname.slice(1);
+      if (!pubkey) return null;
+      const transport = parsed.searchParams.get("transport") ?? undefined;
+      return { pubkey, transportNodeId: transport };
     } catch {
       return null;
     }
   }
 
   function handleScanResult(text: string) {
-    const nodeId = parseNodeIdFromUrl(text);
-    if (nodeId) {
+    const result = parseFromUrl(text);
+    if (result) {
       hapticNotification("success");
-      onscanned(nodeId);
+      onscanned(result);
     } else {
       error = `Not an invite link: ${text}`;
     }

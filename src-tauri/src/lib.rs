@@ -59,6 +59,7 @@ pub fn run() {
         .setup(|app| setup::initialize(app))
         .invoke_handler(tauri::generate_handler![
             get_node_id,
+            get_transport_node_id,
             get_my_profile,
             save_my_profile,
             get_remote_profile,
@@ -125,6 +126,10 @@ pub fn run() {
             server_list_users,
             sync_profile_to_server,
             fetch_link_previews,
+            get_seed_phrase,
+            is_seed_phrase_backed_up,
+            mark_seed_phrase_backed_up,
+            verify_seed_phrase_words,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

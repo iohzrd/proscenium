@@ -1,3 +1,4 @@
+use crate::delegation::UserKeyDelegation;
 use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::types::{Interaction, Post, Profile};
 use iroh::{PublicKey, SecretKey};
@@ -12,6 +13,20 @@ pub enum GossipMessage {
     ProfileUpdate(Profile),
     NewInteraction(Interaction),
     DeleteInteraction { id: String, author: String },
+}
+
+/// Response to an IdentityRequest. Contains everything a peer needs
+/// to verify this user's identity and cache their delegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityResponse {
+    /// The user's permanent identity (master public key).
+    pub master_pubkey: String,
+    /// The current user key delegation (signed by master key).
+    pub delegation: UserKeyDelegation,
+    /// Transport NodeIds for this user's devices.
+    pub transport_node_ids: Vec<String>,
+    /// The user's profile, if available.
+    pub profile: Option<Profile>,
 }
 
 pub fn user_feed_topic(pubkey: &str) -> TopicId {
@@ -33,6 +48,8 @@ pub enum PeerRequest {
     Sync(SyncRequest),
     Push(PushMessage),
     FollowRequest(FollowRequest),
+    /// Ask a peer "who are you?" -- resolves transport NodeId to master pubkey.
+    IdentityRequest,
 }
 
 /// Response sent back depending on the request type.
@@ -41,6 +58,7 @@ pub enum PeerResponse {
     SyncSummary(SyncSummary),
     PushAck(PushAck),
     FollowResponse(FollowResponse),
+    Identity(IdentityResponse),
 }
 
 /// Pushed from author to follower/mutual.
@@ -62,9 +80,13 @@ pub struct PushAck {
 /// Follow request from one user to another (for Listed visibility).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FollowRequest {
+    /// The requester's master pubkey (permanent identity).
     pub requester: String,
     pub timestamp: u64,
+    /// Signed by the requester's user key (verified via delegation).
     pub signature: String,
+    /// The requester's user key delegation, so the receiver can verify the signature.
+    pub delegation: UserKeyDelegation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,15 +157,13 @@ pub fn sign_follow_request(requester: &str, timestamp: u64, secret_key: &SecretK
     signature_to_hex(&sig)
 }
 
-/// Verify a follow request's signature.
-pub fn verify_follow_request(req: &FollowRequest) -> Result<(), String> {
+/// Verify a follow request's signature against the given signer public key.
+/// The signer is the user key (from a cached delegation), NOT req.requester
+/// (which is the master pubkey / permanent identity).
+pub fn verify_follow_request(req: &FollowRequest, signer_pubkey: &PublicKey) -> Result<(), String> {
     let sig = hex_to_signature(&req.signature)?;
-    let pubkey: PublicKey = req
-        .requester
-        .parse()
-        .map_err(|e| format!("invalid requester pubkey: {e}"))?;
     let bytes = follow_request_signing_bytes(&req.requester, req.timestamp);
-    pubkey
+    signer_pubkey
         .verify(&bytes, &sig)
         .map_err(|_| "follow request signature verification failed".to_string())
 }

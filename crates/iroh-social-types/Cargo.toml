@@ -5,8 +5,12 @@ edition.workspace = true
 
 [dependencies]
 hex = "0.4"
+hkdf = "0.12"
 iroh = "0.96"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 iroh-gossip = { workspace = true }
+
+[dev-dependencies]
+getrandom = "0.3"

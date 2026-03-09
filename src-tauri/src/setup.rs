@@ -10,22 +10,34 @@ use crate::sync;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
-use iroh_social_types::{DM_ALPN, PEER_ALPN, short_id};
+use iroh_social_types::{
+    DM_ALPN, PEER_ALPN, derive_transport_key, derive_user_key, now_millis, short_id,
+    sign_delegation,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex;
 
-fn load_or_create_key(path: &std::path::Path) -> SecretKey {
+/// Load raw key bytes from a file, or generate new ones.
+fn load_or_create_key_bytes(path: &std::path::Path) -> [u8; 32] {
     if path.exists() {
-        let bytes = std::fs::read(path).expect("failed to read identity key");
-        let bytes: [u8; 32] = bytes.try_into().expect("invalid key length");
-        SecretKey::from_bytes(&bytes)
+        let bytes = std::fs::read(path).expect("failed to read key file");
+        bytes.try_into().expect("invalid key length")
     } else {
         let mut key_bytes = [0u8; 32];
         getrandom::fill(&mut key_bytes).expect("failed to generate random key");
-        let key = SecretKey::from_bytes(&key_bytes);
-        std::fs::write(path, key.to_bytes()).expect("failed to write identity key");
-        key
+        std::fs::write(path, key_bytes).expect("failed to write key file");
+        key_bytes
+    }
+}
+
+/// Migrate old identity.key to master_key.key if needed.
+fn migrate_identity_key(data_dir: &std::path::Path) {
+    let old_path = data_dir.join("identity.key");
+    let new_path = data_dir.join("master_key.key");
+    if old_path.exists() && !new_path.exists() {
+        log::info!("[setup] migrating identity.key -> master_key.key");
+        std::fs::rename(&old_path, &new_path).expect("failed to rename identity.key");
     }
 }
 
@@ -36,9 +48,21 @@ async fn sync_peer_posts(
     my_id: &str,
     handle: &AppHandle,
 ) {
-    let target: iroh::EndpointId = match pubkey.parse() {
-        Ok(t) => t,
-        Err(_) => return,
+    // Resolve transport NodeId from peer delegation cache
+    let node_ids = storage
+        .get_peer_transport_node_ids(pubkey)
+        .unwrap_or_default();
+    let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
+        match first.parse() {
+            Ok(t) => t,
+            Err(_) => return,
+        }
+    } else {
+        log::warn!(
+            "[startup-sync] no cached transport NodeIds for {}, skipping",
+            short_id(pubkey)
+        );
+        return;
     };
 
     for attempt in 1..=SYNC_MAX_RETRIES {
@@ -124,7 +148,30 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
     log::info!("[setup] data dir: {}", data_dir.display());
 
-    let secret_key = load_or_create_key(&data_dir.join("identity.key"));
+    // Migrate old identity.key -> master_key.key if needed
+    migrate_identity_key(&data_dir);
+
+    // Load or create master key (permanent identity)
+    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
+    let master_secret = SecretKey::from_bytes(&master_secret_key_bytes);
+    let master_pubkey = master_secret.public().to_string();
+    log::info!("[setup] master pubkey: {}", short_id(&master_pubkey));
+
+    // Derive user key at index 0
+    let user_key_index: u32 = 0;
+    let user_secret_key_bytes = derive_user_key(&master_secret_key_bytes, user_key_index);
+    let user_secret = SecretKey::from_bytes(&user_secret_key_bytes);
+    let user_pubkey = user_secret.public().to_string();
+    log::info!("[setup] user pubkey: {}", short_id(&user_pubkey));
+
+    // Sign delegation binding user key to master key
+    let delegation = sign_delegation(
+        &master_secret,
+        &user_secret.public(),
+        user_key_index,
+        now_millis(),
+    );
+
     let db_path = data_dir.join("social.db");
     let storage = Arc::new(Storage::open(&db_path).expect("failed to open database"));
     log::info!("[setup] database opened");
@@ -132,12 +179,19 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let follows = storage.get_follows().unwrap_or_default();
     log::info!("[setup] loaded {} follows", follows.len());
 
-    let secret_key_bytes = secret_key.to_bytes();
+    // Derive stable transport key from master key (device index 0 = primary device)
+    let device_index: u32 = 0;
+    let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, device_index);
+    let transport_secret = SecretKey::from_bytes(&transport_key_bytes);
+
+    let master_pubkey_clone = master_pubkey.clone();
+    let user_pubkey_clone = user_pubkey.clone();
+    let delegation_clone = delegation.clone();
     let storage_clone = storage.clone();
     tauri::async_runtime::spawn(async move {
         log::info!("[setup] binding iroh endpoint...");
         let endpoint = Endpoint::builder()
-            .secret_key(secret_key)
+            .secret_key(transport_secret)
             .alpns(vec![
                 iroh_blobs::ALPN.to_vec(),
                 iroh_gossip::ALPN.to_vec(),
@@ -148,7 +202,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             .await
             .expect("failed to bind iroh endpoint");
 
-        log::info!("[setup] Node ID: {}", endpoint.id());
+        let transport_node_id = endpoint.id().to_string();
+        log::info!("[setup] Transport NodeId: {}", short_id(&transport_node_id));
         log::info!("[setup] addr (immediate): {:?}", endpoint.addr());
 
         let ep_clone = endpoint.clone();
@@ -180,15 +235,21 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let gossip = Gossip::builder().spawn(endpoint.clone());
         log::info!("[setup] gossip started");
 
-        let node_id_str = endpoint.id().to_string();
+        // DM handler uses user key for X25519 derivation
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
-            secret_key_bytes,
-            endpoint.id().to_string(),
+            user_secret_key_bytes,
+            master_pubkey_clone.clone(),
         );
-        let peer_handler =
-            PeerHandler::new(storage_clone.clone(), node_id_str.clone(), handle.clone());
+        // Peer handler needs master pubkey, delegation, and transport node id
+        let peer_handler = PeerHandler::new(
+            storage_clone.clone(),
+            master_pubkey_clone.clone(),
+            transport_node_id.clone(),
+            delegation_clone.clone(),
+            handle.clone(),
+        );
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs.clone())
@@ -203,6 +264,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let mut feed = FeedManager::new(
             gossip,
             endpoint.clone(),
+            master_pubkey_clone.clone(),
             storage_clone.clone(),
             handle.clone(),
             reconnect_tx,
@@ -214,7 +276,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             log::info!("[setup] own gossip feed started");
         }
 
-        if let Ok(Some(profile)) = storage_clone.get_profile(&node_id_str) {
+        if let Ok(Some(profile)) = storage_clone.get_profile(&master_pubkey_clone) {
             if let Err(e) = feed.broadcast_profile(&profile).await {
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
@@ -223,8 +285,18 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         }
 
         for f in &follows {
+            let node_ids = storage_clone
+                .get_peer_transport_node_ids(&f.pubkey)
+                .unwrap_or_default();
+            if node_ids.is_empty() {
+                log::warn!(
+                    "[setup] no cached transport NodeIds for {}, skipping gossip subscribe",
+                    short_id(&f.pubkey)
+                );
+                continue;
+            }
             log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
-            if let Err(e) = feed.follow_user(f.pubkey.clone()).await {
+            if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
                 log::error!(
                     "[setup] failed to resubscribe to {}: {e}",
                     short_id(&f.pubkey)
@@ -239,7 +311,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let sync_storage = storage_clone.clone();
         let sync_follows = follows.clone();
         let sync_handle = handle.clone();
-        let sync_my_id = endpoint.id().to_string();
+        let sync_my_id = master_pubkey_clone.clone();
         tokio::spawn(async move {
             log::info!("[startup-sync] waiting for relay connectivity...");
             let mut has_relay = false;
@@ -286,7 +358,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let drip_endpoint = endpoint.clone();
         let drip_storage = storage_clone.clone();
         let drip_handle = handle.clone();
-        let drip_my_id = endpoint.id().to_string();
+        let drip_my_id = master_pubkey_clone.clone();
         tokio::spawn(async move {
             tokio::time::sleep(DRIP_INITIAL_DELAY).await;
 
@@ -295,9 +367,16 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 let mut any_work = false;
 
                 for f in &follows {
-                    let target: iroh::EndpointId = match f.pubkey.parse() {
-                        Ok(t) => t,
-                        Err(_) => continue,
+                    let node_ids = drip_storage
+                        .get_peer_transport_node_ids(&f.pubkey)
+                        .unwrap_or_default();
+                    let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
+                        match first.parse() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
                     };
 
                     log::info!("[drip-sync] syncing {}", short_id(&f.pubkey));
@@ -390,7 +469,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         // Push outbox flush task
         let push_ep = endpoint.clone();
         let push_storage = storage_clone.clone();
-        let push_my_id = endpoint.id().to_string();
+        let push_my_id = master_pubkey_clone.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL).await;
@@ -402,9 +481,16 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     }
                 };
                 for peer in peers {
-                    let target: iroh::EndpointId = match peer.parse() {
-                        Ok(t) => t,
-                        Err(_) => continue,
+                    let peer_node_ids = push_storage
+                        .get_peer_transport_node_ids(&peer)
+                        .unwrap_or_default();
+                    let target: iroh::EndpointId = if let Some(first) = peer_node_ids.first() {
+                        match first.parse() {
+                            Ok(t) => t,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        continue;
                     };
 
                     let profile_entries = push_storage
@@ -531,7 +617,13 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             storage: storage_clone,
             feed: Arc::new(Mutex::new(feed)),
             dm: dm_handler,
-            secret_key_bytes,
+            master_secret_key_bytes,
+            master_pubkey: master_pubkey_clone.clone(),
+            user_secret_key_bytes,
+            user_pubkey: user_pubkey_clone,
+            user_key_index,
+            transport_node_id: transport_node_id.clone(),
+            delegation: delegation_clone,
         });
 
         // Gossip reconnection loop: restarts dead gossip tasks on demand

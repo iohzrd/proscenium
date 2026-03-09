@@ -167,6 +167,7 @@ export interface ServerUser {
   registered_at: number;
   post_count: number;
   latest_post_at: number | null;
+  transport_node_id: string | null;
 }
 
 export interface UserSearchResponse {

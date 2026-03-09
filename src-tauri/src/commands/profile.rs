@@ -7,12 +7,17 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn get_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.endpoint.id().to_string())
+    Ok(state.master_pubkey.clone())
+}
+
+#[tauri::command]
+pub async fn get_transport_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(state.transport_node_id.clone())
 }
 
 #[tauri::command]
 pub async fn get_my_profile(state: State<'_, Arc<AppState>>) -> Result<Option<Profile>, String> {
-    let node_id = state.endpoint.id().to_string();
+    let node_id = state.master_pubkey.clone();
     state.storage.get_profile(&node_id).str_err()
 }
 
@@ -25,7 +30,7 @@ pub async fn save_my_profile(
     avatar_ticket: Option<String>,
     visibility: String,
 ) -> Result<(), String> {
-    let node_id = state.endpoint.id().to_string();
+    let node_id = state.master_pubkey.clone();
     let new_visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
     let profile = Profile {
         display_name: display_name.clone(),
@@ -87,7 +92,7 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
     let follower_count = state.storage.get_followers().map(|f| f.len()).unwrap_or(0);
 
     Ok(NodeStatus {
-        node_id: state.endpoint.id().to_string(),
+        node_id: state.master_pubkey.clone(),
         has_relay,
         relay_url,
         follow_count,

@@ -8,14 +8,26 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 
 ## How It Works
 
-Each node gets a permanent cryptographic identity (stored in `identity.key`). Your public key is your Node ID -- share it with others so they can follow you.
+### Identity and Key Architecture
+
+Each node has a three-tier key hierarchy:
+
+- **Master key** (Ed25519) -- The permanent, unforgeable identity. Stored in `master_key.key`. Your master public key is what others follow. The master key signs delegations and key rotations but never signs content directly. On first launch, a 24-word BIP39 recovery phrase is generated for backup.
+- **User key** (Ed25519) -- Derived from the master key via HKDF-SHA256. Shared across all linked devices. Signs posts, interactions, profiles, and server registrations. Also derives the X25519 key used for DM encryption. Rotatable by the master key if a device is compromised.
+- **Transport key** (Ed25519) -- Derived from the master key via HKDF with a device-specific index. Unique per device. Used as iroh's QUIC endpoint identity (NodeId) for networking. Never used for signing content.
+
+The master key signs a `UserKeyDelegation` binding the user key to the identity. Peers cache this delegation and verify content signatures against the user key. This separation means a compromised device's user key can be rotated without losing the permanent identity.
+
+### Protocols
 
 **Four protocol layers handle all communication:**
 
-- **Gossip** -- Real-time pub/sub. When you post, it broadcasts instantly to anyone following you. Each user has a topic derived from their public key.
+- **Gossip** -- Real-time pub/sub. When you post, it broadcasts instantly to anyone following you. Each user has a topic derived from their master public key.
 - **Sync** -- Historical pull. When you follow someone, their existing posts are fetched via a custom QUIC protocol with a three-tier streaming protocol (timestamp catch-up, ID diff, or up-to-date). On startup, all followed users are synced in parallel with bounded concurrency.
 - **Blobs** -- Content-addressed media storage. Images, videos, and files are stored locally and transferred peer-to-peer using iroh-blobs.
 - **DM** -- End-to-end encrypted direct messaging. A Noise IK handshake over QUIC establishes a shared secret between peers, which seeds a Double Ratchet providing per-message forward secrecy with ChaCha20-Poly1305 encryption. Messages are sent directly peer-to-peer with no intermediary, and queued locally for retry when the recipient is offline.
+
+When following a new user, an `IdentityRequest` is sent to their transport NodeId. The response contains their master pubkey, user key delegation, and profile. This is cached locally so subsequent connections can resolve the master pubkey to reachable transport NodeIds.
 
 All data is persisted in a local SQLite database. The app works offline and syncs when peers are available.
 
@@ -156,6 +168,7 @@ This builds a static musl binary, uploads it via scp, and restarts the systemd s
 - `GET /api/v1/trending` -- Trending hashtags
 - `GET /api/v1/users` -- User directory
 - `GET /api/v1/users/search?q=` -- Search users
+- `GET /api/v1/users/{pubkey}/devices` -- Transport NodeIds for a user's devices
 - `GET /api/v1/posts/search?q=` -- Full-text post search
 
 ### Registration Visibility
@@ -192,11 +205,13 @@ Peer-to-peer voice and video calls, with call signaling encrypted via the DM rat
 
 See [todos/voice-video-calling.md](todos/voice-video-calling.md) for the design document.
 
-## Linked Devices (Planned)
+## Linked Devices (In Progress)
 
-Link multiple devices to a single identity, similar to Signal's linked devices. A primary device holds the master keypair and authorizes secondaries via QR code pairing over an encrypted channel. Linked devices share the social graph, message history, and profile.
+Link multiple devices (phone, desktop, tablet) to a single identity. The three-tier key hierarchy (master / user / transport) is implemented: a master key is the permanent identity, a derived user key handles signing and DM encryption across all devices, and per-device transport keys provide unique iroh NodeIds. The master key enables secure user key rotation if a device is compromised without losing the identity.
 
-See [todos/linked-devices.md](todos/linked-devices.md) for the design document.
+Phase 1 (key hierarchy, identity resolution, delegation) is complete. Remaining phases cover device pairing, multi-device sync, key rotation, and revocation.
+
+See [todos/linked-devices.md](todos/linked-devices.md) for the full design document.
 
 ## Recommended IDE Setup
 

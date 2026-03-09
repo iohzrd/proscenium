@@ -3,14 +3,19 @@
   import { copyToClipboard } from "$lib/utils";
 
   interface Props {
-    nodeId: string;
+    pubkey: string;
+    transportNodeId?: string;
     onclose: () => void;
   }
 
-  let { nodeId, onclose }: Props = $props();
+  let { pubkey, transportNodeId, onclose }: Props = $props();
   let copyFeedback = $state(false);
 
-  let deepLinkUrl = $derived(`iroh-social://profile/${nodeId}`);
+  let deepLinkUrl = $derived(
+    transportNodeId
+      ? `iroh-social://profile/${pubkey}?transport=${transportNodeId}`
+      : `iroh-social://profile/${pubkey}`,
+  );
 
   async function copyLink() {
     await copyToClipboard(deepLinkUrl);

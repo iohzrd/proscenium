@@ -4,6 +4,7 @@ mod interactions;
 mod messaging;
 mod moderation;
 mod notifications;
+mod peer_delegations;
 mod posts;
 mod profiles;
 mod push;
@@ -100,6 +101,10 @@ impl Storage {
         (
             "013_servers",
             include_str!("../../migrations/013_servers.sql"),
+        ),
+        (
+            "014_peer_delegations",
+            include_str!("../../migrations/014_peer_delegations.sql"),
         ),
     ];
 

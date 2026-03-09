@@ -159,7 +159,9 @@
           [...followedPubkeys].filter((p) => p !== pubkey),
         );
       } else {
-        await invoke("follow_user", { pubkey });
+        const user = users.find((u) => u.pubkey === pubkey);
+        const transportNodeId = user?.transport_node_id ?? null;
+        await invoke("follow_user", { pubkey, transportNodeId });
         followedPubkeys = new Set([...followedPubkeys, pubkey]);
       }
     } catch (e) {

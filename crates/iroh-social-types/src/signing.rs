@@ -61,28 +61,27 @@ pub fn sign_interaction(interaction: &mut Interaction, secret_key: &SecretKey) {
     interaction.signature = signature_to_hex(&sig);
 }
 
-/// Verify a Post's signature against its author public key.
-pub fn verify_post_signature(post: &Post) -> Result<(), String> {
+/// Verify a Post's signature against the given signer public key.
+/// The signer is the user key (from a cached UserKeyDelegation), NOT post.author
+/// (which is the master pubkey / permanent identity).
+pub fn verify_post_signature(post: &Post, signer_pubkey: &PublicKey) -> Result<(), String> {
     let sig = hex_to_signature(&post.signature)?;
-    let pubkey: PublicKey = post
-        .author
-        .parse()
-        .map_err(|e| format!("invalid author pubkey: {e}"))?;
     let bytes = post_signing_bytes(post);
-    pubkey
+    signer_pubkey
         .verify(&bytes, &sig)
-        .map_err(|_| "signature verification failed".to_string())
+        .map_err(|_| "post signature verification failed".to_string())
 }
 
-/// Verify an Interaction's signature against its author public key.
-pub fn verify_interaction_signature(interaction: &Interaction) -> Result<(), String> {
+/// Verify an Interaction's signature against the given signer public key.
+/// The signer is the user key (from a cached UserKeyDelegation), NOT interaction.author
+/// (which is the master pubkey / permanent identity).
+pub fn verify_interaction_signature(
+    interaction: &Interaction,
+    signer_pubkey: &PublicKey,
+) -> Result<(), String> {
     let sig = hex_to_signature(&interaction.signature)?;
-    let pubkey: PublicKey = interaction
-        .author
-        .parse()
-        .map_err(|e| format!("invalid author pubkey: {e}"))?;
     let bytes = interaction_signing_bytes(interaction);
-    pubkey
+    signer_pubkey
         .verify(&bytes, &sig)
-        .map_err(|_| "signature verification failed".to_string())
+        .map_err(|_| "interaction signature verification failed".to_string())
 }

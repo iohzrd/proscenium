@@ -5,8 +5,9 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use iroh_social_types::{
-    FollowRequest, FollowResponse, PEER_ALPN, PeerRequest, Visibility, now_millis, short_id,
-    sign_follow_request, verify_follow_request,
+    FollowRequest, FollowResponse, IdentityResponse, PEER_ALPN, PeerRequest, PeerResponse,
+    UserKeyDelegation, Visibility, now_millis, short_id, sign_follow_request,
+    verify_follow_request,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -14,15 +15,28 @@ use tauri::{AppHandle, Emitter};
 #[derive(Debug, Clone)]
 pub struct PeerHandler {
     storage: Arc<Storage>,
-    node_id: String,
+    /// The permanent identity (master public key).
+    master_pubkey: String,
+    /// The transport NodeId (iroh's own key).
+    transport_node_id: String,
+    /// The current user key delegation.
+    delegation: UserKeyDelegation,
     app_handle: AppHandle,
 }
 
 impl PeerHandler {
-    pub fn new(storage: Arc<Storage>, node_id: String, app_handle: AppHandle) -> Self {
+    pub fn new(
+        storage: Arc<Storage>,
+        master_pubkey: String,
+        transport_node_id: String,
+        delegation: UserKeyDelegation,
+        app_handle: AppHandle,
+    ) -> Self {
         Self {
             storage,
-            node_id,
+            master_pubkey,
+            transport_node_id,
+            delegation,
             app_handle,
         }
     }
@@ -54,6 +68,7 @@ impl ProtocolHandler for PeerHandler {
                 PeerRequest::Sync(_) => "sync",
                 PeerRequest::Push(_) => "push",
                 PeerRequest::FollowRequest(_) => "follow-request",
+                PeerRequest::IdentityRequest => "identity-request",
             },
             short_id(&remote_str)
         );
@@ -62,7 +77,7 @@ impl ProtocolHandler for PeerHandler {
             PeerRequest::Sync(sync_req) => {
                 crate::sync::handle_sync(
                     &self.storage,
-                    &self.node_id,
+                    &self.master_pubkey,
                     &remote_str,
                     &conn,
                     send,
@@ -73,7 +88,7 @@ impl ProtocolHandler for PeerHandler {
             PeerRequest::Push(push_msg) => {
                 crate::push::handle_push(
                     &self.storage,
-                    &self.node_id,
+                    &self.master_pubkey,
                     &remote_str,
                     &self.app_handle,
                     send,
@@ -85,11 +100,22 @@ impl ProtocolHandler for PeerHandler {
             PeerRequest::FollowRequest(follow_req) => {
                 handle_follow_request(
                     &self.storage,
-                    &self.node_id,
+                    &self.master_pubkey,
                     &remote_str,
                     &self.app_handle,
                     send,
                     follow_req,
+                    &conn,
+                )
+                .await
+            }
+            PeerRequest::IdentityRequest => {
+                handle_identity_request(
+                    &self.storage,
+                    &self.master_pubkey,
+                    &self.transport_node_id,
+                    &self.delegation,
+                    send,
                     &conn,
                 )
                 .await
@@ -109,20 +135,43 @@ async fn handle_follow_request(
     req: iroh_social_types::FollowRequest,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
-    // Validate requester matches remote peer
-    if req.requester != remote_str {
+    // Verify the delegation (master key signed the user key binding)
+    if let Err(reason) = iroh_social_types::verify_delegation(&req.delegation) {
         log::warn!(
-            "[follow-req] requester mismatch: req={}, remote={}",
-            short_id(&req.requester),
+            "[follow-req] invalid delegation from {}: {reason}",
             short_id(remote_str)
         );
         return Err(AcceptError::from_err(std::io::Error::other(
-            "requester mismatch",
+            "invalid delegation",
         )));
     }
 
-    // Verify signature
-    if let Err(reason) = verify_follow_request(&req) {
+    // Check that the delegation's master pubkey matches the requester
+    if req.delegation.master_pubkey != req.requester {
+        log::warn!(
+            "[follow-req] delegation master_pubkey mismatch: delegation={}, requester={}",
+            short_id(&req.delegation.master_pubkey),
+            short_id(&req.requester)
+        );
+        return Err(AcceptError::from_err(std::io::Error::other(
+            "delegation master_pubkey mismatch",
+        )));
+    }
+
+    // Verify signature using the user key from the delegation
+    let signer: iroh::PublicKey = match req.delegation.user_pubkey.parse() {
+        Ok(pk) => pk,
+        Err(e) => {
+            log::warn!(
+                "[follow-req] invalid user pubkey in delegation from {}: {e}",
+                short_id(remote_str)
+            );
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "invalid user pubkey in delegation",
+            )));
+        }
+    };
+    if let Err(reason) = verify_follow_request(&req, &signer) {
         log::warn!(
             "[follow-req] invalid signature from {}: {reason}",
             short_id(remote_str)
@@ -132,6 +181,17 @@ async fn handle_follow_request(
         )));
     }
 
+    // Cache the peer's delegation and transport NodeId
+    let _ = storage.cache_peer_identity(&IdentityResponse {
+        master_pubkey: req.requester.clone(),
+        delegation: req.delegation.clone(),
+        transport_node_ids: vec![remote_str.to_string()],
+        profile: None,
+    });
+
+    // Use master pubkey (permanent identity) for all storage lookups, not transport NodeId
+    let requester_pubkey = &req.requester;
+
     // Only Listed users accept follow requests
     let visibility = storage
         .get_visibility(node_id)
@@ -140,26 +200,37 @@ async fn handle_follow_request(
     let response = match visibility {
         Visibility::Listed => {
             // Check if already approved
-            if storage.is_approved_follower(remote_str).unwrap_or(false) {
-                log::info!("[follow-req] already approved: {}", short_id(remote_str));
+            if storage
+                .is_approved_follower(requester_pubkey)
+                .unwrap_or(false)
+            {
+                log::info!(
+                    "[follow-req] already approved: {}",
+                    short_id(requester_pubkey)
+                );
                 FollowResponse::Approved
             } else {
                 let now = now_millis();
                 let expires_at = now + FOLLOW_REQUEST_TTL_MS;
-                match storage.insert_follow_request(remote_str, req.timestamp, now, expires_at) {
+                match storage.insert_follow_request(
+                    requester_pubkey,
+                    req.timestamp,
+                    now,
+                    expires_at,
+                ) {
                     Ok(true) => {
                         log::info!(
                             "[follow-req] stored pending request from {}",
-                            short_id(remote_str)
+                            short_id(requester_pubkey)
                         );
                         let _ = storage.insert_notification(
                             "follow_request",
-                            remote_str,
+                            requester_pubkey,
                             None,
                             None,
                             now,
                         );
-                        let _ = app_handle.emit("follow-request-received", remote_str);
+                        let _ = app_handle.emit("follow-request-received", requester_pubkey);
                         let _ = app_handle.emit("notification-received", ());
                         FollowResponse::Pending
                     }
@@ -180,7 +251,7 @@ async fn handle_follow_request(
             // Public users don't need follow requests, auto-approve
             log::info!(
                 "[follow-req] auto-approving for public profile: {}",
-                short_id(remote_str)
+                short_id(requester_pubkey)
             );
             FollowResponse::Approved
         }
@@ -188,7 +259,7 @@ async fn handle_follow_request(
             // Private users deny follow requests
             log::info!(
                 "[follow-req] denying for private profile: {}",
-                short_id(remote_str)
+                short_id(requester_pubkey)
             );
             FollowResponse::Denied
         }
@@ -208,17 +279,19 @@ async fn handle_follow_request(
 pub async fn send_follow_request(
     endpoint: &Endpoint,
     target: EndpointId,
-    secret_key_bytes: &[u8; 32],
+    master_pubkey: &str,
+    user_secret_key_bytes: &[u8; 32],
+    delegation: &UserKeyDelegation,
 ) -> anyhow::Result<FollowResponse> {
-    let my_id = endpoint.id().to_string();
     let timestamp = now_millis();
-    let secret_key = iroh::SecretKey::from_bytes(secret_key_bytes);
-    let signature = sign_follow_request(&my_id, timestamp, &secret_key);
+    let secret_key = iroh::SecretKey::from_bytes(user_secret_key_bytes);
+    let signature = sign_follow_request(master_pubkey, timestamp, &secret_key);
 
     let req = FollowRequest {
-        requester: my_id,
+        requester: master_pubkey.to_string(),
         timestamp,
         signature,
+        delegation: delegation.clone(),
     };
 
     let peer_req = PeerRequest::FollowRequest(req);
@@ -235,4 +308,59 @@ pub async fn send_follow_request(
 
     conn.close(0u32.into(), b"done");
     Ok(response)
+}
+
+/// Client: query a peer's identity by connecting to their transport NodeId.
+/// Returns the IdentityResponse containing master_pubkey, delegation, device list, and profile.
+pub async fn query_identity(
+    endpoint: &Endpoint,
+    target: EndpointId,
+) -> anyhow::Result<IdentityResponse> {
+    let addr = EndpointAddr::from(target);
+    let conn = endpoint.connect(addr, PEER_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let req_bytes = serde_json::to_vec(&PeerRequest::IdentityRequest)?;
+    send.write_all(&req_bytes).await?;
+    send.finish()?;
+
+    let resp_bytes = recv.read_to_end(65_536).await?;
+    let response: PeerResponse = serde_json::from_slice(&resp_bytes)?;
+
+    conn.close(0u32.into(), b"done");
+
+    match response {
+        PeerResponse::Identity(identity) => Ok(identity),
+        other => anyhow::bail!(
+            "unexpected response: expected Identity, got {:?}",
+            std::mem::discriminant(&other)
+        ),
+    }
+}
+
+/// Handle an IdentityRequest: respond with our master pubkey, delegation, and profile.
+async fn handle_identity_request(
+    storage: &Storage,
+    master_pubkey: &str,
+    transport_node_id: &str,
+    delegation: &UserKeyDelegation,
+    mut send: iroh::endpoint::SendStream,
+    conn: &Connection,
+) -> Result<(), AcceptError> {
+    let profile = storage.get_profile(master_pubkey).ok().flatten();
+    let response = PeerResponse::Identity(IdentityResponse {
+        master_pubkey: master_pubkey.to_string(),
+        delegation: delegation.clone(),
+        transport_node_ids: vec![transport_node_id.to_string()],
+        profile,
+    });
+
+    let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+    send.write_all(&resp_bytes)
+        .await
+        .map_err(AcceptError::from_err)?;
+    send.finish().map_err(AcceptError::from_err)?;
+
+    conn.closed().await;
+    Ok(())
 }

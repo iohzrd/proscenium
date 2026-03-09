@@ -1,6 +1,7 @@
 use crate::ext::ResultExt;
 use crate::state::{AppState, FrontendSyncResult, SyncStatus};
 use crate::storage::Storage;
+use iroh::PublicKey;
 use iroh_social_types::{
     parse_mentions, short_id, validate_interaction, validate_post, verify_interaction_signature,
     verify_post_signature,
@@ -21,7 +22,19 @@ pub(crate) fn process_incoming_post(
         log::error!("[{label}] rejected post {}: {reason}", &post.id);
         return false;
     }
-    if let Err(reason) = verify_post_signature(post) {
+    // TODO: look up user key from delegation cache instead of using author directly.
+    // For backward compat with pre-migration content, author == signer.
+    let signer: PublicKey = match post.author.parse() {
+        Ok(pk) => pk,
+        Err(e) => {
+            log::error!(
+                "[{label}] rejected post {} (bad author pubkey): {e}",
+                &post.id
+            );
+            return false;
+        }
+    };
+    if let Err(reason) = verify_post_signature(post, &signer) {
         log::error!("[{label}] rejected post {} (bad sig): {reason}", &post.id);
         return false;
     }
@@ -84,7 +97,18 @@ pub(crate) fn process_incoming_interaction(
         );
         return;
     }
-    if let Err(reason) = verify_interaction_signature(interaction) {
+    // TODO: look up user key from delegation cache instead of using author directly.
+    let signer: PublicKey = match interaction.author.parse() {
+        Ok(pk) => pk,
+        Err(e) => {
+            log::error!(
+                "[{label}] rejected interaction {} (bad author pubkey): {e}",
+                &interaction.id
+            );
+            return;
+        }
+    };
+    if let Err(reason) = verify_interaction_signature(interaction, &signer) {
         log::error!(
             "[{label}] rejected interaction {} (bad sig): {reason}",
             &interaction.id
@@ -141,7 +165,7 @@ pub async fn sync_posts(
     let storage = state.storage.clone();
     let target: iroh::EndpointId = pubkey.parse().str_err()?;
 
-    let my_id = state.endpoint.id().to_string();
+    let my_id = state.master_pubkey.clone();
     let result = crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey)
         .await
         .str_err()?;

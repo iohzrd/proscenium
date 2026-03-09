@@ -24,7 +24,8 @@ struct MessageResponse {
 
 #[derive(Deserialize)]
 struct ProfileUpdateRequest {
-    pubkey: String,
+    master_pubkey: String,
+    transport_node_id: String,
     server_url: String,
     timestamp: u64,
     visibility: String,
@@ -32,6 +33,7 @@ struct ProfileUpdateRequest {
     bio: Option<String>,
     avatar_hash: Option<String>,
     signature: String,
+    delegation: iroh_social_types::UserKeyDelegation,
 }
 
 fn validate_registration(
@@ -89,14 +91,22 @@ async fn register(
     validate_registration(&req, &state.config)
         .map_err(|(code, msg)| (code, Json(MessageResponse { message: msg })))?;
 
+    let delegation_json = serde_json::to_string(&req.delegation).ok();
+
     // Check if already registered
-    if let Ok(Some(existing)) = state.storage.get_registration(&req.pubkey).await
+    if let Ok(Some(existing)) = state.storage.get_registration(&req.master_pubkey).await
         && existing.is_active != 0
     {
         let vis = req.visibility.to_string();
         state
             .storage
-            .register_user(&req.pubkey, &vis, None)
+            .register_user(
+                &req.master_pubkey,
+                &vis,
+                None,
+                Some(&req.transport_node_id),
+                delegation_json.as_deref(),
+            )
             .await
             .map_err(|e| {
                 (
@@ -110,7 +120,7 @@ async fn register(
         return Ok((
             StatusCode::OK,
             Json(RegisterResponse {
-                pubkey: req.pubkey,
+                pubkey: req.master_pubkey,
                 registered_at: existing.registered_at as u64,
                 message: "registration updated".to_string(),
             }),
@@ -121,7 +131,13 @@ async fn register(
     let now = now_millis();
     state
         .storage
-        .register_user(&req.pubkey, &vis, None)
+        .register_user(
+            &req.master_pubkey,
+            &vis,
+            None,
+            Some(&req.transport_node_id),
+            delegation_json.as_deref(),
+        )
         .await
         .map_err(|e| {
             (
@@ -134,18 +150,18 @@ async fn register(
 
     // If Public, subscribe to gossip and trigger sync
     if req.visibility == Visibility::Public
-        && let Err(e) = state.ingestion.subscribe(&req.pubkey).await
+        && let Err(e) = state.ingestion.subscribe(&req.master_pubkey).await
     {
         tracing::error!(
             "[auth] failed to subscribe to {}: {e}",
-            iroh_social_types::short_id(&req.pubkey)
+            iroh_social_types::short_id(&req.master_pubkey)
         );
     }
 
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
-            pubkey: req.pubkey,
+            pubkey: req.master_pubkey,
             registered_at: now,
             message: "registered successfully".to_string(),
         }),
@@ -174,10 +190,10 @@ async fn unregister(
         ));
     }
 
-    state.ingestion.unsubscribe(&req.pubkey).await;
+    state.ingestion.unsubscribe(&req.master_pubkey).await;
     state
         .storage
-        .unregister_user(&req.pubkey)
+        .unregister_user(&req.master_pubkey)
         .await
         .map_err(|e| {
             (
@@ -199,7 +215,8 @@ async fn update_profile(
 ) -> Result<Json<MessageResponse>, (StatusCode, Json<MessageResponse>)> {
     // Verify via RegistrationRequest
     let reg_req = RegistrationRequest {
-        pubkey: req.pubkey.clone(),
+        master_pubkey: req.master_pubkey.clone(),
+        transport_node_id: req.transport_node_id.clone(),
         server_url: req.server_url.clone(),
         timestamp: req.timestamp,
         visibility: req.visibility.parse().map_err(|_| {
@@ -212,6 +229,7 @@ async fn update_profile(
         })?,
         action: None,
         signature: req.signature.clone(),
+        delegation: req.delegation.clone(),
     };
 
     if let Err(e) = verify_registration_signature(&reg_req) {
@@ -242,7 +260,7 @@ async fn update_profile(
 
     let updated = state
         .storage
-        .update_profile(&req.pubkey, &profile)
+        .update_profile(&req.master_pubkey, &profile)
         .await
         .map_err(|e| {
             (

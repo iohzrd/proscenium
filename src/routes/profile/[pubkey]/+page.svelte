@@ -44,6 +44,7 @@
   let togglingBlock = $state(false);
   let showQr = $state(false);
   let editingProfile = $state(false);
+  let transportNodeId = $state<string | undefined>(undefined);
 
   const FILTERS = [
     { value: "all", label: "All" },
@@ -74,6 +75,7 @@
     if (pubkey === nid) {
       const myProfile: Profile | null = await invoke("get_my_profile");
       profile = myProfile;
+      transportNodeId = await invoke("get_transport_node_id");
     } else {
       profile = await invoke("get_remote_profile", { pubkey });
     }
@@ -197,7 +199,7 @@
         await invoke("unfollow_user", { pubkey });
         isFollowing = false;
       } else {
-        await invoke("follow_user", { pubkey });
+        await invoke("follow_user", { pubkey, transportNodeId: null });
         isFollowing = true;
       }
     } catch (e) {
@@ -287,7 +289,7 @@
 </script>
 
 {#if showQr}
-  <QrModal nodeId={pubkey} onclose={() => (showQr = false)} />
+  <QrModal {pubkey} {transportNodeId} onclose={() => (showQr = false)} />
 {/if}
 
 {#if lightbox.src}

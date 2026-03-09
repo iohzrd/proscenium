@@ -14,7 +14,7 @@ pub async fn like_post(
     target_post_id: String,
     target_author: String,
 ) -> Result<Interaction, String> {
-    let my_id = state.endpoint.id().to_string();
+    let my_id = state.master_pubkey.clone();
     let mut interaction = Interaction {
         id: generate_id(),
         author: my_id,
@@ -24,7 +24,7 @@ pub async fn like_post(
         timestamp: now_millis(),
         signature: String::new(),
     };
-    let sk = SecretKey::from_bytes(&state.secret_key_bytes);
+    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
     sign_interaction(&mut interaction, &sk);
     state.storage.save_interaction(&interaction).str_err()?;
     let feed = state.feed.lock().await;
@@ -37,7 +37,7 @@ pub async fn unlike_post(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<(), String> {
-    let my_id = state.endpoint.id().to_string();
+    let my_id = state.master_pubkey.clone();
     let id = state
         .storage
         .delete_interaction_by_target(&my_id, "Like", &target_post_id)
@@ -57,7 +57,7 @@ pub async fn repost(
     target_post_id: String,
     target_author: String,
 ) -> Result<Post, String> {
-    let author = state.endpoint.id().to_string();
+    let author = state.master_pubkey.clone();
     let mut post = Post {
         id: generate_id(),
         author,
@@ -73,7 +73,7 @@ pub async fn repost(
 
     validate_post(&post)?;
 
-    let sk = SecretKey::from_bytes(&state.secret_key_bytes);
+    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
     sign_post(&mut post, &sk);
 
     state.storage.insert_post(&post).str_err()?;
@@ -87,7 +87,7 @@ pub async fn unrepost(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<(), String> {
-    let my_id = state.endpoint.id().to_string();
+    let my_id = state.master_pubkey.clone();
     let id = state
         .storage
         .delete_repost_by_target(&my_id, &target_post_id)
@@ -104,7 +104,7 @@ pub async fn get_post_counts(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<PostCounts, String> {
-    let my_id = state.endpoint.id().to_string();
+    let my_id = state.master_pubkey.clone();
     state
         .storage
         .get_post_counts(&my_id, &target_post_id)

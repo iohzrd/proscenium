@@ -25,7 +25,7 @@ Link multiple devices (phone, desktop, tablet) to a single identity. A three-tie
 
 ## Design Principles
 
-1. **Three-tier key hierarchy** -- A master key (Ed25519) is the permanent identity, kept in cold storage after setup. A user key (derived from master via hardened derivation) handles day-to-day signing and DM encryption, shared across all linked devices. Each device has its own iroh transport key for QUIC networking.
+1. **Three-tier key hierarchy** -- A master key (Ed25519) is the permanent identity, kept in cold storage after setup. A user key (derived from master via hardened derivation) handles day-to-day signing and DM encryption, shared across all linked devices. The transport key is also derived from the master key via HKDF (separate derivation path) and passed to iroh for QUIC networking. In the multi-device future, each device will derive its own transport key using a device-specific index.
 2. **Simple verification** -- Peers verify content signatures against the user key's public key. The master key is only involved during key delegation and rotation -- not on every post. Peers cache the master-signed delegation and verify content against the current user key.
 3. **Survivable compromise** -- If a device holding the user key is compromised, the master key (on a secure device) derives a new user key and publishes a signed rotation. The master public key is the permanent identity; the user key is rotatable. This is the key advantage over a flat shared-key model.
 4. **Shared DM sessions** -- All devices share the same X25519 static key (derived from the user key). A peer needs only one DM ratchet session per user identity, regardless of how many devices that user has. Ratchet state must be synchronized between devices.
@@ -111,12 +111,15 @@ User Key (Ed25519) -- derived from master, shared across all linked devices
   - Stored as user_key.key (32 bytes) on all linked devices
   - Rotatable: master derives a new one if compromised
 
-Transport Key (Ed25519) -- unique per device, managed by iroh
+Transport Key (Ed25519) -- derived from master + device index, unique per device
+  - Derived: transport_secret = HKDF-SHA256(master_secret, info="iroh-social/transport-key", salt=device_index)
+  - Primary device uses device_index=0, each linked device gets a unique index
   - iroh EndpointId / NodeId
   - QUIC transport authentication
   - Gossip participation
   - Never used for content signing or DM encryption
-  - Managed by iroh internally (iroh data directory)
+  - Passed to iroh via Endpoint::builder().secret_key()
+  - Stable across restarts (same master key + device index = same transport NodeId)
 ```
 
 ### User Key Derivation
@@ -142,6 +145,29 @@ Properties:
 - **Hardened**: knowing `user_secret[i]` does not reveal `master_secret` or `user_secret[j]` for any `j != i`.
 - **Deterministic**: the same `(master_secret, index)` always produces the same user key.
 - **Cheap**: HKDF is a single hash operation. No complex curve math.
+
+### Transport Key Derivation
+
+The transport key is derived from the master key using HKDF with a device-specific index as the salt. Each linked device uses a unique index, ensuring distinct NodeIds on the network:
+
+```rust
+/// Derive a stable transport key from the master key for a given device index.
+/// Each device uses a unique index so linked devices get distinct NodeIds.
+/// The primary device uses index 0.
+fn derive_transport_key(master_secret: &[u8; 32], device_index: u32) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(&device_index.to_be_bytes()), master_secret);
+    let mut transport_secret = [0u8; 32];
+    hk.expand(b"iroh-social/transport-key", &mut transport_secret)
+        .expect("32 bytes is a valid length for HKDF-SHA256");
+    transport_secret
+}
+```
+
+The derived key is passed to iroh via `Endpoint::builder().secret_key()`. This ensures:
+- **Stable NodeId**: same master key + device index always produces the same transport NodeId across app restarts.
+- **Unique per device**: different device indices produce different NodeIds, so linked devices don't collide on the network.
+- **Independence**: the transport key is cryptographically independent from the user key (different HKDF info).
+- **Deterministic**: no separate key file needed; the transport key is always recoverable from the master key + device index.
 
 ### User Key Delegation
 
@@ -199,7 +225,7 @@ Since all devices share the same user key, they all derive the same X25519 key. 
 |------|---------|-----------|
 | `master_key.key` | Ed25519 master secret (32 bytes), permanent identity | Primary device only (unless user transfers full control) |
 | `user_key.key` | Ed25519 user secret (32 bytes), derived from master via HKDF | All linked devices |
-| (iroh internal) | Transport key, managed by iroh | Every device (auto-generated) |
+| (derived from master) | Transport key, derived via HKDF from master key | Every device (deterministic) |
 
 ### Key Relationships
 
@@ -209,13 +235,13 @@ Since all devices share the same user key, they all derive the same X25519 key. 
 | Content signing | user_key.key signs |
 | DM encryption | X25519 derived from user_key.key |
 | Gossip topic | `user_feed_topic(master_pubkey)` |
-| Transport / QUIC | iroh's own key (NodeId) |
+| Transport / QUIC | Derived from master key via HKDF (NodeId) |
 
 ### First Launch (Fresh Install)
 
 1. Generate a new Ed25519 keypair for `master_key.key`
 2. Derive `user_key.key` at index 0: `derive_user_key(&master_secret, 0)`
-3. iroh generates its own transport key automatically
+3. Derive transport key: `derive_transport_key(&master_secret, 0)` -- device index 0 for primary, passed to iroh via `Endpoint::builder().secret_key()`
 4. Sign a `UserKeyDelegation` binding the user key to the master key
 5. Store master key bytes in `AppState::master_secret_key_bytes`
 6. Store user key bytes in `AppState::user_secret_key_bytes`
@@ -615,9 +641,12 @@ Existing Device                     New Device
    |     pubkey and device name          |
    |     <----------------------------   |
    |                                     |
-   |  6. Existing device sends           |
-   |     LinkBundle:                     |
+   |  6. Existing device derives          |
+   |     transport key for new device    |
+   |     at next available device_index  |
+   |     and sends LinkBundle:           |
    |     - User secret key (32 bytes)    |
+   |     - Transport secret key for B    |
    |     - Profile data                  |
    |     - Follow list                   |
    |     - Bookmarks, mutes, blocks      |
@@ -683,6 +712,13 @@ pub struct LinkBundle {
     pub user_secret_key: String,
     /// The user key delegation (signed by master key).
     pub delegation: UserKeyDelegation,
+    /// The new device's transport secret key (32 bytes, base64-encoded).
+    /// Derived by the existing device: derive_transport_key(master_secret, new_device_index).
+    /// The new device stores this directly -- it does NOT need the master key to derive it.
+    pub transport_secret_key: String,
+    /// The device index used to derive the transport key.
+    /// The new device stores this so it can be included in the device registry.
+    pub device_index: u32,
     /// The master secret key (32 bytes, base64-encoded).
     /// ONLY included if the sending device holds it AND user opts in.
     /// None for secondary-to-secondary pairing or if user chooses not to share.
@@ -711,8 +747,10 @@ pub struct RatchetSessionExport {
 
 Security notes:
 - The `user_secret_key` controls signing and DM. Compromise allows impersonation until the master key rotates it.
+- The `transport_secret_key` is derived by the existing device from the master key using `derive_transport_key(master_secret, device_index)`. The new device stores it directly and passes it to iroh via `Endpoint::builder().secret_key()`. The new device never sees the master key material used to derive it.
 - The `master_secret_key` (if included) is the permanent identity. Its compromise is unrecoverable.
 - Users should be warned before transferring the master key. Default: do NOT include it. Only include if the user explicitly chooses "transfer full control."
+- **Secondary-to-secondary pairing**: A secondary device (one without the master key) can still pair a new device by sharing the user key and DM sessions, but it CANNOT derive a new transport key. In this case, the existing device must either (a) have a pre-derived transport key assigned to it for this purpose, or (b) the pairing must go through the primary device. The simplest approach: only the primary device (or any device holding the master key) can initiate "Link New Device."
 - The Noise IK + PSK channel provides end-to-end encryption and authentication.
 - The one-time PSK prevents MITM attacks on the QUIC connection.
 - After successful transfer, all secret key bytes should be zeroized from the transfer buffer.
@@ -1613,23 +1651,23 @@ Events are created on the device holding the master key:
 
 ### Phase 1: Key Hierarchy and Separation
 
-- [ ] Implement `derive_user_key(master_secret, index)` using HKDF-SHA256
-- [ ] Define `UserKeyDelegation` type with canonical signing bytes and sign/verify functions
-- [ ] Generate `master_key.key` on first launch, derive `user_key.key` at index 0
-- [ ] Sign `UserKeyDelegation` binding user key to master key on startup
-- [ ] Update `AppState` to hold `master_secret_key_bytes`, `master_pubkey`, `user_secret_key_bytes`, `user_pubkey`, `user_key_index`, and `transport_node_id`
-- [ ] Update all post/interaction/profile signing to use `user_secret_key_bytes`
-- [ ] Update all verification to require delegation lookup (no fallback)
-- [ ] Update DM handler to derive X25519 from user key
-- [ ] Add `IdentityRequest` / `IdentityResponse` to `PeerRequest` / `PeerResponse` enums
-- [ ] Implement `IdentityRequest` handler: respond with master pubkey, delegation, device list, profile
-- [ ] Implement `resolve_transport_nodes(master_pubkey)` with local cache (+ optional server fallback)
-- [ ] Update gossip subscription to resolve transport NodeIds instead of parsing master pubkey as EndpointId
-- [ ] Update follow flow: connect to transport NodeId, send IdentityRequest, cache result, then subscribe
-- [ ] Update `SyncHandler` to accept sync requests where `author == master_pubkey`
-- [ ] Update user profile links/QR codes to include transport NodeId alongside master pubkey
-- [ ] Update server registration payload to include `master_pubkey`, `transport_node_id`, and `UserKeyDelegation`
-- [ ] Add server endpoint (optional): `GET /api/v1/user/{master_pubkey}/devices`
+- [x] Implement `derive_user_key(master_secret, index)` using HKDF-SHA256
+- [x] Define `UserKeyDelegation` type with canonical signing bytes and sign/verify functions
+- [x] Generate `master_key.key` on first launch, derive `user_key.key` at index 0
+- [x] Sign `UserKeyDelegation` binding user key to master key on startup
+- [x] Update `AppState` to hold `master_secret_key_bytes`, `master_pubkey`, `user_secret_key_bytes`, `user_pubkey`, `user_key_index`, and `transport_node_id`
+- [x] Update all post/interaction/profile signing to use `user_secret_key_bytes`
+- [x] Update all verification to require delegation lookup (server has backward-compat fallback for transition)
+- [x] Update DM handler to derive X25519 from user key
+- [x] Add `IdentityRequest` / `IdentityResponse` to `PeerRequest` / `PeerResponse` enums
+- [x] Implement `IdentityRequest` handler: respond with master pubkey, delegation, device list, profile
+- [x] Implement `resolve_transport_nodes(master_pubkey)` with local cache (+ optional server fallback)
+- [x] Update gossip subscription to resolve transport NodeIds instead of parsing master pubkey as EndpointId
+- [x] Update follow flow: connect to transport NodeId, send IdentityRequest, cache result, then subscribe
+- [x] Update `SyncHandler` to accept sync requests where `author == master_pubkey`
+- [x] Update user profile links/QR codes to include transport NodeId alongside master pubkey
+- [x] Update server registration payload to include `master_pubkey`, `transport_node_id`, and `UserKeyDelegation`
+- [x] Add server endpoint (optional): `GET /api/v1/users/{master_pubkey}/devices`
 - [ ] Verify functionality works with separated keys (single device)
 
 ### Phase 2: Profile Signing and Delete Signing

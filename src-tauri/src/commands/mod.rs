@@ -1,6 +1,7 @@
 mod blobs;
 mod dm;
 mod follow_requests;
+mod identity;
 mod interactions;
 mod moderation;
 mod notifications;
@@ -13,6 +14,7 @@ pub(crate) mod sync;
 pub use blobs::*;
 pub use dm::*;
 pub use follow_requests::*;
+pub use identity::*;
 pub use interactions::*;
 pub use moderation::*;
 pub use notifications::*;

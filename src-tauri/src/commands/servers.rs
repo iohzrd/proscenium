@@ -109,11 +109,13 @@ pub async fn register_with_server(
     visibility: String,
 ) -> Result<(), String> {
     let vis: Visibility = visibility.parse().map_err(|_| "invalid visibility")?;
-    let pubkey = state.endpoint.id().to_string();
-    let secret_key = SecretKey::from_bytes(&state.secret_key_bytes);
+    let master_pubkey = state.master_pubkey.clone();
+    let transport_node_id = state.transport_node_id.clone();
+    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
 
     let payload = RegistrationPayload {
-        pubkey: pubkey.clone(),
+        master_pubkey: master_pubkey.clone(),
+        transport_node_id: transport_node_id.clone(),
         server_url: url.clone(),
         timestamp: now_millis(),
         visibility: vis,
@@ -122,12 +124,14 @@ pub async fn register_with_server(
     let signature = sign_registration(&payload, &secret_key);
 
     let request = RegistrationRequest {
-        pubkey,
+        master_pubkey,
+        transport_node_id,
         server_url: url.clone(),
         timestamp: payload.timestamp,
         visibility: vis,
         action: None,
         signature,
+        delegation: state.delegation.clone(),
     };
 
     let client = reqwest::Client::new();
@@ -160,11 +164,13 @@ pub async fn unregister_from_server(
     state: State<'_, Arc<AppState>>,
     url: String,
 ) -> Result<(), String> {
-    let pubkey = state.endpoint.id().to_string();
-    let secret_key = SecretKey::from_bytes(&state.secret_key_bytes);
+    let master_pubkey = state.master_pubkey.clone();
+    let transport_node_id = state.transport_node_id.clone();
+    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
 
     let payload = RegistrationPayload {
-        pubkey: pubkey.clone(),
+        master_pubkey: master_pubkey.clone(),
+        transport_node_id: transport_node_id.clone(),
         server_url: url.clone(),
         timestamp: now_millis(),
         visibility: Visibility::Public,
@@ -173,12 +179,14 @@ pub async fn unregister_from_server(
     let signature = sign_registration(&payload, &secret_key);
 
     let request = RegistrationRequest {
-        pubkey,
+        master_pubkey,
+        transport_node_id,
         server_url: url.clone(),
         timestamp: payload.timestamp,
         visibility: Visibility::Public,
         action: Some("unregister".to_string()),
         signature,
+        delegation: state.delegation.clone(),
     };
 
     let client = reqwest::Client::new();
@@ -397,12 +405,12 @@ pub async fn sync_profile_to_server(
 }
 
 pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), String> {
-    let pubkey = state.endpoint.id().to_string();
-    let secret_key = SecretKey::from_bytes(&state.secret_key_bytes);
+    let master_pubkey = state.master_pubkey.clone();
+    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
 
     let profile = state
         .storage
-        .get_profile(&pubkey)
+        .get_profile(&master_pubkey)
         .str_err()?
         .ok_or("no profile to sync")?;
 
@@ -414,7 +422,8 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         .unwrap_or_else(|| "public".to_string());
 
     let payload = RegistrationPayload {
-        pubkey: pubkey.clone(),
+        master_pubkey: master_pubkey.clone(),
+        transport_node_id: state.transport_node_id.clone(),
         server_url: url.to_string(),
         timestamp: now_millis(),
         visibility: vis.parse().unwrap_or_default(),
@@ -424,7 +433,8 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
 
     #[derive(Serialize)]
     struct ProfileUpdate {
-        pubkey: String,
+        master_pubkey: String,
+        transport_node_id: String,
         server_url: String,
         timestamp: u64,
         visibility: String,
@@ -432,10 +442,12 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         bio: Option<String>,
         avatar_hash: Option<String>,
         signature: String,
+        delegation: iroh_social_types::UserKeyDelegation,
     }
 
     let update = ProfileUpdate {
-        pubkey,
+        master_pubkey,
+        transport_node_id: state.transport_node_id.clone(),
         server_url: url.to_string(),
         timestamp: payload.timestamp,
         visibility: vis,
@@ -443,6 +455,7 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         bio: Some(profile.bio).filter(|s| !s.is_empty()),
         avatar_hash: profile.avatar_hash,
         signature,
+        delegation: state.delegation.clone(),
     };
 
     let client = reqwest::Client::new();

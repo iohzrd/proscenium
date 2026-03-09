@@ -18,6 +18,15 @@
   let copyFeedback = $state(false);
   let fileInput = $state<HTMLInputElement>(null!);
 
+  // Seed phrase state
+  let seedPhrase = $state("");
+  let seedRevealed = $state(false);
+  let seedCopyFeedback = $state(false);
+  let verifyIndices = $state<number[]>([]);
+  let verifyInputs = $state<string[]>(["", "", ""]);
+  let verifyError = $state("");
+  let verifying = $state(false);
+
   const visibilityOptions: {
     value: Visibility;
     label: string;
@@ -48,6 +57,12 @@
         goto("/");
         return;
       }
+      // Check if seed phrase was already backed up (returning user)
+      const backedUp = await invoke<boolean>("is_seed_phrase_backed_up");
+      if (backedUp) {
+        // Skip seed phrase steps
+        step = 0;
+      }
     } catch {
       setTimeout(() => location.reload(), 500);
     }
@@ -57,6 +72,60 @@
     await copyToClipboard(nodeId);
     copyFeedback = true;
     setTimeout(() => (copyFeedback = false), 1500);
+  }
+
+  async function loadSeedPhrase() {
+    seedPhrase = await invoke<string>("get_seed_phrase");
+  }
+
+  async function copySeedPhrase() {
+    await copyToClipboard(seedPhrase);
+    seedCopyFeedback = true;
+    setTimeout(() => (seedCopyFeedback = false), 1500);
+  }
+
+  function pickVerifyIndices() {
+    const indices: number[] = [];
+    while (indices.length < 3) {
+      const i = Math.floor(Math.random() * 24);
+      if (!indices.includes(i)) indices.push(i);
+    }
+    indices.sort((a, b) => a - b);
+    verifyIndices = indices;
+    verifyInputs = ["", "", ""];
+    verifyError = "";
+  }
+
+  async function goToVerify() {
+    pickVerifyIndices();
+    step = 2;
+  }
+
+  async function verifySeedPhrase() {
+    verifying = true;
+    verifyError = "";
+    try {
+      const checks: [number, string][] = verifyIndices.map((idx, i) => [
+        idx,
+        verifyInputs[i].trim().toLowerCase(),
+      ]);
+      const valid = await invoke<boolean>("verify_seed_phrase_words", {
+        checks,
+      });
+      if (valid) {
+        await invoke("mark_seed_phrase_backed_up");
+        step = 3;
+      } else {
+        verifyError = "One or more words are incorrect. Please try again.";
+      }
+    } catch (e) {
+      verifyError = `Verification failed: ${e}`;
+    }
+    verifying = false;
+  }
+
+  function skipBackup() {
+    step = 3;
   }
 
   async function handleAvatarUpload(e: Event) {
@@ -101,6 +170,8 @@
     }
     saving = false;
   }
+
+  let seedWords = $derived(seedPhrase ? seedPhrase.split(" ") : []);
 </script>
 
 <input
@@ -133,9 +204,105 @@
           {/if}
         </div>
       {/if}
-      <button class="btn-accent primary-btn" onclick={() => (step = 1)}>
-        Set Up Profile
+      <button
+        class="btn-accent primary-btn"
+        onclick={async () => {
+          await loadSeedPhrase();
+          step = 1;
+        }}
+      >
+        Continue
       </button>
+    </div>
+  {:else if step === 1}
+    <div class="step">
+      <h2>Back Up Your Recovery Phrase</h2>
+      <p class="desc">
+        This 24-word phrase is the only way to recover your identity. Write it
+        down and store it somewhere safe. If you lose it, your identity cannot
+        be recovered.
+      </p>
+
+      {#if seedRevealed}
+        <div class="seed-grid">
+          {#each seedWords as word, i}
+            <div class="seed-word">
+              <span class="seed-num">{i + 1}</span>
+              <span class="seed-text">{word}</span>
+            </div>
+          {/each}
+        </div>
+
+        <div class="seed-actions">
+          <button class="secondary-btn" onclick={copySeedPhrase}>
+            {seedCopyFeedback ? "Copied!" : "Copy to Clipboard"}
+          </button>
+        </div>
+      {:else}
+        <div class="seed-hidden">
+          <p class="seed-warning">
+            Make sure no one is looking at your screen before revealing.
+          </p>
+          <button
+            class="btn-accent primary-btn"
+            onclick={() => (seedRevealed = true)}
+          >
+            Reveal Recovery Phrase
+          </button>
+        </div>
+      {/if}
+
+      <div class="actions">
+        <button class="secondary-btn" onclick={() => (step = 0)}>Back</button>
+        {#if seedRevealed}
+          <button class="btn-accent primary-btn" onclick={goToVerify}>
+            I've Written It Down
+          </button>
+        {/if}
+      </div>
+
+      <button class="skip-btn" onclick={skipBackup}>
+        Skip for now (not recommended)
+      </button>
+    </div>
+  {:else if step === 2}
+    <div class="step">
+      <h2>Verify Your Phrase</h2>
+      <p class="desc">
+        Enter the following words from your recovery phrase to confirm you've
+        saved it correctly.
+      </p>
+
+      <div class="verify-fields">
+        {#each verifyIndices as wordIdx, i}
+          <label class="verify-field">
+            <span class="verify-label">Word #{wordIdx + 1}</span>
+            <input
+              class="input-base"
+              type="text"
+              bind:value={verifyInputs[i]}
+              placeholder="Enter word"
+              autocapitalize="none"
+              autocomplete="off"
+            />
+          </label>
+        {/each}
+      </div>
+
+      {#if verifyError}
+        <p class="error">{verifyError}</p>
+      {/if}
+
+      <div class="actions">
+        <button class="secondary-btn" onclick={() => (step = 1)}>Back</button>
+        <button
+          class="btn-accent primary-btn"
+          onclick={verifySeedPhrase}
+          disabled={verifyInputs.some((w) => !w.trim()) || verifying}
+        >
+          {verifying ? "Verifying..." : "Verify"}
+        </button>
+      </div>
     </div>
   {:else}
     <div class="step">
@@ -202,7 +369,7 @@
       </div>
 
       <div class="actions">
-        <button class="secondary-btn" onclick={() => (step = 0)}>Back</button>
+        <button class="secondary-btn" onclick={() => (step = 1)}>Back</button>
         <button
           class="btn-accent primary-btn"
           onclick={saveProfile}
@@ -226,7 +393,7 @@
   }
 
   .step {
-    max-width: 360px;
+    max-width: 420px;
     width: 100%;
     text-align: center;
   }
@@ -290,6 +457,98 @@
     margin-top: 0.3rem;
   }
 
+  /* Seed phrase grid */
+  .seed-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    text-align: left;
+  }
+
+  .seed-word {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.6rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+
+  .seed-num {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+    min-width: 1.2rem;
+  }
+
+  .seed-text {
+    color: var(--text-primary);
+  }
+
+  .seed-actions {
+    margin-bottom: 1.5rem;
+  }
+
+  .seed-hidden {
+    padding: 2rem 1rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    margin-bottom: 1.5rem;
+  }
+
+  .seed-warning {
+    color: var(--text-tertiary);
+    font-size: var(--text-sm);
+    margin: 0 0 1rem;
+  }
+
+  .skip-btn {
+    display: block;
+    margin: 1rem auto 0;
+    background: none;
+    border: none;
+    color: var(--text-tertiary);
+    font-size: var(--text-sm);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  .skip-btn:hover {
+    color: var(--text-secondary);
+  }
+
+  /* Verify */
+  .verify-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    text-align: left;
+  }
+
+  .verify-field {
+    display: block;
+  }
+
+  .verify-label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+  }
+
+  .error {
+    color: var(--color-danger);
+    font-size: var(--text-sm);
+    margin: 0 0 1rem;
+  }
+
+  /* Shared */
   .avatar-section {
     display: flex;
     flex-direction: column;

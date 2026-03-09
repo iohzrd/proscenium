@@ -31,6 +31,7 @@
   let aliasInput = $state("");
   const isMobile = platform() === "android" || platform() === "ios";
   let showScanner = $state(false);
+  let scannedTransportNodeId = $state<string | null>(null);
 
   const copyFb = useCopyFeedback();
 
@@ -136,7 +137,9 @@
     addingFollow = true;
     status = "";
     try {
-      await invoke("follow_user", { pubkey });
+      const transportNodeId = scannedTransportNodeId;
+      scannedTransportNodeId = null;
+      await invoke("follow_user", { pubkey, transportNodeId });
       newPubkey = "";
       await loadFollows();
       hapticImpact("light");
@@ -278,9 +281,10 @@
 
     {#if showScanner}
       <ScannerModal
-        onscanned={(nodeId) => {
+        onscanned={(result) => {
           showScanner = false;
-          newPubkey = nodeId;
+          newPubkey = result.pubkey;
+          scannedTransportNodeId = result.transportNodeId ?? null;
           followUser();
         }}
         onclose={() => (showScanner = false)}

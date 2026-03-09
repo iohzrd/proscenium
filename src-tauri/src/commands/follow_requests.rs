@@ -52,11 +52,26 @@ pub async fn send_follow_request_to_peer(
         "[follow-req] sending follow request to {}",
         short_id(&pubkey)
     );
-    let target: iroh::EndpointId = pubkey.parse().str_err()?;
-    let response =
-        crate::peer::send_follow_request(&state.endpoint, target, &state.secret_key_bytes)
-            .await
-            .str_err()?;
+
+    // Resolve transport NodeId from cache
+    let node_ids = state
+        .storage
+        .get_peer_transport_node_ids(&pubkey)
+        .str_err()?;
+    let first_node_id = node_ids
+        .first()
+        .ok_or_else(|| format!("no transport NodeIds cached for {}", short_id(&pubkey)))?;
+    let target: iroh::EndpointId = first_node_id.parse().str_err()?;
+
+    let response = crate::peer::send_follow_request(
+        &state.endpoint,
+        target,
+        &state.master_pubkey,
+        &state.user_secret_key_bytes,
+        &state.delegation,
+    )
+    .await
+    .str_err()?;
 
     let result = match response {
         FollowResponse::Approved => "approved",
