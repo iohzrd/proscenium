@@ -71,8 +71,10 @@ pub async fn handle_device_sync(
         .map_err(AcceptError::from_err)?;
     send.finish().map_err(AcceptError::from_err)?;
 
-    // Open a data stream to send our deltas
-    let (mut data_send, mut data_recv) = conn.accept_bi().await?;
+    // Open a data stream to send our deltas first.
+    // Responder must open_bi() because QUIC streams are lazy: the remote
+    // won't see the stream via accept_bi() until data or FIN is sent on it.
+    let (mut data_send, mut data_recv) = conn.open_bi().await.map_err(AcceptError::from_err)?;
 
     // Compute and send deltas that the peer needs
     send_deltas(storage, master_pubkey, &peer_vector, &mut data_send).await?;
@@ -141,8 +143,9 @@ pub async fn sync_with_device(
         anyhow::bail!("peer failed challenge: {reason}");
     }
 
-    // Open data stream: first receive peer's deltas, then send ours
-    let (mut data_send, mut data_recv) = conn.open_bi().await?;
+    // Accept the data stream opened by the responder.
+    // The responder opens this stream and sends first (QUIC streams are lazy).
+    let (mut data_send, mut data_recv) = conn.accept_bi().await?;
 
     // Receive and import deltas from the responder
     let imported = import_deltas(storage, master_pubkey, &mut data_recv).await?;
