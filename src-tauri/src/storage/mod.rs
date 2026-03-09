@@ -1,4 +1,5 @@
 mod crypto;
+mod device_sync;
 pub(crate) mod follow_requests;
 mod interactions;
 mod linked_devices;

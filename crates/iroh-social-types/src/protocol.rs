@@ -1,6 +1,9 @@
 use crate::delegation::SigningKeyDelegation;
 use crate::signing::{hex_to_signature, signature_to_hex};
-use crate::types::{DeviceEntry, Interaction, Post, Profile};
+use crate::types::{
+    DeviceEntry, DeviceSyncVector, FollowSyncEntry, Interaction, ModerationSyncEntry, Post,
+    Profile, RatchetSessionExport,
+};
 use iroh::{PublicKey, SecretKey};
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
@@ -82,6 +85,15 @@ pub enum PeerRequest {
         /// Noise IK+PSK handshake init message (opaque bytes).
         noise_init: Vec<u8>,
     },
+    /// Device-to-device sync: linked device requests state sync.
+    DeviceSyncRequest {
+        /// Random challenge (32 bytes) to prove signing key possession.
+        challenge: Vec<u8>,
+        /// Signature of the challenge with the signing key.
+        challenge_sig: String,
+        /// Compact summary of the initiator's local state.
+        vector: DeviceSyncVector,
+    },
 }
 
 /// Response sent back depending on the request type.
@@ -97,6 +109,13 @@ pub enum PeerResponse {
         noise_response: Vec<u8>,
         /// LinkBundleData encrypted with the Noise transport.
         encrypted_bundle: Vec<u8>,
+    },
+    /// Device-to-device sync: responder accepts and sends its own vector.
+    DeviceSyncAccepted {
+        /// Signature of the initiator's challenge (proves signing key).
+        challenge_response: String,
+        /// Responder's own sync vector.
+        vector: DeviceSyncVector,
     },
 }
 
@@ -179,6 +198,46 @@ pub enum SyncFrame {
     Posts(Vec<Post>),
     Interactions(Vec<Interaction>),
     DeviceAnnouncements(Vec<LinkedDevicesAnnouncement>),
+}
+
+/// Streamed frame for device-to-device sync.
+/// Uses the same length-prefixed framing as SyncFrame.
+#[derive(Debug, Serialize, Deserialize)]
+pub enum DeviceSyncFrame {
+    Posts(Vec<Post>),
+    Interactions(Vec<Interaction>),
+    Follows(Vec<FollowSyncEntry>),
+    Mutes(Vec<ModerationSyncEntry>),
+    Blocks(Vec<ModerationSyncEntry>),
+    Bookmarks(Vec<String>),
+    RatchetSessions(Vec<RatchetSessionExport>),
+}
+
+/// Canonical bytes for signing a device sync challenge.
+fn device_sync_challenge_signing_bytes(challenge: &[u8]) -> Vec<u8> {
+    let mut bytes = b"iroh-social-device-sync-v1:".to_vec();
+    bytes.extend_from_slice(challenge);
+    bytes
+}
+
+/// Sign a device sync challenge with the signing key.
+pub fn sign_device_sync_challenge(challenge: &[u8], secret_key: &SecretKey) -> String {
+    let bytes = device_sync_challenge_signing_bytes(challenge);
+    let sig = secret_key.sign(&bytes);
+    signature_to_hex(&sig)
+}
+
+/// Verify a device sync challenge signature against the signing key.
+pub fn verify_device_sync_challenge(
+    challenge: &[u8],
+    signature: &str,
+    signer_pubkey: &PublicKey,
+) -> Result<(), String> {
+    let sig = hex_to_signature(signature)?;
+    let bytes = device_sync_challenge_signing_bytes(challenge);
+    signer_pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "device sync challenge verification failed".to_string())
 }
 
 /// Canonical bytes for signing a follow request.

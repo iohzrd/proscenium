@@ -84,6 +84,7 @@ impl ProtocolHandler for PeerHandler {
                 PeerRequest::FollowRequest(_) => "follow-request",
                 PeerRequest::IdentityRequest => "identity-request",
                 PeerRequest::LinkRequest { .. } => "link-request",
+                PeerRequest::DeviceSyncRequest { .. } => "device-sync",
             },
             short_id(&remote_str)
         );
@@ -146,6 +147,23 @@ impl ProtocolHandler for PeerHandler {
                     &self.app_handle,
                     send,
                     noise_init,
+                    &conn,
+                )
+                .await
+            }
+            PeerRequest::DeviceSyncRequest {
+                challenge,
+                challenge_sig,
+                vector,
+            } => {
+                crate::device_sync::handle_device_sync(
+                    &self.storage,
+                    &self.master_pubkey,
+                    &self.signing_secret_key_bytes,
+                    send,
+                    challenge,
+                    challenge_sig,
+                    vector,
                     &conn,
                 )
                 .await

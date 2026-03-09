@@ -1,6 +1,7 @@
 mod commands;
 mod constants;
 mod crypto;
+mod device_sync;
 mod dm;
 mod ext;
 mod gossip;
@@ -135,6 +136,7 @@ pub fn run() {
             cancel_device_link,
             link_with_device,
             get_linked_devices,
+            force_device_sync,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

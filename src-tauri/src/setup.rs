@@ -526,14 +526,13 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     let peer_node_ids = push_storage
                         .get_peer_transport_node_ids(&peer)
                         .unwrap_or_default();
-                    let target: iroh::EndpointId = if let Some(first) = peer_node_ids.first() {
-                        match first.parse() {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        }
-                    } else {
+                    let targets: Vec<iroh::EndpointId> = peer_node_ids
+                        .iter()
+                        .filter_map(|id| id.parse().ok())
+                        .collect();
+                    if targets.is_empty() {
                         continue;
-                    };
+                    }
 
                     let profile_entries = push_storage
                         .get_pending_push_profile_ids(&peer)
@@ -593,25 +592,41 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         .collect();
                     all_ids.extend_from_slice(&profile_entries);
 
-                    match push::push_to_peer(&push_ep, target, &msg).await {
-                        Ok(ack) => {
-                            log::info!(
-                                "[push-outbox] delivered {} posts, {} interactions to {}{}",
-                                ack.received_post_ids.len(),
-                                ack.received_interaction_ids.len(),
-                                short_id(&peer),
-                                if profile_entries.is_empty() {
-                                    ""
-                                } else {
-                                    " (+ profile)"
-                                },
-                            );
-                            let _ = push_storage.remove_push_outbox_entries(&all_ids);
+                    let mut delivered = false;
+                    for target in &targets {
+                        match push::push_to_peer(&push_ep, *target, &msg).await {
+                            Ok(ack) => {
+                                log::info!(
+                                    "[push-outbox] delivered {} posts, {} interactions to {}{}",
+                                    ack.received_post_ids.len(),
+                                    ack.received_interaction_ids.len(),
+                                    short_id(&peer),
+                                    if profile_entries.is_empty() {
+                                        ""
+                                    } else {
+                                        " (+ profile)"
+                                    },
+                                );
+                                delivered = true;
+                                break;
+                            }
+                            Err(e) => {
+                                log::debug!(
+                                    "[push-outbox] failed to push to {} device: {e}",
+                                    short_id(&peer)
+                                );
+                            }
                         }
-                        Err(e) => {
-                            log::error!("[push-outbox] failed to push to {}: {e}", short_id(&peer));
-                            let _ = push_storage.mark_push_attempted(&all_ids);
-                        }
+                    }
+                    if delivered {
+                        let _ = push_storage.remove_push_outbox_entries(&all_ids);
+                    } else {
+                        log::error!(
+                            "[push-outbox] failed to push to {} (tried {} devices)",
+                            short_id(&peer),
+                            targets.len()
+                        );
+                        let _ = push_storage.mark_push_attempted(&all_ids);
                     }
                 }
             }
@@ -648,6 +663,25 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     }
                     _ => {}
                 }
+            }
+        });
+
+        // Periodic device sync task
+        let dsync_ep = endpoint.clone();
+        let dsync_storage = storage_clone.clone();
+        let dsync_master = master_pubkey_clone.clone();
+        let dsync_signing = signing_secret_key_bytes;
+        tokio::spawn(async move {
+            tokio::time::sleep(DEVICE_SYNC_INITIAL_DELAY).await;
+            loop {
+                crate::device_sync::sync_all_devices(
+                    &dsync_ep,
+                    &dsync_storage,
+                    &dsync_master,
+                    &dsync_signing,
+                )
+                .await;
+                tokio::time::sleep(DEVICE_SYNC_INTERVAL).await;
             }
         });
 

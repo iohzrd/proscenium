@@ -229,3 +229,16 @@ pub async fn get_linked_devices(
         .get_linked_devices()
         .map_err(|e| format!("failed to get linked devices: {e}"))
 }
+
+/// Force an immediate device sync with all linked devices.
+#[tauri::command]
+pub async fn force_device_sync(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    crate::device_sync::sync_all_devices(
+        &state.endpoint,
+        &state.storage,
+        &state.master_pubkey,
+        &state.signing_secret_key_bytes,
+    )
+    .await;
+    Ok(())
+}

@@ -138,13 +138,16 @@ impl Storage {
     /// Export all ratchet sessions for device pairing transfer.
     pub fn export_ratchet_sessions(&self) -> anyhow::Result<Vec<RatchetSessionExport>> {
         self.with_db(|db| {
-            let mut stmt = db.prepare("SELECT peer_pubkey, state_json FROM dm_ratchet_sessions")?;
+            let mut stmt = db.prepare(
+                "SELECT peer_pubkey, state_json, COALESCE(updated_at, 0) FROM dm_ratchet_sessions",
+            )?;
             let mut rows = stmt.query([])?;
             let mut sessions = Vec::new();
             while let Some(row) = rows.next()? {
                 sessions.push(RatchetSessionExport {
                     peer_pubkey: row.get(0)?,
                     state_json: row.get(1)?,
+                    updated_at: row.get::<_, i64>(2)? as u64,
                 });
             }
             Ok(sessions)

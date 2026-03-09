@@ -162,9 +162,58 @@ pub struct LinkBundleData {
     pub ratchet_sessions: Vec<RatchetSessionExport>,
 }
 
-/// Exported ratchet session for transfer during device pairing.
+/// Exported ratchet session for transfer during device pairing and sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RatchetSessionExport {
     pub peer_pubkey: String,
     pub state_json: String,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+/// Follow entry with LWW state for device sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowSyncEntry {
+    pub pubkey: String,
+    pub alias: Option<String>,
+    pub followed_at: u64,
+    pub state: String,
+    pub last_changed_at: u64,
+}
+
+/// Moderation entry (mute or block) with LWW state for device sync.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModerationSyncEntry {
+    pub pubkey: String,
+    pub created_at: u64,
+    pub state: String,
+    pub last_changed_at: u64,
+}
+
+/// Ratchet session summary for device sync vector comparison.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetSyncEntry {
+    pub peer_pubkey: String,
+    pub updated_at: u64,
+}
+
+/// Compact summary of local state for device sync negotiation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceSyncVector {
+    pub post_count: u64,
+    pub newest_post_ts: u64,
+    pub interaction_count: u64,
+    pub newest_interaction_ts: u64,
+    /// Full follow list with LWW timestamps.
+    pub follows: Vec<FollowSyncEntry>,
+    /// Full mute list with LWW timestamps.
+    pub mutes: Vec<ModerationSyncEntry>,
+    /// Full block list with LWW timestamps.
+    pub blocks: Vec<ModerationSyncEntry>,
+    /// All bookmark post IDs.
+    pub bookmarks: Vec<String>,
+    /// Ratchet session summaries (peer + updated_at).
+    pub ratchet_summaries: Vec<RatchetSyncEntry>,
+    /// Newest DM message timestamp across all conversations.
+    pub dm_newest_ts: u64,
 }
