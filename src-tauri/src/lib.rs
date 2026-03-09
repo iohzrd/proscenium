@@ -89,6 +89,7 @@ pub fn run() {
             fetch_blob,
             add_blob_bytes,
             fetch_blob_bytes,
+            refetch_blob_bytes,
             get_node_status,
             send_dm,
             get_conversations,
@@ -130,6 +131,10 @@ pub fn run() {
             is_seed_phrase_backed_up,
             mark_seed_phrase_backed_up,
             verify_seed_phrase_words,
+            start_device_link,
+            cancel_device_link,
+            link_with_device,
+            get_linked_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

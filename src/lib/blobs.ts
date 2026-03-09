@@ -31,6 +31,21 @@ export function createBlobCache() {
     return url;
   }
 
+  async function refetchBlobUrl(attachment: MediaAttachment): Promise<string> {
+    const old = cache.get(attachment.hash);
+    if (old) URL.revokeObjectURL(old);
+    cache.delete(attachment.hash);
+    const bytes: number[] = await invoke("refetch_blob_bytes", {
+      ticket: attachment.ticket,
+    });
+    const blob = new Blob([new Uint8Array(bytes)], {
+      type: attachment.mime_type,
+    });
+    const url = URL.createObjectURL(blob);
+    cache.set(attachment.hash, url);
+    return url;
+  }
+
   async function downloadFile(att: MediaAttachment): Promise<void> {
     const url = await getBlobUrl(att);
     const a = document.createElement("a");
@@ -55,5 +70,5 @@ export function createBlobCache() {
     }
   }
 
-  return { getBlobUrl, downloadFile, revokeAll, revokeStale };
+  return { getBlobUrl, refetchBlobUrl, downloadFile, revokeAll, revokeStale };
 }

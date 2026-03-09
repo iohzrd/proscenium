@@ -1,3 +1,4 @@
+use crate::state::PendingLinkState;
 use crate::storage::Storage;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -6,11 +7,11 @@ use iroh::{
 };
 use iroh_social_types::{
     FollowRequest, FollowResponse, IdentityResponse, PEER_ALPN, PeerRequest, PeerResponse,
-    SigningKeyDelegation, Visibility, now_millis, short_id, sign_follow_request,
-    verify_follow_request,
+    SigningKeyDelegation, Visibility, derive_transport_key, now_millis, short_id,
+    sign_follow_request, verify_follow_request,
 };
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone)]
 pub struct PeerHandler {
@@ -21,15 +22,25 @@ pub struct PeerHandler {
     transport_node_id: String,
     /// The current signing key delegation.
     delegation: SigningKeyDelegation,
+    /// Master secret key bytes (needed for deriving transport keys during pairing).
+    master_secret_key_bytes: [u8; 32],
+    /// Signing secret key bytes (transferred during pairing).
+    signing_secret_key_bytes: [u8; 32],
+    /// Active device-linking session (if any).
+    pending_link: PendingLinkState,
     app_handle: AppHandle,
 }
 
 impl PeerHandler {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage: Arc<Storage>,
         master_pubkey: String,
         transport_node_id: String,
         delegation: SigningKeyDelegation,
+        master_secret_key_bytes: [u8; 32],
+        signing_secret_key_bytes: [u8; 32],
+        pending_link: PendingLinkState,
         app_handle: AppHandle,
     ) -> Self {
         Self {
@@ -37,6 +48,9 @@ impl PeerHandler {
             master_pubkey,
             transport_node_id,
             delegation,
+            master_secret_key_bytes,
+            signing_secret_key_bytes,
+            pending_link,
             app_handle,
         }
     }
@@ -69,6 +83,7 @@ impl ProtocolHandler for PeerHandler {
                 PeerRequest::Push(_) => "push",
                 PeerRequest::FollowRequest(_) => "follow-request",
                 PeerRequest::IdentityRequest => "identity-request",
+                PeerRequest::LinkRequest { .. } => "link-request",
             },
             short_id(&remote_str)
         );
@@ -116,6 +131,21 @@ impl ProtocolHandler for PeerHandler {
                     &self.transport_node_id,
                     &self.delegation,
                     send,
+                    &conn,
+                )
+                .await
+            }
+            PeerRequest::LinkRequest { noise_init } => {
+                handle_link_request(
+                    &self.storage,
+                    &self.master_pubkey,
+                    &self.master_secret_key_bytes,
+                    &self.signing_secret_key_bytes,
+                    &self.delegation,
+                    &self.pending_link,
+                    &self.app_handle,
+                    send,
+                    noise_init,
                     &conn,
                 )
                 .await
@@ -336,6 +366,162 @@ pub async fn query_identity(
             std::mem::discriminant(&other)
         ),
     }
+}
+
+/// Handle a LinkRequest: validate the pending link session, perform Noise IK+PSK handshake,
+/// and send the encrypted LinkBundle to the new device.
+#[allow(clippy::too_many_arguments)]
+async fn handle_link_request(
+    storage: &Storage,
+    master_pubkey: &str,
+    master_secret_key_bytes: &[u8; 32],
+    signing_secret_key_bytes: &[u8; 32],
+    delegation: &SigningKeyDelegation,
+    pending_link: &PendingLinkState,
+    app_handle: &AppHandle,
+    mut send: iroh::endpoint::SendStream,
+    noise_init: Vec<u8>,
+    conn: &Connection,
+) -> Result<(), AcceptError> {
+    // Take the pending link session (consume it - one-time use)
+    let link_session = {
+        let mut lock = pending_link.lock().await;
+        lock.take()
+    };
+
+    let link_session = match link_session {
+        Some(session) => {
+            // Check expiry
+            if now_millis() > session.expires_at {
+                log::warn!("[link] pending link session expired");
+                return Err(AcceptError::from_err(std::io::Error::other(
+                    "link session expired",
+                )));
+            }
+            session
+        }
+        None => {
+            log::warn!("[link] no pending link session");
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "no pending link session",
+            )));
+        }
+    };
+
+    // Perform Noise IK+PSK handshake (responder side)
+    let (mut transport, noise_response) = crate::crypto::noise_psk_respond(
+        &link_session.x25519_private,
+        &link_session.psk,
+        &noise_init,
+    )
+    .map_err(|e| {
+        log::error!("[link] noise handshake failed: {e}");
+        AcceptError::from_err(std::io::Error::other(format!(
+            "noise handshake failed: {e}"
+        )))
+    })?;
+
+    // Derive a transport key for the new device
+    let new_device_index = storage.next_device_index().map_err(|e| {
+        AcceptError::from_err(std::io::Error::other(format!(
+            "failed to get next device index: {e}"
+        )))
+    })?;
+    let new_transport_key_bytes = derive_transport_key(master_secret_key_bytes, new_device_index);
+
+    // Build the link bundle
+    let master_key_to_send = if link_session.transfer_master_key {
+        Some(master_secret_key_bytes)
+    } else {
+        None
+    };
+
+    let bundle = storage
+        .export_link_bundle(
+            master_pubkey,
+            signing_secret_key_bytes,
+            delegation,
+            &new_transport_key_bytes,
+            new_device_index,
+            master_key_to_send,
+        )
+        .map_err(|e| {
+            AcceptError::from_err(std::io::Error::other(format!(
+                "failed to export link bundle: {e}"
+            )))
+        })?;
+
+    // Serialize and encrypt the bundle with Noise transport
+    let bundle_json = serde_json::to_vec(&bundle).map_err(AcceptError::from_err)?;
+    let encrypted_bundle = crate::crypto::noise_transport_encrypt(&mut transport, &bundle_json)
+        .map_err(|e| {
+            AcceptError::from_err(std::io::Error::other(format!("noise encrypt failed: {e}")))
+        })?;
+
+    // Send the response
+    let response = PeerResponse::LinkBundle {
+        noise_response,
+        encrypted_bundle,
+    };
+    let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+    send.write_all(&resp_bytes)
+        .await
+        .map_err(AcceptError::from_err)?;
+    send.finish().map_err(AcceptError::from_err)?;
+
+    log::info!("[link] sent link bundle to new device");
+    let _ = app_handle.emit("device-link-progress", "bundle_sent");
+
+    // Register the new device and broadcast updated announcement
+    let new_transport_secret = iroh::SecretKey::from_bytes(&new_transport_key_bytes);
+    let new_transport_node_id = new_transport_secret.public().to_string();
+
+    let device_name = format!("Device {}", new_device_index);
+    let now = now_millis();
+    if let Err(e) =
+        storage.upsert_linked_device(&new_transport_node_id, &device_name, false, false, now)
+    {
+        log::error!("[link] failed to register new device: {e}");
+    } else {
+        log::info!(
+            "[link] registered new device {} (index={})",
+            short_id(&new_transport_node_id),
+            new_device_index
+        );
+    }
+
+    // Build and broadcast updated announcement with all devices
+    if let Ok(all_devices) = storage.get_linked_devices() {
+        let signing_sk = iroh::SecretKey::from_bytes(signing_secret_key_bytes);
+        let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
+            master_pubkey: master_pubkey.to_string(),
+            delegation: delegation.clone(),
+            devices: all_devices,
+            version: (new_device_index + 1) as u64,
+            timestamp: now,
+            signature: String::new(),
+        };
+        iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
+
+        if let Some(state) = app_handle.try_state::<Arc<crate::state::AppState>>() {
+            let feed = state.feed.clone();
+            let announcement_clone = announcement.clone();
+            tokio::spawn(async move {
+                let feed_lock = feed.lock().await;
+                if let Err(e) = feed_lock
+                    .broadcast_linked_devices(&announcement_clone)
+                    .await
+                {
+                    log::error!("[link] failed to broadcast device announcement: {e}");
+                } else {
+                    log::info!("[link] broadcast updated device announcement");
+                }
+            });
+        }
+    }
+
+    conn.closed().await;
+    Ok(())
 }
 
 /// Handle an IdentityRequest: respond with our master pubkey, delegation, and profile.

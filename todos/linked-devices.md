@@ -629,7 +629,7 @@ Existing Device                     New Device
    |                         <---------  |
    |                                     |
    |  3. New device connects via QUIC    |
-   |     on LINK_ALPN                    |
+   |     on PEER_ALPN                    |
    |     <----------------------------   |
    |                                     |
    |  4. Noise IK + PSK handshake        |
@@ -664,11 +664,9 @@ Existing Device                     New Device
    |   independent operation.]           |
 ```
 
-### ALPN
+### Protocol Integration
 
-```rust
-pub const LINK_ALPN: &[u8] = b"iroh-social/link/1";
-```
+Device linking uses the existing `PEER_ALPN` with new `PeerRequest::LinkRequest` and `PeerResponse::LinkBundle` variants. No new ALPN is needed.
 
 ### QR Code Content
 
@@ -1044,15 +1042,13 @@ Device sync keeps linked devices consistent. It is more complex than the per-dev
 | Bookmarks | Yes | Set union |
 | Mutes / Blocks | Yes | LWW-per-entry by timestamp |
 
-### Sync ALPN
+### Sync Protocol Integration
 
-```rust
-pub const DEVICE_SYNC_ALPN: &[u8] = b"iroh-social/device-sync/1";
-```
+Device sync uses the existing `PEER_ALPN` with new `PeerRequest::DeviceSync` and `PeerResponse::DeviceSyncData` variants. No new ALPN is needed.
 
 ### Sync Protocol
 
-A lightweight protocol between linked devices. Authentication: during the QUIC connection on `DEVICE_SYNC_ALPN`, both sides prove they hold the user secret key by signing a challenge with it. This ensures only devices with the shared user key can sync.
+A lightweight protocol between linked devices. Authentication: during the QUIC connection on `PEER_ALPN`, both sides prove they hold the user secret key by signing a challenge with it. This ensures only devices with the shared user key can sync.
 
 ```rust
 /// Summary of what a device has, exchanged at sync start.
@@ -1103,7 +1099,7 @@ pub struct DeviceSyncAuth {
 ```
 
 Flow:
-1. Device A connects to Device B on `DEVICE_SYNC_ALPN`.
+1. Device A connects to Device B on `PEER_ALPN` and sends `PeerRequest::DeviceSync`.
 2. Both send `DeviceSyncAuth` with a random nonce, signed by user key.
 3. Both verify the other's signature matches the expected user pubkey.
 4. If verification fails, disconnect.
@@ -1352,24 +1348,24 @@ pub struct AppState {
 
 Register new protocol handlers in the router:
 
+The router does NOT need new ALPN registrations. Device linking and device sync are handled as new variants within the existing `PeerHandler` on `PEER_ALPN`:
+
 ```rust
 let router = Router::builder(endpoint.clone())
     .accept(iroh_blobs::ALPN, blobs.clone())
     .accept(iroh_gossip::ALPN, gossip.clone())
-    .accept(SYNC_ALPN, sync_handler)
+    .accept(PEER_ALPN, peer_handler)  // handles Sync, Push, FollowRequest, IdentityRequest, LinkRequest, DeviceSync
     .accept(DM_ALPN, dm_handler.clone())
-    .accept(LINK_ALPN, link_handler)             // NEW
-    .accept(DEVICE_SYNC_ALPN, device_sync_handler) // NEW
     .spawn();
 ```
 
-**LinkHandler**: Accepts incoming pairing connections. Performs Noise IK + PSK handshake, receives device info, sends LinkBundle (including user secret key and ratchet sessions).
-
-**DeviceSyncHandler**: Accepts incoming sync connections from linked devices. Performs challenge-response authentication (both sides prove user key possession). Exchanges sync vectors and streams deltas including ratchet state.
+The `PeerHandler` is extended with new `PeerRequest`/`PeerResponse` variants:
+- `PeerRequest::LinkRequest(LinkPayload)` / `PeerResponse::LinkBundle(LinkBundle)` for pairing
+- `PeerRequest::DeviceSync(DeviceSyncAuth)` / `PeerResponse::DeviceSyncData(...)` for device sync
 
 ### SyncHandler Update (Peer Sync)
 
-The existing `SyncHandler` (for peer sync on `SYNC_ALPN`) must be updated to accept sync requests where `SyncRequest.author` matches this device's master pubkey. Currently verification checks that the author matches the iroh NodeId; with separate transport keys, the NodeId differs from the identity. The handler must map from master pubkey to "this is my identity" via `AppState::master_pubkey`.
+The existing `PeerHandler` (for peer sync on `PEER_ALPN`) must be updated to accept sync requests where `SyncRequest.author` matches this device's master pubkey. Currently verification checks that the author matches the iroh NodeId; with separate transport keys, the NodeId differs from the identity. The handler must map from master pubkey to "this is my identity" via `AppState::master_pubkey`.
 
 ### Gossip Topic Participation
 
@@ -1695,8 +1691,8 @@ Events are created on the device holding the master key:
 
 ### Phase 4: Pairing Protocol
 
-- [ ] Define `LINK_ALPN` and wire types (`LinkQrPayload`, `LinkBundle`, `RatchetSessionExport`)
-- [ ] Implement `LinkHandler` (ProtocolHandler for pairing)
+- [ ] Add `LinkRequest`/`LinkBundle` variants to `PeerRequest`/`PeerResponse` and define wire types (`LinkQrPayload`, `LinkBundle`, `RatchetSessionExport`)
+- [ ] Handle `LinkRequest` in `PeerHandler`
 - [ ] Implement Noise IK + PSK handshake for pairing channel
 - [ ] Implement existing device side: generate QR, listen, send LinkBundle (including user key, delegation, optionally master key, and ratchet sessions)
 - [ ] Implement new device side: scan QR, connect, receive LinkBundle, import data, save user key (and master key if provided)
@@ -1709,8 +1705,8 @@ Events are created on the device holding the master key:
 
 ### Phase 5: Device Sync
 
-- [ ] Define `DEVICE_SYNC_ALPN` and sync types (`DeviceSyncVector`, `DeviceSyncAuth`)
-- [ ] Implement `DeviceSyncHandler` (ProtocolHandler)
+- [ ] Add `DeviceSync` variants to `PeerRequest`/`PeerResponse` and define sync types (`DeviceSyncVector`, `DeviceSyncAuth`)
+- [ ] Handle `DeviceSync` in `PeerHandler`
 - [ ] Implement challenge-response authentication (both sides prove user key possession)
 - [ ] Implement sync vector generation from local state
 - [ ] Implement delta computation and streaming

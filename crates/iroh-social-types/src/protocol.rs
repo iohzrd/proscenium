@@ -77,6 +77,11 @@ pub enum PeerRequest {
     FollowRequest(FollowRequest),
     /// Ask a peer "who are you?" -- resolves transport NodeId to master pubkey.
     IdentityRequest,
+    /// Device pairing: new device sends Noise IK+PSK init message.
+    LinkRequest {
+        /// Noise IK+PSK handshake init message (opaque bytes).
+        noise_init: Vec<u8>,
+    },
 }
 
 /// Response sent back depending on the request type.
@@ -86,6 +91,13 @@ pub enum PeerResponse {
     PushAck(PushAck),
     FollowResponse(FollowResponse),
     Identity(IdentityResponse),
+    /// Device pairing: existing device sends Noise response + encrypted bundle.
+    LinkBundle {
+        /// Noise IK+PSK handshake response message (opaque bytes).
+        noise_response: Vec<u8>,
+        /// LinkBundleData encrypted with the Noise transport.
+        encrypted_bundle: Vec<u8>,
+    },
 }
 
 /// Pushed from author to follower/mutual.

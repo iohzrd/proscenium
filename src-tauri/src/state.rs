@@ -7,6 +7,22 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Active device-linking session on the existing device.
+/// Created when the user taps "Link New Device", consumed when a new device connects.
+#[derive(Debug)]
+pub struct PendingLink {
+    /// The one-time PSK (32 bytes) for Noise IK+PSK handshake.
+    pub psk: [u8; 32],
+    /// The existing device's X25519 private key (for Noise handshake).
+    pub x25519_private: [u8; 32],
+    /// When this pending link expires (Unix timestamp ms).
+    pub expires_at: u64,
+    /// Whether to include the master secret key in the bundle.
+    pub transfer_master_key: bool,
+}
+
+pub type PendingLinkState = Arc<Mutex<Option<PendingLink>>>;
+
 pub struct AppState {
     pub endpoint: Endpoint,
     /// Kept alive to maintain protocol handler registrations (DM, blobs, etc.)
@@ -18,7 +34,6 @@ pub struct AppState {
     pub feed: Arc<Mutex<FeedManager>>,
     pub dm: DmHandler,
     /// Master key secret bytes (permanent identity, cold storage).
-    #[allow(dead_code)]
     pub master_secret_key_bytes: [u8; 32],
     /// Master public key string (the permanent, unforgeable identity).
     pub master_pubkey: String,
@@ -34,6 +49,8 @@ pub struct AppState {
     pub transport_node_id: String,
     /// The current signing key delegation (signed by master key).
     pub delegation: iroh_social_types::SigningKeyDelegation,
+    /// Active device-linking session (if any).
+    pub pending_link: PendingLinkState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

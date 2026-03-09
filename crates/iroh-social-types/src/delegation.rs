@@ -65,8 +65,7 @@ pub fn sign_delegation(
 ) -> SigningKeyDelegation {
     let master_pubkey = master_secret.public().to_string();
     let signing_pubkey_str = signing_pubkey.to_string();
-    let bytes =
-        delegation_signing_bytes(&master_pubkey, &signing_pubkey_str, key_index, issued_at);
+    let bytes = delegation_signing_bytes(&master_pubkey, &signing_pubkey_str, key_index, issued_at);
     let sig = master_secret.sign(&bytes);
     SigningKeyDelegation {
         master_pubkey,

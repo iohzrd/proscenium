@@ -3273,6 +3273,7 @@ name = "iroh-tauri-app"
 version = "0.1.40"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bip39",
  "bytes",
  "chacha20poly1305",

@@ -120,3 +120,51 @@ pub struct FollowerEntry {
     pub last_seen: u64,
     pub is_online: bool,
 }
+
+/// Encoded in the QR code displayed by the existing device during pairing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkQrPayload {
+    /// Existing device's iroh NodeId (for QUIC connection).
+    pub node_id: String,
+    /// One-time secret for Noise PSK (32 bytes, base64-encoded).
+    pub secret: String,
+    /// Existing device's relay URL for connection (if available).
+    pub relay_url: Option<String>,
+}
+
+/// Data bundle sent from existing device to new device during pairing.
+/// Encrypted inside the Noise channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkBundleData {
+    /// The signing key secret (32 bytes, base64-encoded).
+    pub signing_secret_key: String,
+    /// The signing key delegation (signed by master key).
+    pub delegation: crate::delegation::SigningKeyDelegation,
+    /// The new device's transport secret key (32 bytes, base64-encoded).
+    /// Derived by the existing device from the master key.
+    pub transport_secret_key: String,
+    /// The device index used to derive the transport key.
+    pub device_index: u32,
+    /// The master secret key (32 bytes, base64-encoded).
+    /// Only included if the sending device holds it AND user opts in.
+    pub master_secret_key: Option<String>,
+    /// User profile.
+    pub profile: Option<Profile>,
+    /// Follow list.
+    pub follows: Vec<FollowEntry>,
+    /// Bookmarked post IDs.
+    pub bookmarks: Vec<String>,
+    /// Blocked user pubkeys.
+    pub blocked_users: Vec<String>,
+    /// Muted user pubkeys.
+    pub muted_users: Vec<String>,
+    /// Current DM ratchet sessions (serialized).
+    pub ratchet_sessions: Vec<RatchetSessionExport>,
+}
+
+/// Exported ratchet session for transfer during device pairing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatchetSessionExport {
+    pub peer_pubkey: String,
+    pub state_json: String,
+}

@@ -242,12 +242,18 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             signing_secret_key_bytes,
             master_pubkey_clone.clone(),
         );
+        // Shared pending link state for device pairing
+        let pending_link: crate::state::PendingLinkState = Arc::new(tokio::sync::Mutex::new(None));
+
         // Peer handler needs master pubkey, delegation, and transport node id
         let peer_handler = PeerHandler::new(
             storage_clone.clone(),
             master_pubkey_clone.clone(),
             transport_node_id.clone(),
             delegation_clone.clone(),
+            master_secret_key_bytes,
+            signing_secret_key_bytes,
+            pending_link.clone(),
             handle.clone(),
         );
 
@@ -660,6 +666,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             signing_key_index,
             transport_node_id: transport_node_id.clone(),
             delegation: delegation_clone,
+            pending_link,
         });
 
         // Gossip reconnection loop: restarts dead gossip tasks on demand

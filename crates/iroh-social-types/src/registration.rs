@@ -52,10 +52,7 @@ fn registration_signing_bytes(
 }
 
 /// Sign a registration payload with the signing key.
-pub fn sign_registration(
-    payload: &RegistrationPayload,
-    signing_secret_key: &SecretKey,
-) -> String {
+pub fn sign_registration(payload: &RegistrationPayload, signing_secret_key: &SecretKey) -> String {
     let bytes = registration_signing_bytes(
         &payload.master_pubkey,
         &payload.transport_node_id,

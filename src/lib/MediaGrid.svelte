@@ -11,14 +11,16 @@
     onlightbox?: (src: string, alt: string) => void;
   } = $props();
 
-  const { getBlobUrl, downloadFile } = getBlobContext();
+  const { getBlobUrl, refetchBlobUrl, downloadFile } = getBlobContext();
+
+  let refetching = $state<Record<string, Promise<string> | undefined>>({});
 </script>
 
 {#if media.length > 0}
   <div class="media-grid" class:grid={media.length > 1}>
     {#each media as att (att.hash)}
       {#if isImage(att.mime_type)}
-        {#await getBlobUrl(att)}
+        {#await refetching[att.hash] ?? getBlobUrl(att)}
           <div class="media-placeholder">Loading...</div>
         {:then url}
           <button
@@ -28,20 +30,42 @@
             <img src={url} alt={att.filename} class="media-img" />
           </button>
         {:catch}
-          <div class="media-placeholder">Failed to load</div>
+          <div class="media-placeholder">
+            Failed to load
+            <button
+              class="retry-btn"
+              onclick={() => {
+                refetching[att.hash] = refetchBlobUrl(att);
+              }}>Re-download</button
+            >
+          </div>
         {/await}
       {:else if isVideo(att.mime_type)}
-        {#await getBlobUrl(att)}
+        {#await refetching[att.hash] ?? getBlobUrl(att)}
           <div class="media-placeholder">Loading...</div>
         {:then url}
           <video src={url} controls class="media-video">
             <track kind="captions" />
           </video>
+          <button
+            class="retry-btn retry-btn-inline"
+            onclick={() => {
+              refetching[att.hash] = refetchBlobUrl(att);
+            }}>Re-download</button
+          >
         {:catch}
-          <div class="media-placeholder">Failed to load</div>
+          <div class="media-placeholder">
+            Failed to load
+            <button
+              class="retry-btn"
+              onclick={() => {
+                refetching[att.hash] = refetchBlobUrl(att);
+              }}>Re-download</button
+            >
+          </div>
         {/await}
       {:else if isAudio(att.mime_type)}
-        {#await getBlobUrl(att)}
+        {#await refetching[att.hash] ?? getBlobUrl(att)}
           <div class="media-placeholder">Loading...</div>
         {:then url}
           <div class="media-audio">
@@ -49,7 +73,15 @@
             <audio src={url} controls preload="metadata"></audio>
           </div>
         {:catch}
-          <div class="media-placeholder">Failed to load</div>
+          <div class="media-placeholder">
+            Failed to load
+            <button
+              class="retry-btn"
+              onclick={() => {
+                refetching[att.hash] = refetchBlobUrl(att);
+              }}>Re-download</button
+            >
+          </div>
         {/await}
       {:else}
         <button class="media-file" onclick={() => downloadFile(att)}>
@@ -162,5 +194,28 @@
   .download-label {
     color: var(--color-link);
     font-size: var(--text-sm);
+  }
+
+  .retry-btn {
+    background: var(--accent-medium);
+    color: var(--text-primary);
+    border: none;
+    border-radius: var(--radius-sm);
+    padding: 0.3rem 0.75rem;
+    font-size: var(--text-sm);
+    cursor: pointer;
+    margin-top: 0.5rem;
+    transition: opacity var(--transition-fast);
+  }
+
+  .retry-btn:hover {
+    opacity: 0.8;
+  }
+
+  .retry-btn-inline {
+    margin-top: 0.25rem;
+    font-size: var(--text-xs, 0.7rem);
+    padding: 0.15rem 0.5rem;
+    opacity: 0.6;
   }
 </style>

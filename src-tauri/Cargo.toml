@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = "0.22"
 bip39 = { version = "2", features = ["zeroize"] }
 bytes = "1"
 chacha20poly1305 = "0.10"

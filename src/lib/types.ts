@@ -196,6 +196,19 @@ export interface PostSearchResponse {
   query: string;
 }
 
+export interface DeviceEntry {
+  node_id: string;
+  device_name: string;
+  is_primary: boolean;
+  added_at: number;
+}
+
+export interface LinkQrPayload {
+  node_id: string;
+  secret: string;
+  relay_url: string | null;
+}
+
 export interface StoredMessage {
   id: string;
   conversation_id: string;

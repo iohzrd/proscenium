@@ -124,6 +124,14 @@
   <a href="/servers" class="server-manage-link">Manage servers</a>
 </section>
 
+<section class="settings-section">
+  <h3>Devices</h3>
+  <p class="section-desc">
+    Link multiple devices to share your identity, follows, and messages.
+  </p>
+  <a href="/settings/devices" class="server-manage-link">Manage devices</a>
+</section>
+
 {#if pendingRemoveUrl}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <div
@@ -311,5 +319,12 @@
 
   .server-manage-link:hover {
     text-decoration: underline;
+  }
+
+  .section-desc {
+    color: var(--text-secondary);
+    font-size: var(--text-sm);
+    margin: 0 0 0.5rem;
+    line-height: 1.5;
   }
 </style>

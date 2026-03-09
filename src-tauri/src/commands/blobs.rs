@@ -122,3 +122,39 @@ pub async fn fetch_blob_bytes(
     );
     Ok(bytes.to_vec())
 }
+
+#[tauri::command]
+pub async fn refetch_blob_bytes(
+    state: State<'_, Arc<AppState>>,
+    ticket: String,
+) -> Result<Vec<u8>, String> {
+    let ticket: BlobTicket = ticket.parse().str_err()?;
+    let store = state.store.clone();
+    let endpoint = state.endpoint.clone();
+    let blobs = state.blobs.clone();
+
+    log::info!(
+        "[blob] re-fetching {} from remote (ignoring local cache)...",
+        ticket.hash()
+    );
+    let conn = endpoint
+        .connect(ticket.addr().clone(), iroh_blobs::ALPN)
+        .await
+        .str_err()?;
+
+    let hash_and_format: HashAndFormat = ticket.hash_and_format();
+    blobs
+        .remote()
+        .fetch(conn, hash_and_format)
+        .await
+        .str_err()?;
+
+    let bytes = store.get_bytes(ticket.hash()).await.str_err()?;
+
+    log::info!(
+        "[blob] re-fetched {} from remote ({} bytes)",
+        ticket.hash(),
+        bytes.len()
+    );
+    Ok(bytes.to_vec())
+}

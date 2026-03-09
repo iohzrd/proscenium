@@ -1,4 +1,7 @@
-use iroh_social_types::{DeviceEntry, LinkedDevicesAnnouncement, now_millis};
+use iroh_social_types::{
+    DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, RatchetSessionExport,
+    SigningKeyDelegation, now_millis,
+};
 use rusqlite::params;
 
 use super::Storage;
@@ -108,5 +111,117 @@ impl Storage {
                 Err(e) => Err(e.into()),
             }
         })
+    }
+
+    /// Get the next available device index for a new linked device.
+    pub fn next_device_index(&self) -> anyhow::Result<u32> {
+        self.with_db(|db| {
+            let count: i64 =
+                db.query_row("SELECT COUNT(*) FROM linked_devices", [], |row| row.get(0))?;
+            Ok(count as u32)
+        })
+    }
+
+    /// Get all bookmark post IDs.
+    pub fn get_all_bookmark_ids(&self) -> anyhow::Result<Vec<String>> {
+        self.with_db(|db| {
+            let mut stmt = db.prepare("SELECT post_id FROM bookmarks ORDER BY created_at DESC")?;
+            let mut rows = stmt.query([])?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+            }
+            Ok(ids)
+        })
+    }
+
+    /// Export all ratchet sessions for device pairing transfer.
+    pub fn export_ratchet_sessions(&self) -> anyhow::Result<Vec<RatchetSessionExport>> {
+        self.with_db(|db| {
+            let mut stmt = db.prepare("SELECT peer_pubkey, state_json FROM dm_ratchet_sessions")?;
+            let mut rows = stmt.query([])?;
+            let mut sessions = Vec::new();
+            while let Some(row) = rows.next()? {
+                sessions.push(RatchetSessionExport {
+                    peer_pubkey: row.get(0)?,
+                    state_json: row.get(1)?,
+                });
+            }
+            Ok(sessions)
+        })
+    }
+
+    /// Export a full link bundle for device pairing.
+    pub fn export_link_bundle(
+        &self,
+        master_pubkey: &str,
+        signing_secret_key_bytes: &[u8; 32],
+        delegation: &SigningKeyDelegation,
+        transport_secret_key_bytes: &[u8; 32],
+        device_index: u32,
+        master_secret_key_bytes: Option<&[u8; 32]>,
+    ) -> anyhow::Result<LinkBundleData> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+
+        let profile = self.get_profile(master_pubkey).ok().flatten();
+        let follows = self.get_follows().unwrap_or_default();
+        let bookmarks = self.get_all_bookmark_ids().unwrap_or_default();
+        let blocked_users = self.get_blocked_pubkeys().unwrap_or_default();
+        let muted_users = self.get_muted_pubkeys().unwrap_or_default();
+        let ratchet_sessions = self.export_ratchet_sessions().unwrap_or_default();
+
+        Ok(LinkBundleData {
+            signing_secret_key: b64.encode(signing_secret_key_bytes),
+            delegation: delegation.clone(),
+            transport_secret_key: b64.encode(transport_secret_key_bytes),
+            device_index,
+            master_secret_key: master_secret_key_bytes.map(|k| b64.encode(k)),
+            profile,
+            follows,
+            bookmarks,
+            blocked_users,
+            muted_users,
+            ratchet_sessions,
+        })
+    }
+
+    /// Import a link bundle received during device pairing.
+    pub fn import_link_bundle(
+        &self,
+        master_pubkey: &str,
+        bundle: &LinkBundleData,
+    ) -> anyhow::Result<()> {
+        // Import profile
+        if let Some(ref profile) = bundle.profile {
+            self.save_profile(master_pubkey, profile)?;
+        }
+
+        // Import follows
+        for follow in &bundle.follows {
+            self.follow(follow)?;
+        }
+
+        // Import bookmarks
+        for post_id in &bundle.bookmarks {
+            let _ = self.toggle_bookmark(post_id);
+        }
+
+        // Import blocks
+        for pubkey in &bundle.blocked_users {
+            self.block_user(pubkey)?;
+        }
+
+        // Import mutes
+        for pubkey in &bundle.muted_users {
+            self.mute_user(pubkey)?;
+        }
+
+        // Import ratchet sessions
+        for session in &bundle.ratchet_sessions {
+            self.save_ratchet_session(&session.peer_pubkey, &session.state_json, now_millis())?;
+        }
+
+        Ok(())
     }
 }
