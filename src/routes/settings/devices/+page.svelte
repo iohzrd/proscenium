@@ -149,36 +149,38 @@
 
   <div class="link-actions">
     <div class="link-card">
-      <h4>I have an existing device</h4>
+      <h4>Enroll a new device</h4>
       <p class="link-card-desc">
-        Show a QR code on this device for a new device to scan.
+        Generate a QR code on this device, then scan it on the new device. The
+        new device will be able to post, interact, and message as you.
       </p>
-      <div class="link-card-buttons">
-        <button
-          class="btn-accent"
-          onclick={() => startLink(false)}
-          disabled={linking}
-        >
-          Link (read-only)
-        </button>
+      <button
+        class="btn-accent"
+        onclick={() => startLink(false)}
+        disabled={linking}
+      >
+        Generate link code
+      </button>
+      <details class="master-key-details">
+        <summary>Advanced: transfer master key</summary>
+        <p class="link-card-hint">
+          The master key controls identity management (enrolling more devices,
+          key rotation). Only transfer it to a device you fully trust.
+        </p>
         <button
           class="btn-elevated"
           onclick={() => startLink(true)}
           disabled={linking}
         >
-          Link (full access)
+          Generate link code (with master key)
         </button>
-      </div>
-      <p class="link-card-hint">
-        "Full access" transfers the master key, allowing the new device to link
-        additional devices.
-      </p>
+      </details>
     </div>
 
     <div class="link-card">
-      <h4>I have a QR code</h4>
+      <h4>Join from another device</h4>
       <p class="link-card-desc">
-        Scan or paste a link payload from your existing device.
+        Scan or paste the link code shown on your existing device.
       </p>
       <button
         class="btn-accent"
@@ -357,7 +359,19 @@
   .link-card-hint {
     color: var(--text-muted);
     font-size: var(--text-xs);
-    margin: 0.5rem 0 0;
+    margin: 0.5rem 0 0.75rem;
     line-height: 1.4;
+  }
+
+  .master-key-details {
+    margin-top: 0.75rem;
+    font-size: var(--text-sm);
+    color: var(--text-secondary);
+  }
+
+  .master-key-details summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: var(--text-xs);
   }
 </style>
