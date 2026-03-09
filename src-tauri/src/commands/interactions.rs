@@ -24,7 +24,7 @@ pub async fn like_post(
         timestamp: now_millis(),
         signature: String::new(),
     };
-    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_interaction(&mut interaction, &sk);
     state.storage.save_interaction(&interaction).str_err()?;
     let feed = state.feed.lock().await;
@@ -73,7 +73,7 @@ pub async fn repost(
 
     validate_post(&post)?;
 
-    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_post(&mut post, &sk);
 
     state.storage.insert_post(&post).str_err()?;

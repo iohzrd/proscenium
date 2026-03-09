@@ -11,7 +11,7 @@ use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
-    DM_ALPN, PEER_ALPN, derive_transport_key, derive_user_key, now_millis, short_id,
+    DM_ALPN, PEER_ALPN, derive_signing_key, derive_transport_key, now_millis, short_id,
     sign_delegation,
 };
 use std::sync::Arc;
@@ -157,18 +157,18 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let master_pubkey = master_secret.public().to_string();
     log::info!("[setup] master pubkey: {}", short_id(&master_pubkey));
 
-    // Derive user key at index 0
-    let user_key_index: u32 = 0;
-    let user_secret_key_bytes = derive_user_key(&master_secret_key_bytes, user_key_index);
-    let user_secret = SecretKey::from_bytes(&user_secret_key_bytes);
-    let user_pubkey = user_secret.public().to_string();
-    log::info!("[setup] user pubkey: {}", short_id(&user_pubkey));
+    // Derive signing key at index 0
+    let signing_key_index: u32 = 0;
+    let signing_secret_key_bytes = derive_signing_key(&master_secret_key_bytes, signing_key_index);
+    let signing_secret = SecretKey::from_bytes(&signing_secret_key_bytes);
+    let signing_pubkey = signing_secret.public().to_string();
+    log::info!("[setup] signing pubkey: {}", short_id(&signing_pubkey));
 
-    // Sign delegation binding user key to master key
+    // Sign delegation binding signing key to master key
     let delegation = sign_delegation(
         &master_secret,
-        &user_secret.public(),
-        user_key_index,
+        &signing_secret.public(),
+        signing_key_index,
         now_millis(),
     );
 
@@ -185,7 +185,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let transport_secret = SecretKey::from_bytes(&transport_key_bytes);
 
     let master_pubkey_clone = master_pubkey.clone();
-    let user_pubkey_clone = user_pubkey.clone();
+    let signing_pubkey_clone = signing_pubkey.clone();
     let delegation_clone = delegation.clone();
     let storage_clone = storage.clone();
     tauri::async_runtime::spawn(async move {
@@ -235,11 +235,11 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let gossip = Gossip::builder().spawn(endpoint.clone());
         log::info!("[setup] gossip started");
 
-        // DM handler uses user key for X25519 derivation
+        // DM handler uses signing key for X25519 derivation
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
-            user_secret_key_bytes,
+            signing_secret_key_bytes,
             master_pubkey_clone.clone(),
         );
         // Peer handler needs master pubkey, delegation, and transport node id
@@ -619,9 +619,9 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             dm: dm_handler,
             master_secret_key_bytes,
             master_pubkey: master_pubkey_clone.clone(),
-            user_secret_key_bytes,
-            user_pubkey: user_pubkey_clone,
-            user_key_index,
+            signing_secret_key_bytes,
+            signing_pubkey: signing_pubkey_clone,
+            signing_key_index,
             transport_node_id: transport_node_id.clone(),
             delegation: delegation_clone,
         });

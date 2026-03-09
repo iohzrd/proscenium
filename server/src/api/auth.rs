@@ -33,7 +33,7 @@ struct ProfileUpdateRequest {
     bio: Option<String>,
     avatar_hash: Option<String>,
     signature: String,
-    delegation: iroh_social_types::UserKeyDelegation,
+    delegation: iroh_social_types::SigningKeyDelegation,
 }
 
 fn validate_registration(

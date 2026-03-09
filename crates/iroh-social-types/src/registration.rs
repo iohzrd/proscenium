@@ -1,4 +1,4 @@
-use crate::delegation::UserKeyDelegation;
+use crate::delegation::SigningKeyDelegation;
 use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::types::Visibility;
 use iroh::{PublicKey, SecretKey};
@@ -26,10 +26,10 @@ pub struct RegistrationRequest {
     pub timestamp: u64,
     pub visibility: Visibility,
     pub action: Option<String>,
-    /// Signature from the user key (verified via cached delegation).
+    /// Signature from the signing key (verified via cached delegation).
     pub signature: String,
-    /// The user key delegation (so the server can verify the signer).
-    pub delegation: UserKeyDelegation,
+    /// The signing key delegation (so the server can verify the signer).
+    pub delegation: SigningKeyDelegation,
 }
 
 fn registration_signing_bytes(
@@ -51,8 +51,11 @@ fn registration_signing_bytes(
     .expect("json serialization should not fail")
 }
 
-/// Sign a registration payload with the user key.
-pub fn sign_registration(payload: &RegistrationPayload, user_secret_key: &SecretKey) -> String {
+/// Sign a registration payload with the signing key.
+pub fn sign_registration(
+    payload: &RegistrationPayload,
+    signing_secret_key: &SecretKey,
+) -> String {
     let bytes = registration_signing_bytes(
         &payload.master_pubkey,
         &payload.transport_node_id,
@@ -61,19 +64,19 @@ pub fn sign_registration(payload: &RegistrationPayload, user_secret_key: &Secret
         &payload.visibility,
         &payload.action,
     );
-    let sig = user_secret_key.sign(&bytes);
+    let sig = signing_secret_key.sign(&bytes);
     signature_to_hex(&sig)
 }
 
-/// Verify a registration request's signature against the user key from the delegation.
+/// Verify a registration request's signature against the signing key from the delegation.
 pub fn verify_registration_signature(request: &RegistrationRequest) -> Result<(), String> {
     let sig = hex_to_signature(&request.signature)?;
-    // The signer is the user key from the delegation
-    let user_pubkey: PublicKey = request
+    // The signer is the signing key from the delegation
+    let signing_pubkey: PublicKey = request
         .delegation
-        .user_pubkey
+        .signing_pubkey
         .parse()
-        .map_err(|e| format!("invalid user pubkey in delegation: {e}"))?;
+        .map_err(|e| format!("invalid signing pubkey in delegation: {e}"))?;
     let bytes = registration_signing_bytes(
         &request.master_pubkey,
         &request.transport_node_id,
@@ -82,7 +85,7 @@ pub fn verify_registration_signature(request: &RegistrationRequest) -> Result<()
         &request.visibility,
         &request.action,
     );
-    user_pubkey
+    signing_pubkey
         .verify(&bytes, &sig)
         .map_err(|_| "registration signature verification failed".to_string())
 }

@@ -36,8 +36,8 @@ pub async fn create_post(
 
     validate_post(&post)?;
 
-    // Sign with user key (not master key)
-    let sk = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    // Sign with signing key (not master key)
+    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_post(&mut post, &sk);
 
     state.storage.insert_post(&post).str_err()?;

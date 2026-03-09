@@ -111,7 +111,7 @@ pub async fn register_with_server(
     let vis: Visibility = visibility.parse().map_err(|_| "invalid visibility")?;
     let master_pubkey = state.master_pubkey.clone();
     let transport_node_id = state.transport_node_id.clone();
-    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
 
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
@@ -166,7 +166,7 @@ pub async fn unregister_from_server(
 ) -> Result<(), String> {
     let master_pubkey = state.master_pubkey.clone();
     let transport_node_id = state.transport_node_id.clone();
-    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
 
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
@@ -406,7 +406,7 @@ pub async fn sync_profile_to_server(
 
 pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), String> {
     let master_pubkey = state.master_pubkey.clone();
-    let secret_key = SecretKey::from_bytes(&state.user_secret_key_bytes);
+    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
 
     let profile = state
         .storage
@@ -442,7 +442,7 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         bio: Option<String>,
         avatar_hash: Option<String>,
         signature: String,
-        delegation: iroh_social_types::UserKeyDelegation,
+        delegation: iroh_social_types::SigningKeyDelegation,
     }
 
     let update = ProfileUpdate {

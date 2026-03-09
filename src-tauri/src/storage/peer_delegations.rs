@@ -1,5 +1,5 @@
 use crate::storage::Storage;
-use iroh_social_types::{IdentityResponse, UserKeyDelegation, now_millis};
+use iroh_social_types::{IdentityResponse, SigningKeyDelegation, now_millis};
 use rusqlite::params;
 
 impl Storage {
@@ -10,16 +10,16 @@ impl Storage {
         let now = now_millis() as i64;
         self.with_db(|db| {
             db.execute(
-                "INSERT INTO peer_delegations (master_pubkey, user_pubkey, delegation_json, transport_node_ids_json, cached_at)
+                "INSERT INTO peer_delegations (master_pubkey, signing_pubkey, delegation_json, transport_node_ids_json, cached_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(master_pubkey) DO UPDATE SET
-                    user_pubkey = ?2,
+                    signing_pubkey = ?2,
                     delegation_json = ?3,
                     transport_node_ids_json = ?4,
                     cached_at = ?5",
                 params![
                     response.master_pubkey,
-                    response.delegation.user_pubkey,
+                    response.delegation.signing_pubkey,
                     delegation_json,
                     transport_json,
                     now,
@@ -34,7 +34,7 @@ impl Storage {
     pub fn get_peer_delegation(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<Option<UserKeyDelegation>> {
+    ) -> anyhow::Result<Option<SigningKeyDelegation>> {
         self.with_db(|db| {
             let mut stmt = db
                 .prepare("SELECT delegation_json FROM peer_delegations WHERE master_pubkey = ?1")?;
@@ -44,7 +44,7 @@ impl Storage {
             });
             match result {
                 Ok(json) => {
-                    let delegation: UserKeyDelegation = serde_json::from_str(&json)?;
+                    let delegation: SigningKeyDelegation = serde_json::from_str(&json)?;
                     Ok(Some(delegation))
                 }
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -74,12 +74,12 @@ impl Storage {
         })
     }
 
-    /// Get the cached user pubkey for a peer (the key that signs their content).
+    /// Get the cached signing pubkey for a peer (the key that signs their content).
     #[allow(dead_code)]
-    pub fn get_peer_user_pubkey(&self, master_pubkey: &str) -> anyhow::Result<Option<String>> {
+    pub fn get_peer_signing_pubkey(&self, master_pubkey: &str) -> anyhow::Result<Option<String>> {
         self.with_db(|db| {
             let mut stmt =
-                db.prepare("SELECT user_pubkey FROM peer_delegations WHERE master_pubkey = ?1")?;
+                db.prepare("SELECT signing_pubkey FROM peer_delegations WHERE master_pubkey = ?1")?;
             let result = stmt.query_row(params![master_pubkey], |row| row.get(0));
             match result {
                 Ok(pubkey) => Ok(Some(pubkey)),

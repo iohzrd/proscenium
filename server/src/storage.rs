@@ -183,12 +183,12 @@ impl Storage {
         if let (Some(delegation_json), Some(transport_node_id)) =
             (delegation_json, transport_node_id)
             && let Ok(delegation) =
-                serde_json::from_str::<iroh_social_types::UserKeyDelegation>(delegation_json)
+                serde_json::from_str::<iroh_social_types::SigningKeyDelegation>(delegation_json)
         {
             let _ = self
                 .cache_peer_delegation(
                     pubkey,
-                    &delegation.user_pubkey,
+                    &delegation.signing_pubkey,
                     delegation_json,
                     Some(transport_node_id),
                 )
@@ -806,22 +806,22 @@ impl Storage {
     pub async fn cache_peer_delegation(
         &self,
         master_pubkey: &str,
-        user_pubkey: &str,
+        signing_pubkey: &str,
         delegation_json: &str,
         transport_node_id: Option<&str>,
     ) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis() as i64;
         sqlx::query(
-            "INSERT INTO peer_delegations (master_pubkey, user_pubkey, delegation_json, transport_node_id, cached_at)
+            "INSERT INTO peer_delegations (master_pubkey, signing_pubkey, delegation_json, transport_node_id, cached_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(master_pubkey) DO UPDATE SET
-                user_pubkey = ?2,
+                signing_pubkey = ?2,
                 delegation_json = ?3,
                 transport_node_id = COALESCE(?4, transport_node_id),
                 cached_at = ?5",
         )
         .bind(master_pubkey)
-        .bind(user_pubkey)
+        .bind(signing_pubkey)
         .bind(delegation_json)
         .bind(transport_node_id)
         .bind(now)
@@ -830,13 +830,13 @@ impl Storage {
         Ok(())
     }
 
-    /// Get the cached user pubkey for a peer (the key that signs their content).
-    pub async fn get_peer_user_pubkey(
+    /// Get the cached signing pubkey for a peer (the key that signs their content).
+    pub async fn get_peer_signing_pubkey(
         &self,
         master_pubkey: &str,
     ) -> anyhow::Result<Option<String>> {
         let row: Option<(String,)> =
-            sqlx::query_as("SELECT user_pubkey FROM peer_delegations WHERE master_pubkey = ?1")
+            sqlx::query_as("SELECT signing_pubkey FROM peer_delegations WHERE master_pubkey = ?1")
                 .bind(master_pubkey)
                 .fetch_optional(&self.pool)
                 .await?;

@@ -216,13 +216,13 @@ impl IngestionManager {
             tracing::warn!("[ingestion] rejected post {}: {reason}", &post.id);
             return;
         }
-        // Look up the user key from the delegation cache
-        let signer: PublicKey = match storage.get_peer_user_pubkey(&post.author).await {
-            Ok(Some(user_pubkey)) => match user_pubkey.parse() {
+        // Look up the signing key from the delegation cache
+        let signer: PublicKey = match storage.get_peer_signing_pubkey(&post.author).await {
+            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
                 Ok(pk) => pk,
                 Err(e) => {
                     tracing::warn!(
-                        "[ingestion] bad user pubkey in delegation for {}: {e}",
+                        "[ingestion] bad signing pubkey in delegation for {}: {e}",
                         short_id(&post.author)
                     );
                     return;
@@ -266,13 +266,13 @@ impl IngestionManager {
             );
             return;
         }
-        // Look up the user key from the delegation cache
-        let signer: PublicKey = match storage.get_peer_user_pubkey(&interaction.author).await {
-            Ok(Some(user_pubkey)) => match user_pubkey.parse() {
+        // Look up the signing key from the delegation cache
+        let signer: PublicKey = match storage.get_peer_signing_pubkey(&interaction.author).await {
+            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
                 Ok(pk) => pk,
                 Err(e) => {
                     tracing::warn!(
-                        "[ingestion] bad user pubkey in delegation for {}: {e}",
+                        "[ingestion] bad signing pubkey in delegation for {}: {e}",
                         short_id(&interaction.author)
                     );
                     return;

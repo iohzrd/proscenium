@@ -22,7 +22,7 @@ pub(crate) fn process_incoming_post(
         log::error!("[{label}] rejected post {}: {reason}", &post.id);
         return false;
     }
-    // TODO: look up user key from delegation cache instead of using author directly.
+    // TODO: look up signing key from delegation cache instead of using author directly.
     // For backward compat with pre-migration content, author == signer.
     let signer: PublicKey = match post.author.parse() {
         Ok(pk) => pk,
@@ -97,7 +97,7 @@ pub(crate) fn process_incoming_interaction(
         );
         return;
     }
-    // TODO: look up user key from delegation cache instead of using author directly.
+    // TODO: look up signing key from delegation cache instead of using author directly.
     let signer: PublicKey = match interaction.author.parse() {
         Ok(pk) => pk,
         Err(e) => {

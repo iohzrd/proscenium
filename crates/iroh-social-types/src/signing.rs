@@ -62,7 +62,7 @@ pub fn sign_interaction(interaction: &mut Interaction, secret_key: &SecretKey) {
 }
 
 /// Verify a Post's signature against the given signer public key.
-/// The signer is the user key (from a cached UserKeyDelegation), NOT post.author
+/// The signer is the signing key (from a cached SigningKeyDelegation), NOT post.author
 /// (which is the master pubkey / permanent identity).
 pub fn verify_post_signature(post: &Post, signer_pubkey: &PublicKey) -> Result<(), String> {
     let sig = hex_to_signature(&post.signature)?;
@@ -73,7 +73,7 @@ pub fn verify_post_signature(post: &Post, signer_pubkey: &PublicKey) -> Result<(
 }
 
 /// Verify an Interaction's signature against the given signer public key.
-/// The signer is the user key (from a cached UserKeyDelegation), NOT interaction.author
+/// The signer is the signing key (from a cached SigningKeyDelegation), NOT interaction.author
 /// (which is the master pubkey / permanent identity).
 pub fn verify_interaction_signature(
     interaction: &Interaction,

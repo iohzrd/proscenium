@@ -1,4 +1,4 @@
-use crate::delegation::UserKeyDelegation;
+use crate::delegation::SigningKeyDelegation;
 use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::types::{Interaction, Post, Profile};
 use iroh::{PublicKey, SecretKey};
@@ -21,8 +21,8 @@ pub enum GossipMessage {
 pub struct IdentityResponse {
     /// The user's permanent identity (master public key).
     pub master_pubkey: String,
-    /// The current user key delegation (signed by master key).
-    pub delegation: UserKeyDelegation,
+    /// The current signing key delegation (signed by master key).
+    pub delegation: SigningKeyDelegation,
     /// Transport NodeIds for this user's devices.
     pub transport_node_ids: Vec<String>,
     /// The user's profile, if available.
@@ -83,10 +83,10 @@ pub struct FollowRequest {
     /// The requester's master pubkey (permanent identity).
     pub requester: String,
     pub timestamp: u64,
-    /// Signed by the requester's user key (verified via delegation).
+    /// Signed by the requester's signing key (verified via delegation).
     pub signature: String,
-    /// The requester's user key delegation, so the receiver can verify the signature.
-    pub delegation: UserKeyDelegation,
+    /// The requester's signing key delegation, so the receiver can verify the signature.
+    pub delegation: SigningKeyDelegation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,7 +158,7 @@ pub fn sign_follow_request(requester: &str, timestamp: u64, secret_key: &SecretK
 }
 
 /// Verify a follow request's signature against the given signer public key.
-/// The signer is the user key (from a cached delegation), NOT req.requester
+/// The signer is the signing key (from a cached delegation), NOT req.requester
 /// (which is the master pubkey / permanent identity).
 pub fn verify_follow_request(req: &FollowRequest, signer_pubkey: &PublicKey) -> Result<(), String> {
     let sig = hex_to_signature(&req.signature)?;

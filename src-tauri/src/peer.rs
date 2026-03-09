@@ -6,7 +6,7 @@ use iroh::{
 };
 use iroh_social_types::{
     FollowRequest, FollowResponse, IdentityResponse, PEER_ALPN, PeerRequest, PeerResponse,
-    UserKeyDelegation, Visibility, now_millis, short_id, sign_follow_request,
+    SigningKeyDelegation, Visibility, now_millis, short_id, sign_follow_request,
     verify_follow_request,
 };
 use std::sync::Arc;
@@ -19,8 +19,8 @@ pub struct PeerHandler {
     master_pubkey: String,
     /// The transport NodeId (iroh's own key).
     transport_node_id: String,
-    /// The current user key delegation.
-    delegation: UserKeyDelegation,
+    /// The current signing key delegation.
+    delegation: SigningKeyDelegation,
     app_handle: AppHandle,
 }
 
@@ -29,7 +29,7 @@ impl PeerHandler {
         storage: Arc<Storage>,
         master_pubkey: String,
         transport_node_id: String,
-        delegation: UserKeyDelegation,
+        delegation: SigningKeyDelegation,
         app_handle: AppHandle,
     ) -> Self {
         Self {
@@ -135,7 +135,7 @@ async fn handle_follow_request(
     req: iroh_social_types::FollowRequest,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
-    // Verify the delegation (master key signed the user key binding)
+    // Verify the delegation (master key signed the signing key binding)
     if let Err(reason) = iroh_social_types::verify_delegation(&req.delegation) {
         log::warn!(
             "[follow-req] invalid delegation from {}: {reason}",
@@ -158,16 +158,16 @@ async fn handle_follow_request(
         )));
     }
 
-    // Verify signature using the user key from the delegation
-    let signer: iroh::PublicKey = match req.delegation.user_pubkey.parse() {
+    // Verify signature using the signing key from the delegation
+    let signer: iroh::PublicKey = match req.delegation.signing_pubkey.parse() {
         Ok(pk) => pk,
         Err(e) => {
             log::warn!(
-                "[follow-req] invalid user pubkey in delegation from {}: {e}",
+                "[follow-req] invalid signing pubkey in delegation from {}: {e}",
                 short_id(remote_str)
             );
             return Err(AcceptError::from_err(std::io::Error::other(
-                "invalid user pubkey in delegation",
+                "invalid signing pubkey in delegation",
             )));
         }
     };
@@ -280,11 +280,11 @@ pub async fn send_follow_request(
     endpoint: &Endpoint,
     target: EndpointId,
     master_pubkey: &str,
-    user_secret_key_bytes: &[u8; 32],
-    delegation: &UserKeyDelegation,
+    signing_secret_key_bytes: &[u8; 32],
+    delegation: &SigningKeyDelegation,
 ) -> anyhow::Result<FollowResponse> {
     let timestamp = now_millis();
-    let secret_key = iroh::SecretKey::from_bytes(user_secret_key_bytes);
+    let secret_key = iroh::SecretKey::from_bytes(signing_secret_key_bytes);
     let signature = sign_follow_request(master_pubkey, timestamp, &secret_key);
 
     let req = FollowRequest {
@@ -343,7 +343,7 @@ async fn handle_identity_request(
     storage: &Storage,
     master_pubkey: &str,
     transport_node_id: &str,
-    delegation: &UserKeyDelegation,
+    delegation: &SigningKeyDelegation,
     mut send: iroh::endpoint::SendStream,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
