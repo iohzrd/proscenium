@@ -4,5 +4,6 @@ CREATE TABLE IF NOT EXISTS profiles (
     bio TEXT NOT NULL,
     avatar_hash TEXT,
     avatar_ticket TEXT,
-    is_private INTEGER NOT NULL DEFAULT 0
+    visibility TEXT NOT NULL DEFAULT 'public',
+    signature TEXT NOT NULL DEFAULT ''
 );

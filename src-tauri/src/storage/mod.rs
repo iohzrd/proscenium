@@ -60,61 +60,40 @@ impl Storage {
             include_str!("../../migrations/001_profiles.sql"),
         ),
         (
-            "002_follows",
-            include_str!("../../migrations/002_follows.sql"),
-        ),
-        ("003_posts", include_str!("../../migrations/003_posts.sql")),
-        (
-            "004_interactions",
-            include_str!("../../migrations/004_interactions.sql"),
+            "002_peer_delegations",
+            include_str!("../../migrations/002_peer_delegations.sql"),
         ),
         (
-            "005_direct_messages",
-            include_str!("../../migrations/005_direct_messages.sql"),
+            "003_linked_devices",
+            include_str!("../../migrations/003_linked_devices.sql"),
         ),
         (
-            "006_bookmarks",
-            include_str!("../../migrations/006_bookmarks.sql"),
+            "004_social_graph",
+            include_str!("../../migrations/004_social_graph.sql"),
         ),
         (
-            "007_moderation",
-            include_str!("../../migrations/007_moderation.sql"),
+            "005_content",
+            include_str!("../../migrations/005_content.sql"),
         ),
         (
-            "008_mentions",
-            include_str!("../../migrations/008_mentions.sql"),
+            "006_notifications",
+            include_str!("../../migrations/006_notifications.sql"),
         ),
         (
-            "009_notifications",
-            include_str!("../../migrations/009_notifications.sql"),
+            "007_direct_messages",
+            include_str!("../../migrations/007_direct_messages.sql"),
         ),
         (
-            "010_visibility",
-            include_str!("../../migrations/010_visibility.sql"),
+            "008_bookmarks",
+            include_str!("../../migrations/008_bookmarks.sql"),
         ),
         (
-            "011_push_outbox",
-            include_str!("../../migrations/011_push_outbox.sql"),
+            "009_servers",
+            include_str!("../../migrations/009_servers.sql"),
         ),
         (
-            "012_follow_requests",
-            include_str!("../../migrations/012_follow_requests.sql"),
-        ),
-        (
-            "013_servers",
-            include_str!("../../migrations/013_servers.sql"),
-        ),
-        (
-            "014_peer_delegations",
-            include_str!("../../migrations/014_peer_delegations.sql"),
-        ),
-        (
-            "015_profile_signature",
-            include_str!("../../migrations/015_profile_signature.sql"),
-        ),
-        (
-            "016_linked_devices",
-            include_str!("../../migrations/016_linked_devices.sql"),
+            "010_push_outbox",
+            include_str!("../../migrations/010_push_outbox.sql"),
         ),
     ];
 

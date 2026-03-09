@@ -9,5 +9,4 @@ CREATE TABLE IF NOT EXISTS push_outbox (
     last_attempt_at INTEGER,
     expires_at INTEGER NOT NULL
 );
-
 CREATE INDEX IF NOT EXISTS idx_push_outbox_recipient ON push_outbox(recipient);

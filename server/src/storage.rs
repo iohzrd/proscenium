@@ -98,46 +98,6 @@ impl Storage {
         let migration_sql = include_str!("../migrations/001_initial.sql");
         sqlx::raw_sql(migration_sql).execute(&pool).await?;
 
-        // Run numbered migrations
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS schema_migrations (
-                name TEXT PRIMARY KEY,
-                applied_at INTEGER NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await?;
-
-        let migrations: &[(&str, &str)] = &[
-            (
-                "002_delegations",
-                include_str!("../migrations/002_delegations.sql"),
-            ),
-            (
-                "003_peer_device_announcements",
-                include_str!("../migrations/003_peer_device_announcements.sql"),
-            ),
-        ];
-
-        for (name, sql) in migrations {
-            let applied: bool =
-                sqlx::query_scalar("SELECT COUNT(*) > 0 FROM schema_migrations WHERE name = ?1")
-                    .bind(name)
-                    .fetch_one(&pool)
-                    .await?;
-
-            if !applied {
-                tracing::info!("[storage] applying migration: {name}");
-                sqlx::raw_sql(sql).execute(&pool).await?;
-                sqlx::query(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, strftime('%s', 'now'))",
-                )
-                .bind(name)
-                .execute(&pool)
-                .await?;
-            }
-        }
-
         Ok(Self { pool })
     }
 

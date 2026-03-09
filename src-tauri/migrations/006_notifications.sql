@@ -9,6 +9,3 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_ts ON notifications(timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(read, timestamp DESC);
-
-DROP TABLE IF EXISTS post_mentions;
-DROP TABLE IF EXISTS mention_read_marker;

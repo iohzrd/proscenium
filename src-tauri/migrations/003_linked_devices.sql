@@ -15,13 +15,3 @@ CREATE TABLE IF NOT EXISTS peer_device_announcements (
     version INTEGER NOT NULL DEFAULT 0,
     cached_at INTEGER NOT NULL
 );
-
--- LWW state columns for cross-device sync
-ALTER TABLE follows ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
-ALTER TABLE follows ADD COLUMN last_changed_at INTEGER NOT NULL DEFAULT 0;
-
-ALTER TABLE mutes ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
-ALTER TABLE mutes ADD COLUMN last_changed_at INTEGER NOT NULL DEFAULT 0;
-
-ALTER TABLE blocks ADD COLUMN state TEXT NOT NULL DEFAULT 'active';
-ALTER TABLE blocks ADD COLUMN last_changed_at INTEGER NOT NULL DEFAULT 0;

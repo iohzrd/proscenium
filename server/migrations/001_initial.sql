@@ -6,7 +6,9 @@ CREATE TABLE IF NOT EXISTS registrations (
     bio TEXT,
     avatar_hash TEXT,
     visibility TEXT NOT NULL DEFAULT 'public',
-    is_active INTEGER NOT NULL DEFAULT 1
+    is_active INTEGER NOT NULL DEFAULT 1,
+    transport_node_id TEXT,
+    delegation_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS posts (
@@ -74,4 +76,22 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_post_timestamp INTEGER,
     last_interaction_timestamp INTEGER,
     FOREIGN KEY (pubkey) REFERENCES registrations(pubkey)
+);
+
+-- Cached delegations for peers (used for signature verification in ingestion)
+CREATE TABLE IF NOT EXISTS peer_delegations (
+    master_pubkey TEXT PRIMARY KEY,
+    signing_pubkey TEXT NOT NULL,
+    delegation_json TEXT NOT NULL,
+    transport_node_id TEXT,
+    transport_node_ids_json TEXT NOT NULL DEFAULT '[]',
+    cached_at INTEGER NOT NULL
+);
+
+-- Cached device announcements for peers (peer device discovery)
+CREATE TABLE IF NOT EXISTS peer_device_announcements (
+    master_pubkey TEXT PRIMARY KEY,
+    announcement_json TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0,
+    cached_at INTEGER NOT NULL
 );
