@@ -8,7 +8,8 @@ use iroh_gossip::Gossip;
 use iroh_social_types::{
     GossipMessage, Interaction, PEER_ALPN, PeerRequest, Post, SyncRequest, short_id,
     user_feed_topic, validate_interaction, validate_post, validate_profile,
-    verify_interaction_signature, verify_post_signature,
+    verify_delete_interaction_signature, verify_delete_post_signature,
+    verify_interaction_signature, verify_post_signature, verify_profile_signature,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,6 +147,24 @@ impl IngestionManager {
         }
     }
 
+    /// Resolve the signing public key for a peer from the delegation cache.
+    /// Returns None if no delegation is cached (backward compat: skip verification).
+    async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
+        match storage.get_peer_signing_pubkey(master_pubkey).await {
+            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    tracing::warn!(
+                        "[ingestion] bad signing pubkey for {}: {e}",
+                        short_id(master_pubkey)
+                    );
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
     async fn process_gossip_message(storage: &Storage, topic_owner: &str, data: &Bytes) {
         match serde_json::from_slice::<GossipMessage>(data) {
             Ok(GossipMessage::NewPost(post)) => {
@@ -154,8 +173,23 @@ impl IngestionManager {
                 }
                 Self::ingest_post(storage, &post).await;
             }
-            Ok(GossipMessage::DeletePost { id, author }) => {
+            Ok(GossipMessage::DeletePost {
+                id,
+                author,
+                signature,
+            }) => {
                 if author != topic_owner {
+                    return;
+                }
+                // Verify delete signature
+                if let Some(signer) = Self::resolve_signer(storage, &author).await
+                    && let Err(reason) =
+                        verify_delete_post_signature(&id, &author, &signature, &signer)
+                {
+                    tracing::warn!(
+                        "[ingestion] bad delete-post signature from {}: {reason}",
+                        short_id(&author)
+                    );
                     return;
                 }
                 if let Ok(Some(existing)) = storage.get_post(&author, &id).await
@@ -169,6 +203,16 @@ impl IngestionManager {
                 if let Err(reason) = validate_profile(&profile) {
                     tracing::warn!(
                         "[ingestion] rejected profile from {}: {reason}",
+                        short_id(topic_owner)
+                    );
+                    return;
+                }
+                // Verify profile signature
+                if let Some(signer) = Self::resolve_signer(storage, topic_owner).await
+                    && let Err(reason) = verify_profile_signature(&profile, &signer)
+                {
+                    tracing::warn!(
+                        "[ingestion] bad profile signature from {}: {reason}",
                         short_id(topic_owner)
                     );
                     return;
@@ -195,8 +239,23 @@ impl IngestionManager {
                 }
                 Self::ingest_interaction(storage, &interaction).await;
             }
-            Ok(GossipMessage::DeleteInteraction { id, author }) => {
+            Ok(GossipMessage::DeleteInteraction {
+                id,
+                author,
+                signature,
+            }) => {
                 if author != topic_owner {
+                    return;
+                }
+                // Verify delete signature
+                if let Some(signer) = Self::resolve_signer(storage, &author).await
+                    && let Err(reason) =
+                        verify_delete_interaction_signature(&id, &author, &signature, &signer)
+                {
+                    tracing::warn!(
+                        "[ingestion] bad delete-interaction signature from {}: {reason}",
+                        short_id(&author)
+                    );
                     return;
                 }
                 let _ = storage.delete_interaction(&id, &author).await;

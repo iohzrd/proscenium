@@ -38,6 +38,8 @@ pub struct Profile {
     pub avatar_hash: Option<String>,
     pub avatar_ticket: Option<String>,
     pub visibility: Visibility,
+    #[serde(default)]
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

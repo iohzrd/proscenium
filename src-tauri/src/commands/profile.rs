@@ -1,7 +1,8 @@
 use crate::commands::servers::sync_profile_inner;
 use crate::ext::ResultExt;
 use crate::state::{AppState, NodeStatus};
-use iroh_social_types::{Profile, Visibility, validate_profile};
+use iroh::SecretKey;
+use iroh_social_types::{Profile, Visibility, sign_profile, validate_profile};
 use std::sync::Arc;
 use tauri::State;
 
@@ -32,14 +33,19 @@ pub async fn save_my_profile(
 ) -> Result<(), String> {
     let node_id = state.master_pubkey.clone();
     let new_visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
-    let profile = Profile {
+    let mut profile = Profile {
         display_name: display_name.clone(),
         bio: bio.clone(),
         avatar_hash,
         avatar_ticket,
         visibility: new_visibility,
+        signature: String::new(),
     };
     validate_profile(&profile)?;
+
+    // Sign with signing key
+    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
+    sign_profile(&mut profile, &sk);
 
     let old_visibility = state
         .storage

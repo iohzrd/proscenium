@@ -9,7 +9,8 @@ use iroh_gossip::{
 };
 use iroh_social_types::{
     GossipMessage, Interaction, Post, Profile, Visibility, now_millis, short_id, user_feed_topic,
-    validate_profile,
+    validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
+    verify_profile_signature,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -278,11 +279,17 @@ impl FeedManager {
         Ok(())
     }
 
-    pub async fn broadcast_delete(&self, id: &str, author: &str) -> anyhow::Result<()> {
+    pub async fn broadcast_delete(
+        &self,
+        id: &str,
+        author: &str,
+        signature: &str,
+    ) -> anyhow::Result<()> {
         if let Some(sender) = self.my_sender.as_ref() {
             let msg = GossipMessage::DeletePost {
                 id: id.to_string(),
                 author: author.to_string(),
+                signature: signature.to_string(),
             };
             let payload = serde_json::to_vec(&msg)?;
             sender.broadcast(Bytes::from(payload)).await?;
@@ -327,11 +334,17 @@ impl FeedManager {
         Ok(())
     }
 
-    pub async fn broadcast_delete_interaction(&self, id: &str, author: &str) -> anyhow::Result<()> {
+    pub async fn broadcast_delete_interaction(
+        &self,
+        id: &str,
+        author: &str,
+        signature: &str,
+    ) -> anyhow::Result<()> {
         if let Some(sender) = self.my_sender.as_ref() {
             let msg = GossipMessage::DeleteInteraction {
                 id: id.to_string(),
                 author: author.to_string(),
+                signature: signature.to_string(),
             };
             let payload = serde_json::to_vec(&msg)?;
             sender.broadcast(Bytes::from(payload)).await?;
@@ -426,6 +439,24 @@ impl FeedManager {
         Ok(())
     }
 
+    /// Resolve the signing public key for a peer from the delegation cache.
+    /// Returns None if no delegation is cached (backward compat: skip verification).
+    fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<iroh::PublicKey> {
+        match storage.get_peer_signing_pubkey(master_pubkey) {
+            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
+                Ok(pk) => Some(pk),
+                Err(e) => {
+                    log::warn!(
+                        "[gossip-rx] bad signing pubkey for {}: {e}",
+                        short_id(master_pubkey)
+                    );
+                    None
+                }
+            },
+            _ => None,
+        }
+    }
+
     fn handle_follow_message(
         storage: &Storage,
         pk: &str,
@@ -455,8 +486,23 @@ impl FeedManager {
                     let _ = app_handle.emit("feed-updated", ());
                 }
             }
-            Ok(GossipMessage::DeletePost { id, author }) => {
+            Ok(GossipMessage::DeletePost {
+                id,
+                author,
+                signature,
+            }) => {
                 if author == pk {
+                    // Verify delete signature
+                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                        && let Err(reason) =
+                            verify_delete_post_signature(&id, &author, &signature, &signer)
+                    {
+                        log::warn!(
+                            "[gossip-rx] bad delete-post signature from {}: {reason}",
+                            short_id(pk)
+                        );
+                        return;
+                    }
                     match storage.get_post_by_id(&id) {
                         Ok(Some(post)) if post.author == pk => {
                             log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
@@ -482,6 +528,16 @@ impl FeedManager {
                         short_id(pk)
                     );
                 } else {
+                    // Verify profile signature
+                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                        && let Err(reason) = verify_profile_signature(&profile, &signer)
+                    {
+                        log::warn!(
+                            "[gossip-rx] bad profile signature from {}: {reason}",
+                            short_id(pk)
+                        );
+                        return;
+                    }
                     log::info!(
                         "[gossip-rx] profile update from {}: {}",
                         short_id(pk),
@@ -513,8 +569,23 @@ impl FeedManager {
                     let _ = app_handle.emit("interaction-received", &interaction);
                 }
             }
-            Ok(GossipMessage::DeleteInteraction { id, author }) => {
+            Ok(GossipMessage::DeleteInteraction {
+                id,
+                author,
+                signature,
+            }) => {
                 if author == pk {
+                    // Verify delete signature
+                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                        && let Err(reason) =
+                            verify_delete_interaction_signature(&id, &author, &signature, &signer)
+                    {
+                        log::warn!(
+                            "[gossip-rx] bad delete-interaction signature from {}: {reason}",
+                            short_id(pk)
+                        );
+                        return;
+                    }
                     log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
                     if let Err(e) = storage.delete_interaction(&id, &author) {
                         log::error!("[gossip-rx] failed to delete interaction: {e}");

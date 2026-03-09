@@ -3,7 +3,7 @@ use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
 use iroh_social_types::{
     MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,
-    Visibility, short_id, validate_profile,
+    Visibility, short_id, validate_profile, verify_profile_signature,
 };
 use tauri::{AppHandle, Emitter};
 
@@ -118,10 +118,25 @@ pub async fn handle_push(
                 "[push-rx] rejected profile from {}: {reason}",
                 short_id(remote_str)
             );
-        } else if let Err(e) = storage.save_profile(remote_str, profile) {
-            log::error!("[push-rx] failed to store profile: {e}");
         } else {
-            let _ = app_handle.emit("profile-updated", remote_str);
+            // Verify profile signature if we have a cached signing key
+            let signer_ok = match storage.get_peer_signing_pubkey(remote_str) {
+                Ok(Some(signing_pubkey)) => match signing_pubkey.parse::<iroh::PublicKey>() {
+                    Ok(pk) => verify_profile_signature(profile, &pk).is_ok(),
+                    Err(_) => true, // bad cached key, allow through
+                },
+                _ => true, // no delegation cached, allow through (backward compat)
+            };
+            if !signer_ok {
+                log::warn!(
+                    "[push-rx] bad profile signature from {}",
+                    short_id(remote_str)
+                );
+            } else if let Err(e) = storage.save_profile(remote_str, profile) {
+                log::error!("[push-rx] failed to store profile: {e}");
+            } else {
+                let _ = app_handle.emit("profile-updated", remote_str);
+            }
         }
     }
 

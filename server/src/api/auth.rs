@@ -256,6 +256,7 @@ async fn update_profile(
         avatar_hash: req.avatar_hash,
         avatar_ticket: None,
         visibility,
+        signature: String::new(),
     };
 
     let updated = state

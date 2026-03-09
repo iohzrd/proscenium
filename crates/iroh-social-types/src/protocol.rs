@@ -9,10 +9,18 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum GossipMessage {
     NewPost(Post),
-    DeletePost { id: String, author: String },
+    DeletePost {
+        id: String,
+        author: String,
+        signature: String,
+    },
     ProfileUpdate(Profile),
     NewInteraction(Interaction),
-    DeleteInteraction { id: String, author: String },
+    DeleteInteraction {
+        id: String,
+        author: String,
+        signature: String,
+    },
 }
 
 /// Response to an IdentityRequest. Contains everything a peer needs

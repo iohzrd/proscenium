@@ -3,7 +3,8 @@ use crate::state::{AppState, generate_id};
 use crate::storage::PostCounts;
 use iroh::SecretKey;
 use iroh_social_types::{
-    Interaction, InteractionKind, Post, now_millis, sign_interaction, sign_post, validate_post,
+    Interaction, InteractionKind, Post, now_millis, sign_delete_interaction, sign_delete_post,
+    sign_interaction, sign_post, validate_post,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -43,8 +44,10 @@ pub async fn unlike_post(
         .delete_interaction_by_target(&my_id, "Like", &target_post_id)
         .str_err()?;
     if let Some(id) = id {
+        let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
+        let signature = sign_delete_interaction(&id, &my_id, &sk);
         let feed = state.feed.lock().await;
-        feed.broadcast_delete_interaction(&id, &my_id)
+        feed.broadcast_delete_interaction(&id, &my_id, &signature)
             .await
             .str_err()?;
     }
@@ -93,8 +96,12 @@ pub async fn unrepost(
         .delete_repost_by_target(&my_id, &target_post_id)
         .str_err()?;
     if let Some(id) = id {
+        let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
+        let signature = sign_delete_post(&id, &my_id, &sk);
         let feed = state.feed.lock().await;
-        feed.broadcast_delete(&id, &my_id).await.str_err()?;
+        feed.broadcast_delete(&id, &my_id, &signature)
+            .await
+            .str_err()?;
     }
     Ok(())
 }

@@ -2,7 +2,9 @@ use crate::ext::ResultExt;
 use crate::state::{AppState, generate_id};
 use crate::storage::FeedQuery;
 use iroh::SecretKey;
-use iroh_social_types::{LinkPreview, MediaAttachment, Post, now_millis, sign_post, validate_post};
+use iroh_social_types::{
+    LinkPreview, MediaAttachment, Post, now_millis, sign_delete_post, sign_post, validate_post,
+};
 use std::sync::Arc;
 use tauri::State;
 
@@ -68,10 +70,16 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
         }
     }
 
+    // Sign the delete action
+    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
+    let signature = sign_delete_post(&id, my_id, &sk);
+
     let removed = state.storage.delete_post(&id).str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
     let feed = state.feed.lock().await;
-    feed.broadcast_delete(&id, my_id).await.str_err()?;
+    feed.broadcast_delete(&id, my_id, &signature)
+        .await
+        .str_err()?;
     log::info!("[post] broadcast delete {id}");
 
     Ok(())

@@ -1,4 +1,4 @@
-use crate::types::{Interaction, Post};
+use crate::types::{Interaction, Post, Profile};
 use iroh::{PublicKey, SecretKey, Signature};
 
 /// Produce the canonical bytes for signing a Post.
@@ -84,4 +84,98 @@ pub fn verify_interaction_signature(
     signer_pubkey
         .verify(&bytes, &sig)
         .map_err(|_| "interaction signature verification failed".to_string())
+}
+
+/// Produce the canonical bytes for signing a Profile.
+/// Excludes `signature` to avoid circular dependency.
+fn profile_signing_bytes(profile: &Profile) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "display_name": profile.display_name,
+        "bio": profile.bio,
+        "avatar_hash": profile.avatar_hash,
+        "avatar_ticket": profile.avatar_ticket,
+        "visibility": profile.visibility,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Sign a Profile in place using the given secret key.
+pub fn sign_profile(profile: &mut Profile, secret_key: &SecretKey) {
+    let bytes = profile_signing_bytes(profile);
+    let sig = secret_key.sign(&bytes);
+    profile.signature = signature_to_hex(&sig);
+}
+
+/// Verify a Profile's signature against the given signer public key.
+pub fn verify_profile_signature(
+    profile: &Profile,
+    signer_pubkey: &PublicKey,
+) -> Result<(), String> {
+    let sig = hex_to_signature(&profile.signature)?;
+    let bytes = profile_signing_bytes(profile);
+    signer_pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "profile signature verification failed".to_string())
+}
+
+/// Produce the canonical bytes for signing a delete-post action.
+fn delete_post_signing_bytes(id: &str, author: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": "delete_post",
+        "id": id,
+        "author": author,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Sign a delete-post action. Returns the hex-encoded signature.
+pub fn sign_delete_post(id: &str, author: &str, secret_key: &SecretKey) -> String {
+    let bytes = delete_post_signing_bytes(id, author);
+    let sig = secret_key.sign(&bytes);
+    signature_to_hex(&sig)
+}
+
+/// Verify a delete-post signature against the given signer public key.
+pub fn verify_delete_post_signature(
+    id: &str,
+    author: &str,
+    signature: &str,
+    signer_pubkey: &PublicKey,
+) -> Result<(), String> {
+    let sig = hex_to_signature(signature)?;
+    let bytes = delete_post_signing_bytes(id, author);
+    signer_pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "delete post signature verification failed".to_string())
+}
+
+/// Produce the canonical bytes for signing a delete-interaction action.
+fn delete_interaction_signing_bytes(id: &str, author: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": "delete_interaction",
+        "id": id,
+        "author": author,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Sign a delete-interaction action. Returns the hex-encoded signature.
+pub fn sign_delete_interaction(id: &str, author: &str, secret_key: &SecretKey) -> String {
+    let bytes = delete_interaction_signing_bytes(id, author);
+    let sig = secret_key.sign(&bytes);
+    signature_to_hex(&sig)
+}
+
+/// Verify a delete-interaction signature against the given signer public key.
+pub fn verify_delete_interaction_signature(
+    id: &str,
+    author: &str,
+    signature: &str,
+    signer_pubkey: &PublicKey,
+) -> Result<(), String> {
+    let sig = hex_to_signature(signature)?;
+    let bytes = delete_interaction_signing_bytes(id, author);
+    signer_pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "delete interaction signature verification failed".to_string())
 }
