@@ -1,6 +1,6 @@
 # Linked Devices - Design Document
 
-Link multiple devices (phone, desktop, tablet) to a single identity. A three-tier key hierarchy separates concerns: a **master key** (permanent identity, cold storage), a **user key** (derived from master, shared across devices for signing and DM), and per-device **transport keys** (iroh networking). The master key enables secure user key rotation if a device is compromised, without losing the identity.
+Link multiple devices (phone, desktop, tablet) to a single identity. A three-tier key hierarchy separates concerns: a **master key** (permanent identity, cold storage), a **signing key** (derived from master, shared across devices for signing and DM), and per-device **transport keys** (iroh networking). The master key enables secure signing key rotation if a device is compromised, without losing the identity.
 
 ## Table of Contents
 
@@ -25,10 +25,10 @@ Link multiple devices (phone, desktop, tablet) to a single identity. A three-tie
 
 ## Design Principles
 
-1. **Three-tier key hierarchy** -- A master key (Ed25519) is the permanent identity, kept in cold storage after setup. A user key (derived from master via hardened derivation) handles day-to-day signing and DM encryption, shared across all linked devices. The transport key is also derived from the master key via HKDF (separate derivation path) and passed to iroh for QUIC networking. In the multi-device future, each device will derive its own transport key using a device-specific index.
-2. **Simple verification** -- Peers verify content signatures against the user key's public key. The master key is only involved during key delegation and rotation -- not on every post. Peers cache the master-signed delegation and verify content against the current user key.
-3. **Survivable compromise** -- If a device holding the user key is compromised, the master key (on a secure device) derives a new user key and publishes a signed rotation. The master public key is the permanent identity; the user key is rotatable. This is the key advantage over a flat shared-key model.
-4. **Shared DM sessions** -- All devices share the same X25519 static key (derived from the user key). A peer needs only one DM ratchet session per user identity, regardless of how many devices that user has. Ratchet state must be synchronized between devices.
+1. **Three-tier key hierarchy** -- A master key (Ed25519) is the permanent identity, kept in cold storage after setup. A signing key (derived from master via hardened derivation) handles day-to-day signing and DM encryption, shared across all linked devices. The transport key is also derived from the master key via HKDF (separate derivation path) and passed to iroh for QUIC networking. In the multi-device future, each device will derive its own transport key using a device-specific index.
+2. **Simple verification** -- Peers verify content signatures against the signing key's public key. The master key is only involved during key delegation and rotation -- not on every post. Peers cache the master-signed delegation and verify content against the current signing key.
+3. **Survivable compromise** -- If a device holding the signing key is compromised, the master key (on a secure device) derives a new signing key and publishes a signed rotation. The master public key is the permanent identity; the signing key is rotatable. This is the key advantage over a flat shared-key model.
+4. **Shared DM sessions** -- All devices share the same X25519 static key (derived from the signing key). A peer needs only one DM ratchet session per user identity, regardless of how many devices that user has. Ratchet state must be synchronized between devices.
 5. **Device registry for routing** -- A signed device announcement lists all linked devices' transport keys so peers and servers can reach any device for sync and DM delivery.
 6. **No server required** -- Pairing, discovery, and sync happen directly between devices over QUIC (iroh transport). No relay or cloud service stores keys.
 
@@ -44,7 +44,7 @@ Signal shares the identity key across all devices. Each device gets its own prek
 
 **What we adopt**: Signal's model of sharing the identity key across devices. All devices are the same identity cryptographically.
 
-**What we differ on**: Signal uses per-device DM sessions (each device has its own X25519 key). We share the X25519 key (derived from the shared user key) so peers need only one ratchet session per user. This trades DM session simplicity for ratchet state synchronization complexity.
+**What we differ on**: Signal uses per-device DM sessions (each device has its own X25519 key). We share the X25519 key (derived from the shared signing key) so peers need only one ratchet session per user. This trades DM session simplicity for ratchet state synchronization complexity.
 
 ### Matrix (Cross-Signing)
 
@@ -56,7 +56,7 @@ Matrix uses a three-level key hierarchy: master key (root of trust) signs a self
 
 Keybase gave each device its own NaCl keypair (never shared). An append-only sigchain recorded device additions and revocations. A Per-User Key (PUK) provided account-level encryption, rotated on device revocation.
 
-**What we adopt**: The concept of a shared-purpose key (PUK) for user-level operations. Our "user key" is analogous to Keybase's PUK but used for signing as well as encryption.
+**What we adopt**: The concept of a shared-purpose key (PUK) for user-level operations. Our "signing key" is analogous to Keybase's PUK but used for signing as well as encryption.
 
 **What we differ on**: We do not use per-device signing keys. Keybase's sigchain was valuable for auditability in a centralized context; in P2P gossip, a lightweight device announcement suffices.
 
@@ -64,7 +64,7 @@ Keybase gave each device its own NaCl keypair (never shared). An append-only sig
 
 In SSB, each device is a separate feed with its own Ed25519 key. The Fusion Identity spec attempted to link feeds by having members exchange a shared fusion identity key. SSB's append-only log model makes key sharing dangerous: two devices using the same key can create conflicting sequence numbers, corrupting the feed.
 
-**What we reject**: SSB's per-device-feed model. It forces peers to understand composite identities and resolve multiple feeds per user. Our model (one shared user key, one identity) avoids this entirely.
+**What we reject**: SSB's per-device-feed model. It forces peers to understand composite identities and resolve multiple feeds per user. Our model (one shared signing key, one identity) avoids this entirely.
 
 **Lesson learned**: Shared keys require coordination to avoid state conflicts. Our ratchet synchronization between devices must handle this carefully.
 
@@ -80,9 +80,9 @@ NIP-46 keeps the private key on a dedicated "signer" device. Client apps request
 
 HD derivation generates a tree of child keys from a master seed. Used in cryptocurrency wallets (BIP32 for secp256k1, SLIP-0010 for Ed25519). Each derivation path produces a unique keypair.
 
-**What we adopt**: Hardened derivation for deriving user keys from the master key. `user_secret[i] = HKDF(master_secret, index=i)`. Compromising a derived user key does NOT reveal the master key. The master can derive a new user key and publish a signed rotation.
+**What we adopt**: Hardened derivation for deriving signing keys from the master key. `signing_secret[i] = HKDF(master_secret, index=i)`. Compromising a derived signing key does NOT reveal the master key. The master can derive a new signing key and publish a signed rotation.
 
-**What we reject**: Non-hardened (public) derivation. While it allows anyone to verify `master_pubkey + index -> user_pubkey`, compromising any derived private key trivially recovers the master private key (`master_secret = user_secret - H(master_pub || i)`). This defeats the entire purpose of key separation. We use hardened derivation and rely on the master key signing a delegation statement to link master and user keys.
+**What we reject**: Non-hardened (public) derivation. While it allows anyone to verify `master_pubkey + index -> signing_pubkey`, compromising any derived private key trivially recovers the master private key (`master_secret = signing_secret - H(master_pub || i)`). This defeats the entire purpose of key separation. We use hardened derivation and rely on the master key signing a delegation statement to link master and signing keys.
 
 ### Multi-Signature / Threshold Signatures (MuSig2 / FROST)
 
@@ -99,16 +99,16 @@ MuSig2 produces a single Schnorr signature from multiple cooperating signers. FR
 ```
 Master Key (Ed25519) -- permanent identity, cold storage
   - master_public = the permanent, unforgeable identity
-  - Signs user key delegations and rotations
+  - Signs signing key delegations and rotations
   - Stored as master_key.key (32 bytes) on the primary device only
   - Can be backed up (paper key, encrypted USB, etc.)
   - NEVER used for content signing or DM encryption
 
-User Key (Ed25519) -- derived from master, shared across all linked devices
-  - Derived: user_secret[i] = HKDF-SHA256(master_secret, info="iroh-social/user-key", salt=i)
+Signing Key (Ed25519) -- derived from master, shared across all linked devices
+  - Derived: signing_secret[i] = HKDF-SHA256(master_secret, info="iroh-social/signing-key", salt=i)
   - Signs posts, interactions, profiles, registrations
   - Derives X25519 key for DM encryption (Noise IK handshake)
-  - Stored as user_key.key (32 bytes) on all linked devices
+  - Stored as signing_key.key (32 bytes) on all linked devices
   - Rotatable: master derives a new one if compromised
 
 Transport Key (Ed25519) -- derived from master + device index, unique per device
@@ -122,28 +122,28 @@ Transport Key (Ed25519) -- derived from master + device index, unique per device
   - Stable across restarts (same master key + device index = same transport NodeId)
 ```
 
-### User Key Derivation
+### Signing Key Derivation
 
-The user key is derived from the master key using HKDF with a key index:
+The signing key is derived from the master key using HKDF with a key index:
 
 ```rust
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-/// Derive a user key from the master key at a given index.
-/// Hardened derivation: compromising the user key does NOT reveal the master key.
-fn derive_user_key(master_secret: &[u8; 32], index: u32) -> [u8; 32] {
+/// Derive a signing key from the master key at a given index.
+/// Hardened derivation: compromising the signing key does NOT reveal the master key.
+fn derive_signing_key(master_secret: &[u8; 32], index: u32) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(&index.to_be_bytes()), master_secret);
-    let mut user_secret = [0u8; 32];
-    hk.expand(b"iroh-social/user-key", &mut user_secret)
+    let mut signing_secret = [0u8; 32];
+    hk.expand(b"iroh-social/signing-key", &mut signing_secret)
         .expect("32 bytes is a valid length for HKDF-SHA256");
-    user_secret
+    signing_secret
 }
 ```
 
 Properties:
-- **Hardened**: knowing `user_secret[i]` does not reveal `master_secret` or `user_secret[j]` for any `j != i`.
-- **Deterministic**: the same `(master_secret, index)` always produces the same user key.
+- **Hardened**: knowing `signing_secret[i]` does not reveal `master_secret` or `signing_secret[j]` for any `j != i`.
+- **Deterministic**: the same `(master_secret, index)` always produces the same signing key.
 - **Cheap**: HKDF is a single hash operation. No complex curve math.
 
 ### Transport Key Derivation
@@ -166,21 +166,21 @@ fn derive_transport_key(master_secret: &[u8; 32], device_index: u32) -> [u8; 32]
 The derived key is passed to iroh via `Endpoint::builder().secret_key()`. This ensures:
 - **Stable NodeId**: same master key + device index always produces the same transport NodeId across app restarts.
 - **Unique per device**: different device indices produce different NodeIds, so linked devices don't collide on the network.
-- **Independence**: the transport key is cryptographically independent from the user key (different HKDF info).
+- **Independence**: the transport key is cryptographically independent from the signing key (different HKDF info).
 - **Deterministic**: no separate key file needed; the transport key is always recoverable from the master key + device index.
 
-### User Key Delegation
+### Signing Key Delegation
 
-The master key signs a delegation statement binding the current user key to the identity:
+The master key signs a delegation statement binding the current signing key to the identity:
 
 ```rust
-/// Signed by the master key. Tells peers "this is my current user key."
+/// Signed by the master key. Tells peers "this is my current signing key."
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserKeyDelegation {
+pub struct SigningKeyDelegation {
     /// The master public key (permanent identity).
     pub master_pubkey: String,
-    /// The current user public key (derived from master at this index).
-    pub user_pubkey: String,
+    /// The current signing public key (derived from master at this index).
+    pub signing_pubkey: String,
     /// The derivation index (so the master can prove derivation if needed).
     pub key_index: u32,
     /// When this delegation was issued (Unix timestamp ms).
@@ -191,15 +191,15 @@ pub struct UserKeyDelegation {
 ```
 
 Peers cache this delegation. When verifying content:
-1. Look up the cached `UserKeyDelegation` for `post.author` (the master pubkey).
-2. Extract the `user_pubkey` from the delegation.
-3. Check `post.signature` against the `user_pubkey`.
+1. Look up the cached `SigningKeyDelegation` for `post.author` (the master pubkey).
+2. Extract the `signing_pubkey` from the delegation.
+3. Check `post.signature` against the `signing_pubkey`.
 
-Every user always has a separate master key and user key. Even single-device users derive their user key from the master key at index 0. The delegation is always present and peers always verify via the delegation.
+Every user always has a separate master key and signing key. Even single-device users derive their signing key from the master key at index 0. The delegation is always present and peers always verify via the delegation.
 
 ### X25519 Key Derivation (DM Encryption)
 
-The X25519 key for DM encryption is deterministically derived from the user key:
+The X25519 key for DM encryption is deterministically derived from the signing key:
 
 ```rust
 // Ed25519 secret -> X25519 secret (standard derivation)
@@ -214,7 +214,7 @@ fn ed25519_secret_to_x25519(ed25519_secret: &[u8; 32]) -> [u8; 32] {
 }
 ```
 
-Since all devices share the same user key, they all derive the same X25519 key. This means:
+Since all devices share the same signing key, they all derive the same X25519 key. This means:
 - Any device can participate in DM sessions as the same static key
 - Peers see one consistent X25519 identity regardless of which device they connect to
 - Ratchet state must be synchronized between devices (the hard problem)
@@ -224,7 +224,7 @@ Since all devices share the same user key, they all derive the same X25519 key. 
 | File | Purpose | Present on |
 |------|---------|-----------|
 | `master_key.key` | Ed25519 master secret (32 bytes), permanent identity | Primary device only (unless user transfers full control) |
-| `user_key.key` | Ed25519 user secret (32 bytes), derived from master via HKDF | All linked devices |
+| `signing_key.key` | Ed25519 signing secret (32 bytes), derived from master via HKDF | All linked devices |
 | (derived from master) | Transport key, derived via HKDF from master key | Every device (deterministic) |
 
 ### Key Relationships
@@ -232,19 +232,19 @@ Since all devices share the same user key, they all derive the same X25519 key. 
 | Aspect | Key used |
 |--------|----------|
 | User identity (pubkey) | master_key.key's public key |
-| Content signing | user_key.key signs |
-| DM encryption | X25519 derived from user_key.key |
+| Content signing | signing_key.key signs |
+| DM encryption | X25519 derived from signing_key.key |
 | Gossip topic | `user_feed_topic(master_pubkey)` |
 | Transport / QUIC | Derived from master key via HKDF (NodeId) |
 
 ### First Launch (Fresh Install)
 
 1. Generate a new Ed25519 keypair for `master_key.key`
-2. Derive `user_key.key` at index 0: `derive_user_key(&master_secret, 0)`
+2. Derive `signing_key.key` at index 0: `derive_signing_key(&master_secret, 0)`
 3. Derive transport key: `derive_transport_key(&master_secret, 0)` -- device index 0 for primary, passed to iroh via `Endpoint::builder().secret_key()`
-4. Sign a `UserKeyDelegation` binding the user key to the master key
+4. Sign a `SigningKeyDelegation` binding the signing key to the master key
 5. Store master key bytes in `AppState::master_secret_key_bytes`
-6. Store user key bytes in `AppState::user_secret_key_bytes`
+6. Store signing key bytes in `AppState::signing_secret_key_bytes`
 
 ---
 
@@ -255,18 +255,18 @@ Since all devices share the same user key, they all derive the same X25519 key. 
 The user's permanent, unforgeable identity is the master key's public key. This is what peers follow and what survives key rotations. It appears in:
 - Follow lists (following/followers)
 - Gossip topic derivation (`user_feed_topic(master_pubkey)`)
-- `UserKeyDelegation` (links master to current user key)
+- `SigningKeyDelegation` (links master to current signing key)
 - `KeyRotation` announcements
 
-### Signing Identity (User Key)
+### Signing Identity (Signing Key)
 
-The user key is the day-to-day signing and encryption key. It does NOT appear in the `author` field -- `author` is always the master pubkey. The user key appears only in:
+The signing key is the day-to-day signing and encryption key. It does NOT appear in the `author` field -- `author` is always the master pubkey. The signing key appears only in:
 - Content signatures (the actual bytes that sign posts/interactions/profiles)
 - DM encryption (X25519 derivation for Noise IK handshake)
 - Server registration signatures
-- `UserKeyDelegation` (linking user key to master key)
+- `SigningKeyDelegation` (linking signing key to master key)
 
-Peers look up the user key via the cached delegation for the master pubkey, then verify signatures against it. For the common case (no key rotation), this is a one-time cached lookup.
+Peers look up the signing key via the cached delegation for the master pubkey, then verify signatures against it. For the common case (no key rotation), this is a one-time cached lookup.
 
 ### Transport Identity
 
@@ -279,7 +279,7 @@ Each device's iroh NodeId (from iroh's internal key) is used for:
 
 Three layers, each with a clear role:
 - **Master key** (permanent identity): what peers follow. Survives key rotation. Rarely used directly.
-- **User key** (signing/DM identity): what signs content and encrypts DMs. Rotatable by master.
+- **Signing key** (signing/DM identity): what signs content and encrypts DMs. Rotatable by master.
 - **Transport key** (network identity): how to reach a specific device. Implementation detail.
 
 ---
@@ -293,7 +293,7 @@ Peers need to know which transport keys (iroh NodeIds) belong to a user identity
 
 ### LinkedDevicesAnnouncement
 
-Published via gossip on the user's feed topic (`user_feed_topic(master_pubkey)`). Signed by the user key.
+Published via gossip on the user's feed topic (`user_feed_topic(master_pubkey)`). Signed by the signing key.
 
 ```rust
 /// Announces the set of devices linked to an identity.
@@ -302,15 +302,15 @@ Published via gossip on the user's feed topic (`user_feed_topic(master_pubkey)`)
 pub struct LinkedDevicesAnnouncement {
     /// The user's master public key (permanent identity).
     pub master_pubkey: String,
-    /// The current user key delegation (signed by master key).
-    pub delegation: UserKeyDelegation,
+    /// The current signing key delegation (signed by master key).
+    pub delegation: SigningKeyDelegation,
     /// All currently active devices.
     pub devices: Vec<DeviceEntry>,
     /// Monotonically increasing version number. Latest wins.
     pub version: u64,
     /// When this announcement was created (Unix timestamp ms).
     pub timestamp: u64,
-    /// Ed25519 signature from the user key over the canonical bytes.
+    /// Ed25519 signature from the signing key over the canonical bytes.
     pub signature: String,
 }
 
@@ -320,7 +320,7 @@ pub struct DeviceEntry {
     pub node_id: String,
     /// Human-readable name.
     pub device_name: String,
-    /// Whether this is the primary device (the one that originally created the user key).
+    /// Whether this is the primary device (the one that originally created the signing key).
     pub is_primary: bool,
     /// When this device was added (Unix timestamp ms).
     pub added_at: u64,
@@ -335,21 +335,21 @@ pub enum GossipMessage {
     DeletePost {
         id: String,
         author: String,
-        signature: String,   // signed by user key
+        signature: String,   // signed by signing key
     },
     ProfileUpdate(Profile),
     NewInteraction(Interaction),
     DeleteInteraction {
         id: String,
         author: String,
-        signature: String,   // signed by user key
+        signature: String,   // signed by signing key
     },
     // New:
     LinkedDevices(LinkedDevicesAnnouncement),
 }
 ```
 
-Note: `DeletePost` and `DeleteInteraction` gain a `signature` field (signed by user key). Since multiple transport NodeIds now publish to the same gossip topic, unsigned deletes would allow any topic participant to forge deletions. No `device_pubkey` field is needed because all devices sign with the same user key.
+Note: `DeletePost` and `DeleteInteraction` gain a `signature` field (signed by signing key). Since multiple transport NodeIds now publish to the same gossip topic, unsigned deletes would allow any topic participant to forge deletions. No `device_pubkey` field is needed because all devices sign with the same signing key.
 
 ### Delete Signing
 
@@ -387,7 +387,7 @@ Same pattern for `delete_interaction`.
 
 When a peer receives a `LinkedDevicesAnnouncement`:
 
-1. Verify the signature against `user_pubkey`.
+1. Verify the signature against `signing_pubkey`.
 2. Check that `version` is greater than any previously cached version for this identity.
 3. Store the announcement (replace previous version).
 4. Use the device list for routing DMs and sync requests.
@@ -443,8 +443,8 @@ pub enum PeerResponse {
 pub struct IdentityResponse {
     /// The user's permanent identity.
     pub master_pubkey: String,
-    /// Proves the user key is authorized by the master key.
-    pub delegation: UserKeyDelegation,
+    /// Proves the signing key is authorized by the master key.
+    pub delegation: SigningKeyDelegation,
     /// All linked devices (transport NodeIds).
     pub devices: Vec<DeviceEntry>,
     /// Current profile.
@@ -476,7 +476,7 @@ If a user opts in to a discovery server, the registration must include both the 
 pub struct RegistrationPayload {
     pub master_pubkey: String,      // permanent identity
     pub transport_node_id: String,  // this device's iroh NodeId
-    pub delegation: UserKeyDelegation,  // proves user key is authorized by master
+    pub delegation: SigningKeyDelegation,  // proves signing key is authorized by master
     pub server_url: String,
     pub timestamp: u64,
     pub visibility: Visibility,
@@ -484,7 +484,7 @@ pub struct RegistrationPayload {
 }
 ```
 
-The signature is produced by the user key. The server verifies it against `delegation.user_pubkey` after checking the delegation's master signature.
+The signature is produced by the signing key. The server verifies it against `delegation.signing_pubkey` after checking the delegation's master signature.
 
 When a user has multiple devices, each device registers independently with the same `master_pubkey` but different `transport_node_id`. The server merges these into a single user record with multiple transport endpoints.
 
@@ -614,7 +614,7 @@ self.gossip.subscribe(topic, bootstrap).await?;
 
 ### Overview
 
-Pairing transfers the user secret key from an existing device to a new device. This is the most security-critical operation -- the user key is the full identity. The transfer happens over an encrypted channel authenticated by a one-time shared secret (QR code or pairing code).
+Pairing transfers the signing secret key from an existing device to a new device. This is the most security-critical operation -- the signing key is the full identity. The transfer happens over an encrypted channel authenticated by a one-time shared secret (QR code or pairing code).
 
 ```
 Existing Device                     New Device
@@ -695,21 +695,21 @@ Use `Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s` -- the Noise IK pattern with an addi
 2. **QR verification** -- Only someone who scanned the QR code knows the PSK, preventing MITM.
 3. **Forward secrecy** -- Ephemeral keys ensure the pairing channel cannot be decrypted later.
 
-Both sides use their iroh transport X25519 keys (derived from iroh Ed25519 keys) for the Noise handshake. The pairing channel authenticates transport identities; the user key is payload transferred inside the encrypted channel.
+Both sides use their iroh transport X25519 keys (derived from iroh Ed25519 keys) for the Noise handshake. The pairing channel authenticates transport identities; the signing key is payload transferred inside the encrypted channel.
 
 ### LinkBundle
 
-Data sent from existing device to new device during pairing. Includes the user secret key and delegation. The master secret key is only transferred if the existing device holds it (primary device) and the user explicitly opts in.
+Data sent from existing device to new device during pairing. Includes the signing secret key and delegation. The master secret key is only transferred if the existing device holds it (primary device) and the user explicitly opts in.
 
 ```rust
 /// Data bundle sent during device pairing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkBundle {
-    /// The user's Ed25519 secret key (32 bytes, base64-encoded).
+    /// The signing Ed25519 secret key (32 bytes, base64-encoded).
     /// Derived from master key. Shared across all devices.
-    pub user_secret_key: String,
-    /// The user key delegation (signed by master key).
-    pub delegation: UserKeyDelegation,
+    pub signing_secret_key: String,
+    /// The signing key delegation (signed by master key).
+    pub delegation: SigningKeyDelegation,
     /// The new device's transport secret key (32 bytes, base64-encoded).
     /// Derived by the existing device: derive_transport_key(master_secret, new_device_index).
     /// The new device stores this directly -- it does NOT need the master key to derive it.
@@ -744,11 +744,11 @@ pub struct RatchetSessionExport {
 ```
 
 Security notes:
-- The `user_secret_key` controls signing and DM. Compromise allows impersonation until the master key rotates it.
+- The `signing_secret_key` controls signing and DM. Compromise allows impersonation until the master key rotates it.
 - The `transport_secret_key` is derived by the existing device from the master key using `derive_transport_key(master_secret, device_index)`. The new device stores it directly and passes it to iroh via `Endpoint::builder().secret_key()`. The new device never sees the master key material used to derive it.
 - The `master_secret_key` (if included) is the permanent identity. Its compromise is unrecoverable.
 - Users should be warned before transferring the master key. Default: do NOT include it. Only include if the user explicitly chooses "transfer full control."
-- **Secondary-to-secondary pairing**: A secondary device (one without the master key) can still pair a new device by sharing the user key and DM sessions, but it CANNOT derive a new transport key. In this case, the existing device must either (a) have a pre-derived transport key assigned to it for this purpose, or (b) the pairing must go through the primary device. The simplest approach: only the primary device (or any device holding the master key) can initiate "Link New Device."
+- **Secondary-to-secondary pairing**: A secondary device (one without the master key) can still pair a new device by sharing the signing key and DM sessions, but it CANNOT derive a new transport key. In this case, the existing device must either (a) have a pre-derived transport key assigned to it for this purpose, or (b) the pairing must go through the primary device. The simplest approach: only the primary device (or any device holding the master key) can initiate "Link New Device."
 - The Noise IK + PSK channel provides end-to-end encryption and authentication.
 - The one-time PSK prevents MITM attacks on the QUIC connection.
 - After successful transfer, all secret key bytes should be zeroized from the transfer buffer.
@@ -761,11 +761,11 @@ When a camera is unavailable (e.g., pairing two desktops), the QR payload can be
 
 ## Signing and Verification
 
-Every device signs with the same user key. The `author` field on all content is the **master pubkey** (the permanent identity). Peers look up the user key via the cached delegation for that master pubkey, then verify the signature. The delegation is cached, so verification is effectively one signature check per post plus a one-time delegation lookup per identity.
+Every device signs with the same signing key. The `author` field on all content is the **master pubkey** (the permanent identity). Peers look up the signing key via the cached delegation for that master pubkey, then verify the signature. The delegation is cached, so verification is effectively one signature check per post plus a one-time delegation lookup per identity.
 
 ### Post Signing
 
-The `author` field is the master pubkey. The signature is produced by the user key's secret key.
+The `author` field is the master pubkey. The signature is produced by the signing key's secret key.
 
 ```rust
 pub struct Post {
@@ -778,18 +778,18 @@ pub struct Post {
     pub reply_to_author: Option<String>,
     pub quote_of: Option<String>,
     pub quote_of_author: Option<String>,
-    pub signature: String,        // signed by user key (NOT master key)
+    pub signature: String,        // signed by signing key (NOT master key)
 }
 ```
 
 #### Signing
 
 ```rust
-/// Sign a post. Uses the user secret key (derived from master).
+/// Sign a post. Uses the signing secret key (derived from master).
 /// The `author` field is set to the master pubkey.
-pub fn sign_post(post: &mut Post, user_secret_key: &SecretKey) {
+pub fn sign_post(post: &mut Post, signing_secret_key: &SecretKey) {
     let bytes = post_signing_bytes(post);
-    let sig = user_secret_key.sign(&bytes);
+    let sig = signing_secret_key.sign(&bytes);
     post.signature = signature_to_hex(&sig);
 }
 ```
@@ -798,12 +798,12 @@ pub fn sign_post(post: &mut Post, user_secret_key: &SecretKey) {
 
 ```rust
 /// Verify a post's signature.
-/// 1. Look up the UserKeyDelegation for post.author (master pubkey).
-/// 2. Verify the signature against the delegated user_pubkey.
+/// 1. Look up the SigningKeyDelegation for post.author (master pubkey).
+/// 2. Verify the signature against the delegated signing_pubkey.
 /// Fails if no delegation is cached -- every user must have one.
 pub fn verify_post_signature(
     post: &Post,
-    get_delegation: impl Fn(&str) -> Option<UserKeyDelegation>,
+    get_delegation: impl Fn(&str) -> Option<SigningKeyDelegation>,
 ) -> Result<(), String> {
     let sig = hex_to_signature(&post.signature)?;
     let bytes = post_signing_bytes(post);
@@ -811,7 +811,7 @@ pub fn verify_post_signature(
     let delegation = get_delegation(&post.author)
         .ok_or_else(|| format!("no delegation cached for {}", &post.author))?;
 
-    let key: PublicKey = delegation.user_pubkey.parse()
+    let key: PublicKey = delegation.signing_pubkey.parse()
         .map_err(|e| format!("invalid pubkey: {e}"))?;
     key.verify(&bytes, &sig)
         .map_err(|_| "post signature verification failed".to_string())
@@ -819,13 +819,13 @@ pub fn verify_post_signature(
 ```
 
 This means:
-- **On key rotation**: old posts still verify because the old user key signed them. Peers must cache the delegation history (old and new user keys for the same master pubkey) or accept that old posts may fail verification after rotation. Simpler approach: old posts are already stored and trusted; only new incoming posts need verification against the current delegation.
+- **On key rotation**: old posts still verify because the old signing key signed them. Peers must cache the delegation history (old and new signing keys for the same master pubkey) or accept that old posts may fail verification after rotation. Simpler approach: old posts are already stored and trusted; only new incoming posts need verification against the current delegation.
 - **`reply_to_author` and `quote_of_author`**: these are always master pubkeys, so they remain stable across rotations.
 - **Follow lists, mentions, profile lookups**: all keyed by master pubkey. No change on rotation.
 
 ### Interaction Signing
 
-Same pattern. `interaction.author` = master pubkey, signature by user key. Verification uses delegation lookup.
+Same pattern. `interaction.author` = master pubkey, signature by signing key. Verification uses delegation lookup.
 
 ### Profile Signing
 
@@ -838,7 +838,7 @@ pub struct Profile {
     pub avatar_hash: Option<String>,
     pub avatar_ticket: Option<String>,
     pub visibility: Visibility,
-    pub signature: String,        // NEW: signed by user key
+    pub signature: String,        // NEW: signed by signing key
 }
 ```
 
@@ -856,9 +856,9 @@ fn profile_signing_bytes(profile: &Profile) -> Vec<u8> {
     .expect("json serialization should not fail")
 }
 
-pub fn sign_profile(profile: &mut Profile, user_secret_key: &SecretKey) {
+pub fn sign_profile(profile: &mut Profile, signing_secret_key: &SecretKey) {
     let bytes = profile_signing_bytes(profile);
-    let sig = user_secret_key.sign(&bytes);
+    let sig = signing_secret_key.sign(&bytes);
     profile.signature = signature_to_hex(&sig);
 }
 ```
@@ -869,7 +869,7 @@ pub fn sign_profile(profile: &mut Profile, user_secret_key: &SecretKey) {
 pub fn verify_profile_signature(
     profile: &Profile,
     expected_master_pubkey: &str,
-    get_delegation: impl Fn(&str) -> Option<UserKeyDelegation>,
+    get_delegation: impl Fn(&str) -> Option<SigningKeyDelegation>,
 ) -> Result<(), String> {
     let sig = hex_to_signature(&profile.signature)?;
     let bytes = profile_signing_bytes(profile);
@@ -877,7 +877,7 @@ pub fn verify_profile_signature(
     let delegation = get_delegation(expected_master_pubkey)
         .ok_or_else(|| format!("no delegation cached for {}", expected_master_pubkey))?;
 
-    let key: PublicKey = delegation.user_pubkey.parse()
+    let key: PublicKey = delegation.signing_pubkey.parse()
         .map_err(|e| format!("invalid pubkey: {e}"))?;
     key.verify(&bytes, &sig)
         .map_err(|_| "profile signature verification failed".to_string())
@@ -888,7 +888,7 @@ pub fn verify_profile_signature(
 
 ### Registration Signing
 
-Server registration uses the user key for the signature, but the registration payload identifies the user by master pubkey. The server caches the `UserKeyDelegation` to verify the signature against the correct user key.
+Server registration uses the signing key for the signature, but the registration payload identifies the user by master pubkey. The server caches the `SigningKeyDelegation` to verify the signature against the correct signing key.
 
 ---
 
@@ -896,14 +896,14 @@ Server registration uses the user key for the signature, but the registration pa
 
 ### Architecture
 
-All devices share the same X25519 static key (derived from the shared Ed25519 user key). This means a peer establishes ONE ratchet session per user identity (master pubkey), regardless of how many devices that user has.
+All devices share the same X25519 static key (derived from the shared Ed25519 signing key). This means a peer establishes ONE ratchet session per user identity (master pubkey), regardless of how many devices that user has.
 
 ```
-Alice (master: MK_A, user key: UK_A, X25519: XK_A)
+Alice (master: MK_A, signing key: UK_A, X25519: XK_A)
   Device A1 (transport: TK_A1)  -- has UK_A, derives XK_A
   Device A2 (transport: TK_A2)  -- has UK_A, derives XK_A
 
-Bob (master: MK_B, user key: UK_B, X25519: XK_B)
+Bob (master: MK_B, signing key: UK_B, X25519: XK_B)
   Device B1 (transport: TK_B1)  -- has UK_B, derives XK_B
 
 Ratchet session (ONE per user pair, keyed by master pubkeys):
@@ -928,10 +928,10 @@ Ratchet sessions are synchronized between linked devices as part of the device s
 
 When Alice sends a DM to Bob from any device:
 
-1. The device uses the shared X25519 key (from user key) to encrypt.
+1. The device uses the shared X25519 key (from signing key) to encrypt.
 2. It looks up Bob's devices from the cached `LinkedDevicesAnnouncement`.
 3. It sends the encrypted message to Bob's available devices via their transport NodeIds.
-4. All of Bob's devices can decrypt (they all have Bob's user key -> X25519 key).
+4. All of Bob's devices can decrypt (they all have Bob's signing key -> X25519 key).
 
 ```rust
 /// Send a DM to a peer. Delivers to all of their online devices.
@@ -967,7 +967,7 @@ When you send a DM from Device A1, Device A2 does not receive the ciphertext dir
 
 The DM handshake uses the shared X25519 key as the Noise static key. The Noise IK pattern authenticates the static key during the handshake. Since all devices present the same X25519 static key, the peer cannot distinguish which device it is talking to at the Noise level -- which is correct behavior for a shared identity.
 
-The DM ALPN does NOT need to change version. The wire format is the same. The only difference is that the X25519 key is now derived from the user key rather than the iroh transport key. This is transparent to the protocol.
+The DM ALPN does NOT need to change version. The wire format is the same. The only difference is that the X25519 key is now derived from the signing key rather than the iroh transport key. This is transparent to the protocol.
 
 ### DM Delivery and Offline Queuing
 
@@ -1048,7 +1048,7 @@ Device sync uses the existing `PEER_ALPN` with new `PeerRequest::DeviceSync` and
 
 ### Sync Protocol
 
-A lightweight protocol between linked devices. Authentication: during the QUIC connection on `PEER_ALPN`, both sides prove they hold the user secret key by signing a challenge with it. This ensures only devices with the shared user key can sync.
+A lightweight protocol between linked devices. Authentication: during the QUIC connection on `PEER_ALPN`, both sides prove they hold the signing secret key by signing a challenge with it. This ensures only devices with the shared signing key can sync.
 
 ```rust
 /// Summary of what a device has, exchanged at sync start.
@@ -1079,28 +1079,28 @@ pub struct DeviceSyncVector {
 
 ### Sync Authentication
 
-Both sides must prove they hold the user key. This prevents a rogue device (which only has a transport key) from connecting and extracting ratchet state.
+Both sides must prove they hold the signing key. This prevents a rogue device (which only has a transport key) from connecting and extracting ratchet state.
 
 ```rust
 /// Challenge-response during device sync handshake.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeviceSyncAuth {
     /// The user's pubkey (both sides should agree).
-    pub user_pubkey: String,
+    pub signing_pubkey: String,
     /// This device's transport NodeId.
     pub node_id: String,
     /// Random challenge nonce.
     pub nonce: [u8; 32],
     /// Timestamp to prevent replay.
     pub timestamp: u64,
-    /// Signature of (user_pubkey || node_id || nonce || timestamp) by user key.
+    /// Signature of (signing_pubkey || node_id || nonce || timestamp) by signing key.
     pub signature: String,
 }
 ```
 
 Flow:
 1. Device A connects to Device B on `PEER_ALPN` and sends `PeerRequest::DeviceSync`.
-2. Both send `DeviceSyncAuth` with a random nonce, signed by user key.
+2. Both send `DeviceSyncAuth` with a random nonce, signed by signing key.
 3. Both verify the other's signature matches the expected user pubkey.
 4. If verification fails, disconnect.
 5. If verification succeeds, exchange `DeviceSyncVector` and sync.
@@ -1143,7 +1143,7 @@ Two tiers of revocation, matching the two tiers of keys:
 
 ### Tier 1: Trust-Based Device Removal (Simple)
 
-Remove a device from the `LinkedDevicesAnnouncement` and stop syncing with it. The removed device still holds the user key but peers stop routing to it. Appropriate for "I got a new phone" scenarios where the old device is wiped or trusted.
+Remove a device from the `LinkedDevicesAnnouncement` and stop syncing with it. The removed device still holds the signing key but peers stop routing to it. Appropriate for "I got a new phone" scenarios where the old device is wiped or trusted.
 
 1. Remove the device from the device registry.
 2. Publish an updated `LinkedDevicesAnnouncement` (incremented version, without the removed device).
@@ -1151,27 +1151,27 @@ Remove a device from the `LinkedDevicesAnnouncement` and stop syncing with it. T
 
 **Limitation**: The removed device can still sign content as the user. This is acceptable when removal is voluntary.
 
-### Tier 2: User Key Rotation (Compromised Device)
+### Tier 2: Signing Key Rotation (Compromised Device)
 
-This is where the master key architecture pays off. If a device is compromised, the master key derives a new user key. The identity (master pubkey) is preserved -- only the signing/DM key changes.
+This is where the master key architecture pays off. If a device is compromised, the master key derives a new signing key. The identity (master pubkey) is preserved -- only the signing/DM key changes.
 
-1. The device holding the master key derives a new user key at index `i+1`:
+1. The device holding the master key derives a new signing key at index `i+1`:
 
 ```rust
-let new_user_key = derive_user_key(&master_secret, current_index + 1);
+let new_signing_key = derive_signing_key(&master_secret, current_index + 1);
 ```
 
-2. The master key signs a `UserKeyRotation` announcement:
+2. The master key signs a `SigningKeyRotation` announcement:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UserKeyRotation {
+pub struct SigningKeyRotation {
     /// The master public key (permanent identity -- unchanged).
     pub master_pubkey: String,
     /// The old user pubkey (being revoked).
-    pub old_user_pubkey: String,
+    pub old_signing_pubkey: String,
     /// The new user pubkey (replacing it).
-    pub new_user_pubkey: String,
+    pub new_signing_pubkey: String,
     /// The new key's derivation index.
     pub new_key_index: u32,
     /// When the rotation was issued (Unix timestamp ms).
@@ -1182,16 +1182,16 @@ pub struct UserKeyRotation {
 ```
 
 3. Publish via gossip on the identity's feed topic (`user_feed_topic(master_pubkey)`).
-4. Publish a new `UserKeyDelegation` for the new user key (signed by master).
-5. Re-pair remaining linked devices with the new user key.
-6. Re-register with discovery servers under the new user key.
-7. DM sessions must be re-established (new X25519 key from new user key).
+4. Publish a new `SigningKeyDelegation` for the new signing key (signed by master).
+5. Re-pair remaining linked devices with the new signing key.
+6. Re-register with discovery servers under the new signing key.
+7. DM sessions must be re-established (new X25519 key from new signing key).
 
-**What peers do on receiving a `UserKeyRotation`**:
+**What peers do on receiving a `SigningKeyRotation`**:
 1. Verify the signature against `master_pubkey`.
-2. Cache the new `UserKeyDelegation`.
-3. Reject content signed by `old_user_pubkey` with timestamps after `rotation.timestamp`.
-4. Accept content signed by `new_user_pubkey` going forward.
+2. Cache the new `SigningKeyDelegation`.
+3. Reject content signed by `old_signing_pubkey` with timestamps after `rotation.timestamp`.
+4. Accept content signed by `new_signing_pubkey` going forward.
 5. The follow relationship (keyed by `master_pubkey`) is preserved -- no action needed.
 6. DM sessions with the old X25519 key are invalidated. New sessions will be established on next DM exchange.
 
@@ -1203,7 +1203,7 @@ If the device holding the master key is the one that's compromised, the identity
 
 Mitigations:
 - **Paper key backup**: Export the master key as a mnemonic / QR code and store offline. Even if the primary device is lost, the master key can be recovered on a new device.
-- **Restrict master key distribution**: By default, only the primary device holds `master_key.key`. The pairing UI warns before transferring it. Most secondary devices hold only the user key.
+- **Restrict master key distribution**: By default, only the primary device holds `master_key.key`. The pairing UI warns before transferring it. Most secondary devices hold only the signing key.
 
 ### GossipMessage Extension for Rotation
 
@@ -1211,7 +1211,7 @@ Mitigations:
 pub enum GossipMessage {
     // ... existing variants ...
     LinkedDevices(LinkedDevicesAnnouncement),
-    UserKeyRotation(UserKeyRotation),  // NEW
+    SigningKeyRotation(SigningKeyRotation),  // NEW
 }
 ```
 
@@ -1239,10 +1239,10 @@ CREATE TABLE IF NOT EXISTS device_sync_state (
     last_sync_at INTEGER NOT NULL DEFAULT 0
 );
 
--- Cached user key delegations for OTHER users
+-- Cached signing key delegations for OTHER users
 CREATE TABLE IF NOT EXISTS peer_key_delegations (
     master_pubkey TEXT PRIMARY KEY,
-    user_pubkey TEXT NOT NULL,
+    signing_pubkey TEXT NOT NULL,
     delegation_json TEXT NOT NULL,
     cached_at INTEGER NOT NULL
 );
@@ -1298,8 +1298,8 @@ fn get_linked_devices() -> Result<Vec<LinkedDevice>>
 fn update_device_last_seen(node_id: &str, timestamp: u64) -> Result<()>
 
 // Peer identity and device info
-fn cache_peer_delegation(delegation: &UserKeyDelegation) -> Result<()>
-fn get_peer_delegation(master_pubkey: &str) -> Result<Option<UserKeyDelegation>>
+fn cache_peer_delegation(delegation: &SigningKeyDelegation) -> Result<()>
+fn get_peer_delegation(master_pubkey: &str) -> Result<Option<SigningKeyDelegation>>
 fn cache_peer_announcement(announcement: &LinkedDevicesAnnouncement) -> Result<()>
 fn get_peer_devices(master_pubkey: &str) -> Result<Vec<DeviceEntry>>
 
@@ -1334,10 +1334,10 @@ pub struct AppState {
     pub master_secret_key_bytes: Option<[u8; 32]>,
     pub master_pubkey: String,  // permanent identity
 
-    // User key (derived from master, shared across all devices)
-    pub user_secret_key_bytes: [u8; 32],
-    pub user_pubkey: String,
-    pub user_key_index: u32,  // derivation index
+    // Signing key (derived from master, shared across all devices)
+    pub signing_secret_key_bytes: [u8; 32],
+    pub signing_pubkey: String,
+    pub signing_key_index: u32,  // derivation index
 
     // Transport identity (iroh's own key)
     pub transport_node_id: String,
@@ -1377,7 +1377,7 @@ Each device subscribes to **two categories** of gossip topics:
 
 Bootstrap nodes for each followed user's topic come from the locally cached `LinkedDevicesAnnouncement` (which lists all their transport NodeIds). When a new device is linked, it receives the follow list via Device Sync, resolves transport NodeIds from the local cache (or via `IdentityRequest`), and subscribes to all followed users' topics.
 
-When publishing to a gossip topic, content is signed by the user key. The publishing NodeId (transport key) differs from the `author` field (master pubkey). Peers accept this because they verify the signature against the user key (looked up via the delegation for `author`), not against the gossip sender's NodeId.
+When publishing to a gossip topic, content is signed by the signing key. The publishing NodeId (transport key) differs from the `author` field (master pubkey). Peers accept this because they verify the signature against the signing key (looked up via the delegation for `author`), not against the gossip sender's NodeId.
 
 ### Tauri Commands
 
@@ -1385,7 +1385,7 @@ When publishing to a gossip topic, content is signed by the user key. The publis
 // Pairing
 start_device_link()                -> LinkQrPayload  // generates QR, starts listening
 cancel_device_link()               -> ()
-link_with_device(qr_payload)       -> ()             // scans QR, pairs, receives user key
+link_with_device(qr_payload)       -> ()             // scans QR, pairs, receives signing key
 
 // Device management
 get_linked_devices()               -> Vec<LinkedDevice>
@@ -1447,7 +1447,7 @@ interface LinkedDevice {
 
 interface DeviceInfo {
   node_id: string;
-  user_pubkey: string;
+  signing_pubkey: string;
   device_name: string;
   is_primary: boolean;
 }
@@ -1457,17 +1457,17 @@ interface DeviceInfo {
 
 ## Discovery Server Considerations
 
-The discovery server subscribes to users' gossip topics and indexes their posts. The shared user key model simplifies server-side changes compared to the per-device-key model.
+The discovery server subscribes to users' gossip topics and indexes their posts. The shared signing key model simplifies server-side changes compared to the per-device-key model.
 
 ### Signing Verification
 
-The server verifies post signatures against the user key looked up via the cached `UserKeyDelegation` for `post.author` (the master pubkey). On key rotation, the server must accept the new user key and reject the old one after the rotation timestamp.
+The server verifies post signatures against the signing key looked up via the cached `SigningKeyDelegation` for `post.author` (the master pubkey). On key rotation, the server must accept the new signing key and reject the old one after the rotation timestamp.
 
 ### Server Must Handle New Gossip Variants
 
 The server's gossip subscriber receives `LinkedDevices(LinkedDevicesAnnouncement)`. It should:
 
-1. Verify the signature against `user_pubkey`.
+1. Verify the signature against `signing_pubkey`.
 2. Cache the device list for routing purposes.
 3. Optionally display device info on the web frontend.
 
@@ -1477,7 +1477,7 @@ The new `DeletePost` and `DeleteInteraction` gossip variants include a `signatur
 
 ### Registration
 
-Server registration uses the user key for signing. The server must also store the `UserKeyDelegation` to know which master pubkey the user key belongs to. On key rotation, re-registration with the new user key is required.
+Server registration uses the signing key for signing. The server must also store the `SigningKeyDelegation` to know which master pubkey the signing key belongs to. On key rotation, re-registration with the new signing key is required.
 
 ### Server-Side Sync Routing
 
@@ -1504,7 +1504,7 @@ async fn sync_from_user(&self, master_pubkey: &str) -> Result<(usize, usize)> {
 
 ## Provenance Log (Optional)
 
-An optional, supplementary append-only hash chain that records identity events. This does NOT replace the snapshot-based verification model -- the `UserKeyDelegation` and `LinkedDevicesAnnouncement` snapshots remain the primary verification path. The provenance log adds auditability for peers who want it.
+An optional, supplementary append-only hash chain that records identity events. This does NOT replace the snapshot-based verification model -- the `SigningKeyDelegation` and `LinkedDevicesAnnouncement` snapshots remain the primary verification path. The provenance log adds auditability for peers who want it.
 
 ### Motivation
 
@@ -1537,9 +1537,9 @@ pub enum IdentityEventPayload {
     Genesis {
         master_pubkey: String,
     },
-    /// A user key was delegated (includes the full delegation).
-    UserKeyDelegated {
-        user_pubkey: String,
+    /// A signing key was delegated (includes the full delegation).
+    SigningKeyDelegated {
+        signing_pubkey: String,
         key_index: u32,
     },
     /// A device was added to the identity.
@@ -1552,10 +1552,10 @@ pub enum IdentityEventPayload {
         node_id: String,
         reason: String,
     },
-    /// The user key was rotated.
-    UserKeyRotated {
-        old_user_pubkey: String,
-        new_user_pubkey: String,
+    /// The signing key was rotated.
+    SigningKeyRotated {
+        old_signing_pubkey: String,
+        new_signing_pubkey: String,
         new_key_index: u32,
     },
 }
@@ -1567,10 +1567,10 @@ The provenance log and snapshot model coexist without dependency:
 
 | Operation | Snapshot (primary) | Provenance log (supplementary) |
 |-----------|-------------------|-------------------------------|
-| Verify a post signature | Check cached `UserKeyDelegation`, verify against `user_pubkey` | Not consulted |
+| Verify a post signature | Check cached `SigningKeyDelegation`, verify against `signing_pubkey` | Not consulted |
 | Verify device membership | Check cached `LinkedDevicesAnnouncement` | Not consulted |
 | Audit identity history | Not possible | Walk the chain from genesis |
-| Key rotation | Accept new `UserKeyDelegation`, discard old | Append `UserKeyRotated` event |
+| Key rotation | Accept new `SigningKeyDelegation`, discard old | Append `SigningKeyRotated` event |
 | Device addition | Accept new `LinkedDevicesAnnouncement` (higher version) | Append `DeviceAdded` event |
 | Device revocation | Accept new `LinkedDevicesAnnouncement` (device removed) | Append `DeviceRevoked` event |
 
@@ -1636,10 +1636,10 @@ CREATE TABLE identity_events (
 
 Events are created on the device holding the master key:
 
-- **First launch**: `Genesis` event (seq=0), then `UserKeyDelegated` (seq=1), then `DeviceAdded` for the first device (seq=2).
+- **First launch**: `Genesis` event (seq=0), then `SigningKeyDelegated` (seq=1), then `DeviceAdded` for the first device (seq=2).
 - **Device pairing**: `DeviceAdded` event after successful pairing.
 - **Device removal**: `DeviceRevoked` event when removing a device.
-- **Key rotation**: `UserKeyRotated` event when deriving a new user key.
+- **Key rotation**: `SigningKeyRotated` event when deriving a new signing key.
 
 ---
 
@@ -1647,14 +1647,14 @@ Events are created on the device holding the master key:
 
 ### Phase 1: Key Hierarchy and Separation
 
-- [x] Implement `derive_user_key(master_secret, index)` using HKDF-SHA256
-- [x] Define `UserKeyDelegation` type with canonical signing bytes and sign/verify functions
-- [x] Generate `master_key.key` on first launch, derive `user_key.key` at index 0
-- [x] Sign `UserKeyDelegation` binding user key to master key on startup
-- [x] Update `AppState` to hold `master_secret_key_bytes`, `master_pubkey`, `user_secret_key_bytes`, `user_pubkey`, `user_key_index`, and `transport_node_id`
-- [x] Update all post/interaction/profile signing to use `user_secret_key_bytes`
+- [x] Implement `derive_signing_key(master_secret, index)` using HKDF-SHA256
+- [x] Define `SigningKeyDelegation` type with canonical signing bytes and sign/verify functions
+- [x] Generate `master_key.key` on first launch, derive `signing_key.key` at index 0
+- [x] Sign `SigningKeyDelegation` binding signing key to master key on startup
+- [x] Update `AppState` to hold `master_secret_key_bytes`, `master_pubkey`, `signing_secret_key_bytes`, `signing_pubkey`, `signing_key_index`, and `transport_node_id`
+- [x] Update all post/interaction/profile signing to use `signing_secret_key_bytes`
 - [x] Update all verification to require delegation lookup (server has backward-compat fallback for transition)
-- [x] Update DM handler to derive X25519 from user key
+- [x] Update DM handler to derive X25519 from signing key
 - [x] Add `IdentityRequest` / `IdentityResponse` to `PeerRequest` / `PeerResponse` enums
 - [x] Implement `IdentityRequest` handler: respond with master pubkey, delegation, device list, profile
 - [x] Implement `resolve_transport_nodes(master_pubkey)` with local cache (+ optional server fallback)
@@ -1662,86 +1662,117 @@ Events are created on the device holding the master key:
 - [x] Update follow flow: connect to transport NodeId, send IdentityRequest, cache result, then subscribe
 - [x] Update `SyncHandler` to accept sync requests where `author == master_pubkey`
 - [x] Update user profile links/QR codes to include transport NodeId alongside master pubkey
-- [x] Update server registration payload to include `master_pubkey`, `transport_node_id`, and `UserKeyDelegation`
+- [x] Update server registration payload to include `master_pubkey`, `transport_node_id`, and `SigningKeyDelegation`
 - [x] Add server endpoint (optional): `GET /api/v1/users/{master_pubkey}/devices`
-- [ ] Verify functionality works with separated keys (single device)
+- [x] Verify functionality works with separated keys (single device)
 
 ### Phase 2: Profile Signing and Delete Signing
 
-- [ ] Add `signature` field to `Profile` struct
-- [ ] Implement `profile_signing_bytes`, `sign_profile`, `verify_profile_signature`
-- [ ] Add `signature` field to `DeletePost` and `DeleteInteraction` gossip variants
-- [ ] Implement `sign_delete_post`, `verify_delete_post_signature`, `sign_delete_interaction`, `verify_delete_interaction_signature`
-- [ ] Update gossip message handlers to verify profile signatures and delete signatures
-- [ ] Update sync-received profile verification
-- [ ] Add `signature` and `updated_at` columns to profiles table
-- [ ] Update server ingestion to verify profile signatures and delete signatures
+- [x] Add `signature` field to `Profile` struct
+- [x] Implement `profile_signing_bytes`, `sign_profile`, `verify_profile_signature`
+- [x] Add `signature` field to `DeletePost` and `DeleteInteraction` gossip variants
+- [x] Implement `sign_delete_post`, `verify_delete_post_signature`, `sign_delete_interaction`, `verify_delete_interaction_signature`
+- [x] Update gossip message handlers to verify profile signatures and delete signatures
+- [x] Update sync-received profile verification
+- [x] Add `signature` and `updated_at` columns to profiles table
+- [x] Update server ingestion to verify profile signatures and delete signatures
 
 ### Phase 3: Device Registry and Storage
 
-- [ ] Define `LinkedDevicesAnnouncement` and `DeviceEntry` types
-- [ ] Add `LinkedDevices` variant to `GossipMessage`
-- [ ] Add `DeviceAnnouncements` variant to `SyncFrame`
-- [ ] Add database migrations for device tables
-- [ ] Implement storage methods for device management and peer announcement caching
-- [ ] Handle incoming gossip announcements: validate and cache
-- [ ] For single-device users, publish a single-device announcement on startup
-- [ ] Add LWW state columns to `follows`, `mutes`, `blocks` tables
-- [ ] Update follow/mute/block operations to set state + timestamp instead of deleting rows
+- [x] Define `LinkedDevicesAnnouncement` and `DeviceEntry` types
+- [x] Add `LinkedDevices` variant to `GossipMessage`
+- [x] Add `DeviceAnnouncements` variant to `SyncFrame`
+- [x] Add database migrations for device tables
+- [x] Implement storage methods for device management and peer announcement caching
+- [x] Handle incoming gossip announcements: validate and cache
+- [x] For single-device users, publish a single-device announcement on startup
+- [x] Add LWW state columns to `follows`, `mutes`, `blocks` tables
+- [x] Update follow/mute/block operations to set state + timestamp instead of deleting rows
 
 ### Phase 4: Pairing Protocol
 
-- [ ] Add `LinkRequest`/`LinkBundle` variants to `PeerRequest`/`PeerResponse` and define wire types (`LinkQrPayload`, `LinkBundle`, `RatchetSessionExport`)
-- [ ] Handle `LinkRequest` in `PeerHandler`
-- [ ] Implement Noise IK + PSK handshake for pairing channel
-- [ ] Implement existing device side: generate QR, listen, send LinkBundle (including user key, delegation, optionally master key, and ratchet sessions)
-- [ ] Implement new device side: scan QR, connect, receive LinkBundle, import data, save user key (and master key if provided)
-- [ ] Add UI warning before transferring master key ("transfer full control")
-- [ ] Publish `LinkedDevicesAnnouncement` after successful pairing
-- [ ] Add Tauri commands: `start_device_link`, `link_with_device`, `cancel_device_link`
-- [ ] Build QR code display modal
-- [ ] Build QR scan / paste modal
-- [ ] Build `/settings/devices` management page
+- [x] Add `LinkRequest`/`LinkBundle` variants to `PeerRequest`/`PeerResponse` and define wire types (`LinkQrPayload`, `LinkBundle`, `RatchetSessionExport`)
+- [x] Handle `LinkRequest` in `PeerHandler`
+- [x] Implement Noise IK + PSK handshake for pairing channel
+- [x] Implement existing device side: generate QR, listen, send LinkBundle (including signing key, delegation, optionally master key, and ratchet sessions)
+- [x] Implement new device side: scan QR, connect, receive LinkBundle, import data, save signing key (and master key if provided)
+- [x] Add UI warning before transferring master key ("transfer full control")
+- [x] Publish `LinkedDevicesAnnouncement` after successful pairing
+- [x] Add Tauri commands: `start_device_link`, `link_with_device`, `cancel_device_link`
+- [x] Build QR code display modal
+- [x] Build QR scan / paste modal
+- [x] Build `/settings/devices` management page
 
 ### Phase 5: Device Sync
 
-- [ ] Add `DeviceSync` variants to `PeerRequest`/`PeerResponse` and define sync types (`DeviceSyncVector`, `DeviceSyncAuth`)
-- [ ] Handle `DeviceSync` in `PeerHandler`
-- [ ] Implement challenge-response authentication (both sides prove user key possession)
-- [ ] Implement sync vector generation from local state
-- [ ] Implement delta computation and streaming
-- [ ] Implement ratchet session sync (export/import with LWW by updated_at)
-- [ ] Implement DM message history sync (set union by message_id)
-- [ ] Extend outbox flush to try all recipient devices from `LinkedDevicesAnnouncement`
-- [ ] Implement post/interaction sync between own devices
-- [ ] Implement LWW-per-entry merge logic for follows, mutes, blocks
-- [ ] Add periodic sync task (60s interval)
-- [ ] Add Tauri command: `force_device_sync`
+- [x] Add `DeviceSync` variants to `PeerRequest`/`PeerResponse` and define sync types (`DeviceSyncVector`, `DeviceSyncAuth`)
+- [x] Handle `DeviceSync` in `PeerHandler`
+- [x] Implement challenge-response authentication (both sides prove signing key possession)
+- [x] Implement sync vector generation from local state
+- [x] Implement delta computation and streaming
+- [x] Implement ratchet session sync (export/import with LWW by updated_at)
+- [x] Implement DM message history sync (set union by message_id)
+- [x] Extend outbox flush to try all recipient devices from `LinkedDevicesAnnouncement`
+- [x] Implement post/interaction sync between own devices
+- [x] Implement LWW-per-entry merge logic for follows, mutes, blocks
+- [x] Add periodic sync task (60s interval)
+- [x] Add Tauri command: `force_device_sync`
 
 ### Phase 6: Server Multi-Device Support
 
-- [ ] Update server ingestion to handle `LinkedDevices` gossip variant
-- [ ] Cache `UserKeyDelegation` on the server (map master pubkey -> user pubkey)
-- [ ] Cache peer device announcements on the server
+Already done (from earlier phases):
+- [x] Update server ingestion to handle `LinkedDevices` gossip variant
+- [x] Cache `SigningKeyDelegation` on the server (map master pubkey -> user pubkey)
+- [x] Cache peer device announcements on the server
+- [x] Handle signed deletes in server ingestion
+- [x] Verify profile signatures in server ingestion
+
+Remaining:
 - [ ] Update server sync to try multiple devices when syncing from a user
-- [ ] Handle signed deletes in server ingestion
-- [ ] Verify profile signatures in server ingestion
-- [ ] Handle `UserKeyRotation` gossip variant (invalidate old user key, accept new one)
-- [ ] Implement server-side DM store (opt-in): `POST /api/dm/store`, `GET /api/dm/pending`, `POST /api/dm/ack`
-- [ ] Add `stored_dms` table with TTL cleanup (7 days) and per-recipient limits
-- [ ] Client: push DMs to recipient's server when direct delivery fails
-- [ ] Client: poll registered server for pending DMs on startup and periodically
+  - `get_all_transport_node_ids()` storage method (check `peer_delegations.transport_node_ids_json` first, fall back to single node id)
+  - `sync_from_peer_inner` tries each device in order, falls through on failure
+- [ ] Update gossip subscription bootstrap to use all device NodeIds
+- [ ] Handle `SigningKeyRotation` gossip variant (invalidate old signing key, accept new one) -- deferred to Phase 7
+
+### Phase 6b: Server-Side DM Relay (opt-in)
+
+Server acts as a dead-drop relay for E2E encrypted DM envelopes when direct P2P delivery fails. The server never sees plaintext -- only opaque encrypted envelopes. Requires explicit opt-in per server via `dm_relay` flag.
+
+Server side:
+- [ ] Add `stored_dms` table migration: `id TEXT PK, sender TEXT, recipient TEXT, envelope_json TEXT, stored_at INTEGER`
+- [ ] Add indexes: `idx_stored_dms_recipient(recipient, stored_at)`, `idx_stored_dms_stored_at(stored_at)`
+- [ ] Storage methods: `store_dm`, `get_pending_dms`, `ack_dms`, `count_pending_dms`, `prune_old_dms`
+- [ ] API endpoints (all require signed requests verified against delegation):
+  - `POST /api/v1/dm/store` -- sender stores an encrypted envelope for a recipient
+  - `POST /api/v1/dm/pending` -- recipient fetches their pending DMs
+  - `POST /api/v1/dm/ack` -- recipient acknowledges receipt (server deletes)
+- [ ] Per-recipient limit (500 pending), envelope size limit (64KB)
+- [ ] TTL cleanup: delete stored DMs older than 7 days (hourly pruning task)
+
+Shared types (iroh-social-types):
+- [ ] `DmStoreRequest`, `DmFetchRequest`, `DmAckRequest`, `PendingDm`, `DmFetchResponse`
+- [ ] Sign/verify functions for each request type (canonical JSON signing bytes)
+
+Client side:
+- [ ] Add `dm_relay` boolean column to `servers` table (migration, default off)
+- [ ] `set_server_dm_relay` Tauri command to toggle per server
+- [ ] `get_dm_relay_server_urls()` storage method (only servers with `dm_relay = 1 AND registered_at IS NOT NULL`)
+- [ ] `dm_relay.rs` module: `push_dm_to_servers()` and `poll_servers_for_dms()`
+- [ ] DM outbox flush: when direct P2P delivery fails, fall back to server relay (push envelope to all opted-in relay servers)
+- [ ] `handle_relayed_message()` on DmHandler to process server-relayed envelopes
+- [ ] Periodic poll task: fetch pending DMs from relay servers, process, and ack
+- [ ] UI: toggle DM relay per server in server settings
 
 ### Phase 7: Key Rotation
 
-- [ ] Define `UserKeyRotation` type with canonical signing bytes and verify function
-- [ ] Implement user key rotation on the device holding the master key
-- [ ] Derive new user key at index+1, sign `UserKeyRotation` with master key
+- [ ] Define `SigningKeyRotation` type with canonical signing bytes and verify function
+- [ ] Implement signing key rotation on the device holding the master key
+- [ ] Derive new signing key at index+1, sign `SigningKeyRotation` with master key
 - [ ] Publish rotation via gossip, update delegation
-- [ ] Re-pair remaining linked devices with new user key
+- [ ] Re-pair remaining linked devices with new signing key
 - [ ] Re-register with discovery servers
-- [ ] Handle incoming `UserKeyRotation` on peers: update cached delegation, reject old user key after rotation timestamp
-- [ ] Handle incoming `UserKeyRotation` on server: same as peers
+- [ ] Handle incoming `SigningKeyRotation` on peers: update cached delegation, reject old signing key after rotation timestamp
+- [ ] Handle incoming `SigningKeyRotation` on server: same as peers
 - [ ] DM session invalidation and re-establishment after rotation
 - [ ] UI for key rotation (Settings -> Security -> "Rotate signing key")
 
@@ -1762,7 +1793,7 @@ Events are created on the device holding the master key:
 - [ ] Create genesis + delegation + device-added events on first launch
 - [ ] Create `DeviceAdded` event during pairing
 - [ ] Create `DeviceRevoked` event during device removal
-- [ ] Create `UserKeyRotated` event during key rotation
+- [ ] Create `SigningKeyRotated` event during key rotation
 - [ ] Add `IdentityEvent` variant to `GossipMessage`
 - [ ] Handle incoming `IdentityEvent` gossip: validate chain integrity (prev_hash, seq, master_sig), store
 - [ ] Add `IdentityLogRequest`/`IdentityLogResponse` to `PeerRequest`/`PeerResponse`
