@@ -75,7 +75,7 @@ fn default_max_posts() -> u32 {
     10000
 }
 fn default_sync_interval() -> u64 {
-    15
+    5
 }
 fn default_max_syncs() -> usize {
     10
