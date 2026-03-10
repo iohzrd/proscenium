@@ -107,6 +107,29 @@ impl Storage {
         })
     }
 
+    pub fn get_registered_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
+        self.with_db(|db| {
+            let mut stmt = db.prepare(
+                "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE registered_at IS NOT NULL ORDER BY added_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(ServerEntry {
+                        url: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        node_id: row.get(3)?,
+                        registered_at: row.get(4)?,
+                        visibility: row.get(5)?,
+                        added_at: row.get(6)?,
+                        last_synced_at: row.get(7)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     pub fn mark_server_unregistered(&self, url: &str) -> anyhow::Result<()> {
         self.with_db(|db| {
             db.execute(

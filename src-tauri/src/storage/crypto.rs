@@ -20,6 +20,16 @@ impl Storage {
         })
     }
 
+    pub fn delete_ratchet_session(&self, peer_pubkey: &str) -> anyhow::Result<()> {
+        self.with_db(|db| {
+            db.execute(
+                "DELETE FROM dm_ratchet_sessions WHERE peer_pubkey=?1",
+                params![peer_pubkey],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn get_ratchet_session(&self, peer_pubkey: &str) -> anyhow::Result<Option<String>> {
         self.with_db(|db| {
             let mut stmt =

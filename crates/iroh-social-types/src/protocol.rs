@@ -1,4 +1,4 @@
-use crate::delegation::SigningKeyDelegation;
+use crate::delegation::{SigningKeyDelegation, SigningKeyRotation};
 use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::types::{
     DeviceEntry, DeviceSyncVector, FollowSyncEntry, Interaction, ModerationSyncEntry, Post,
@@ -43,6 +43,7 @@ pub enum GossipMessage {
         signature: String,
     },
     LinkedDevices(LinkedDevicesAnnouncement),
+    SigningKeyRotation(SigningKeyRotation),
 }
 
 /// Response to an IdentityRequest. Contains everything a peer needs

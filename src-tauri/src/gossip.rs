@@ -10,7 +10,7 @@ use iroh_gossip::{
 use iroh_social_types::{
     GossipMessage, Interaction, Post, Profile, Visibility, now_millis, short_id, user_feed_topic,
     validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
-    verify_linked_devices_announcement, verify_profile_signature,
+    verify_linked_devices_announcement, verify_profile_signature, verify_rotation,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -375,6 +375,24 @@ impl FeedManager {
         Ok(())
     }
 
+    pub async fn broadcast_signing_key_rotation(
+        &self,
+        rotation: &iroh_social_types::SigningKeyRotation,
+    ) -> anyhow::Result<()> {
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::SigningKeyRotation(rotation.clone());
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+            log::info!(
+                "[gossip] broadcast signing key rotation to index {}",
+                rotation.new_key_index
+            );
+        } else {
+            log::info!("[gossip] no gossip sender, skipping rotation broadcast");
+        }
+        Ok(())
+    }
+
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
@@ -647,6 +665,55 @@ impl FeedManager {
                 );
                 if let Err(e) = storage.cache_peer_device_announcement(pk, &announcement) {
                     log::error!("[gossip-rx] failed to cache device announcement: {e}");
+                }
+            }
+            Ok(GossipMessage::SigningKeyRotation(rotation)) => {
+                if rotation.master_pubkey != pk {
+                    log::warn!(
+                        "[gossip-rx] ignoring key rotation from {} (expected {})",
+                        short_id(&rotation.master_pubkey),
+                        short_id(pk)
+                    );
+                    return;
+                }
+                // Verify the rotation signature and embedded delegation
+                if let Err(reason) = verify_rotation(&rotation) {
+                    log::warn!(
+                        "[gossip-rx] bad key rotation from {}: {reason}",
+                        short_id(pk)
+                    );
+                    return;
+                }
+                // Reject replay/downgrade: new key index must be higher than cached
+                if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk)
+                    && rotation.new_key_index <= cached_delegation.key_index
+                {
+                    log::warn!(
+                        "[gossip-rx] stale key rotation from {} (index {} <= cached {})",
+                        short_id(pk),
+                        rotation.new_key_index,
+                        cached_delegation.key_index
+                    );
+                    return;
+                }
+                log::info!(
+                    "[gossip-rx] signing key rotation from {} to index {}",
+                    short_id(pk),
+                    rotation.new_key_index
+                );
+                // Update cached delegation with the new signing key
+                let response = iroh_social_types::IdentityResponse {
+                    master_pubkey: rotation.master_pubkey.clone(),
+                    delegation: rotation.new_delegation.clone(),
+                    transport_node_ids: storage.get_peer_transport_node_ids(pk).unwrap_or_default(),
+                    profile: None,
+                };
+                if let Err(e) = storage.cache_peer_identity(&response) {
+                    log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
+                }
+                // Invalidate DM ratchet session (new signing key = new DH key)
+                if let Err(e) = storage.delete_ratchet_session(pk) {
+                    log::error!("[gossip-rx] failed to invalidate DM session after rotation: {e}");
                 }
             }
             Err(e) => {

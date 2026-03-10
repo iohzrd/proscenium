@@ -43,7 +43,6 @@ pub struct AppState {
     #[allow(dead_code)]
     pub signing_pubkey: String,
     /// Signing key derivation index (0 for initial, incremented on rotation).
-    #[allow(dead_code)]
     pub signing_key_index: u32,
     /// Transport NodeId string (iroh's own key, for QUIC networking).
     pub transport_node_id: String,

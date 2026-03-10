@@ -76,6 +76,107 @@ pub fn sign_delegation(
     }
 }
 
+/// Signed by the master key. Announces that the old signing key has been replaced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SigningKeyRotation {
+    /// The master public key (permanent identity -- unchanged).
+    pub master_pubkey: String,
+    /// The old signing pubkey (being revoked).
+    pub old_signing_pubkey: String,
+    /// The new signing pubkey (replacing it).
+    pub new_signing_pubkey: String,
+    /// The new key's derivation index.
+    pub new_key_index: u32,
+    /// When the rotation was issued (Unix timestamp ms).
+    pub timestamp: u64,
+    /// Signed by the MASTER key (proves the identity owner initiated rotation).
+    pub signature: String,
+    /// The new delegation (signed by master key), so peers can immediately cache it.
+    pub new_delegation: SigningKeyDelegation,
+}
+
+/// Canonical bytes for signing a SigningKeyRotation.
+fn rotation_signing_bytes(
+    master_pubkey: &str,
+    old_signing_pubkey: &str,
+    new_signing_pubkey: &str,
+    new_key_index: u32,
+    timestamp: u64,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": "signing_key_rotation",
+        "master_pubkey": master_pubkey,
+        "old_signing_pubkey": old_signing_pubkey,
+        "new_signing_pubkey": new_signing_pubkey,
+        "new_key_index": new_key_index,
+        "timestamp": timestamp,
+    }))
+    .expect("json serialization should not fail")
+}
+
+/// Create and sign a SigningKeyRotation.
+pub fn sign_rotation(
+    master_secret: &SecretKey,
+    old_signing_pubkey: &PublicKey,
+    new_signing_pubkey: &PublicKey,
+    new_key_index: u32,
+    timestamp: u64,
+    new_delegation: SigningKeyDelegation,
+) -> SigningKeyRotation {
+    let master_pubkey = master_secret.public().to_string();
+    let old_str = old_signing_pubkey.to_string();
+    let new_str = new_signing_pubkey.to_string();
+    let bytes =
+        rotation_signing_bytes(&master_pubkey, &old_str, &new_str, new_key_index, timestamp);
+    let sig = master_secret.sign(&bytes);
+    SigningKeyRotation {
+        master_pubkey,
+        old_signing_pubkey: old_str,
+        new_signing_pubkey: new_str,
+        new_key_index,
+        timestamp,
+        signature: signature_to_hex(&sig),
+        new_delegation,
+    }
+}
+
+/// Verify a SigningKeyRotation's signature against the master public key.
+/// Also verifies the embedded new_delegation.
+pub fn verify_rotation(rotation: &SigningKeyRotation) -> Result<(), String> {
+    // Verify the rotation signature itself
+    let sig = hex_to_signature(&rotation.signature)?;
+    let master_pubkey: PublicKey = rotation
+        .master_pubkey
+        .parse()
+        .map_err(|e| format!("invalid master pubkey: {e}"))?;
+    let bytes = rotation_signing_bytes(
+        &rotation.master_pubkey,
+        &rotation.old_signing_pubkey,
+        &rotation.new_signing_pubkey,
+        rotation.new_key_index,
+        rotation.timestamp,
+    );
+    master_pubkey
+        .verify(&bytes, &sig)
+        .map_err(|_| "rotation signature verification failed".to_string())?;
+
+    // Verify the embedded delegation
+    verify_delegation(&rotation.new_delegation)?;
+
+    // Check consistency: delegation must match rotation fields
+    if rotation.new_delegation.master_pubkey != rotation.master_pubkey {
+        return Err("rotation delegation master_pubkey mismatch".to_string());
+    }
+    if rotation.new_delegation.signing_pubkey != rotation.new_signing_pubkey {
+        return Err("rotation delegation signing_pubkey mismatch".to_string());
+    }
+    if rotation.new_delegation.key_index != rotation.new_key_index {
+        return Err("rotation delegation key_index mismatch".to_string());
+    }
+
+    Ok(())
+}
+
 /// Verify a SigningKeyDelegation's signature against the master public key.
 pub fn verify_delegation(delegation: &SigningKeyDelegation) -> Result<(), String> {
     let sig = hex_to_signature(&delegation.signature)?;
@@ -164,6 +265,57 @@ mod tests {
 
         let delegation = sign_delegation(&master_secret, &signing_pubkey, 0, now_millis());
         assert!(verify_delegation(&delegation).is_ok());
+    }
+
+    #[test]
+    fn test_sign_and_verify_rotation() {
+        let mut master_bytes = [0u8; 32];
+        getrandom::fill(&mut master_bytes).unwrap();
+        let master_secret = SecretKey::from_bytes(&master_bytes);
+
+        let old_signing = derive_signing_key(&master_bytes, 0);
+        let old_signing_pub = SecretKey::from_bytes(&old_signing).public();
+
+        let new_signing = derive_signing_key(&master_bytes, 1);
+        let new_signing_pub = SecretKey::from_bytes(&new_signing).public();
+
+        let now = now_millis();
+        let new_delegation = sign_delegation(&master_secret, &new_signing_pub, 1, now);
+        let rotation = sign_rotation(
+            &master_secret,
+            &old_signing_pub,
+            &new_signing_pub,
+            1,
+            now,
+            new_delegation,
+        );
+        assert!(verify_rotation(&rotation).is_ok());
+    }
+
+    #[test]
+    fn test_tampered_rotation_fails() {
+        let mut master_bytes = [0u8; 32];
+        getrandom::fill(&mut master_bytes).unwrap();
+        let master_secret = SecretKey::from_bytes(&master_bytes);
+
+        let old_signing = derive_signing_key(&master_bytes, 0);
+        let old_signing_pub = SecretKey::from_bytes(&old_signing).public();
+
+        let new_signing = derive_signing_key(&master_bytes, 1);
+        let new_signing_pub = SecretKey::from_bytes(&new_signing).public();
+
+        let now = now_millis();
+        let new_delegation = sign_delegation(&master_secret, &new_signing_pub, 1, now);
+        let mut rotation = sign_rotation(
+            &master_secret,
+            &old_signing_pub,
+            &new_signing_pub,
+            1,
+            now,
+            new_delegation,
+        );
+        rotation.new_key_index = 2; // tamper
+        assert!(verify_rotation(&rotation).is_err());
     }
 
     #[test]

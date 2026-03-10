@@ -10,6 +10,7 @@ use iroh_social_types::{
     user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
+    verify_rotation,
     verify_profile_signature,
 };
 use std::collections::HashMap;
@@ -306,6 +307,69 @@ impl IngestionManager {
                         short_id(topic_owner),
                         announcement.version,
                         announcement.devices.len()
+                    );
+                }
+            }
+            Ok(GossipMessage::SigningKeyRotation(rotation)) => {
+                if rotation.master_pubkey != topic_owner {
+                    return;
+                }
+                if let Err(reason) = verify_rotation(&rotation) {
+                    tracing::warn!(
+                        "[ingestion] bad key rotation from {}: {reason}",
+                        short_id(topic_owner)
+                    );
+                    return;
+                }
+                // Reject replay/downgrade: check cached delegation's key_index
+                if let Ok(Some(cached_json)) = sqlx::query_scalar::<_, String>(
+                    "SELECT delegation_json FROM peer_delegations WHERE master_pubkey = ?1",
+                )
+                .bind(topic_owner)
+                .fetch_optional(&storage.pool)
+                .await
+                    && let Ok(cached) = serde_json::from_str::<iroh_social_types::SigningKeyDelegation>(&cached_json)
+                    && rotation.new_key_index <= cached.key_index
+                {
+                    tracing::warn!(
+                        "[ingestion] stale key rotation for {} (index {} <= cached {})",
+                        short_id(topic_owner),
+                        rotation.new_key_index,
+                        cached.key_index
+                    );
+                    return;
+                }
+                // Update cached delegation with the new signing key
+                let delegation_json =
+                    serde_json::to_string(&rotation.new_delegation).unwrap_or_default();
+                if let Err(e) = storage
+                    .cache_peer_delegation(
+                        topic_owner,
+                        &rotation.new_signing_pubkey,
+                        &delegation_json,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!("[ingestion] failed to cache rotated delegation: {e}");
+                } else {
+                    tracing::info!(
+                        "[ingestion] signing key rotation for {} to index {}",
+                        short_id(topic_owner),
+                        rotation.new_key_index
+                    );
+                }
+                // Also update the registration's delegation_json
+                if let Err(e) = sqlx::query(
+                    "UPDATE registrations SET delegation_json = ?2 WHERE pubkey = ?1",
+                )
+                .bind(topic_owner)
+                .bind(&delegation_json)
+                .execute(&storage.pool)
+                .await
+                {
+                    tracing::error!(
+                        "[ingestion] failed to update registration delegation: {e}"
                     );
                 }
             }

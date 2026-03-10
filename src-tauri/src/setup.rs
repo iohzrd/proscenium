@@ -31,6 +31,21 @@ fn load_or_create_key_bytes(path: &std::path::Path) -> [u8; 32] {
     }
 }
 
+/// Load the persisted signing key index (returns 0 if not yet saved).
+fn load_signing_key_index(data_dir: &std::path::Path) -> u32 {
+    let path = data_dir.join("signing_key_index");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+/// Save the signing key index to disk.
+pub fn save_signing_key_index(data_dir: &std::path::Path, index: u32) {
+    let path = data_dir.join("signing_key_index");
+    std::fs::write(path, index.to_string()).expect("failed to write signing_key_index");
+}
+
 /// Migrate old identity.key to master_key.key if needed.
 fn migrate_identity_key(data_dir: &std::path::Path) {
     let old_path = data_dir.join("identity.key");
@@ -157,8 +172,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let master_pubkey = master_secret.public().to_string();
     log::info!("[setup] master pubkey: {}", short_id(&master_pubkey));
 
-    // Derive signing key at index 0
-    let signing_key_index: u32 = 0;
+    // Load persisted signing key index (defaults to 0 for fresh installs)
+    let signing_key_index: u32 = load_signing_key_index(&data_dir);
     let signing_secret_key_bytes = derive_signing_key(&master_secret_key_bytes, signing_key_index);
     let signing_secret = SecretKey::from_bytes(&signing_secret_key_bytes);
     let signing_pubkey = signing_secret.public().to_string();
