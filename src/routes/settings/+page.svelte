@@ -5,6 +5,7 @@
   import type { ServerEntry } from "$lib/types";
 
   let nodeId = $state("");
+  let pubkey = $state("");
   let servers = $state<ServerEntry[]>([]);
   let newServerUrl = $state("");
   let adding = $state(false);
@@ -72,7 +73,10 @@
 
   onMount(async () => {
     try {
-      nodeId = await invoke<string>("get_node_id");
+      [nodeId, pubkey] = await Promise.all([
+        invoke<string>("get_node_id"),
+        invoke<string>("get_pubkey"),
+      ]);
     } catch {
       // Node not ready
     }
@@ -88,6 +92,14 @@
     <span class="setting-label">Node ID</span>
     <code class="setting-value">{nodeId || "..."}</code>
   </div>
+  <div class="setting-row">
+    <span class="setting-label">Public Key</span>
+    <code class="setting-value">{pubkey || "..."}</code>
+  </div>
+  <p class="setting-hint">
+    Node ID is your transport address (share to connect). Public Key is your
+    permanent identity.
+  </p>
 </section>
 
 <section class="settings-section">
@@ -247,6 +259,7 @@
     display: flex;
     align-items: center;
     gap: 0.75rem;
+    margin-bottom: 0.4rem;
   }
 
   .setting-label {
@@ -259,6 +272,13 @@
     color: var(--text-primary);
     font-size: var(--text-sm);
     word-break: break-all;
+  }
+
+  .setting-hint {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+    margin: 0.5rem 0 0;
+    line-height: 1.4;
   }
 
   .settings-section + .settings-section {

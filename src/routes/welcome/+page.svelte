@@ -7,6 +7,7 @@
 
   let step = $state(0);
   let nodeId = $state("");
+  let masterPubkey = $state("");
   let displayName = $state("");
   let bio = $state("");
   let visibility = $state<Visibility>("public");
@@ -51,7 +52,10 @@
 
   onMount(async () => {
     try {
-      nodeId = await invoke("get_node_id");
+      [nodeId, masterPubkey] = await Promise.all([
+        invoke<string>("get_node_id"),
+        invoke<string>("get_pubkey"),
+      ]);
       const profile = await invoke("get_my_profile");
       if (profile) {
         goto("/");
@@ -195,13 +199,29 @@
       </p>
       {#if nodeId}
         <div class="node-id-section">
-          <p class="label">Your Node ID</p>
-          <button class="node-id" onclick={copyNodeId} title="Copy">
+          <p class="label">Your Node ID (transport address)</p>
+          <button class="node-id" onclick={copyNodeId} title="Copy Node ID">
             {nodeId.slice(0, 16)}...{nodeId.slice(-8)}
           </button>
           {#if copyFeedback}
             <span class="copied">Copied!</span>
           {/if}
+        </div>
+      {/if}
+      {#if masterPubkey}
+        <div class="node-id-section">
+          <p class="label">Your Public Key (permanent identity)</p>
+          <button
+            class="node-id"
+            onclick={async () => {
+              await copyToClipboard(masterPubkey);
+              copyFeedback = true;
+              setTimeout(() => (copyFeedback = false), 1500);
+            }}
+            title="Copy Public Key"
+          >
+            {masterPubkey.slice(0, 16)}...{masterPubkey.slice(-8)}
+          </button>
         </div>
       {/if}
       <button

@@ -9,6 +9,19 @@ use iroh_social_types::{
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+/// Resolve the signing public key for a peer from the delegation cache.
+/// Falls back to the master pubkey for backward compat with pre-delegation content.
+fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
+    // Try cached signing key first (from peer_delegations)
+    if let Ok(Some(signing_pubkey)) = storage.get_peer_signing_pubkey(master_pubkey)
+        && let Ok(pk) = signing_pubkey.parse()
+    {
+        return Some(pk);
+    }
+    // Fall back to master pubkey (backward compat: pre-delegation content was signed by master key)
+    master_pubkey.parse().ok()
+}
+
 /// Validate, verify signature, and store a single incoming post.
 /// Returns `true` if the post was stored successfully.
 pub(crate) fn process_incoming_post(
@@ -22,14 +35,13 @@ pub(crate) fn process_incoming_post(
         log::error!("[{label}] rejected post {}: {reason}", &post.id);
         return false;
     }
-    // TODO: look up signing key from delegation cache instead of using author directly.
-    // For backward compat with pre-migration content, author == signer.
-    let signer: PublicKey = match post.author.parse() {
-        Ok(pk) => pk,
-        Err(e) => {
+    let signer = match resolve_signer(storage, &post.author) {
+        Some(pk) => pk,
+        None => {
             log::error!(
-                "[{label}] rejected post {} (bad author pubkey): {e}",
-                &post.id
+                "[{label}] rejected post {} (cannot resolve signer for {})",
+                &post.id,
+                short_id(&post.author),
             );
             return false;
         }
@@ -97,13 +109,13 @@ pub(crate) fn process_incoming_interaction(
         );
         return;
     }
-    // TODO: look up signing key from delegation cache instead of using author directly.
-    let signer: PublicKey = match interaction.author.parse() {
-        Ok(pk) => pk,
-        Err(e) => {
+    let signer = match resolve_signer(storage, &interaction.author) {
+        Some(pk) => pk,
+        None => {
             log::error!(
-                "[{label}] rejected interaction {} (bad author pubkey): {e}",
-                &interaction.id
+                "[{label}] rejected interaction {} (cannot resolve signer for {})",
+                &interaction.id,
+                short_id(&interaction.author),
             );
             return;
         }
@@ -163,25 +175,55 @@ pub async fn sync_posts(
 ) -> Result<FrontendSyncResult, String> {
     let endpoint = state.endpoint.clone();
     let storage = state.storage.clone();
-    let target: iroh::EndpointId = pubkey.parse().str_err()?;
 
+    // Look up cached transport NodeIds for this peer's master pubkey
+    let node_ids = storage.get_peer_transport_node_ids(&pubkey).str_err()?;
+    if node_ids.is_empty() {
+        return Err(format!(
+            "no cached transport NodeId for {}",
+            short_id(&pubkey)
+        ));
+    }
+
+    // Try each known transport NodeId until one succeeds
     let my_id = state.master_pubkey.clone();
-    let result = crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey)
-        .await
-        .str_err()?;
+    let mut last_err = String::new();
+    for node_id in &node_ids {
+        let target: iroh::EndpointId = match node_id.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[sync] bad transport NodeId {}: {e}", short_id(node_id));
+                continue;
+            }
+        };
+        match crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey).await {
+            Ok(result) => {
+                let stored =
+                    process_sync_result(&storage, &pubkey, &result, "sync", &my_id, &app_handle);
+                log::info!(
+                    "[sync] stored {stored}/{} posts from {} via {} (mode={:?})",
+                    result.posts.len(),
+                    short_id(&pubkey),
+                    short_id(node_id),
+                    result.mode,
+                );
+                return Ok(FrontendSyncResult {
+                    posts: result.posts,
+                    remote_total: result.remote_post_count,
+                });
+            }
+            Err(e) => {
+                log::warn!("[sync] failed via {}: {e}", short_id(node_id),);
+                last_err = e.to_string();
+            }
+        }
+    }
 
-    let stored = process_sync_result(&storage, &pubkey, &result, "sync", &my_id, &app_handle);
-    log::info!(
-        "[sync] stored {stored}/{} posts from {} (mode={:?})",
-        result.posts.len(),
+    Err(format!(
+        "sync failed for {} (tried {} node(s)): {last_err}",
         short_id(&pubkey),
-        result.mode,
-    );
-
-    Ok(FrontendSyncResult {
-        posts: result.posts,
-        remote_total: result.remote_post_count,
-    })
+        node_ids.len(),
+    ))
 }
 
 #[tauri::command]

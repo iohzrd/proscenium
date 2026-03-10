@@ -44,7 +44,7 @@
   let togglingBlock = $state(false);
   let showQr = $state(false);
   let editingProfile = $state(false);
-  let transportNodeId = $state<string | undefined>(undefined);
+  let transportNodeIds = $state<string[]>([]);
 
   const FILTERS = [
     { value: "all", label: "All" },
@@ -75,9 +75,15 @@
     if (pubkey === node.pubkey) {
       const myProfile: Profile | null = await invoke("get_my_profile");
       profile = myProfile;
-      transportNodeId = await invoke("get_node_id");
+      const myNodeId: string = await invoke("get_node_id");
+      transportNodeIds = [myNodeId];
     } else {
       profile = await invoke("get_remote_profile", { pubkey });
+      try {
+        transportNodeIds = await invoke("get_peer_node_ids", { pubkey });
+      } catch {
+        transportNodeIds = [];
+      }
     }
 
     const allPosts: Post[] = await invoke("get_user_posts", {
@@ -199,16 +205,12 @@
         await invoke("unfollow_user", { pubkey });
         isFollowing = false;
       } else {
-        // Resolve a transport NodeId for this user
-        const peerNodeIds: string[] = await invoke("get_peer_node_ids", {
-          pubkey,
-        });
-        if (peerNodeIds.length === 0) {
+        if (transportNodeIds.length === 0) {
           toast.show("No transport NodeId known for this user");
           toggling = false;
           return;
         }
-        await invoke("follow_user", { nodeId: peerNodeIds[0] });
+        await invoke("follow_user", { nodeId: transportNodeIds[0] });
         isFollowing = true;
       }
     } catch (e) {
@@ -298,7 +300,11 @@
 </script>
 
 {#if showQr}
-  <QrModal {pubkey} {transportNodeId} onclose={() => (showQr = false)} />
+  <QrModal
+    {pubkey}
+    transportNodeId={transportNodeIds[0]}
+    onclose={() => (showQr = false)}
+  />
 {/if}
 
 {#if lightbox.src}
@@ -355,17 +361,34 @@
     </div>
   {/if}
 
-  <div class="id-row">
-    <code>{pubkey}</code>
-    <button
-      class="btn-elevated copy-btn"
-      onclick={() => copyFb.copy(pubkey, "pubkey")}
-    >
-      {copyFb.feedback === "pubkey" ? "Copied!" : "Copy ID"}
-    </button>
-    <button class="btn-elevated copy-btn" onclick={() => (showQr = true)}
-      >QR</button
-    >
+  <div class="id-section">
+    <div class="id-row">
+      <span class="id-label">Public Key</span>
+      <code>{pubkey}</code>
+      <button
+        class="btn-elevated copy-btn"
+        onclick={() => copyFb.copy(pubkey, "pubkey")}
+      >
+        {copyFb.feedback === "pubkey" ? "Copied!" : "Copy"}
+      </button>
+      <button class="btn-elevated copy-btn" onclick={() => (showQr = true)}
+        >QR</button
+      >
+    </div>
+    {#each transportNodeIds as nid, i}
+      <div class="id-row">
+        <span class="id-label"
+          >Node ID{transportNodeIds.length > 1 ? ` ${i + 1}` : ""}</span
+        >
+        <code>{nid}</code>
+        <button
+          class="btn-elevated copy-btn"
+          onclick={() => copyFb.copy(nid, `transport-${i}`)}
+        >
+          {copyFb.feedback === `transport-${i}` ? "Copied!" : "Copy"}
+        </button>
+      </div>
+    {/each}
   </div>
 
   {#if !isSelf}
@@ -503,11 +526,27 @@
     margin-top: 0.25rem;
   }
 
+  .id-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+  }
+
   .id-row {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    margin-bottom: 1rem;
+  }
+
+  .id-label {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+    min-width: 5.5rem;
+    flex-shrink: 0;
   }
 
   code {

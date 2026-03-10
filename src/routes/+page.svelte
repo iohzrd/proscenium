@@ -226,15 +226,27 @@
         </span>
       </div>
     {/if}
-    <div class="node-id">
-      <span class="label">You</span>
-      <code>{shortId(node.nodeId)}</code>
-      <button
-        class="btn-elevated copy-btn"
-        onclick={() => copyFb.copy(node.nodeId, "node-id")}
-      >
-        {copyFb.feedback === "node-id" ? "Copied!" : "Copy ID"}
-      </button>
+    <div class="identity-card">
+      <div class="key-row">
+        <span class="key-label">Node ID</span>
+        <code class="key-value">{shortId(node.nodeId)}</code>
+        <button
+          class="btn-elevated copy-btn"
+          onclick={() => copyFb.copy(node.nodeId, "node-id")}
+        >
+          {copyFb.feedback === "node-id" ? "Copied!" : "Copy"}
+        </button>
+      </div>
+      <div class="key-row">
+        <span class="key-label">Public Key</span>
+        <code class="key-value">{shortId(node.pubkey)}</code>
+        <button
+          class="btn-elevated copy-btn"
+          onclick={() => copyFb.copy(node.pubkey, "pubkey")}
+        >
+          {copyFb.feedback === "pubkey" ? "Copied!" : "Copy"}
+        </button>
+      </div>
     </div>
 
     <PostComposer pubkey={node.pubkey} onsubmitted={loadFeed} />
@@ -311,10 +323,10 @@
     margin: 0.25rem 0 1rem;
   }
 
-  .node-id {
+  .identity-card {
     display: flex;
-    align-items: center;
-    gap: 0.5rem;
+    flex-direction: column;
+    gap: 0.4rem;
     padding: 0.6rem 0.85rem;
     background: var(--bg-surface);
     border: 1px solid var(--border);
@@ -322,17 +334,24 @@
     margin-bottom: 1rem;
   }
 
-  .node-id .label {
+  .key-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .key-label {
     color: var(--text-secondary);
-    font-size: var(--text-sm);
+    font-size: var(--text-xs);
     text-transform: uppercase;
     letter-spacing: 0.05em;
     font-weight: 600;
+    min-width: 5.5rem;
   }
 
-  .node-id code {
+  .key-value {
     color: var(--color-link);
-    font-size: var(--text-base);
+    font-size: var(--text-sm);
     flex: 1;
     font-family: var(--font-mono);
   }
