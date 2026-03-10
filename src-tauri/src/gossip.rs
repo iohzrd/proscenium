@@ -20,8 +20,20 @@ use tokio::task::JoinHandle;
 
 /// Sent by gossip tasks when their stream dies, so the reconnect loop can restart them.
 pub enum ReconnectRequest {
-    OwnFeed { attempt: u32 },
-    Follow { pubkey: String, attempt: u32 },
+    OwnFeed {
+        attempt: u32,
+    },
+    Follow {
+        pubkey: String,
+        attempt: u32,
+    },
+    /// A followed peer appeared as a neighbor on our own feed -- refresh our
+    /// subscription to their feed so the gossip overlay is connected in both
+    /// directions.  This handles the startup race where we subscribe to their
+    /// topic before they are reachable, ending up with zero neighbors.
+    RefreshFollow {
+        pubkey: String,
+    },
 }
 
 fn backoff_secs(attempt: u32) -> u64 {
@@ -216,6 +228,20 @@ impl FeedManager {
                                 Err(e) => {
                                     log::error!("[gossip-own] failed to store follower: {e}");
                                 }
+                            }
+
+                            // If we follow this peer, refresh our subscription to
+                            // their feed.  This fixes the startup race where we
+                            // subscribed before they were reachable and ended up
+                            // with zero gossip neighbors on their topic.
+                            if storage.is_following(&pubkey).unwrap_or(false) {
+                                log::info!(
+                                    "[gossip-own] followed peer {} came online, requesting subscription refresh",
+                                    short_id(&pubkey),
+                                );
+                                let _ = reconnect_tx.send(ReconnectRequest::RefreshFollow {
+                                    pubkey: pubkey.clone(),
+                                });
                             }
                         }
                         Event::NeighborDown(endpoint_id) => {
@@ -788,6 +814,38 @@ pub async fn gossip_reconnect_loop(
                     let _ = tx.send(ReconnectRequest::OwnFeed {
                         attempt: attempt + 1,
                     });
+                }
+            }
+            ReconnectRequest::RefreshFollow { pubkey } => {
+                let mut fm = feed.lock().await;
+                // Remove stale subscription (if any) so follow_user re-subscribes
+                // with fresh bootstrap peers.
+                if let Some(handle) = fm.subscriptions.remove(&pubkey) {
+                    handle.abort();
+                    log::info!(
+                        "[reconnect] removed stale subscription for {}",
+                        short_id(&pubkey)
+                    );
+                }
+                let node_ids = fm
+                    .storage
+                    .get_peer_transport_node_ids(&pubkey)
+                    .unwrap_or_default();
+                if node_ids.is_empty() {
+                    log::warn!(
+                        "[reconnect] no transport NodeIds for {}, cannot refresh",
+                        short_id(&pubkey)
+                    );
+                } else if let Err(e) = fm.follow_user(pubkey.clone(), &node_ids).await {
+                    log::error!(
+                        "[reconnect] refresh follow for {} failed: {e}",
+                        short_id(&pubkey)
+                    );
+                } else {
+                    log::info!(
+                        "[reconnect] refreshed follow subscription for {}",
+                        short_id(&pubkey)
+                    );
                 }
             }
             ReconnectRequest::Follow { pubkey, attempt } => {

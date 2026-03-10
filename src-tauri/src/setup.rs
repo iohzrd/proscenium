@@ -341,48 +341,57 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         }
 
-        for f in &follows {
-            let node_ids = storage_clone
-                .get_peer_transport_node_ids(&f.pubkey)
-                .unwrap_or_default();
-            if node_ids.is_empty() {
-                log::warn!(
-                    "[setup] no cached transport NodeIds for {}, skipping gossip subscribe",
-                    short_id(&f.pubkey)
-                );
-                continue;
-            }
-            log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
-            if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
-                log::error!(
-                    "[setup] failed to resubscribe to {}: {e}",
-                    short_id(&f.pubkey)
-                );
-            } else {
-                log::info!("[setup] resubscribed to {}", short_id(&f.pubkey));
-            }
-        }
+        // Wrap feed in Arc<Mutex> early so the spawned subscription task can use it
+        let shared_feed = Arc::new(Mutex::new(feed));
 
-        // Concurrent startup sync with semaphore for bounded parallelism
+        // Gossip follow subscriptions + startup sync -- both need relay
+        let sub_feed = shared_feed.clone();
+        let sub_follows = follows.clone();
+        let sub_storage = storage_clone.clone();
         let sync_endpoint = endpoint.clone();
         let sync_storage = storage_clone.clone();
         let sync_follows = follows.clone();
         let sync_handle = handle.clone();
         let sync_my_id = master_pubkey_clone.clone();
         tokio::spawn(async move {
-            log::info!("[startup-sync] waiting for relay connectivity...");
+            // Wait for relay connectivity before subscribing to follows
+            log::info!("[startup] waiting for relay connectivity...");
             let mut has_relay = false;
             for i in 0..RELAY_WAIT_ATTEMPTS {
                 let addr = sync_endpoint.addr();
                 if addr.relay_urls().next().is_some() {
-                    log::info!("[startup-sync] relay connected after {}s", i);
+                    log::info!("[startup] relay connected after {}s", i);
                     has_relay = true;
                     break;
                 }
                 tokio::time::sleep(RELAY_CHECK_INTERVAL).await;
             }
             if !has_relay {
-                log::error!("[startup-sync] no relay after 10s, attempting sync anyway");
+                log::error!("[startup] no relay after 10s, attempting subscriptions anyway");
+            }
+
+            // Subscribe to followed users' gossip topics
+            for f in &sub_follows {
+                let node_ids = sub_storage
+                    .get_peer_transport_node_ids(&f.pubkey)
+                    .unwrap_or_default();
+                if node_ids.is_empty() {
+                    log::warn!(
+                        "[setup] no cached transport NodeIds for {}, skipping gossip subscribe",
+                        short_id(&f.pubkey)
+                    );
+                    continue;
+                }
+                log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
+                let mut feed = sub_feed.lock().await;
+                if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
+                    log::error!(
+                        "[setup] failed to resubscribe to {}: {e}",
+                        short_id(&f.pubkey)
+                    );
+                } else {
+                    log::info!("[setup] resubscribed to {}", short_id(&f.pubkey));
+                }
             }
 
             log::info!("[startup-sync] waiting 5s for peers to be ready...");
@@ -706,7 +715,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             blobs,
             store,
             storage: storage_clone,
-            feed: Arc::new(Mutex::new(feed)),
+            feed: shared_feed,
             dm: dm_handler,
             master_secret_key_bytes,
             master_pubkey: master_pubkey_clone.clone(),

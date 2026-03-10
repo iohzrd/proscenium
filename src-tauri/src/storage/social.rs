@@ -127,6 +127,17 @@ impl Storage {
         })
     }
 
+    pub fn is_following(&self, pubkey: &str) -> anyhow::Result<bool> {
+        self.with_db(|db| {
+            let exists: bool = db.query_row(
+                "SELECT COUNT(*) > 0 FROM follows WHERE pubkey=?1 AND state='active'",
+                params![pubkey],
+                |row| row.get(0),
+            )?;
+            Ok(exists)
+        })
+    }
+
     pub fn is_mutual(&self, pubkey: &str) -> anyhow::Result<bool> {
         self.with_db(|db| {
             let is_follower: bool = db.query_row(
