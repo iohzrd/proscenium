@@ -12,10 +12,10 @@
   const isMobile = platform() === "android" || platform() === "ios";
 
   let {
-    nodeId,
+    pubkey,
     onsubmitted,
   }: {
-    nodeId: string;
+    pubkey: string;
     onsubmitted: () => void;
   } = $props();
 
@@ -72,7 +72,7 @@
   <MentionAutocomplete
     bind:this={mentionAutocomplete}
     query={mention.query}
-    selfId={nodeId}
+    selfId={pubkey}
     visible={mention.active}
     onselect={mention.insertMention}
   />

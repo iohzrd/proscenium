@@ -13,7 +13,7 @@
 
   let {
     post,
-    nodeId,
+    pubkey,
     showAuthor = true,
     showDelete = false,
     showReplyContext = true,
@@ -23,7 +23,7 @@
     onlightbox,
   }: {
     post: Post;
-    nodeId: string;
+    pubkey: string;
     showAuthor?: boolean;
     showDelete?: boolean;
     showReplyContext?: boolean;
@@ -54,11 +54,11 @@
   // Reactive name resolution (replaces 4 separate $effect/$state blocks)
   const author = useDisplayName(
     () => displayPost.author,
-    () => nodeId,
+    () => pubkey,
   );
   const repostAuthor = useDisplayName(
     () => post.author,
-    () => nodeId,
+    () => pubkey,
   );
 
   // Fetch link previews on-demand for posts with URLs
@@ -90,10 +90,10 @@
         <Avatar
           pubkey={displayPost.author}
           name={author.name}
-          isSelf={displayPost.author === nodeId}
+          isSelf={displayPost.author === pubkey}
           ticket={getCachedAvatarTicket(displayPost.author)}
         />
-        <span class="author" class:self={displayPost.author === nodeId}>
+        <span class="author" class:self={displayPost.author === pubkey}>
           {author.name}
         </span>
       </a>
@@ -102,7 +102,7 @@
       <a href="/post/{displayPost.id}" class="time-link">
         <Timeago timestamp={displayPost.timestamp} />
       </a>
-      {#if showDelete && post.author === nodeId && ondelete}
+      {#if showDelete && post.author === pubkey && ondelete}
         <button
           class="delete-btn"
           onclick={() => ondelete(post.id)}
@@ -115,13 +115,13 @@
   </div>
 
   {#if showReplyContext && post.reply_to}
-    <ReplyContextBlock replyToId={post.reply_to} {nodeId} />
+    <ReplyContextBlock replyToId={post.reply_to} {pubkey} />
   {/if}
 
   {#if isRepostOnly && quotedPost}
     {#if quotedPost.content}
       <p class="post-content">
-        {@html renderContent(quotedPost.content, nodeId)}
+        {@html renderContent(quotedPost.content, pubkey)}
       </p>
     {/if}
     <MediaGrid media={quotedPost.media} {onlightbox} />
@@ -132,11 +132,11 @@
     {/if}
   {:else}
     {#if post.content}
-      <p class="post-content">{@html renderContent(post.content, nodeId)}</p>
+      <p class="post-content">{@html renderContent(post.content, pubkey)}</p>
     {/if}
     <MediaGrid media={post.media} {onlightbox} />
     {#if post.quote_of}
-      <QuotedPostEmbed quoteOfId={post.quote_of} {nodeId} />
+      <QuotedPostEmbed quoteOfId={post.quote_of} {pubkey} />
     {/if}
     {#if linkPreviews.length}
       {#each linkPreviews as preview (preview.url)}

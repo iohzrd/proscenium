@@ -3,7 +3,7 @@
   import Icon from "$lib/Icon.svelte";
 
   interface Props {
-    nodeId: string;
+    pubkey: string;
     status: NodeStatus | null;
     unreadDmCount: number;
     unreadNotificationCount: number;
@@ -11,7 +11,7 @@
   }
 
   let {
-    nodeId,
+    pubkey,
     status,
     unreadDmCount,
     unreadNotificationCount,
@@ -48,10 +48,10 @@
       <Icon name="users" />
       <span class="nav-label">Follows</span>
     </a>
-    {#if nodeId}
+    {#if pubkey}
       <a
-        href="/profile/{nodeId}"
-        class:active={currentPath === `/profile/${nodeId}`}
+        href="/profile/{pubkey}"
+        class:active={currentPath === `/profile/${pubkey}`}
       >
         <Icon name="user" />
         <span class="nav-label">Profile</span>

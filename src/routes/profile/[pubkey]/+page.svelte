@@ -71,11 +71,11 @@
     }
   });
 
-  const node = useNodeInit(async (nid) => {
-    if (pubkey === nid) {
+  const node = useNodeInit(async () => {
+    if (pubkey === node.pubkey) {
       const myProfile: Profile | null = await invoke("get_my_profile");
       profile = myProfile;
-      transportNodeId = await invoke("get_transport_node_id");
+      transportNodeId = await invoke("get_node_id");
     } else {
       profile = await invoke("get_remote_profile", { pubkey });
     }
@@ -92,12 +92,12 @@
     const follows: FollowEntry[] = await invoke("get_follows");
     isFollowing = follows.some((f) => f.pubkey === pubkey);
 
-    if (pubkey !== nid) {
+    if (pubkey !== node.pubkey) {
       isMuted = await invoke("is_muted", { pubkey });
       isBlocked = await invoke("is_blocked", { pubkey });
     }
 
-    if (pubkey !== nid) {
+    if (pubkey !== node.pubkey) {
       try {
         syncStatus = await invoke("get_sync_status", { pubkey });
       } catch {
@@ -106,7 +106,7 @@
     }
   });
 
-  let isSelf = $derived(pubkey === node.nodeId);
+  let isSelf = $derived(pubkey === node.pubkey);
   let displayName = $derived(
     profile?.display_name || (isSelf ? "You" : shortId(pubkey)),
   );
@@ -199,7 +199,16 @@
         await invoke("unfollow_user", { pubkey });
         isFollowing = false;
       } else {
-        await invoke("follow_user", { pubkey, transportNodeId: null });
+        // Resolve a transport NodeId for this user
+        const peerNodeIds: string[] = await invoke("get_peer_node_ids", {
+          pubkey,
+        });
+        if (peerNodeIds.length === 0) {
+          toast.show("No transport NodeId known for this user");
+          toggling = false;
+          return;
+        }
+        await invoke("follow_user", { nodeId: peerNodeIds[0] });
         isFollowing = true;
       }
     } catch (e) {
@@ -426,7 +435,7 @@
 
   <PostFeed
     {posts}
-    nodeId={node.nodeId}
+    pubkey={node.pubkey}
     showAuthor={false}
     showDelete={isSelf}
     emptyMessage="No posts from this user yet."

@@ -6,13 +6,13 @@
   let {
     replyToId,
     replyToAuthor,
-    nodeId,
+    pubkey,
     onsubmitted,
     oncancel,
   }: {
     replyToId: string;
     replyToAuthor: string;
-    nodeId: string;
+    pubkey: string;
     onsubmitted?: () => void;
     oncancel?: () => void;
   } = $props();
@@ -60,7 +60,7 @@
   <MentionAutocomplete
     bind:this={mentionAutocomplete}
     query={mention.query}
-    selfId={nodeId}
+    selfId={pubkey}
     visible={mention.active}
     onselect={mention.insertMention}
   />

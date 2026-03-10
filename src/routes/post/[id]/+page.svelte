@@ -105,7 +105,7 @@
     <div class="parent-post">
       <PostCard
         {post}
-        nodeId={node.nodeId}
+        pubkey={node.pubkey}
         showReplyContext={true}
         onreply={() => {
           replySection?.scrollIntoView({ behavior: "smooth" });
@@ -122,7 +122,7 @@
       <ReplyComposer
         replyToId={post.id}
         replyToAuthor={post.author}
-        nodeId={node.nodeId}
+        pubkey={node.pubkey}
         onsubmitted={loadReplies}
       />
     </div>
@@ -140,7 +140,7 @@
     {#each replies as reply (reply.id)}
       <PostCard
         post={reply}
-        nodeId={node.nodeId}
+        pubkey={node.pubkey}
         showReplyContext={false}
         onlightbox={lightbox.open}
       />

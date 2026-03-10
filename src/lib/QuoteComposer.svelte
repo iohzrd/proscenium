@@ -7,12 +7,12 @@
 
   let {
     quotedPost,
-    nodeId,
+    pubkey,
     onsubmitted,
     oncancel,
   }: {
     quotedPost: Post;
-    nodeId: string;
+    pubkey: string;
     onsubmitted?: () => void;
     oncancel?: () => void;
   } = $props();
@@ -66,7 +66,7 @@
 
 <div class="composer quote-composer">
   <div class="quoted-preview">
-    {#await getDisplayName(quotedPost.author, nodeId)}
+    {#await getDisplayName(quotedPost.author, pubkey)}
       <span class="quote-author">{shortId(quotedPost.author)}</span>
     {:then name}
       <span class="quote-author">{name}</span>
@@ -80,7 +80,7 @@
   <MentionAutocomplete
     bind:this={mentionAutocomplete}
     query={mention.query}
-    selfId={nodeId}
+    selfId={pubkey}
     visible={mention.active}
     onselect={mention.insertMention}
   />

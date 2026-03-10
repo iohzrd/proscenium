@@ -28,6 +28,7 @@
   let unreadDmCount = $state(0);
   let unreadNotificationCount = $state(0);
   let nodeId = $state("");
+  let pubkey = $state("");
 
   async function applyZoom(level: number) {
     zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
@@ -103,6 +104,9 @@
     window.addEventListener("keydown", handleZoomKeys);
     invoke<string>("get_node_id")
       .then((id) => (nodeId = id))
+      .catch(() => {});
+    invoke<string>("get_pubkey")
+      .then((id) => (pubkey = id))
       .catch(() => {});
     pollStatus();
     pollUnread();
@@ -209,7 +213,7 @@
 
 <div class="app-shell">
   <Sidebar
-    {nodeId}
+    {pubkey}
     {status}
     {unreadDmCount}
     {unreadNotificationCount}
@@ -231,7 +235,7 @@
   </div>
 
   <BottomNav
-    {nodeId}
+    {pubkey}
     {unreadDmCount}
     {unreadNotificationCount}
     currentPath={page.url.pathname}

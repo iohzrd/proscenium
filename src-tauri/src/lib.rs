@@ -60,7 +60,7 @@ pub fn run() {
         .setup(|app| setup::initialize(app))
         .invoke_handler(tauri::generate_handler![
             get_node_id,
-            get_transport_node_id,
+            get_pubkey,
             get_my_profile,
             save_my_profile,
             get_remote_profile,
@@ -86,6 +86,7 @@ pub fn run() {
             update_follow_alias,
             get_follows,
             get_followers,
+            get_peer_node_ids,
             add_blob,
             fetch_blob,
             add_blob_bytes,

@@ -5,10 +5,10 @@
 
   let {
     replyToId,
-    nodeId,
+    pubkey,
   }: {
     replyToId: string;
-    nodeId: string;
+    pubkey: string;
   } = $props();
 
   let context = $state<{ author: string; preview: string } | null>(null);
@@ -21,7 +21,7 @@
     try {
       const parent: Post | null = await invoke("get_post", { id: parentId });
       if (parent) {
-        const name = await getDisplayName(parent.author, nodeId);
+        const name = await getDisplayName(parent.author, pubkey);
         const preview =
           parent.content.length > 100
             ? parent.content.slice(0, 100) + "..."

@@ -6,79 +6,61 @@ use tauri::{AppHandle, State};
 
 use super::sync::process_sync_result;
 
-/// Resolve transport NodeIds for a peer's master pubkey.
-/// If `transport_node_id` is provided, uses it (and queries identity to cache delegation).
-/// Otherwise, falls back to the local peer_delegations cache.
+/// Resolve a peer's identity from a transport NodeId.
+/// Connects to the peer, queries identity, caches the result.
 async fn resolve_peer_identity(
     state: &AppState,
-    master_pubkey: &str,
-    transport_node_id: Option<&str>,
-) -> Result<Vec<String>, String> {
-    // If a transport_node_id was provided, use it to query identity and cache the result
-    if let Some(node_id) = transport_node_id {
-        let target: iroh::EndpointId = node_id.parse().str_err()?;
-        match crate::peer::query_identity(&state.endpoint, target).await {
-            Ok(identity) => {
-                log::info!(
-                    "[identity] resolved {} -> master={}",
-                    short_id(node_id),
-                    short_id(&identity.master_pubkey),
-                );
-                if identity.master_pubkey != master_pubkey {
-                    return Err(format!(
-                        "identity mismatch: expected {}, got {}",
-                        short_id(master_pubkey),
-                        short_id(&identity.master_pubkey),
-                    ));
-                }
-                let _ = state.storage.cache_peer_identity(&identity);
-                // Save profile if present
-                if let Some(profile) = &identity.profile {
-                    let _ = state.storage.save_profile(master_pubkey, profile);
-                }
-                return Ok(identity.transport_node_ids);
+    node_id: &str,
+) -> Result<iroh_social_types::IdentityResponse, String> {
+    let target: iroh::EndpointId = node_id.parse().str_err()?;
+    match crate::peer::query_identity(&state.endpoint, target).await {
+        Ok(identity) => {
+            log::info!(
+                "[identity] resolved {} -> master={}",
+                short_id(node_id),
+                short_id(&identity.master_pubkey),
+            );
+            let _ = state.storage.cache_peer_identity(&identity);
+            if let Some(profile) = &identity.profile {
+                let _ = state.storage.save_profile(&identity.master_pubkey, profile);
             }
-            Err(e) => {
-                log::warn!(
-                    "[identity] failed to query identity from {}: {e}",
-                    short_id(node_id),
-                );
-                // Fall through to use the provided node_id directly
-                return Ok(vec![node_id.to_string()]);
-            }
+            Ok(identity)
         }
+        Err(e) => Err(format!(
+            "failed to query identity from {}: {e}",
+            short_id(node_id),
+        )),
     }
-
-    // Check local cache
-    let cached = state
-        .storage
-        .get_peer_transport_node_ids(master_pubkey)
-        .str_err()?;
-    if !cached.is_empty() {
-        return Ok(cached);
-    }
-
-    Err(format!(
-        "no transport NodeIds known for {}. Provide a transport_node_id to connect.",
-        short_id(master_pubkey),
-    ))
 }
 
 #[tauri::command]
 pub async fn follow_user(
     app_handle: AppHandle,
     state: State<'_, Arc<AppState>>,
-    pubkey: String,
-    transport_node_id: Option<String>,
+    node_id: String,
 ) -> Result<(), String> {
     let my_id = state.master_pubkey.clone();
+    let my_transport = state.transport_node_id.clone();
+    if node_id == my_transport {
+        return Err("cannot follow yourself".to_string());
+    }
+    log::info!("[follow] resolving identity for {}...", short_id(&node_id));
+
+    // Connect to the transport NodeId and resolve identity
+    let identity = resolve_peer_identity(&state, &node_id).await?;
+    let pubkey = identity.master_pubkey.clone();
+
     if pubkey == my_id {
         return Err("cannot follow yourself".to_string());
     }
-    log::info!("[follow] following {}...", short_id(&pubkey));
 
-    // Resolve transport NodeIds (via IdentityRequest or cache)
-    let node_ids = resolve_peer_identity(&state, &pubkey, transport_node_id.as_deref()).await?;
+    let node_ids = if identity.transport_node_ids.is_empty() {
+        vec![node_id.clone()]
+    } else {
+        identity.transport_node_ids.clone()
+    };
+
+    log::info!("[follow] following {}...", short_id(&pubkey));
 
     let entry = FollowEntry {
         pubkey: pubkey.clone(),
@@ -166,4 +148,12 @@ pub async fn get_follows(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowEn
 #[tauri::command]
 pub async fn get_followers(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowerEntry>, String> {
     state.storage.get_followers().str_err()
+}
+
+#[tauri::command]
+pub async fn get_peer_node_ids(
+    state: State<'_, Arc<AppState>>,
+    pubkey: String,
+) -> Result<Vec<String>, String> {
+    state.storage.get_peer_transport_node_ids(&pubkey).str_err()
 }

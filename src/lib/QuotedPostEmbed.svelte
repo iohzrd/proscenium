@@ -8,17 +8,17 @@
 
   let {
     quoteOfId,
-    nodeId,
+    pubkey,
   }: {
     quoteOfId: string;
-    nodeId: string;
+    pubkey: string;
   } = $props();
 
   let quotedPost = $state<Post | null>(null);
 
   const author = useDisplayName(
     () => quotedPost?.author ?? "",
-    () => nodeId,
+    () => pubkey,
   );
 
   $effect(() => {
@@ -36,7 +36,7 @@
       <Avatar
         pubkey={quotedPost.author}
         name={author.name || shortId(quotedPost.author)}
-        isSelf={quotedPost.author === nodeId}
+        isSelf={quotedPost.author === pubkey}
         ticket={getCachedAvatarTicket(quotedPost.author)}
         size={20}
       />

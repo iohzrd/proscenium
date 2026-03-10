@@ -20,7 +20,7 @@
   let activeTab = $state<Tab>("users");
   let searchQuery = $state("");
   let searching = $state(false);
-  let nodeId = $state("");
+  let myPubkey = $state("");
 
   let users = $state<ServerUser[]>([]);
   let posts = $state<ServerSearchPost[]>([]);
@@ -33,7 +33,7 @@
   );
 
   const node = useNodeInit(async () => {
-    nodeId = await invoke<string>("get_node_id");
+    myPubkey = await invoke<string>("get_pubkey");
     const follows: FollowEntry[] = await invoke("get_follows");
     followedPubkeys = new Set(follows.map((f) => f.pubkey));
     servers = await invoke("list_servers");
@@ -160,8 +160,13 @@
         );
       } else {
         const user = users.find((u) => u.pubkey === pubkey);
-        const transportNodeId = user?.transport_node_id ?? null;
-        await invoke("follow_user", { pubkey, transportNodeId });
+        const nodeId = user?.transport_node_id;
+        if (!nodeId) {
+          console.error("No transport node ID for user:", pubkey);
+          togglingFollow = null;
+          return;
+        }
+        await invoke("follow_user", { nodeId });
         followedPubkeys = new Set([...followedPubkeys, pubkey]);
       }
     } catch (e) {
@@ -293,7 +298,7 @@
                   <span class="user-stat">{user.post_count} posts</span>
                 </div>
               </a>
-              {#if user.pubkey !== nodeId}
+              {#if user.pubkey !== myPubkey}
                 <button
                   class="follow-btn"
                   class:following={followedPubkeys.has(user.pubkey)}

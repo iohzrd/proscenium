@@ -6,7 +6,7 @@
 
   let {
     posts,
-    nodeId,
+    pubkey,
     emptyMessage = "No posts yet.",
     showAuthor = true,
     showDelete = false,
@@ -16,7 +16,7 @@
     onlightbox,
   }: {
     posts: Post[];
-    nodeId: string;
+    pubkey: string;
     emptyMessage?: string;
     showAuthor?: boolean;
     showDelete?: boolean;
@@ -34,7 +34,7 @@
   {#each posts as post (post.id)}
     <PostCard
       {post}
-      {nodeId}
+      {pubkey}
       {showAuthor}
       {showDelete}
       {showReplyContext}
@@ -53,7 +53,7 @@
       <ReplyComposer
         replyToId={post.id}
         replyToAuthor={post.author}
-        {nodeId}
+        {pubkey}
         onsubmitted={() => {
           replyingTo = null;
           onreload?.();
@@ -64,7 +64,7 @@
     {#if quotingPost?.id === post.id}
       <QuoteComposer
         quotedPost={post}
-        {nodeId}
+        {pubkey}
         onsubmitted={() => {
           quotingPost = null;
           onreload?.();

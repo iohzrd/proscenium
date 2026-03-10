@@ -43,7 +43,7 @@
 
   async function resolveName(pubkey: string): Promise<string> {
     if (nameCache[pubkey]) return nameCache[pubkey];
-    const name = await getDisplayName(pubkey, node.nodeId);
+    const name = await getDisplayName(pubkey, node.pubkey);
     nameCache = { ...nameCache, [pubkey]: name };
     return name;
   }
@@ -216,7 +216,7 @@
           >
         {:else if post}
           <div class="notif-post">
-            <PostCard {post} nodeId={node.nodeId} onlightbox={lightbox.open} />
+            <PostCard {post} pubkey={node.pubkey} onlightbox={lightbox.open} />
           </div>
         {:else}
           <p class="notif-deleted">Post no longer available</p>

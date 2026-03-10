@@ -33,7 +33,7 @@
 
   async function init() {
     try {
-      nodeId = await invoke("get_node_id");
+      nodeId = await invoke("get_pubkey");
       await loadConversations();
       await resolveNames(conversations);
       loading = false;

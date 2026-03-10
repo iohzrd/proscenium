@@ -39,8 +39,8 @@
 
   const blobs = createBlobCache();
 
-  const node = useNodeInit(async (nid) => {
-    peerName = await getDisplayName(pubkey, nid);
+  const node = useNodeInit(async () => {
+    peerName = await getDisplayName(pubkey, node.pubkey);
     try {
       peerProfile = await invoke("get_remote_profile", { pubkey });
     } catch {
@@ -58,7 +58,7 @@
 
     // Send read receipts for unread incoming messages
     for (const msg of msgs) {
-      if (msg.from_pubkey !== nid && !msg.read) {
+      if (msg.from_pubkey !== node.pubkey && !msg.read) {
         invoke("send_dm_signal", {
           to: pubkey,
           signalType: "read",
@@ -315,9 +315,9 @@
         {/if}
         <div
           class="message-row"
-          class:sent={msg.from_pubkey === node.nodeId}
-          class:received={msg.from_pubkey !== node.nodeId}
-          class:failed-msg={msg.from_pubkey === node.nodeId &&
+          class:sent={msg.from_pubkey === node.pubkey}
+          class:received={msg.from_pubkey !== node.pubkey}
+          class:failed-msg={msg.from_pubkey === node.pubkey &&
             failedIds.has(msg.id)}
         >
           <div class="message-bubble">
@@ -362,7 +362,7 @@
             {/if}
             <div class="message-meta">
               <span class="message-time">{formatTime(msg.timestamp)}</span>
-              {#if msg.from_pubkey === node.nodeId}
+              {#if msg.from_pubkey === node.pubkey}
                 {#if msg.read}
                   <span class="delivery-status read" title="Read">Read</span>
                 {:else if msg.delivered}

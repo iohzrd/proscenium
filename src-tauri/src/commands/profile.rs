@@ -8,12 +8,12 @@ use tauri::State;
 
 #[tauri::command]
 pub async fn get_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.master_pubkey.clone())
+    Ok(state.transport_node_id.clone())
 }
 
 #[tauri::command]
-pub async fn get_transport_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.transport_node_id.clone())
+pub async fn get_pubkey(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    Ok(state.master_pubkey.clone())
 }
 
 #[tauri::command]
@@ -98,7 +98,7 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
     let follower_count = state.storage.get_followers().map(|f| f.len()).unwrap_or(0);
 
     Ok(NodeStatus {
-        node_id: state.master_pubkey.clone(),
+        node_id: state.transport_node_id.clone(),
         has_relay,
         relay_url,
         follow_count,

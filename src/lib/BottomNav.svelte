@@ -2,13 +2,13 @@
   import Icon from "$lib/Icon.svelte";
 
   interface Props {
-    nodeId: string;
+    pubkey: string;
     unreadDmCount: number;
     unreadNotificationCount: number;
     currentPath: string;
   }
 
-  let { nodeId, unreadDmCount, unreadNotificationCount, currentPath }: Props =
+  let { pubkey, unreadDmCount, unreadNotificationCount, currentPath }: Props =
     $props();
 
   let moreOpen = $state(false);
@@ -16,7 +16,7 @@
   let moreActive = $derived(
     currentPath === "/follows" ||
       currentPath === "/settings" ||
-      (!!nodeId && currentPath === `/profile/${nodeId}`),
+      (!!pubkey && currentPath === `/profile/${pubkey}`),
   );
 
   function toggleMore(e: Event) {
@@ -85,10 +85,10 @@
 
   {#if moreOpen}
     <div class="more-menu">
-      {#if nodeId}
+      {#if pubkey}
         <a
-          href="/profile/{nodeId}"
-          class:active={currentPath === `/profile/${nodeId}`}
+          href="/profile/{pubkey}"
+          class:active={currentPath === `/profile/${pubkey}`}
           onclick={closeMore}
         >
           <Icon name="user" size={18} />

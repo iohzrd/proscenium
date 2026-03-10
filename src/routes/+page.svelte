@@ -44,13 +44,13 @@
     }
   });
 
-  const node = useNodeInit(async (nid) => {
+  const node = useNodeInit(async () => {
     const profile = await invoke("get_my_profile");
     if (!profile) {
       goto("/welcome");
       return;
     }
-    await seedOwnProfile(nid);
+    await seedOwnProfile(node.pubkey);
     await loadFeed();
   });
 
@@ -237,7 +237,7 @@
       </button>
     </div>
 
-    <PostComposer nodeId={node.nodeId} onsubmitted={loadFeed} />
+    <PostComposer pubkey={node.pubkey} onsubmitted={loadFeed} />
 
     {#if del.pendingId}
       <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
@@ -247,7 +247,7 @@
 
     <PostFeed
       {posts}
-      nodeId={node.nodeId}
+      pubkey={node.pubkey}
       showDelete={true}
       emptyMessage="No posts yet. Write something or follow someone!"
       onreload={loadFeed}
