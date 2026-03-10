@@ -237,16 +237,6 @@
           {copyFb.feedback === "node-id" ? "Copied!" : "Copy"}
         </button>
       </div>
-      <div class="key-row">
-        <span class="key-label">Public Key</span>
-        <code class="key-value">{shortId(node.pubkey)}</code>
-        <button
-          class="btn-elevated copy-btn"
-          onclick={() => copyFb.copy(node.pubkey, "pubkey")}
-        >
-          {copyFb.feedback === "pubkey" ? "Copied!" : "Copy"}
-        </button>
-      </div>
     </div>
 
     <PostComposer pubkey={node.pubkey} onsubmitted={loadFeed} />
