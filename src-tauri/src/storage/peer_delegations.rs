@@ -74,6 +74,29 @@ impl Storage {
         })
     }
 
+    /// Reverse lookup: find the master pubkey that has a given transport NodeId in its cached list.
+    pub fn get_master_pubkey_for_transport(&self, transport_id: &str) -> Option<String> {
+        self.with_db(|db| {
+            let mut stmt =
+                db.prepare("SELECT master_pubkey, transport_node_ids_json FROM peer_delegations")?;
+            let rows = stmt.query_map([], |row| {
+                let master: String = row.get(0)?;
+                let json: String = row.get(1)?;
+                Ok((master, json))
+            })?;
+            for row in rows.flatten() {
+                if let Ok(ids) = serde_json::from_str::<Vec<String>>(&row.1)
+                    && ids.iter().any(|id| id == transport_id)
+                {
+                    return Ok(Some(row.0));
+                }
+            }
+            Ok(None)
+        })
+        .ok()
+        .flatten()
+    }
+
     /// Get the cached signing pubkey for a peer (the key that signs their content).
     #[allow(dead_code)]
     pub fn get_peer_signing_pubkey(&self, master_pubkey: &str) -> anyhow::Result<Option<String>> {

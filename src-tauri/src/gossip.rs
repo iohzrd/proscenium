@@ -159,6 +159,7 @@ impl FeedManager {
         self.my_sender = Some(sender);
 
         let storage = self.storage.clone();
+        let endpoint = self.endpoint.clone();
         let app_handle = self.app_handle.clone();
         let reconnect_tx = self.reconnect_tx.clone();
         let handle = tokio::spawn(async move {
@@ -168,8 +169,38 @@ impl FeedManager {
                 match receiver.try_next().await {
                     Ok(Some(event)) => match &event {
                         Event::NeighborUp(endpoint_id) => {
-                            let pubkey = endpoint_id.to_string();
-                            log::info!("[gossip-own] new follower: {}", short_id(&pubkey));
+                            let transport_id = endpoint_id.to_string();
+                            log::info!(
+                                "[gossip-own] new follower transport: {}",
+                                short_id(&transport_id)
+                            );
+
+                            // Resolve master pubkey from transport NodeId
+                            let pubkey = match crate::peer::query_identity(&endpoint, *endpoint_id)
+                                .await
+                            {
+                                Ok(identity) => {
+                                    let master = identity.master_pubkey.clone();
+                                    let _ = storage.cache_peer_identity(&identity);
+                                    if let Some(profile) = &identity.profile {
+                                        let _ = storage.save_profile(&master, profile);
+                                    }
+                                    log::info!(
+                                        "[gossip-own] resolved follower {} -> master={}",
+                                        short_id(&transport_id),
+                                        short_id(&master),
+                                    );
+                                    master
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "[gossip-own] failed to resolve identity for {}: {e}, using transport id",
+                                        short_id(&transport_id),
+                                    );
+                                    transport_id.clone()
+                                }
+                            };
+
                             let now = now_millis();
                             match storage.upsert_follower(&pubkey, now) {
                                 Ok(is_new) => {
@@ -188,8 +219,14 @@ impl FeedManager {
                             }
                         }
                         Event::NeighborDown(endpoint_id) => {
-                            let pubkey = endpoint_id.to_string();
-                            log::info!("[gossip-own] follower left: {}", short_id(&pubkey));
+                            let transport_id = endpoint_id.to_string();
+                            log::info!("[gossip-own] follower left: {}", short_id(&transport_id));
+
+                            // Try to resolve to master pubkey from cache
+                            let pubkey = storage
+                                .get_master_pubkey_for_transport(&transport_id)
+                                .unwrap_or(transport_id);
+
                             if let Err(e) = storage.set_follower_offline(&pubkey) {
                                 log::error!("[gossip-own] failed to update follower: {e}");
                             }
