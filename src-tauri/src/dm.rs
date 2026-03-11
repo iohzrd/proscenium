@@ -409,8 +409,24 @@ impl DmHandler {
         let (responder_hs, response_msg) = noise_respond(&self.my_x25519_private, &noise_message)
             .map_err(|e| anyhow::anyhow!("noise respond: {e}"))?;
 
-        let shared_secret = noise_complete_responder(responder_hs)
+        let (shared_secret, initiator_dm_pubkey) = noise_complete_responder(responder_hs)
             .map_err(|e| anyhow::anyhow!("noise complete: {e}"))?;
+
+        // Verify the Noise IK-authenticated initiator DM key matches the claimed sender.
+        // Noise IK encrypts the initiator's long-term key to us, so this is cryptographically
+        // authenticated -- not just a wire claim.
+        let claimed_key = dm_pubkey_to_x25519(peer_dm_pubkey)?;
+        match initiator_dm_pubkey {
+            Some(actual) if actual == claimed_key => {}
+            Some(_) => {
+                anyhow::bail!(
+                    "DmHandshake::Init sender mismatch: claimed key does not match authenticated key"
+                );
+            }
+            None => {
+                anyhow::bail!("Noise IK handshake did not reveal initiator key");
+            }
+        }
 
         // Initialize Double Ratchet as Bob (responder)
         let ratchet = RatchetState::init_bob(

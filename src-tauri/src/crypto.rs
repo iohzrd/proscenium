@@ -121,11 +121,18 @@ pub fn noise_complete_initiator(
 }
 
 /// Complete the handshake on the responder side.
-/// Returns the handshake hash (shared secret for ratchet seeding).
-pub fn noise_complete_responder(responder: snow::HandshakeState) -> Result<[u8; 32], snow::Error> {
+/// Returns `(handshake_hash, initiator_dm_pubkey)`.
+/// The initiator's long-term X25519 key, authenticated by the Noise IK handshake.
+pub fn noise_complete_responder(
+    responder: snow::HandshakeState,
+) -> Result<([u8; 32], Option<[u8; 32]>), snow::Error> {
     let hash = extract_handshake_hash(&responder);
+    let initiator_dm_pubkey = responder.get_remote_static().and_then(|s| {
+        let arr: [u8; 32] = s.try_into().ok()?;
+        Some(arr)
+    });
     let _transport = responder.into_transport_mode()?;
-    Ok(hash)
+    Ok((hash, initiator_dm_pubkey))
 }
 
 /// Extract the handshake hash from a Noise handshake state.
@@ -547,7 +554,7 @@ mod tests {
 
         // Both complete and get the same handshake hash
         let alice_hash = noise_complete_initiator(alice_hs, &msg2).unwrap();
-        let bob_hash = noise_complete_responder(bob_hs).unwrap();
+        let (bob_hash, _) = noise_complete_responder(bob_hs).unwrap();
         assert_eq!(alice_hash, bob_hash);
     }
 
@@ -711,7 +718,7 @@ mod tests {
         let (alice_hs, msg1) = noise_initiate(&alice_x, &bob_x_pub).unwrap();
         let (bob_hs, msg2) = noise_respond(&bob_x, &msg1).unwrap();
         let shared_secret = noise_complete_initiator(alice_hs, &msg2).unwrap();
-        let bob_shared = noise_complete_responder(bob_hs).unwrap();
+        let (bob_shared, _) = noise_complete_responder(bob_hs).unwrap();
         assert_eq!(shared_secret, bob_shared);
 
         // Initialize ratchets

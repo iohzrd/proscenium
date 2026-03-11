@@ -188,12 +188,19 @@ pub async fn link_with_device(
     std::fs::write(data_dir.join("signing_key.key"), &signing_key_bytes)
         .map_err(|e| format!("failed to save signing key: {e}"))?;
 
-    // Save the DM key
-    let dm_key_bytes = b64
-        .decode(&bundle.dm_secret_key)
-        .map_err(|e| format!("invalid DM key: {e}"))?;
-    std::fs::write(data_dir.join("dm_key.key"), &dm_key_bytes)
-        .map_err(|e| format!("failed to save DM key: {e}"))?;
+    // Save the signing key index so setup.rs re-derives the correct key on restart
+    std::fs::write(
+        data_dir.join("signing_key_index"),
+        bundle.delegation.key_index.to_string(),
+    )
+    .map_err(|e| format!("failed to save signing_key_index: {e}"))?;
+
+    // Save the DM key index so setup.rs re-derives the correct DM key on restart
+    std::fs::write(
+        data_dir.join("dm_key_index"),
+        bundle.delegation.dm_key_index.to_string(),
+    )
+    .map_err(|e| format!("failed to save dm_key_index: {e}"))?;
 
     // Save the transport key for this device
     let transport_key_bytes = b64
