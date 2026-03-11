@@ -43,8 +43,10 @@ pub fn run() {
         .plugin(
             tauri_plugin_log::Builder::new()
                 .level(log::LevelFilter::Info)
-                .level_for("iroh", log::LevelFilter::Warn)
-                .level_for("tracing", log::LevelFilter::Warn)
+                .level_for("iroh", log::LevelFilter::Error)
+                .level_for("iroh_quinn_proto", log::LevelFilter::Error)
+                .level_for("netlink_packet_route", log::LevelFilter::Error)
+                .level_for("tracing", log::LevelFilter::Error)
                 .targets([
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
                     tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
