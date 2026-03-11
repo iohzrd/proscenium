@@ -7,8 +7,13 @@ pub const DM_ALPN: &[u8] = b"iroh-social/dm/1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DmHandshake {
-    Init { noise_message: Vec<u8> },
-    Response { noise_message: Vec<u8> },
+    Init {
+        noise_message: Vec<u8>,
+        sender: String,
+    },
+    Response {
+        noise_message: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

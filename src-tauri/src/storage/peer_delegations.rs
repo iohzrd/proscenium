@@ -74,6 +74,22 @@ impl Storage {
         })
     }
 
+    /// Reverse lookup: find the master pubkey for a given signing pubkey.
+    pub fn get_master_pubkey_for_signing_pubkey(&self, signing_pubkey: &str) -> Option<String> {
+        self.with_db(|db| {
+            let mut stmt =
+                db.prepare("SELECT master_pubkey FROM peer_delegations WHERE signing_pubkey = ?1")?;
+            let result = stmt.query_row(params![signing_pubkey], |row| row.get(0));
+            match result {
+                Ok(master) => Ok(Some(master)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+        .ok()
+        .flatten()
+    }
+
     /// Reverse lookup: find the master pubkey that has a given transport NodeId in its cached list.
     pub fn get_master_pubkey_for_transport(&self, transport_id: &str) -> Option<String> {
         self.with_db(|db| {
@@ -98,7 +114,6 @@ impl Storage {
     }
 
     /// Get the cached signing pubkey for a peer (the key that signs their content).
-    #[allow(dead_code)]
     pub fn get_peer_signing_pubkey(&self, master_pubkey: &str) -> anyhow::Result<Option<String>> {
         self.with_db(|db| {
             let mut stmt =

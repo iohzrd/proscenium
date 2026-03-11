@@ -11,6 +11,7 @@ static CACHE: LazyLock<Mutex<HashMap<String, Option<LinkPreview>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const MAX_PREVIEWS: usize = 3;
+const MAX_CACHE_ENTRIES: usize = 512;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
@@ -31,10 +32,15 @@ pub async fn get_link_preview(url: &str) -> Option<LinkPreview> {
     let result = fetch_og(url).await;
 
     // Cache the result (including None to avoid re-fetching failures)
-    CACHE
-        .lock()
-        .unwrap()
-        .insert(url.to_string(), result.clone());
+    let mut cache = CACHE.lock().unwrap();
+    if cache.len() >= MAX_CACHE_ENTRIES {
+        // Evict oldest half when at capacity (simple but effective)
+        let evict: Vec<String> = cache.keys().take(MAX_CACHE_ENTRIES / 2).cloned().collect();
+        for k in evict {
+            cache.remove(&k);
+        }
+    }
+    cache.insert(url.to_string(), result.clone());
 
     result
 }

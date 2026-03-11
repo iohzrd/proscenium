@@ -250,12 +250,14 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let gossip = Gossip::builder().spawn(endpoint.clone());
         log::info!("[setup] gossip started");
 
-        // DM handler uses signing key for X25519 derivation
+        // DM handler: signing key for X25519 + wire identity, master key for at-rest encryption.
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
             signing_secret_key_bytes,
+            master_secret_key_bytes,
             master_pubkey_clone.clone(),
+            signing_pubkey_clone.clone(),
         );
         // Shared pending link state for device pairing
         let pending_link: crate::state::PendingLinkState = Arc::new(tokio::sync::Mutex::new(None));

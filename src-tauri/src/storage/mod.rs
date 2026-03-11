@@ -112,8 +112,22 @@ impl Storage {
         &self,
         f: impl FnOnce(&Connection) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let db = self.db.lock().unwrap();
-        f(&db)
+        // block_in_place signals tokio to move other tasks off this thread while
+        // we hold the SQLite mutex, preventing thread starvation on the async runtime.
+        tokio::task::block_in_place(|| {
+            let db = self.db.lock().unwrap();
+            f(&db)
+        })
+    }
+
+    pub(crate) fn with_db_mut<T>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        tokio::task::block_in_place(|| {
+            let mut db = self.db.lock().unwrap();
+            f(&mut db)
+        })
     }
 
     fn run_migrations(conn: &Connection) -> anyhow::Result<()> {

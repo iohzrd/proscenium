@@ -55,16 +55,6 @@ impl Storage {
         })
     }
 
-    pub fn increment_unread(&self, conversation_id: &str) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            db.execute(
-                "UPDATE dm_conversations SET unread_count = unread_count + 1 WHERE conversation_id=?1",
-                params![conversation_id],
-            )?;
-            Ok(())
-        })
-    }
-
     pub fn mark_conversation_read(&self, peer_pubkey: &str, my_pubkey: &str) -> anyhow::Result<()> {
         let conv_id = Self::conversation_id(my_pubkey, peer_pubkey);
         self.with_db(|db| {
@@ -252,6 +242,69 @@ impl Storage {
     pub fn remove_outbox_message(&self, id: &str) -> anyhow::Result<()> {
         self.with_db(|db| {
             db.execute("DELETE FROM dm_outbox WHERE id=?1", params![id])?;
+            Ok(())
+        })
+    }
+
+    /// Atomically save ratchet state + conversation upsert + message insert + unread increment
+    /// in a single SQLite transaction. `peer_signing_pubkey` keys the ratchet session;
+    /// `peer_master_pubkey` is the conversation identity stored in `dm_conversations.peer_pubkey`.
+    pub fn receive_dm_message_atomically(
+        &self,
+        peer_signing_pubkey: &str,
+        peer_master_pubkey: &str,
+        ratchet_state: &str,
+        ratchet_updated_at: u64,
+        message: &StoredMessage,
+        preview: &str,
+    ) -> anyhow::Result<()> {
+        let conv_id = &message.conversation_id;
+        let media_json = serde_json::to_string(&message.media)?;
+        self.with_db_mut(|db| {
+            let tx = db.transaction()?;
+
+            tx.execute(
+                "INSERT INTO dm_ratchet_sessions (peer_pubkey, state_json, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(peer_pubkey) DO UPDATE SET state_json=?2, updated_at=?3",
+                params![peer_signing_pubkey, ratchet_state, ratchet_updated_at as i64],
+            )?;
+
+            tx.execute(
+                "INSERT INTO dm_conversations
+                     (conversation_id, peer_pubkey, last_message_at, last_message_preview, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?3)
+                     ON CONFLICT(conversation_id)
+                     DO UPDATE SET last_message_at=?3, last_message_preview=?4",
+                params![conv_id, peer_master_pubkey, message.timestamp as i64, preview],
+            )?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO dm_messages
+                     (id, conversation_id, from_pubkey, to_pubkey, content, timestamp,
+                      media_json, read, delivered, reply_to)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message.id,
+                    conv_id,
+                    message.from_pubkey,
+                    message.to_pubkey,
+                    message.content,
+                    message.timestamp as i64,
+                    media_json,
+                    message.read as i32,
+                    message.delivered as i32,
+                    message.reply_to,
+                ],
+            )?;
+
+            tx.execute(
+                "UPDATE dm_conversations SET unread_count = unread_count + 1
+                 WHERE conversation_id=?1",
+                params![conv_id],
+            )?;
+
+            tx.commit()?;
             Ok(())
         })
     }
