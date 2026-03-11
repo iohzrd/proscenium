@@ -881,12 +881,27 @@ pub async fn gossip_reconnect_loop(
             }
             ReconnectRequest::RefreshFollow { pubkey } => {
                 let mut fm = feed.lock().await;
-                // Remove stale subscription (if any) so follow_user re-subscribes
+                // Skip if we already have a live subscription for this peer.
+                // This prevents the NeighborUp -> RefreshFollow -> NeighborUp
+                // feedback loop: the refresh creates a new subscription which
+                // triggers NeighborUp again on our own feed topic.
+                if fm
+                    .subscriptions
+                    .get(&pubkey)
+                    .is_some_and(|h| !h.is_finished())
+                {
+                    log::info!(
+                        "[reconnect] skipping refresh for {} (subscription alive)",
+                        short_id(&pubkey)
+                    );
+                    continue;
+                }
+                // Remove dead subscription (if any) so follow_user re-subscribes
                 // with fresh bootstrap peers.
                 if let Some(handle) = fm.subscriptions.remove(&pubkey) {
                     handle.abort();
                     log::info!(
-                        "[reconnect] removed stale subscription for {}",
+                        "[reconnect] removed dead subscription for {}",
                         short_id(&pubkey)
                     );
                 }
