@@ -58,7 +58,342 @@ impl PeerHandler {
             app_handle,
         }
     }
+
+    /// Build an IdentityResponse for this node.
+    fn identity_response(&self) -> IdentityResponse {
+        let profile = self.storage.get_profile(&self.master_pubkey).ok().flatten();
+        IdentityResponse {
+            master_pubkey: self.master_pubkey.clone(),
+            delegation: self.delegation.clone(),
+            transport_node_ids: vec![self.transport_node_id.clone()],
+            profile,
+        }
+    }
+
+    async fn handle_follow_request(
+        &self,
+        remote_str: &str,
+        mut send: iroh::endpoint::SendStream,
+        req: FollowRequest,
+        conn: &Connection,
+    ) -> Result<(), AcceptError> {
+        // Verify the delegation (master key signed the signing key binding)
+        if let Err(reason) = iroh_social_types::verify_delegation(&req.delegation) {
+            log::warn!(
+                "[follow-req] invalid delegation from {}: {reason}",
+                short_id(remote_str)
+            );
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "invalid delegation",
+            )));
+        }
+
+        // Check that the delegation's master pubkey matches the requester
+        if req.delegation.master_pubkey != req.requester {
+            log::warn!(
+                "[follow-req] delegation master_pubkey mismatch: delegation={}, requester={}",
+                short_id(&req.delegation.master_pubkey),
+                short_id(&req.requester)
+            );
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "delegation master_pubkey mismatch",
+            )));
+        }
+
+        // Verify signature using the signing key from the delegation
+        let signer: iroh::PublicKey = match req.delegation.signing_pubkey.parse() {
+            Ok(pk) => pk,
+            Err(e) => {
+                log::warn!(
+                    "[follow-req] invalid signing pubkey in delegation from {}: {e}",
+                    short_id(remote_str)
+                );
+                return Err(AcceptError::from_err(std::io::Error::other(
+                    "invalid signing pubkey in delegation",
+                )));
+            }
+        };
+        if let Err(reason) = verify_follow_request(&req, &signer) {
+            log::warn!(
+                "[follow-req] invalid signature from {}: {reason}",
+                short_id(remote_str)
+            );
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "invalid signature",
+            )));
+        }
+
+        // Cache the peer's delegation and transport NodeId
+        let _ = self.storage.cache_peer_identity(&IdentityResponse {
+            master_pubkey: req.requester.clone(),
+            delegation: req.delegation.clone(),
+            transport_node_ids: vec![remote_str.to_string()],
+            profile: None,
+        });
+
+        // Use master pubkey (permanent identity) for all storage lookups, not transport NodeId
+        let requester_pubkey = &req.requester;
+
+        // Only Listed users accept follow requests
+        let visibility = self
+            .storage
+            .get_visibility(&self.master_pubkey)
+            .unwrap_or(Visibility::Public);
+
+        let response = match visibility {
+            Visibility::Listed => {
+                // Check if already approved
+                if self
+                    .storage
+                    .is_approved_follower(requester_pubkey)
+                    .unwrap_or(false)
+                {
+                    log::info!(
+                        "[follow-req] already approved: {}",
+                        short_id(requester_pubkey)
+                    );
+                    FollowResponse::Approved(Box::new(self.identity_response()))
+                } else {
+                    let now = now_millis();
+                    let expires_at = now + FOLLOW_REQUEST_TTL_MS;
+                    match self.storage.insert_follow_request(
+                        requester_pubkey,
+                        req.timestamp,
+                        now,
+                        expires_at,
+                    ) {
+                        Ok(true) => {
+                            log::info!(
+                                "[follow-req] stored pending request from {}",
+                                short_id(requester_pubkey)
+                            );
+                            let _ = self.storage.insert_notification(
+                                "follow_request",
+                                requester_pubkey,
+                                None,
+                                None,
+                                now,
+                            );
+                            let _ = self
+                                .app_handle
+                                .emit("follow-request-received", requester_pubkey);
+                            let _ = self.app_handle.emit("notification-received", ());
+                            FollowResponse::Pending
+                        }
+                        Ok(false) => {
+                            // Already approved (race condition)
+                            FollowResponse::Approved(Box::new(self.identity_response()))
+                        }
+                        Err(e) => {
+                            log::error!("[follow-req] failed to store request: {e}");
+                            return Err(AcceptError::from_err(std::io::Error::other(
+                                "storage error",
+                            )));
+                        }
+                    }
+                }
+            }
+            Visibility::Public => {
+                // Public users don't need follow requests, auto-approve
+                log::info!(
+                    "[follow-req] auto-approving for public profile: {}",
+                    short_id(requester_pubkey)
+                );
+                FollowResponse::Approved(Box::new(self.identity_response()))
+            }
+            Visibility::Private => {
+                // Private users deny follow requests
+                log::info!(
+                    "[follow-req] denying for private profile: {}",
+                    short_id(requester_pubkey)
+                );
+                FollowResponse::Denied
+            }
+        };
+
+        let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&resp_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+
+        conn.closed().await;
+        Ok(())
+    }
+
+    async fn handle_identity_request(
+        &self,
+        mut send: iroh::endpoint::SendStream,
+        conn: &Connection,
+    ) -> Result<(), AcceptError> {
+        let response = PeerResponse::Identity(self.identity_response());
+
+        let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&resp_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+
+        conn.closed().await;
+        Ok(())
+    }
+
+    async fn handle_link_request(
+        &self,
+        mut send: iroh::endpoint::SendStream,
+        noise_init: Vec<u8>,
+        conn: &Connection,
+    ) -> Result<(), AcceptError> {
+        // Take the pending link session (consume it - one-time use)
+        let link_session = {
+            let mut lock = self.pending_link.lock().await;
+            lock.take()
+        };
+
+        let link_session = match link_session {
+            Some(session) => {
+                // Check expiry
+                if now_millis() > session.expires_at {
+                    log::warn!("[link] pending link session expired");
+                    return Err(AcceptError::from_err(std::io::Error::other(
+                        "link session expired",
+                    )));
+                }
+                session
+            }
+            None => {
+                log::warn!("[link] no pending link session");
+                return Err(AcceptError::from_err(std::io::Error::other(
+                    "no pending link session",
+                )));
+            }
+        };
+
+        // Perform Noise IK+PSK handshake (responder side)
+        let (mut transport, noise_response) = crate::crypto::noise_psk_respond(
+            &link_session.x25519_private,
+            &link_session.psk,
+            &noise_init,
+        )
+        .map_err(|e| {
+            log::error!("[link] noise handshake failed: {e}");
+            AcceptError::from_err(std::io::Error::other(format!(
+                "noise handshake failed: {e}"
+            )))
+        })?;
+
+        // Derive a transport key for the new device
+        let new_device_index = self.storage.next_device_index().map_err(|e| {
+            AcceptError::from_err(std::io::Error::other(format!(
+                "failed to get next device index: {e}"
+            )))
+        })?;
+        let new_transport_key_bytes =
+            derive_transport_key(&self.master_secret_key_bytes, new_device_index);
+
+        // Build the link bundle
+        let master_key_to_send = if link_session.transfer_master_key {
+            Some(&self.master_secret_key_bytes)
+        } else {
+            None
+        };
+
+        let bundle = self
+            .storage
+            .export_link_bundle(
+                &self.master_pubkey,
+                &self.signing_secret_key_bytes,
+                &self.dm_secret_key_bytes,
+                &self.delegation,
+                &new_transport_key_bytes,
+                new_device_index,
+                master_key_to_send,
+            )
+            .map_err(|e| {
+                AcceptError::from_err(std::io::Error::other(format!(
+                    "failed to export link bundle: {e}"
+                )))
+            })?;
+
+        // Serialize and encrypt the bundle with Noise transport
+        let bundle_json = serde_json::to_vec(&bundle).map_err(AcceptError::from_err)?;
+        let encrypted_bundle = crate::crypto::noise_transport_encrypt(&mut transport, &bundle_json)
+            .map_err(|e| {
+                AcceptError::from_err(std::io::Error::other(format!("noise encrypt failed: {e}")))
+            })?;
+
+        // Send the response
+        let response = PeerResponse::LinkBundle {
+            noise_response,
+            encrypted_bundle,
+        };
+        let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&resp_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+
+        log::info!("[link] sent link bundle to new device");
+        let _ = self.app_handle.emit("device-link-progress", "bundle_sent");
+
+        // Register the new device and broadcast updated announcement
+        let new_transport_secret = iroh::SecretKey::from_bytes(&new_transport_key_bytes);
+        let new_transport_node_id = new_transport_secret.public().to_string();
+
+        let device_name = format!("Device {}", new_device_index);
+        let now = now_millis();
+        if let Err(e) = self.storage.upsert_linked_device(
+            &new_transport_node_id,
+            &device_name,
+            false,
+            false,
+            now,
+        ) {
+            log::error!("[link] failed to register new device: {e}");
+        } else {
+            log::info!(
+                "[link] registered new device {} (index={})",
+                short_id(&new_transport_node_id),
+                new_device_index
+            );
+        }
+
+        // Build and broadcast updated announcement with all devices
+        if let Ok(all_devices) = self.storage.get_linked_devices() {
+            let signing_sk = iroh::SecretKey::from_bytes(&self.signing_secret_key_bytes);
+            let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
+                master_pubkey: self.master_pubkey.clone(),
+                delegation: self.delegation.clone(),
+                devices: all_devices,
+                version: (new_device_index + 1) as u64,
+                timestamp: now,
+                signature: String::new(),
+            };
+            iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
+
+            if let Some(state) = self.app_handle.try_state::<Arc<crate::state::AppState>>() {
+                let feed = state.feed.clone();
+                let announcement_clone = announcement.clone();
+                tokio::spawn(async move {
+                    let feed_lock = feed.lock().await;
+                    if let Err(e) = feed_lock
+                        .broadcast_linked_devices(&announcement_clone)
+                        .await
+                    {
+                        log::error!("[link] failed to broadcast device announcement: {e}");
+                    } else {
+                        log::info!("[link] broadcast updated device announcement");
+                    }
+                });
+            }
+        }
+
+        conn.closed().await;
+        Ok(())
+    }
 }
+
+const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 impl ProtocolHandler for PeerHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
@@ -118,43 +453,12 @@ impl ProtocolHandler for PeerHandler {
                 .await
             }
             PeerRequest::FollowRequest(follow_req) => {
-                handle_follow_request(
-                    &self.storage,
-                    &self.master_pubkey,
-                    &remote_str,
-                    &self.app_handle,
-                    send,
-                    follow_req,
-                    &conn,
-                )
-                .await
+                self.handle_follow_request(&remote_str, send, follow_req, &conn)
+                    .await
             }
-            PeerRequest::IdentityRequest => {
-                handle_identity_request(
-                    &self.storage,
-                    &self.master_pubkey,
-                    &self.transport_node_id,
-                    &self.delegation,
-                    send,
-                    &conn,
-                )
-                .await
-            }
+            PeerRequest::IdentityRequest => self.handle_identity_request(send, &conn).await,
             PeerRequest::LinkRequest { noise_init } => {
-                handle_link_request(
-                    &self.storage,
-                    &self.master_pubkey,
-                    &self.master_secret_key_bytes,
-                    &self.signing_secret_key_bytes,
-                    &self.dm_secret_key_bytes,
-                    &self.delegation,
-                    &self.pending_link,
-                    &self.app_handle,
-                    send,
-                    noise_init,
-                    &conn,
-                )
-                .await
+                self.handle_link_request(send, noise_init, &conn).await
             }
             PeerRequest::DeviceSyncRequest {
                 challenge,
@@ -177,160 +481,11 @@ impl ProtocolHandler for PeerHandler {
     }
 }
 
-const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-async fn handle_follow_request(
-    storage: &Storage,
-    node_id: &str,
-    remote_str: &str,
-    app_handle: &AppHandle,
-    mut send: iroh::endpoint::SendStream,
-    req: iroh_social_types::FollowRequest,
-    conn: &Connection,
-) -> Result<(), AcceptError> {
-    // Verify the delegation (master key signed the signing key binding)
-    if let Err(reason) = iroh_social_types::verify_delegation(&req.delegation) {
-        log::warn!(
-            "[follow-req] invalid delegation from {}: {reason}",
-            short_id(remote_str)
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "invalid delegation",
-        )));
-    }
-
-    // Check that the delegation's master pubkey matches the requester
-    if req.delegation.master_pubkey != req.requester {
-        log::warn!(
-            "[follow-req] delegation master_pubkey mismatch: delegation={}, requester={}",
-            short_id(&req.delegation.master_pubkey),
-            short_id(&req.requester)
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "delegation master_pubkey mismatch",
-        )));
-    }
-
-    // Verify signature using the signing key from the delegation
-    let signer: iroh::PublicKey = match req.delegation.signing_pubkey.parse() {
-        Ok(pk) => pk,
-        Err(e) => {
-            log::warn!(
-                "[follow-req] invalid signing pubkey in delegation from {}: {e}",
-                short_id(remote_str)
-            );
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "invalid signing pubkey in delegation",
-            )));
-        }
-    };
-    if let Err(reason) = verify_follow_request(&req, &signer) {
-        log::warn!(
-            "[follow-req] invalid signature from {}: {reason}",
-            short_id(remote_str)
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "invalid signature",
-        )));
-    }
-
-    // Cache the peer's delegation and transport NodeId
-    let _ = storage.cache_peer_identity(&IdentityResponse {
-        master_pubkey: req.requester.clone(),
-        delegation: req.delegation.clone(),
-        transport_node_ids: vec![remote_str.to_string()],
-        profile: None,
-    });
-
-    // Use master pubkey (permanent identity) for all storage lookups, not transport NodeId
-    let requester_pubkey = &req.requester;
-
-    // Only Listed users accept follow requests
-    let visibility = storage
-        .get_visibility(node_id)
-        .unwrap_or(Visibility::Public);
-
-    let response = match visibility {
-        Visibility::Listed => {
-            // Check if already approved
-            if storage
-                .is_approved_follower(requester_pubkey)
-                .unwrap_or(false)
-            {
-                log::info!(
-                    "[follow-req] already approved: {}",
-                    short_id(requester_pubkey)
-                );
-                FollowResponse::Approved
-            } else {
-                let now = now_millis();
-                let expires_at = now + FOLLOW_REQUEST_TTL_MS;
-                match storage.insert_follow_request(
-                    requester_pubkey,
-                    req.timestamp,
-                    now,
-                    expires_at,
-                ) {
-                    Ok(true) => {
-                        log::info!(
-                            "[follow-req] stored pending request from {}",
-                            short_id(requester_pubkey)
-                        );
-                        let _ = storage.insert_notification(
-                            "follow_request",
-                            requester_pubkey,
-                            None,
-                            None,
-                            now,
-                        );
-                        let _ = app_handle.emit("follow-request-received", requester_pubkey);
-                        let _ = app_handle.emit("notification-received", ());
-                        FollowResponse::Pending
-                    }
-                    Ok(false) => {
-                        // Already approved (race condition)
-                        FollowResponse::Approved
-                    }
-                    Err(e) => {
-                        log::error!("[follow-req] failed to store request: {e}");
-                        return Err(AcceptError::from_err(std::io::Error::other(
-                            "storage error",
-                        )));
-                    }
-                }
-            }
-        }
-        Visibility::Public => {
-            // Public users don't need follow requests, auto-approve
-            log::info!(
-                "[follow-req] auto-approving for public profile: {}",
-                short_id(requester_pubkey)
-            );
-            FollowResponse::Approved
-        }
-        Visibility::Private => {
-            // Private users deny follow requests
-            log::info!(
-                "[follow-req] denying for private profile: {}",
-                short_id(requester_pubkey)
-            );
-            FollowResponse::Denied
-        }
-    };
-
-    let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-    send.write_all(&resp_bytes)
-        .await
-        .map_err(AcceptError::from_err)?;
-    send.finish().map_err(AcceptError::from_err)?;
-
-    conn.closed().await;
-    Ok(())
-}
-
 /// Client: send a follow request to a remote peer.
+/// If approved, the responder's identity is automatically cached.
 pub async fn send_follow_request(
     endpoint: &Endpoint,
+    storage: &Storage,
     target: EndpointId,
     master_pubkey: &str,
     signing_secret_key_bytes: &[u8; 32],
@@ -360,6 +515,12 @@ pub async fn send_follow_request(
     let response: FollowResponse = serde_json::from_slice(&resp_bytes)?;
 
     conn.close(0u32.into(), b"done");
+
+    // Cache the responder's identity if approved
+    if let FollowResponse::Approved(ref identity) = response {
+        let _ = storage.cache_peer_identity(identity);
+    }
+
     Ok(response)
 }
 
@@ -389,189 +550,4 @@ pub async fn query_identity(
             std::mem::discriminant(&other)
         ),
     }
-}
-
-/// Handle a LinkRequest: validate the pending link session, perform Noise IK+PSK handshake,
-/// and send the encrypted LinkBundle to the new device.
-#[allow(clippy::too_many_arguments)]
-async fn handle_link_request(
-    storage: &Storage,
-    master_pubkey: &str,
-    master_secret_key_bytes: &[u8; 32],
-    signing_secret_key_bytes: &[u8; 32],
-    dm_secret_key_bytes: &[u8; 32],
-    delegation: &SigningKeyDelegation,
-    pending_link: &PendingLinkState,
-    app_handle: &AppHandle,
-    mut send: iroh::endpoint::SendStream,
-    noise_init: Vec<u8>,
-    conn: &Connection,
-) -> Result<(), AcceptError> {
-    // Take the pending link session (consume it - one-time use)
-    let link_session = {
-        let mut lock = pending_link.lock().await;
-        lock.take()
-    };
-
-    let link_session = match link_session {
-        Some(session) => {
-            // Check expiry
-            if now_millis() > session.expires_at {
-                log::warn!("[link] pending link session expired");
-                return Err(AcceptError::from_err(std::io::Error::other(
-                    "link session expired",
-                )));
-            }
-            session
-        }
-        None => {
-            log::warn!("[link] no pending link session");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "no pending link session",
-            )));
-        }
-    };
-
-    // Perform Noise IK+PSK handshake (responder side)
-    let (mut transport, noise_response) = crate::crypto::noise_psk_respond(
-        &link_session.x25519_private,
-        &link_session.psk,
-        &noise_init,
-    )
-    .map_err(|e| {
-        log::error!("[link] noise handshake failed: {e}");
-        AcceptError::from_err(std::io::Error::other(format!(
-            "noise handshake failed: {e}"
-        )))
-    })?;
-
-    // Derive a transport key for the new device
-    let new_device_index = storage.next_device_index().map_err(|e| {
-        AcceptError::from_err(std::io::Error::other(format!(
-            "failed to get next device index: {e}"
-        )))
-    })?;
-    let new_transport_key_bytes = derive_transport_key(master_secret_key_bytes, new_device_index);
-
-    // Build the link bundle
-    let master_key_to_send = if link_session.transfer_master_key {
-        Some(master_secret_key_bytes)
-    } else {
-        None
-    };
-
-    let bundle = storage
-        .export_link_bundle(
-            master_pubkey,
-            signing_secret_key_bytes,
-            dm_secret_key_bytes,
-            delegation,
-            &new_transport_key_bytes,
-            new_device_index,
-            master_key_to_send,
-        )
-        .map_err(|e| {
-            AcceptError::from_err(std::io::Error::other(format!(
-                "failed to export link bundle: {e}"
-            )))
-        })?;
-
-    // Serialize and encrypt the bundle with Noise transport
-    let bundle_json = serde_json::to_vec(&bundle).map_err(AcceptError::from_err)?;
-    let encrypted_bundle = crate::crypto::noise_transport_encrypt(&mut transport, &bundle_json)
-        .map_err(|e| {
-            AcceptError::from_err(std::io::Error::other(format!("noise encrypt failed: {e}")))
-        })?;
-
-    // Send the response
-    let response = PeerResponse::LinkBundle {
-        noise_response,
-        encrypted_bundle,
-    };
-    let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-    send.write_all(&resp_bytes)
-        .await
-        .map_err(AcceptError::from_err)?;
-    send.finish().map_err(AcceptError::from_err)?;
-
-    log::info!("[link] sent link bundle to new device");
-    let _ = app_handle.emit("device-link-progress", "bundle_sent");
-
-    // Register the new device and broadcast updated announcement
-    let new_transport_secret = iroh::SecretKey::from_bytes(&new_transport_key_bytes);
-    let new_transport_node_id = new_transport_secret.public().to_string();
-
-    let device_name = format!("Device {}", new_device_index);
-    let now = now_millis();
-    if let Err(e) =
-        storage.upsert_linked_device(&new_transport_node_id, &device_name, false, false, now)
-    {
-        log::error!("[link] failed to register new device: {e}");
-    } else {
-        log::info!(
-            "[link] registered new device {} (index={})",
-            short_id(&new_transport_node_id),
-            new_device_index
-        );
-    }
-
-    // Build and broadcast updated announcement with all devices
-    if let Ok(all_devices) = storage.get_linked_devices() {
-        let signing_sk = iroh::SecretKey::from_bytes(signing_secret_key_bytes);
-        let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
-            master_pubkey: master_pubkey.to_string(),
-            delegation: delegation.clone(),
-            devices: all_devices,
-            version: (new_device_index + 1) as u64,
-            timestamp: now,
-            signature: String::new(),
-        };
-        iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
-
-        if let Some(state) = app_handle.try_state::<Arc<crate::state::AppState>>() {
-            let feed = state.feed.clone();
-            let announcement_clone = announcement.clone();
-            tokio::spawn(async move {
-                let feed_lock = feed.lock().await;
-                if let Err(e) = feed_lock
-                    .broadcast_linked_devices(&announcement_clone)
-                    .await
-                {
-                    log::error!("[link] failed to broadcast device announcement: {e}");
-                } else {
-                    log::info!("[link] broadcast updated device announcement");
-                }
-            });
-        }
-    }
-
-    conn.closed().await;
-    Ok(())
-}
-
-/// Handle an IdentityRequest: respond with our master pubkey, delegation, and profile.
-async fn handle_identity_request(
-    storage: &Storage,
-    master_pubkey: &str,
-    transport_node_id: &str,
-    delegation: &SigningKeyDelegation,
-    mut send: iroh::endpoint::SendStream,
-    conn: &Connection,
-) -> Result<(), AcceptError> {
-    let profile = storage.get_profile(master_pubkey).ok().flatten();
-    let response = PeerResponse::Identity(IdentityResponse {
-        master_pubkey: master_pubkey.to_string(),
-        delegation: delegation.clone(),
-        transport_node_ids: vec![transport_node_id.to_string()],
-        profile,
-    });
-
-    let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-    send.write_all(&resp_bytes)
-        .await
-        .map_err(AcceptError::from_err)?;
-    send.finish().map_err(AcceptError::from_err)?;
-
-    conn.closed().await;
-    Ok(())
 }

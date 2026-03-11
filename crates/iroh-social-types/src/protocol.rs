@@ -153,7 +153,7 @@ pub struct FollowRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FollowResponse {
-    Approved,
+    Approved(Box<IdentityResponse>),
     Denied,
     Pending,
 }

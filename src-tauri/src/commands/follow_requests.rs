@@ -65,6 +65,7 @@ pub async fn send_follow_request_to_peer(
 
     let response = crate::peer::send_follow_request(
         &state.endpoint,
+        &state.storage,
         target,
         &state.master_pubkey,
         &state.signing_secret_key_bytes,
@@ -74,7 +75,7 @@ pub async fn send_follow_request_to_peer(
     .str_err()?;
 
     let result = match response {
-        FollowResponse::Approved => "approved",
+        FollowResponse::Approved(_) => "approved",
         FollowResponse::Denied => "denied",
         FollowResponse::Pending => "pending",
     };
