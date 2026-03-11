@@ -34,6 +34,10 @@ pub enum ReconnectRequest {
     RefreshFollow {
         pubkey: String,
     },
+    /// Tear down and re-establish all gossip connections (own feed + every
+    /// follow).  Triggered after detecting a sleep/wake cycle where the
+    /// underlying network connections have gone stale.
+    RefreshAll,
 }
 
 fn backoff_secs(attempt: u32) -> u64 {
@@ -456,6 +460,15 @@ impl FeedManager {
         Ok(())
     }
 
+    pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
+        if let Some(sender) = self.my_sender.as_ref() {
+            let msg = GossipMessage::Heartbeat;
+            let payload = serde_json::to_vec(&msg)?;
+            sender.broadcast(Bytes::from(payload)).await?;
+        }
+        Ok(())
+    }
+
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
@@ -497,6 +510,7 @@ impl FeedManager {
         let my_id = self.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
         let reconnect_tx = self.reconnect_tx.clone();
+
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
             let _sender_hold = sender;
@@ -512,6 +526,9 @@ impl FeedManager {
                                 &app_handle,
                                 &msg.content,
                             );
+                        }
+                        Event::NeighborUp(_) | Event::NeighborDown(_) => {
+                            log::info!("[gossip-rx] event from {}: {event:?}", short_id(&pk));
                         }
                         other => {
                             log::info!("[gossip-rx] event from {}: {other:?}", short_id(&pk));
@@ -779,10 +796,30 @@ impl FeedManager {
                     log::error!("[gossip-rx] failed to invalidate DM session after rotation: {e}");
                 }
             }
+            Ok(GossipMessage::Heartbeat) => {
+                // No-op: heartbeats keep the underlying QUIC connections
+                // alive so they don't time out during idle periods.
+            }
             Err(e) => {
                 log::error!("[gossip-rx] failed to parse message: {e}");
             }
         }
+    }
+
+    /// Tear down own feed and all follow subscriptions so they can be
+    /// re-established with fresh connections (e.g. after sleep/wake).
+    pub fn teardown_all(&mut self) {
+        self.stop_own_feed();
+        let keys: Vec<String> = self.subscriptions.keys().cloned().collect();
+        for key in &keys {
+            if let Some(handle) = self.subscriptions.remove(key) {
+                handle.abort();
+            }
+        }
+        log::info!(
+            "[gossip] tore down own feed + {} follow subscriptions",
+            keys.len()
+        );
     }
 
     pub fn unfollow_user(&mut self, pubkey: &str) {
@@ -815,6 +852,32 @@ pub async fn gossip_reconnect_loop(
                         attempt: attempt + 1,
                     });
                 }
+            }
+            ReconnectRequest::RefreshAll => {
+                log::info!("[reconnect] refreshing all gossip connections");
+                let mut fm = feed.lock().await;
+                fm.teardown_all();
+
+                // Restart own feed
+                if let Err(e) = fm.start_own_feed().await {
+                    log::error!("[reconnect] own feed restart failed: {e}");
+                }
+
+                // Resubscribe to all follows
+                let follows = fm.storage.get_follows().unwrap_or_default();
+                for f in &follows {
+                    let node_ids = fm
+                        .storage
+                        .get_peer_transport_node_ids(&f.pubkey)
+                        .unwrap_or_default();
+                    if node_ids.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = fm.follow_user(f.pubkey.clone(), &node_ids).await {
+                        log::error!("[reconnect] re-follow {} failed: {e}", short_id(&f.pubkey));
+                    }
+                }
+                log::info!("[reconnect] refreshed own feed + {} follows", follows.len());
             }
             ReconnectRequest::RefreshFollow { pubkey } => {
                 let mut fm = feed.lock().await;

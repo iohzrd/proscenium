@@ -10,8 +10,7 @@ use iroh_social_types::{
     user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
-    verify_rotation,
-    verify_profile_signature,
+    verify_profile_signature, verify_rotation,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -328,7 +327,9 @@ impl IngestionManager {
                 .bind(topic_owner)
                 .fetch_optional(&storage.pool)
                 .await
-                    && let Ok(cached) = serde_json::from_str::<iroh_social_types::SigningKeyDelegation>(&cached_json)
+                    && let Ok(cached) = serde_json::from_str::<
+                        iroh_social_types::SigningKeyDelegation,
+                    >(&cached_json)
                     && rotation.new_key_index <= cached.key_index
                 {
                     tracing::warn!(
@@ -360,18 +361,18 @@ impl IngestionManager {
                     );
                 }
                 // Also update the registration's delegation_json
-                if let Err(e) = sqlx::query(
-                    "UPDATE registrations SET delegation_json = ?2 WHERE pubkey = ?1",
-                )
-                .bind(topic_owner)
-                .bind(&delegation_json)
-                .execute(&storage.pool)
-                .await
+                if let Err(e) =
+                    sqlx::query("UPDATE registrations SET delegation_json = ?2 WHERE pubkey = ?1")
+                        .bind(topic_owner)
+                        .bind(&delegation_json)
+                        .execute(&storage.pool)
+                        .await
                 {
-                    tracing::error!(
-                        "[ingestion] failed to update registration delegation: {e}"
-                    );
+                    tracing::error!("[ingestion] failed to update registration delegation: {e}");
                 }
+            }
+            Ok(GossipMessage::Heartbeat) => {
+                // Keep-alive ping from publisher, nothing to store.
             }
             Err(e) => {
                 tracing::warn!("[ingestion] failed to parse gossip message: {e}");

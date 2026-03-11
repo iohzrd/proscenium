@@ -44,6 +44,9 @@ pub enum GossipMessage {
     },
     LinkedDevices(LinkedDevicesAnnouncement),
     SigningKeyRotation(SigningKeyRotation),
+    /// Lightweight keep-alive so followers know the connection is still
+    /// active even when the publisher isn't posting.
+    Heartbeat,
 }
 
 /// Response to an IdentityRequest. Contains everything a peer needs

@@ -32,6 +32,13 @@ pub const DEVICE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(15);
 #[cfg(target_os = "android")]
 pub const ANDROID_NET_INTERVAL: Duration = Duration::from_secs(30);
 
+// Sleep/wake detection
+pub const WAKE_CHECK_INTERVAL: Duration = Duration::from_secs(10);
+pub const WAKE_THRESHOLD: Duration = Duration::from_secs(30);
+
+// Gossip heartbeat
+pub const GOSSIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 // Relay address logging delay
 pub const RELAY_LOG_DELAY: Duration = Duration::from_secs(3);
 

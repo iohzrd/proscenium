@@ -709,6 +709,44 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
+        // Sleep/wake detection: if wall-clock time jumps far beyond the
+        // expected tick interval, the machine likely slept.  Notify iroh's
+        // endpoint and refresh all gossip connections.
+        let wake_ep = endpoint.clone();
+        let wake_reconnect_tx = reconnect_tx_loop.clone();
+        tokio::spawn(async move {
+            let mut last_tick = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(WAKE_CHECK_INTERVAL).await;
+                let now = std::time::Instant::now();
+                let elapsed = now.duration_since(last_tick);
+                last_tick = now;
+
+                if elapsed > WAKE_THRESHOLD {
+                    log::info!(
+                        "[wake] detected sleep/wake (elapsed {:.0}s, expected {:.0}s), refreshing network",
+                        elapsed.as_secs_f64(),
+                        WAKE_CHECK_INTERVAL.as_secs_f64(),
+                    );
+                    wake_ep.network_change().await;
+                    let _ = wake_reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
+                }
+            }
+        });
+
+        // Periodic heartbeat broadcast on own feed topic so followers
+        // know the connection is alive even when we're not posting.
+        let heartbeat_feed = shared_feed.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(GOSSIP_HEARTBEAT_INTERVAL).await;
+                let feed = heartbeat_feed.lock().await;
+                if let Err(e) = feed.broadcast_heartbeat().await {
+                    log::error!("[heartbeat] broadcast failed: {e}");
+                }
+            }
+        });
+
         let state = Arc::new(AppState {
             endpoint,
             router,
