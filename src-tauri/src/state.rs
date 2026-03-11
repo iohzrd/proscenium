@@ -37,13 +37,17 @@ pub struct AppState {
     pub master_secret_key_bytes: [u8; 32],
     /// Master public key string (the permanent, unforgeable identity).
     pub master_pubkey: String,
-    /// Signing key secret bytes (derived from master, signs content and DMs).
+    /// Signing key secret bytes (derived from master, signs content).
     pub signing_secret_key_bytes: [u8; 32],
-    /// Signing public key string (will be used for delegation cache lookups).
+    /// Signing public key string.
     #[allow(dead_code)]
     pub signing_pubkey: String,
     /// Signing key derivation index (0 for initial, incremented on rotation).
     pub signing_key_index: u32,
+    /// DM public key string (hex-encoded X25519).
+    pub dm_pubkey: String,
+    /// DM key derivation index.
+    pub dm_key_index: u32,
     /// Transport NodeId string (iroh's own key, for QUIC networking).
     pub transport_node_id: String,
     /// The current signing key delegation (signed by master key).

@@ -38,6 +38,17 @@ pub fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
     public.to_bytes()
 }
 
+/// Clamp a raw 32-byte secret to an X25519 private key per RFC 7748 and derive the public key.
+/// Used for DM keys that are already raw bytes (not Ed25519-derived).
+pub fn x25519_keypair_from_raw(secret: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let mut private = *secret;
+    private[0] &= 248;
+    private[31] &= 127;
+    private[31] |= 64;
+    let public = x25519_public_from_private(&private);
+    (private, public)
+}
+
 /// Perform X25519 Diffie-Hellman key agreement.
 fn x25519_dh(my_private: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
     let secret = StaticSecret::from(*my_private);

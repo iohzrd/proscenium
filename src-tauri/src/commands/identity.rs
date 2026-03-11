@@ -62,9 +62,15 @@ pub async fn rotate_signing_key(
     let master_secret = SecretKey::from_bytes(&state.master_secret_key_bytes);
     let now = now_millis();
 
-    // Sign new delegation with master key
-    let new_delegation: SigningKeyDelegation =
-        sign_delegation(&master_secret, &new_signing_pub, new_index, now);
+    // Sign new delegation with master key (DM key unchanged during signing key rotation)
+    let new_delegation: SigningKeyDelegation = sign_delegation(
+        &master_secret,
+        &new_signing_pub,
+        new_index,
+        &state.dm_pubkey,
+        state.dm_key_index,
+        now,
+    );
 
     // Sign the rotation announcement with master key
     let rotation = sign_rotation(
@@ -123,7 +129,14 @@ pub async fn rotate_signing_key(
         .get_registered_servers()
         .map_err(|e| format!("failed to get servers: {e}"))?;
     let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
-    let new_delegation_for_reg = sign_delegation(&master_secret, &new_signing_pub, new_index, now);
+    let new_delegation_for_reg = sign_delegation(
+        &master_secret,
+        &new_signing_pub,
+        new_index,
+        &state.dm_pubkey,
+        state.dm_key_index,
+        now,
+    );
     for server in &servers {
         let payload = iroh_social_types::RegistrationPayload {
             master_pubkey: state.master_pubkey.clone(),

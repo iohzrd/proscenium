@@ -9,6 +9,7 @@ pub const DM_ALPN: &[u8] = b"iroh-social/dm/1";
 pub enum DmHandshake {
     Init {
         noise_message: Vec<u8>,
+        /// Sender's DM public key (hex-encoded X25519).
         sender: String,
     },
     Response {
@@ -18,6 +19,7 @@ pub enum DmHandshake {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedEnvelope {
+    /// Sender's DM public key (hex-encoded X25519).
     pub sender: String,
     pub ratchet_header: RatchetHeaderWire,
     pub ciphertext: Vec<u8>,

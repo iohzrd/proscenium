@@ -1,7 +1,6 @@
 use crate::crypto::{
-    RatchetHeader, RatchetState, ed25519_public_to_x25519, ed25519_secret_to_x25519,
-    noise_complete_initiator, noise_complete_responder, noise_initiate, noise_respond,
-    x25519_public_from_private,
+    RatchetHeader, RatchetState, noise_complete_initiator, noise_complete_responder,
+    noise_initiate, noise_respond, x25519_keypair_from_raw,
 };
 use crate::storage::Storage;
 use base64::Engine as _;
@@ -26,11 +25,11 @@ pub struct DmHandler {
     app_handle: AppHandle,
     my_x25519_private: [u8; 32],
     my_x25519_public: [u8; 32],
-    /// Master pubkey — used for conversation/message storage identifiers.
+    /// Master pubkey -- used for conversation/message storage identifiers.
     my_master_pubkey_str: String,
-    /// Signing pubkey — used as the DM identity sent on the wire (envelope.sender).
-    my_signing_pubkey_str: String,
-    /// Key derived from master secret for encrypting ratchet state at rest.
+    /// DM pubkey (hex-encoded X25519) -- used as the DM identity sent on the wire.
+    my_dm_pubkey_str: String,
+    /// Key derived from DM secret for encrypting ratchet state at rest.
     ratchet_storage_key: [u8; 32],
 }
 
@@ -38,17 +37,15 @@ impl DmHandler {
     pub fn new(
         storage: Arc<Storage>,
         app_handle: AppHandle,
-        signing_secret: [u8; 32],
-        master_secret: [u8; 32],
+        dm_secret: [u8; 32],
         master_pubkey_str: String,
-        signing_pubkey_str: String,
+        dm_pubkey_str: String,
     ) -> Self {
-        let my_x25519_private = ed25519_secret_to_x25519(&signing_secret);
-        let my_x25519_public = x25519_public_from_private(&my_x25519_private);
+        let (my_x25519_private, my_x25519_public) = x25519_keypair_from_raw(&dm_secret);
 
-        // Derive a stable storage key from the permanent master key.
-        // This survives signing key rotation since it's anchored to the master.
-        let hk = Hkdf::<Sha256>::new(None, &master_secret);
+        // Derive ratchet storage key from the DM secret (not master).
+        // This allows secondary devices without the master key to encrypt/decrypt ratchet state.
+        let hk = Hkdf::<Sha256>::new(None, &dm_secret);
         let mut ratchet_storage_key = [0u8; 32];
         hk.expand(b"iroh-social-ratchet-storage-v1", &mut ratchet_storage_key)
             .expect("HKDF expand valid length");
@@ -59,13 +56,13 @@ impl DmHandler {
             my_x25519_private,
             my_x25519_public,
             my_master_pubkey_str: master_pubkey_str,
-            my_signing_pubkey_str: signing_pubkey_str,
+            my_dm_pubkey_str: dm_pubkey_str,
             ratchet_storage_key,
         }
     }
 
     /// Get or establish a ratchet session with a peer.
-    /// Returns `(RatchetState, peer_signing_pubkey)` — callers must use `peer_signing_pubkey`
+    /// Returns `(RatchetState, peer_dm_pubkey)` -- callers must use `peer_dm_pubkey`
     /// as the key for any subsequent `save_ratchet_session` calls.
     async fn get_or_establish_session(
         &self,
@@ -77,29 +74,26 @@ impl DmHandler {
             short_id(peer_master_pubkey)
         );
 
-        // Resolve the peer's signing pubkey — this is the session key for ratchet storage.
-        let peer_signing_pubkey = self
+        // Resolve the peer's DM pubkey from cached delegation.
+        let peer_dm_pubkey = self
             .storage
-            .get_peer_signing_pubkey(peer_master_pubkey)?
+            .get_peer_dm_pubkey(peer_master_pubkey)?
             .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no signing pubkey cached for {}",
-                    short_id(peer_master_pubkey)
-                )
+                anyhow::anyhow!("no DM pubkey cached for {}", short_id(peer_master_pubkey))
             })?;
 
-        // Try loading existing session (keyed by signing pubkey)
-        if let Some(stored) = self.storage.get_ratchet_session(&peer_signing_pubkey)? {
+        // Try loading existing session (keyed by DM pubkey)
+        if let Some(stored) = self.storage.get_ratchet_session(&peer_dm_pubkey)? {
             log::info!(
                 "[dm] loaded existing ratchet session for {}",
                 short_id(peer_master_pubkey),
             );
             let json = open_ratchet_state(&self.ratchet_storage_key, &stored)?;
             let state: RatchetState = serde_json::from_str(&json)?;
-            return Ok((state, peer_signing_pubkey));
+            return Ok((state, peer_dm_pubkey));
         }
 
-        // No session — need to handshake
+        // No session -- need to handshake
         log::info!(
             "[dm] no existing session, initiating Noise IK handshake with {}",
             short_id(peer_master_pubkey)
@@ -115,15 +109,9 @@ impl DmHandler {
         let transport_id: EndpointId = transport_id_str.parse()?;
         let addr = EndpointAddr::from(transport_id);
 
-        // Use the peer's signing pubkey for x25519 (mirrors how we derive our own from signing key)
-        let peer_signing_id: EndpointId = peer_signing_pubkey.parse().map_err(|e| {
-            log::error!("[dm] failed to parse peer signing pubkey: {e}");
-            anyhow::anyhow!("invalid peer signing pubkey: {e}")
-        })?;
-        let peer_ed_public = peer_signing_id.as_bytes();
-        let peer_x25519_public = ed25519_public_to_x25519(peer_ed_public)
-            .ok_or_else(|| anyhow::anyhow!("invalid peer signing public key"))?;
-        log::info!("[dm] converted peer signing ed25519 -> x25519 key");
+        // Peer's DM pubkey IS already X25519 -- just hex-decode it
+        let peer_x25519_public = dm_pubkey_to_x25519(&peer_dm_pubkey)?;
+        log::info!("[dm] resolved peer DM X25519 key");
 
         // Noise IK handshake: initiator
         let (initiator_hs, msg1) = noise_initiate(&self.my_x25519_private, &peer_x25519_public)
@@ -157,10 +145,10 @@ impl DmHandler {
         log::info!("[dm] QUIC connected, opening bi-stream...");
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        // Send handshake init — sender is our signing pubkey (the DM identity)
+        // Send handshake init -- sender is our DM pubkey
         let handshake = DmHandshake::Init {
             noise_message: msg1,
-            sender: self.my_signing_pubkey_str.clone(),
+            sender: self.my_dm_pubkey_str.clone(),
         };
         let bytes = serde_json::to_vec(&handshake)?;
         log::info!("[dm] sending handshake init ({} bytes)...", bytes.len());
@@ -191,17 +179,17 @@ impl DmHandler {
         // Initialize Double Ratchet as Alice (initiator)
         let ratchet = RatchetState::init_alice(&shared_secret, &peer_x25519_public);
 
-        // Encrypt and save session keyed by peer's signing pubkey
+        // Encrypt and save session keyed by peer's DM pubkey
         let json = serde_json::to_string(&ratchet)?;
         let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
         self.storage
-            .save_ratchet_session(&peer_signing_pubkey, &sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &sealed, now_millis())?;
 
         log::info!(
             "[dm] established and saved ratchet session with {}",
             short_id(peer_master_pubkey)
         );
-        Ok((ratchet, peer_signing_pubkey))
+        Ok((ratchet, peer_dm_pubkey))
     }
 
     /// Send a DM to a peer. Encrypts with Double Ratchet and sends over QUIC.
@@ -214,7 +202,7 @@ impl DmHandler {
         message: DirectMessage,
     ) -> anyhow::Result<()> {
         let message_id = message.id.clone();
-        let (mut ratchet, peer_signing_pubkey) =
+        let (mut ratchet, peer_dm_pubkey) =
             self.get_or_establish_session(endpoint, peer_pubkey).await?;
 
         // Encrypt the message
@@ -222,14 +210,14 @@ impl DmHandler {
         let plaintext = serde_json::to_vec(&payload)?;
         let (header, ciphertext) = ratchet.encrypt(&plaintext);
 
-        // Encrypt and save updated ratchet state (keyed by signing pubkey)
+        // Encrypt and save updated ratchet state (keyed by DM pubkey)
         let ratchet_json = serde_json::to_string(&ratchet)?;
         let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
         self.storage
-            .save_ratchet_session(&peer_signing_pubkey, &ratchet_sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())?;
 
         let envelope = EncryptedEnvelope {
-            sender: self.my_signing_pubkey_str.clone(),
+            sender: self.my_dm_pubkey_str.clone(),
             ratchet_header: ratchet_header_to_wire(&header),
             ciphertext,
         };
@@ -385,7 +373,7 @@ impl DmHandler {
         peer_pubkey: &str,
         payload: DmPayload,
     ) -> anyhow::Result<()> {
-        let (mut ratchet, peer_signing_pubkey) =
+        let (mut ratchet, peer_dm_pubkey) =
             self.get_or_establish_session(endpoint, peer_pubkey).await?;
 
         let plaintext = serde_json::to_vec(&payload)?;
@@ -394,10 +382,10 @@ impl DmHandler {
         let ratchet_json = serde_json::to_string(&ratchet)?;
         let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
         self.storage
-            .save_ratchet_session(&peer_signing_pubkey, &ratchet_sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())?;
 
         let envelope = EncryptedEnvelope {
-            sender: self.my_signing_pubkey_str.clone(),
+            sender: self.my_dm_pubkey_str.clone(),
             ratchet_header: ratchet_header_to_wire(&header),
             ciphertext,
         };
@@ -409,16 +397,13 @@ impl DmHandler {
     }
 
     /// Handle an incoming handshake (Noise IK responder side).
-    /// `peer_signing_pubkey` is taken from `DmHandshake::Init.sender`.
+    /// `peer_dm_pubkey` is taken from `DmHandshake::Init.sender`.
     fn handle_handshake(
         &self,
-        peer_signing_pubkey: &str,
+        peer_dm_pubkey: &str,
         noise_message: Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
-        log::info!(
-            "[dm] handling handshake from {}",
-            short_id(peer_signing_pubkey)
-        );
+        log::info!("[dm] handling handshake from {}", short_id(peer_dm_pubkey));
 
         // Noise IK responder
         let (responder_hs, response_msg) = noise_respond(&self.my_x25519_private, &noise_message)
@@ -433,16 +418,13 @@ impl DmHandler {
             (self.my_x25519_private, self.my_x25519_public),
         );
 
-        // Save session keyed by peer's signing pubkey
+        // Save session keyed by peer's DM pubkey
         let json = serde_json::to_string(&ratchet)?;
         let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
         self.storage
-            .save_ratchet_session(peer_signing_pubkey, &sealed, now_millis())?;
+            .save_ratchet_session(peer_dm_pubkey, &sealed, now_millis())?;
 
-        log::info!(
-            "[dm] session established with {}",
-            short_id(peer_signing_pubkey)
-        );
+        log::info!("[dm] session established with {}", short_id(peer_dm_pubkey));
 
         let resp = DmHandshake::Response {
             noise_message: response_msg,
@@ -451,10 +433,10 @@ impl DmHandler {
     }
 
     /// Handle an incoming encrypted message.
-    /// `peer_signing_pubkey` is taken from `EncryptedEnvelope.sender`.
+    /// `peer_dm_pubkey` is taken from `EncryptedEnvelope.sender`.
     fn handle_encrypted_message(
         &self,
-        peer_signing_pubkey: &str,
+        peer_dm_pubkey: &str,
         envelope: EncryptedEnvelope,
     ) -> anyhow::Result<()> {
         log::debug!(
@@ -465,11 +447,11 @@ impl DmHandler {
             &envelope.ratchet_header.dh_public[..8],
             envelope.ciphertext.len(),
         );
-        // Load and decrypt ratchet session (keyed by signing pubkey)
+        // Load and decrypt ratchet session (keyed by DM pubkey)
         let stored = self
             .storage
-            .get_ratchet_session(peer_signing_pubkey)?
-            .ok_or_else(|| anyhow::anyhow!("no session with {}", short_id(peer_signing_pubkey)))?;
+            .get_ratchet_session(peer_dm_pubkey)?
+            .ok_or_else(|| anyhow::anyhow!("no session with {}", short_id(peer_dm_pubkey)))?;
         let json = open_ratchet_state(&self.ratchet_storage_key, &stored)?;
         let mut ratchet: RatchetState = serde_json::from_str(&json)?;
 
@@ -492,16 +474,11 @@ impl DmHandler {
         match payload {
             DmPayload::Message(msg) => {
                 // Master pubkey is required to route the message to the right conversation.
-                // If we can't resolve it, we can't store the message — fail without saving
-                // ratchet state so the session is not silently corrupted.
                 let peer_master_pubkey = self
                     .storage
-                    .get_master_pubkey_for_signing_pubkey(peer_signing_pubkey)
+                    .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
                     .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "no master pubkey for signing key {}",
-                            short_id(peer_signing_pubkey)
-                        )
+                        anyhow::anyhow!("no master pubkey for DM key {}", short_id(peer_dm_pubkey))
                     })?;
 
                 let conv_id =
@@ -527,7 +504,7 @@ impl DmHandler {
 
                 // Atomically save ratchet state + store message (single SQLite transaction)
                 self.storage.receive_dm_message_atomically(
-                    peer_signing_pubkey,
+                    peer_dm_pubkey,
                     &peer_master_pubkey,
                     &ratchet_sealed,
                     ratchet_ts,
@@ -549,11 +526,8 @@ impl DmHandler {
                 );
             }
             DmPayload::Delivered { message_id } => {
-                self.storage.save_ratchet_session(
-                    peer_signing_pubkey,
-                    &ratchet_sealed,
-                    ratchet_ts,
-                )?;
+                self.storage
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
                 self.storage.mark_dm_delivered(&message_id)?;
                 let _ = self.app_handle.emit(
                     "dm-delivered",
@@ -561,26 +535,18 @@ impl DmHandler {
                 );
             }
             DmPayload::Read { message_id } => {
-                self.storage.save_ratchet_session(
-                    peer_signing_pubkey,
-                    &ratchet_sealed,
-                    ratchet_ts,
-                )?;
+                self.storage
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
                 self.storage.mark_dm_read_by_id(&message_id)?;
                 let _ = self
                     .app_handle
                     .emit("dm-read", serde_json::json!({ "message_id": message_id }));
             }
             DmPayload::Typing => {
-                self.storage.save_ratchet_session(
-                    peer_signing_pubkey,
-                    &ratchet_sealed,
-                    ratchet_ts,
-                )?;
-                // Best-effort: if master pubkey isn't cached, skip the event
-                if let Some(peer_master_pubkey) = self
-                    .storage
-                    .get_master_pubkey_for_signing_pubkey(peer_signing_pubkey)
+                self.storage
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
+                if let Some(peer_master_pubkey) =
+                    self.storage.get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
                 {
                     let _ = self.app_handle.emit(
                         "typing-indicator",
@@ -614,7 +580,7 @@ impl ProtocolHandler for DmHandler {
             .map_err(AcceptError::from_err)?;
 
         // Try handshake first, then encrypted message.
-        // In both cases, sender = peer's signing pubkey (the DM session key).
+        // In both cases, sender = peer's DM pubkey (hex X25519).
         if let Ok(handshake) = serde_json::from_slice::<DmHandshake>(&frame_bytes) {
             match handshake {
                 DmHandshake::Init {
@@ -637,7 +603,7 @@ impl ProtocolHandler for DmHandler {
                 }
             }
         } else if let Ok(envelope) = serde_json::from_slice::<EncryptedEnvelope>(&frame_bytes) {
-            // envelope.sender is the peer's signing pubkey
+            // envelope.sender is the peer's DM pubkey
             let sender = envelope.sender.clone();
             if let Err(e) = self.handle_encrypted_message(&sender, envelope) {
                 log::error!(
@@ -675,29 +641,32 @@ fn seal_ratchet_state(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String>
 }
 
 /// Decrypt a ratchet state stored by `seal_ratchet_state`.
-/// Falls back to treating the input as plaintext JSON for migration of existing sessions.
 fn open_ratchet_state(key: &[u8; 32], stored: &str) -> anyhow::Result<String> {
-    if let Ok(blob) = base64::engine::general_purpose::STANDARD.decode(stored)
-        && blob.len() > 12
-    {
-        let (nonce_bytes, ciphertext) = blob.split_at(12);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-        let nonce = Nonce::from_slice(nonce_bytes);
-        if let Ok(plaintext_bytes) = cipher.decrypt(nonce, ciphertext)
-            && let Ok(s) = String::from_utf8(plaintext_bytes)
-        {
-            return Ok(s);
-        }
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(stored)
+        .map_err(|_| anyhow::anyhow!("invalid base64 in ratchet state"))?;
+    if blob.len() <= 12 {
+        return Err(anyhow::anyhow!("ratchet state too short"));
     }
-    // Migration path: treat as legacy plaintext JSON
-    if serde_json::from_str::<serde_json::Value>(stored).is_ok() {
-        log::info!("[dm] migrating legacy plaintext ratchet session to encrypted storage");
-        return Ok(stored.to_string());
-    }
-    Err(anyhow::anyhow!("failed to open ratchet state"))
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext_bytes = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| anyhow::anyhow!("ratchet state decryption failed"))?;
+    String::from_utf8(plaintext_bytes).map_err(|_| anyhow::anyhow!("ratchet state not valid UTF-8"))
 }
 
-// -- Helper functions for header conversion --
+// -- Helper functions --
+
+/// Decode a hex-encoded DM pubkey (X25519) to 32 bytes.
+fn dm_pubkey_to_x25519(hex_pubkey: &str) -> anyhow::Result<[u8; 32]> {
+    let bytes =
+        hex::decode(hex_pubkey).map_err(|e| anyhow::anyhow!("invalid hex DM pubkey: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("DM pubkey wrong length"))
+}
 
 fn ratchet_header_to_wire(header: &RatchetHeader) -> RatchetHeaderWire {
     RatchetHeaderWire {

@@ -138,6 +138,9 @@ pub struct LinkQrPayload {
 pub struct LinkBundleData {
     /// The signing key secret (32 bytes, base64-encoded).
     pub signing_secret_key: String,
+    /// The DM key secret (32 bytes, base64-encoded).
+    /// Used for X25519 DH (Noise IK + Double Ratchet).
+    pub dm_secret_key: String,
     /// The signing key delegation (signed by master key).
     pub delegation: crate::delegation::SigningKeyDelegation,
     /// The new device's transport secret key (32 bytes, base64-encoded).

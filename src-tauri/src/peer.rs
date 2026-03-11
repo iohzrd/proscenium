@@ -26,6 +26,8 @@ pub struct PeerHandler {
     master_secret_key_bytes: [u8; 32],
     /// Signing secret key bytes (transferred during pairing).
     signing_secret_key_bytes: [u8; 32],
+    /// DM secret key bytes (transferred during pairing).
+    dm_secret_key_bytes: [u8; 32],
     /// Active device-linking session (if any).
     pending_link: PendingLinkState,
     app_handle: AppHandle,
@@ -40,6 +42,7 @@ impl PeerHandler {
         delegation: SigningKeyDelegation,
         master_secret_key_bytes: [u8; 32],
         signing_secret_key_bytes: [u8; 32],
+        dm_secret_key_bytes: [u8; 32],
         pending_link: PendingLinkState,
         app_handle: AppHandle,
     ) -> Self {
@@ -50,6 +53,7 @@ impl PeerHandler {
             delegation,
             master_secret_key_bytes,
             signing_secret_key_bytes,
+            dm_secret_key_bytes,
             pending_link,
             app_handle,
         }
@@ -142,6 +146,7 @@ impl ProtocolHandler for PeerHandler {
                     &self.master_pubkey,
                     &self.master_secret_key_bytes,
                     &self.signing_secret_key_bytes,
+                    &self.dm_secret_key_bytes,
                     &self.delegation,
                     &self.pending_link,
                     &self.app_handle,
@@ -394,6 +399,7 @@ async fn handle_link_request(
     master_pubkey: &str,
     master_secret_key_bytes: &[u8; 32],
     signing_secret_key_bytes: &[u8; 32],
+    dm_secret_key_bytes: &[u8; 32],
     delegation: &SigningKeyDelegation,
     pending_link: &PendingLinkState,
     app_handle: &AppHandle,
@@ -458,6 +464,7 @@ async fn handle_link_request(
         .export_link_bundle(
             master_pubkey,
             signing_secret_key_bytes,
+            dm_secret_key_bytes,
             delegation,
             &new_transport_key_bytes,
             new_device_index,

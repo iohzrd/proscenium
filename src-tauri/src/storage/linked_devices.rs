@@ -155,10 +155,12 @@ impl Storage {
     }
 
     /// Export a full link bundle for device pairing.
+    #[allow(clippy::too_many_arguments)]
     pub fn export_link_bundle(
         &self,
         master_pubkey: &str,
         signing_secret_key_bytes: &[u8; 32],
+        dm_secret_key_bytes: &[u8; 32],
         delegation: &SigningKeyDelegation,
         transport_secret_key_bytes: &[u8; 32],
         device_index: u32,
@@ -176,6 +178,7 @@ impl Storage {
 
         Ok(LinkBundleData {
             signing_secret_key: b64.encode(signing_secret_key_bytes),
+            dm_secret_key: b64.encode(dm_secret_key_bytes),
             delegation: delegation.clone(),
             transport_secret_key: b64.encode(transport_secret_key_bytes),
             device_index,

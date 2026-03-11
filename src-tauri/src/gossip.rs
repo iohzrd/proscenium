@@ -791,10 +791,9 @@ impl FeedManager {
                 if let Err(e) = storage.cache_peer_identity(&response) {
                     log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
                 }
-                // Invalidate DM ratchet session (new signing key = new DH key)
-                if let Err(e) = storage.delete_ratchet_session(pk) {
-                    log::error!("[gossip-rx] failed to invalidate DM session after rotation: {e}");
-                }
+                // Note: signing key rotation does NOT invalidate DM sessions.
+                // The DM key is derived independently from the master key and
+                // only changes when explicitly rotated via dm_key_index.
             }
             Ok(GossipMessage::Heartbeat) => {
                 // No-op: heartbeats keep the underlying QUIC connections

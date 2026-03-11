@@ -11,7 +11,7 @@ use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
-    DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_signing_key,
+    DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_dm_key, derive_signing_key,
     derive_transport_key, now_millis, short_id, sign_delegation, sign_linked_devices_announcement,
 };
 use std::sync::Arc;
@@ -44,6 +44,15 @@ fn load_signing_key_index(data_dir: &std::path::Path) -> u32 {
 pub fn save_signing_key_index(data_dir: &std::path::Path, index: u32) {
     let path = data_dir.join("signing_key_index");
     std::fs::write(path, index.to_string()).expect("failed to write signing_key_index");
+}
+
+/// Load the persisted DM key index (returns 0 if not yet saved).
+fn load_dm_key_index(data_dir: &std::path::Path) -> u32 {
+    let path = data_dir.join("dm_key_index");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse().unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 /// Migrate old identity.key to master_key.key if needed.
@@ -179,11 +188,20 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let signing_pubkey = signing_secret.public().to_string();
     log::info!("[setup] signing pubkey: {}", short_id(&signing_pubkey));
 
-    // Sign delegation binding signing key to master key
+    // Derive DM key (pure X25519, independent from signing key)
+    let dm_key_index: u32 = load_dm_key_index(&data_dir);
+    let dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes, dm_key_index);
+    let (_, dm_x25519_public) = crate::crypto::x25519_keypair_from_raw(&dm_secret_key_bytes);
+    let dm_pubkey = hex::encode(dm_x25519_public);
+    log::info!("[setup] DM pubkey: {}", short_id(&dm_pubkey));
+
+    // Sign delegation binding signing key + DM key to master key
     let delegation = sign_delegation(
         &master_secret,
         &signing_secret.public(),
         signing_key_index,
+        &dm_pubkey,
+        dm_key_index,
         now_millis(),
     );
 
@@ -201,6 +219,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
     let master_pubkey_clone = master_pubkey.clone();
     let signing_pubkey_clone = signing_pubkey.clone();
+    let dm_pubkey_clone = dm_pubkey.clone();
     let delegation_clone = delegation.clone();
     let storage_clone = storage.clone();
     tauri::async_runtime::spawn(async move {
@@ -250,14 +269,13 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         let gossip = Gossip::builder().spawn(endpoint.clone());
         log::info!("[setup] gossip started");
 
-        // DM handler: signing key for X25519 + wire identity, master key for at-rest encryption.
+        // DM handler: dedicated X25519 key for Noise IK + Double Ratchet.
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
-            signing_secret_key_bytes,
-            master_secret_key_bytes,
+            dm_secret_key_bytes,
             master_pubkey_clone.clone(),
-            signing_pubkey_clone.clone(),
+            dm_pubkey_clone.clone(),
         );
         // Shared pending link state for device pairing
         let pending_link: crate::state::PendingLinkState = Arc::new(tokio::sync::Mutex::new(None));
@@ -270,6 +288,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             delegation_clone.clone(),
             master_secret_key_bytes,
             signing_secret_key_bytes,
+            dm_secret_key_bytes,
             pending_link.clone(),
             handle.clone(),
         );
@@ -745,6 +764,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             signing_secret_key_bytes,
             signing_pubkey: signing_pubkey_clone,
             signing_key_index,
+            dm_pubkey: dm_pubkey_clone,
+            dm_key_index,
             transport_node_id: transport_node_id.clone(),
             delegation: delegation_clone,
             pending_link,
