@@ -344,15 +344,15 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         // Wrap feed in Arc<Mutex> early so the spawned subscription task can use it
         let shared_feed = Arc::new(Mutex::new(feed));
 
-        // Gossip follow subscriptions + startup sync -- both need relay
-        let sub_feed = shared_feed.clone();
-        let sub_follows = follows.clone();
-        let sub_storage = storage_clone.clone();
+        // Gossip follow subscriptions + startup sync + drip sync
+        // All in one task so drip naturally starts after startup-sync finishes,
+        // avoiding concurrent syncs to the same peer.
+        let sync_feed = shared_feed.clone();
         let sync_endpoint = endpoint.clone();
         let sync_storage = storage_clone.clone();
-        let sync_follows = follows.clone();
         let sync_handle = handle.clone();
         let sync_my_id = master_pubkey_clone.clone();
+        let sync_follows = follows.clone();
         tokio::spawn(async move {
             // Wait for relay connectivity before subscribing to follows
             log::info!("[startup] waiting for relay connectivity...");
@@ -371,8 +371,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
 
             // Subscribe to followed users' gossip topics
-            for f in &sub_follows {
-                let node_ids = sub_storage
+            for f in &sync_follows {
+                let node_ids = sync_storage
                     .get_peer_transport_node_ids(&f.pubkey)
                     .unwrap_or_default();
                 if node_ids.is_empty() {
@@ -383,7 +383,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     continue;
                 }
                 log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
-                let mut feed = sub_feed.lock().await;
+                let mut feed = sync_feed.lock().await;
                 if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
                     log::error!(
                         "[setup] failed to resubscribe to {}: {e}",
@@ -394,6 +394,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 }
             }
 
+            // Startup sync: parallel fetch from all followed peers
             log::info!("[startup-sync] waiting 5s for peers to be ready...");
             tokio::time::sleep(PEER_READY_DELAY).await;
 
@@ -417,23 +418,15 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     log::error!("[startup-sync] task panicked: {e}");
                 }
             }
-            log::info!("[startup-sync] done");
-        });
+            log::info!("[startup-sync] done, starting drip sync");
 
-        // Background drip sync
-        let drip_endpoint = endpoint.clone();
-        let drip_storage = storage_clone.clone();
-        let drip_handle = handle.clone();
-        let drip_my_id = master_pubkey_clone.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(DRIP_INITIAL_DELAY).await;
-
+            // Drip sync: sequential periodic sync with all followed peers
             loop {
-                let follows = drip_storage.get_follows().unwrap_or_default();
+                let follows = sync_storage.get_follows().unwrap_or_default();
                 let mut any_work = false;
 
                 for f in &follows {
-                    let node_ids = drip_storage
+                    let node_ids = sync_storage
                         .get_peer_transport_node_ids(&f.pubkey)
                         .unwrap_or_default();
                     let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
@@ -449,29 +442,29 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
                     let result = tokio::time::timeout(
                         SYNC_TIMEOUT,
-                        sync::sync_from_peer(&drip_endpoint, &drip_storage, target, &f.pubkey),
+                        sync::sync_from_peer(&sync_endpoint, &sync_storage, target, &f.pubkey),
                     )
                     .await;
 
                     match result {
                         Ok(Ok(sync_result)) => {
                             if sync_result.posts.is_empty() && sync_result.interactions.is_empty() {
-                                log::info!("[drip-sync] {} up to date", short_id(&f.pubkey),);
+                                log::info!("[drip-sync] {} up to date", short_id(&f.pubkey));
                                 continue;
                             }
 
                             let stored = process_sync_result(
-                                &drip_storage,
+                                &sync_storage,
                                 &f.pubkey,
                                 &sync_result,
                                 "drip-sync",
-                                &drip_my_id,
-                                &drip_handle,
+                                &sync_my_id,
+                                &sync_handle,
                             );
 
                             if stored > 0 {
                                 any_work = true;
-                                let _ = drip_handle.emit("feed-updated", ());
+                                let _ = sync_handle.emit("feed-updated", ());
                             }
 
                             log::info!(

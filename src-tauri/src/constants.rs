@@ -9,7 +9,6 @@ pub const SYNC_MAX_RETRIES: u32 = 3;
 pub const SYNC_CONCURRENCY: usize = 5;
 
 // Drip sync
-pub const DRIP_INITIAL_DELAY: Duration = Duration::from_secs(30);
 pub const DRIP_PEER_PACE: Duration = Duration::from_secs(5);
 pub const DRIP_ACTIVE_INTERVAL: Duration = Duration::from_secs(30);
 pub const DRIP_IDLE_INTERVAL: Duration = Duration::from_secs(120);
