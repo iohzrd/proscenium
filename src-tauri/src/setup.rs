@@ -525,18 +525,21 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
-        // Push outbox flush task
+        // Push outbox flush + periodic housekeeping (prune expired push entries & follow requests)
         let push_ep = endpoint.clone();
         let push_storage = storage_clone.clone();
         let push_my_id = master_pubkey_clone.clone();
         tokio::spawn(async move {
+            let mut last_prune = std::time::Instant::now();
             loop {
                 tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL).await;
+
+                // Flush push outbox
                 let peers = match push_storage.get_push_outbox_peers() {
                     Ok(p) => p,
                     Err(e) => {
                         log::error!("[push-outbox] failed to get peers: {e}");
-                        continue;
+                        Vec::new()
                     }
                 };
                 for peer in peers {
@@ -646,39 +649,28 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         let _ = push_storage.mark_push_attempted(&all_ids);
                     }
                 }
-            }
-        });
 
-        // Push outbox prune task
-        let prune_storage = storage_clone.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(PUSH_OUTBOX_PRUNE_INTERVAL).await;
-                match prune_storage.prune_expired_push_entries() {
-                    Ok(count) if count > 0 => {
-                        log::info!("[push-outbox] pruned {count} expired entries");
+                // Hourly housekeeping: prune expired push entries and follow requests
+                if last_prune.elapsed() >= HOUSEKEEPING_INTERVAL {
+                    last_prune = std::time::Instant::now();
+                    match push_storage.prune_expired_push_entries() {
+                        Ok(count) if count > 0 => {
+                            log::info!("[housekeeping] pruned {count} expired push entries");
+                        }
+                        Err(e) => {
+                            log::error!("[housekeeping] push prune error: {e}");
+                        }
+                        _ => {}
                     }
-                    Err(e) => {
-                        log::error!("[push-outbox] prune error: {e}");
+                    match push_storage.prune_expired_follow_requests() {
+                        Ok(count) if count > 0 => {
+                            log::info!("[housekeeping] pruned {count} expired follow requests");
+                        }
+                        Err(e) => {
+                            log::error!("[housekeeping] follow request prune error: {e}");
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
-            }
-        });
-
-        // Follow request expiry task
-        let follow_req_storage = storage_clone.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(FOLLOW_REQUEST_PRUNE_INTERVAL).await;
-                match follow_req_storage.prune_expired_follow_requests() {
-                    Ok(count) if count > 0 => {
-                        log::info!("[follow-req] pruned {count} expired requests");
-                    }
-                    Err(e) => {
-                        log::error!("[follow-req] prune error: {e}");
-                    }
-                    _ => {}
                 }
             }
         });
@@ -702,40 +694,38 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
-        // Sleep/wake detection: if wall-clock time jumps far beyond the
-        // expected tick interval, the machine likely slept.  Notify iroh's
-        // endpoint and refresh all gossip connections.
-        let wake_ep = endpoint.clone();
-        let wake_reconnect_tx = reconnect_tx_loop.clone();
+        // Network health: sleep/wake detection + periodic heartbeat broadcast.
+        // Single 5s tick loop handles both concerns.
+        let health_ep = endpoint.clone();
+        let health_reconnect_tx = reconnect_tx_loop.clone();
+        let health_feed = shared_feed.clone();
         tokio::spawn(async move {
             let mut last_tick = std::time::Instant::now();
+            let mut last_heartbeat = std::time::Instant::now();
             loop {
-                tokio::time::sleep(WAKE_CHECK_INTERVAL).await;
+                tokio::time::sleep(HEALTH_TICK_INTERVAL).await;
                 let now = std::time::Instant::now();
                 let elapsed = now.duration_since(last_tick);
                 last_tick = now;
 
+                // Sleep/wake detection
                 if elapsed > WAKE_THRESHOLD {
                     log::info!(
                         "[wake] detected sleep/wake (elapsed {:.0}s, expected {:.0}s), refreshing network",
                         elapsed.as_secs_f64(),
-                        WAKE_CHECK_INTERVAL.as_secs_f64(),
+                        HEALTH_TICK_INTERVAL.as_secs_f64(),
                     );
-                    wake_ep.network_change().await;
-                    let _ = wake_reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
+                    health_ep.network_change().await;
+                    let _ = health_reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
                 }
-            }
-        });
 
-        // Periodic heartbeat broadcast on own feed topic so followers
-        // know the connection is alive even when we're not posting.
-        let heartbeat_feed = shared_feed.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(GOSSIP_HEARTBEAT_INTERVAL).await;
-                let feed = heartbeat_feed.lock().await;
-                if let Err(e) = feed.broadcast_heartbeat().await {
-                    log::error!("[heartbeat] broadcast failed: {e}");
+                // Heartbeat broadcast
+                if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
+                    last_heartbeat = std::time::Instant::now();
+                    let feed = health_feed.lock().await;
+                    if let Err(e) = feed.broadcast_heartbeat().await {
+                        log::error!("[heartbeat] broadcast failed: {e}");
+                    }
                 }
             }
         });
