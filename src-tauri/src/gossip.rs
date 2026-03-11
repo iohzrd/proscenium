@@ -13,7 +13,10 @@ use iroh_social_types::{
     verify_linked_devices_announcement, verify_profile_signature, verify_rotation,
 };
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -53,7 +56,11 @@ pub struct FeedManager {
     pub master_pubkey: String,
     my_sender: Option<GossipSender>,
     own_feed_handle: Option<JoinHandle<()>>,
-    pub subscriptions: HashMap<String, JoinHandle<()>>,
+    /// Maps peer master pubkey to (task_handle, has_neighbor_flag).
+    /// The flag is set to true when the subscription has received at least one NeighborUp event,
+    /// meaning the gossip mesh is actually connected. Used to distinguish "alive but isolated"
+    /// from "alive and connected" when deciding whether to refresh.
+    pub subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
     pub storage: Arc<Storage>,
     pub app_handle: AppHandle,
     reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
@@ -510,6 +517,8 @@ impl FeedManager {
         let my_id = self.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
         let reconnect_tx = self.reconnect_tx.clone();
+        let has_neighbor = Arc::new(AtomicBool::new(false));
+        let has_neighbor_task = has_neighbor.clone();
 
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
@@ -527,7 +536,11 @@ impl FeedManager {
                                 &msg.content,
                             );
                         }
-                        Event::NeighborUp(_) | Event::NeighborDown(_) => {
+                        Event::NeighborUp(_) => {
+                            has_neighbor_task.store(true, Ordering::Relaxed);
+                            log::info!("[gossip-rx] event from {}: {event:?}", short_id(&pk));
+                        }
+                        Event::NeighborDown(_) => {
                             log::info!("[gossip-rx] event from {}: {event:?}", short_id(&pk));
                         }
                         other => {
@@ -551,7 +564,7 @@ impl FeedManager {
             });
         });
 
-        self.subscriptions.insert(pubkey, handle);
+        self.subscriptions.insert(pubkey, (handle, has_neighbor));
         Ok(())
     }
 
@@ -811,7 +824,7 @@ impl FeedManager {
         self.stop_own_feed();
         let keys: Vec<String> = self.subscriptions.keys().cloned().collect();
         for key in &keys {
-            if let Some(handle) = self.subscriptions.remove(key) {
+            if let Some((handle, _)) = self.subscriptions.remove(key) {
                 handle.abort();
             }
         }
@@ -822,7 +835,7 @@ impl FeedManager {
     }
 
     pub fn unfollow_user(&mut self, pubkey: &str) {
-        if let Some(handle) = self.subscriptions.remove(pubkey) {
+        if let Some((handle, _)) = self.subscriptions.remove(pubkey) {
             log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
             handle.abort();
         }
@@ -880,27 +893,30 @@ pub async fn gossip_reconnect_loop(
             }
             ReconnectRequest::RefreshFollow { pubkey } => {
                 let mut fm = feed.lock().await;
-                // Skip if we already have a live subscription for this peer.
-                // This prevents the NeighborUp -> RefreshFollow -> NeighborUp
-                // feedback loop: the refresh creates a new subscription which
-                // triggers NeighborUp again on our own feed topic.
+                // Skip if the subscription is alive AND already has a neighbor.
+                // A live subscription with 0 neighbors means the gossip mesh is not
+                // connected (startup race), so we must allow the refresh in that case.
+                // Once we have neighbors, skipping prevents the NeighborUp -> RefreshFollow
+                // -> NeighborUp feedback loop.
                 if fm
                     .subscriptions
                     .get(&pubkey)
-                    .is_some_and(|h| !h.is_finished())
+                    .is_some_and(|(h, has_neighbor)| {
+                        !h.is_finished() && has_neighbor.load(Ordering::Relaxed)
+                    })
                 {
                     log::info!(
-                        "[reconnect] skipping refresh for {} (subscription alive)",
+                        "[reconnect] skipping refresh for {} (subscription alive with neighbors)",
                         short_id(&pubkey)
                     );
                     continue;
                 }
-                // Remove dead subscription (if any) so follow_user re-subscribes
-                // with fresh bootstrap peers.
-                if let Some(handle) = fm.subscriptions.remove(&pubkey) {
+                // Remove stale subscription (dead or alive-but-isolated) so
+                // follow_user re-subscribes with fresh bootstrap peers.
+                if let Some((handle, _)) = fm.subscriptions.remove(&pubkey) {
                     handle.abort();
                     log::info!(
-                        "[reconnect] removed dead subscription for {}",
+                        "[reconnect] removed isolated/dead subscription for {}",
                         short_id(&pubkey)
                     );
                 }
@@ -933,7 +949,9 @@ pub async fn gossip_reconnect_loop(
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 let mut fm = feed.lock().await;
-                fm.subscriptions.remove(&pubkey);
+                if let Some((handle, _)) = fm.subscriptions.remove(&pubkey) {
+                    handle.abort();
+                }
                 let node_ids = fm
                     .storage
                     .get_peer_transport_node_ids(&pubkey)
