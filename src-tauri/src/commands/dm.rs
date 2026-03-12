@@ -26,7 +26,7 @@ pub async fn send_dm(
         reply_to
     );
 
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let msg_id = uuid::Uuid::new_v4().to_string();
     let timestamp = now_millis();
 
@@ -107,7 +107,7 @@ pub async fn get_dm_messages(
     limit: Option<usize>,
     before: Option<u64>,
 ) -> Result<Vec<StoredMessage>, String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let conv_id = Storage::conversation_id(&my_id, &peer_pubkey);
     let msgs = state
         .storage
@@ -128,7 +128,7 @@ pub async fn mark_dm_read(
     state: State<'_, Arc<AppState>>,
     peer_pubkey: String,
 ) -> Result<(), String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     state
         .storage
         .mark_conversation_read(&peer_pubkey, &my_id)

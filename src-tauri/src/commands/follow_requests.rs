@@ -76,9 +76,9 @@ pub async fn send_follow_request_to_peer(
         &state.endpoint,
         &state.storage,
         target,
-        &state.master_pubkey,
-        &state.signing_secret_key_bytes,
-        &state.delegation,
+        &state.identity.master_pubkey,
+        &state.identity.signing_secret_key_bytes,
+        &state.identity.delegation,
     )
     .await
     .str_err()?;

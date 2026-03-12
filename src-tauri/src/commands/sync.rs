@@ -22,7 +22,7 @@ pub async fn sync_posts(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> Result<FrontendSyncResult, String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let result = crate::sync::sync_one_peer(
         &state.endpoint,
         &state.storage,

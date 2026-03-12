@@ -10,7 +10,7 @@ use tauri::{Manager, State};
 /// Return the master key as a BIP39 24-word mnemonic.
 #[tauri::command]
 pub async fn get_seed_phrase(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let mnemonic = bip39::Mnemonic::from_entropy(&state.master_secret_key_bytes)
+    let mnemonic = bip39::Mnemonic::from_entropy(&state.identity.master_secret_key_bytes)
         .map_err(|e| format!("failed to generate mnemonic: {e}"))?;
     Ok(mnemonic.to_string())
 }
@@ -50,17 +50,17 @@ pub async fn rotate_signing_key(
         .app_data_dir()
         .map_err(|e| format!("failed to resolve data dir: {e}"))?;
 
-    let old_index = state.signing_key_index;
+    let old_index = state.identity.signing_key_index;
     let new_index = old_index + 1;
 
     // Derive old and new signing keys
-    let old_signing_bytes = derive_signing_key(&state.master_secret_key_bytes, old_index);
+    let old_signing_bytes = derive_signing_key(&state.identity.master_secret_key_bytes, old_index);
     let old_signing_pub = SecretKey::from_bytes(&old_signing_bytes).public();
 
-    let new_signing_bytes = derive_signing_key(&state.master_secret_key_bytes, new_index);
+    let new_signing_bytes = derive_signing_key(&state.identity.master_secret_key_bytes, new_index);
     let new_signing_pub = SecretKey::from_bytes(&new_signing_bytes).public();
 
-    let master_secret = SecretKey::from_bytes(&state.master_secret_key_bytes);
+    let master_secret = SecretKey::from_bytes(&state.identity.master_secret_key_bytes);
     let now = now_millis();
 
     // Sign new delegation with master key (DM key unchanged during signing key rotation)
@@ -68,8 +68,8 @@ pub async fn rotate_signing_key(
         &master_secret,
         &new_signing_pub,
         new_index,
-        &state.dm_pubkey,
-        state.dm_key_index,
+        &state.identity.dm_pubkey,
+        state.identity.dm_key_index,
         now,
     );
 
@@ -100,13 +100,13 @@ pub async fn rotate_signing_key(
     // Use own cached announcement version + 1, or device count as base
     let current_version = state
         .storage
-        .get_peer_announcement_version(&state.master_pubkey)
+        .get_peer_announcement_version(&state.identity.master_pubkey)
         .await
         .unwrap_or(None)
         .unwrap_or(devices.len() as u64);
     let version = current_version + 1;
     let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
-        master_pubkey: state.master_pubkey.clone(),
+        master_pubkey: state.identity.master_pubkey.clone(),
         delegation: new_delegation,
         devices,
         version,
@@ -117,7 +117,7 @@ pub async fn rotate_signing_key(
     // Cache our own announcement so version tracking works
     if let Err(e) = state
         .storage
-        .cache_peer_device_announcement(&state.master_pubkey, &announcement)
+        .cache_peer_device_announcement(&state.identity.master_pubkey, &announcement)
         .await
     {
         log::error!("[rotate] failed to cache own announcement: {e}");
@@ -139,14 +139,14 @@ pub async fn rotate_signing_key(
         &master_secret,
         &new_signing_pub,
         new_index,
-        &state.dm_pubkey,
-        state.dm_key_index,
+        &state.identity.dm_pubkey,
+        state.identity.dm_key_index,
         now,
     );
     for server in &servers {
         let payload = iroh_social_types::RegistrationPayload {
-            master_pubkey: state.master_pubkey.clone(),
-            transport_node_id: state.transport_node_id.clone(),
+            master_pubkey: state.identity.master_pubkey.clone(),
+            transport_node_id: state.identity.transport_node_id.clone(),
             server_url: server.url.clone(),
             timestamp: now,
             visibility: server
@@ -157,8 +157,8 @@ pub async fn rotate_signing_key(
         };
         let signature = iroh_social_types::sign_registration(&payload, &new_signing_sk);
         let request = iroh_social_types::RegistrationRequest {
-            master_pubkey: state.master_pubkey.clone(),
-            transport_node_id: state.transport_node_id.clone(),
+            master_pubkey: state.identity.master_pubkey.clone(),
+            transport_node_id: state.identity.transport_node_id.clone(),
             server_url: server.url.clone(),
             timestamp: now,
             visibility: server
@@ -210,7 +210,7 @@ pub async fn verify_seed_phrase_words(
     state: State<'_, Arc<AppState>>,
     checks: Vec<(usize, String)>,
 ) -> Result<bool, String> {
-    let mnemonic = bip39::Mnemonic::from_entropy(&state.master_secret_key_bytes)
+    let mnemonic = bip39::Mnemonic::from_entropy(&state.identity.master_secret_key_bytes)
         .map_err(|e| format!("failed to generate mnemonic: {e}"))?;
     let words: Vec<&str> = mnemonic.words().collect();
     for (idx, word) in &checks {

@@ -14,8 +14,9 @@ pub(crate) mod servers;
 mod social;
 
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostCounts {
@@ -98,17 +99,14 @@ impl Storage {
 
     pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
+        let opts = SqliteConnectOptions::from_str(&url)?
+            .pragma("journal_mode", "WAL")
+            .pragma("foreign_keys", "ON")
+            .pragma("busy_timeout", "5000");
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&url)
-            .await?;
-
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
-        sqlx::query("PRAGMA busy_timeout=5000")
-            .execute(&pool)
+            .connect_with(opts)
             .await?;
 
         Self::run_migrations(&pool).await?;

@@ -17,17 +17,17 @@ pub struct NodeStatus {
 
 #[tauri::command]
 pub async fn get_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.transport_node_id.clone())
+    Ok(state.identity.transport_node_id.clone())
 }
 
 #[tauri::command]
 pub async fn get_pubkey(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    Ok(state.master_pubkey.clone())
+    Ok(state.identity.master_pubkey.clone())
 }
 
 #[tauri::command]
 pub async fn get_my_profile(state: State<'_, Arc<AppState>>) -> Result<Option<Profile>, String> {
-    let node_id = state.master_pubkey.clone();
+    let node_id = state.identity.master_pubkey.clone();
     state.storage.get_profile(&node_id).await.str_err()
 }
 
@@ -40,7 +40,7 @@ pub async fn save_my_profile(
     avatar_ticket: Option<String>,
     visibility: String,
 ) -> Result<(), String> {
-    let node_id = state.master_pubkey.clone();
+    let node_id = state.identity.master_pubkey.clone();
     let new_visibility: Visibility = visibility.parse().map_err(|e: String| e)?;
     let mut profile = Profile {
         display_name: display_name.clone(),
@@ -53,7 +53,7 @@ pub async fn save_my_profile(
     validate_profile(&profile)?;
 
     // Sign with signing key
-    sign_profile(&mut profile, &state.signing_key);
+    sign_profile(&mut profile, &state.identity.signing_key);
 
     let old_visibility = state
         .storage
@@ -115,7 +115,7 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
         .unwrap_or(0);
 
     Ok(NodeStatus {
-        node_id: state.transport_node_id.clone(),
+        node_id: state.identity.transport_node_id.clone(),
         has_relay,
         relay_url,
         follow_count,

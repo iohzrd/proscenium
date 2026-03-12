@@ -24,7 +24,7 @@ pub async fn start_device_link(
     getrandom::fill(&mut psk).map_err(|e| format!("failed to generate PSK: {e}"))?;
 
     // Derive X25519 key from the transport Ed25519 key for the Noise handshake
-    let transport_secret_bytes = derive_transport_key(&state.master_secret_key_bytes, 0);
+    let transport_secret_bytes = derive_transport_key(&state.identity.master_secret_key_bytes, 0);
     let x25519_private = ed25519_secret_to_x25519(&transport_secret_bytes);
 
     let expires_at = now_millis() + LINK_SESSION_TTL_MS;
@@ -52,7 +52,7 @@ pub async fn start_device_link(
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
     let payload = LinkQrPayload {
-        node_id: state.transport_node_id.clone(),
+        node_id: state.identity.transport_node_id.clone(),
         secret: b64.encode(psk),
         relay_url,
     };
@@ -102,7 +102,7 @@ pub async fn link_with_device(
         .map_err(|e| format!("invalid node_id: {e}"))?;
 
     // Derive our X25519 key for the Noise handshake
-    let transport_secret_bytes = derive_transport_key(&state.master_secret_key_bytes, 0);
+    let transport_secret_bytes = derive_transport_key(&state.identity.master_secret_key_bytes, 0);
     let my_x25519_private = ed25519_secret_to_x25519(&transport_secret_bytes);
 
     // Derive the peer's X25519 public key from their Ed25519 NodeId
@@ -171,7 +171,7 @@ pub async fn link_with_device(
     // Import the bundle into storage
     state
         .storage
-        .import_link_bundle(&state.master_pubkey, &bundle)
+        .import_link_bundle(&state.identity.master_pubkey, &bundle)
         .await
         .map_err(|e| format!("import failed: {e}"))?;
 
@@ -258,8 +258,8 @@ pub async fn force_device_sync(state: State<'_, Arc<AppState>>) -> Result<(), St
     crate::device_sync::sync_all_devices(
         &state.endpoint,
         &state.storage,
-        &state.master_pubkey,
-        &state.signing_secret_key_bytes,
+        &state.identity.master_pubkey,
+        &state.identity.signing_secret_key_bytes,
     )
     .await;
     Ok(())

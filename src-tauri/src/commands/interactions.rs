@@ -15,7 +15,7 @@ pub async fn like_post(
     target_post_id: String,
     target_author: String,
 ) -> Result<Interaction, String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let mut interaction = Interaction {
         id: generate_id(),
         author: my_id,
@@ -25,7 +25,7 @@ pub async fn like_post(
         timestamp: now_millis(),
         signature: String::new(),
     };
-    sign_interaction(&mut interaction, &state.signing_key);
+    sign_interaction(&mut interaction, &state.identity.signing_key);
     state
         .storage
         .save_interaction(&interaction)
@@ -44,14 +44,14 @@ pub async fn unlike_post(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<(), String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let id = state
         .storage
         .delete_interaction_by_target(&my_id, "Like", &target_post_id)
         .await
         .str_err()?;
     if let Some(id) = id {
-        let signature = sign_delete_interaction(&id, &my_id, &state.signing_key);
+        let signature = sign_delete_interaction(&id, &my_id, &state.identity.signing_key);
         state
             .gossip
             .broadcast_delete_interaction(&id, &my_id, &signature)
@@ -67,7 +67,7 @@ pub async fn repost(
     target_post_id: String,
     target_author: String,
 ) -> Result<Post, String> {
-    let author = state.master_pubkey.clone();
+    let author = state.identity.master_pubkey.clone();
     let mut post = Post {
         id: generate_id(),
         author,
@@ -83,7 +83,7 @@ pub async fn repost(
 
     validate_post(&post)?;
 
-    sign_post(&mut post, &state.signing_key);
+    sign_post(&mut post, &state.identity.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
     state.gossip.broadcast_post(&post).await.str_err()?;
@@ -95,14 +95,14 @@ pub async fn unrepost(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<(), String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     let id = state
         .storage
         .delete_repost_by_target(&my_id, &target_post_id)
         .await
         .str_err()?;
     if let Some(id) = id {
-        let signature = sign_delete_post(&id, &my_id, &state.signing_key);
+        let signature = sign_delete_post(&id, &my_id, &state.identity.signing_key);
         state
             .gossip
             .broadcast_delete(&id, &my_id, &signature)
@@ -117,7 +117,7 @@ pub async fn get_post_counts(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<PostCounts, String> {
-    let my_id = state.master_pubkey.clone();
+    let my_id = state.identity.master_pubkey.clone();
     state
         .storage
         .get_post_counts(&my_id, &target_post_id)

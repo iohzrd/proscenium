@@ -111,8 +111,8 @@ pub async fn register_with_server(
     visibility: String,
 ) -> Result<(), String> {
     let vis: Visibility = visibility.parse().map_err(|_| "invalid visibility")?;
-    let master_pubkey = state.master_pubkey.clone();
-    let transport_node_id = state.transport_node_id.clone();
+    let master_pubkey = state.identity.master_pubkey.clone();
+    let transport_node_id = state.identity.transport_node_id.clone();
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
         transport_node_id: transport_node_id.clone(),
@@ -121,7 +121,7 @@ pub async fn register_with_server(
         visibility: vis,
         action: None,
     };
-    let signature = sign_registration(&payload, &state.signing_key);
+    let signature = sign_registration(&payload, &state.identity.signing_key);
 
     let request = RegistrationRequest {
         master_pubkey,
@@ -131,7 +131,7 @@ pub async fn register_with_server(
         visibility: vis,
         action: None,
         signature,
-        delegation: state.delegation.clone(),
+        delegation: state.identity.delegation.clone(),
     };
 
     let resp = state
@@ -165,8 +165,8 @@ pub async fn unregister_from_server(
     state: State<'_, Arc<AppState>>,
     url: String,
 ) -> Result<(), String> {
-    let master_pubkey = state.master_pubkey.clone();
-    let transport_node_id = state.transport_node_id.clone();
+    let master_pubkey = state.identity.master_pubkey.clone();
+    let transport_node_id = state.identity.transport_node_id.clone();
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
         transport_node_id: transport_node_id.clone(),
@@ -175,7 +175,7 @@ pub async fn unregister_from_server(
         visibility: Visibility::Public,
         action: Some("unregister".to_string()),
     };
-    let signature = sign_registration(&payload, &state.signing_key);
+    let signature = sign_registration(&payload, &state.identity.signing_key);
 
     let request = RegistrationRequest {
         master_pubkey,
@@ -185,7 +185,7 @@ pub async fn unregister_from_server(
         visibility: Visibility::Public,
         action: Some("unregister".to_string()),
         signature,
-        delegation: state.delegation.clone(),
+        delegation: state.identity.delegation.clone(),
     };
 
     let resp = state
@@ -409,7 +409,7 @@ pub async fn sync_profile_to_server(
 }
 
 pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), String> {
-    let master_pubkey = state.master_pubkey.clone();
+    let master_pubkey = state.identity.master_pubkey.clone();
     let profile = state
         .storage
         .get_profile(&master_pubkey)
@@ -427,13 +427,13 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
 
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
-        transport_node_id: state.transport_node_id.clone(),
+        transport_node_id: state.identity.transport_node_id.clone(),
         server_url: url.to_string(),
         timestamp: now_millis(),
         visibility: vis.parse().unwrap_or_default(),
         action: None,
     };
-    let signature = sign_registration(&payload, &state.signing_key);
+    let signature = sign_registration(&payload, &state.identity.signing_key);
 
     #[derive(Serialize)]
     struct ProfileUpdate {
@@ -451,7 +451,7 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
 
     let update = ProfileUpdate {
         master_pubkey,
-        transport_node_id: state.transport_node_id.clone(),
+        transport_node_id: state.identity.transport_node_id.clone(),
         server_url: url.to_string(),
         timestamp: payload.timestamp,
         visibility: vis,
@@ -459,7 +459,7 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         bio: Some(profile.bio).filter(|s| !s.is_empty()),
         avatar_hash: profile.avatar_hash,
         signature,
-        delegation: state.delegation.clone(),
+        delegation: state.identity.delegation.clone(),
     };
 
     let resp = state

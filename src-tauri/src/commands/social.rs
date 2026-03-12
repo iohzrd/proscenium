@@ -40,8 +40,8 @@ pub async fn follow_user(
     state: State<'_, Arc<AppState>>,
     node_id: String,
 ) -> Result<(), String> {
-    let my_id = state.master_pubkey.clone();
-    let my_transport = state.transport_node_id.clone();
+    let my_id = state.identity.master_pubkey.clone();
+    let my_transport = state.identity.transport_node_id.clone();
     if node_id == my_transport {
         return Err("cannot follow yourself".to_string());
     }

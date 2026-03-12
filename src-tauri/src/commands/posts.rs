@@ -21,7 +21,7 @@ pub async fn create_post(
     quote_of_author: Option<String>,
 ) -> Result<Post, String> {
     // author = master pubkey (permanent identity)
-    let author = state.master_pubkey.clone();
+    let author = state.identity.master_pubkey.clone();
     let media_count = media.as_ref().map_or(0, |m| m.len());
     let mut post = Post {
         id: generate_id(),
@@ -39,7 +39,7 @@ pub async fn create_post(
     validate_post(&post)?;
 
     // Sign with signing key (not master key)
-    sign_post(&mut post, &state.signing_key);
+    sign_post(&mut post, &state.identity.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
     log::info!(
@@ -55,7 +55,7 @@ pub async fn create_post(
 
 #[tauri::command]
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let my_id = &state.master_pubkey;
+    let my_id = &state.identity.master_pubkey;
 
     let post = state.storage.get_post_by_id(&id).await.str_err()?;
     match post {
@@ -69,7 +69,7 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
     }
 
     // Sign the delete action
-    let signature = sign_delete_post(&id, my_id, &state.signing_key);
+    let signature = sign_delete_post(&id, my_id, &state.identity.signing_key);
 
     let removed = state.storage.delete_post(&id).await.str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");

@@ -13,6 +13,7 @@ mod setup;
 mod state;
 mod storage;
 mod sync;
+mod tasks;
 mod util;
 
 use commands::*;

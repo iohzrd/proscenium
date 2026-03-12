@@ -33,16 +33,8 @@ pub struct PendingLink {
 
 pub type PendingLinkState = Arc<tokio::sync::Mutex<Option<PendingLink>>>;
 
-pub struct AppState {
-    pub endpoint: Endpoint,
-    /// Kept alive to maintain protocol handler registrations (DM, blobs, etc.)
-    #[allow(dead_code)]
-    pub router: Router,
-    pub blobs: BlobsProtocol,
-    pub store: FsStore,
-    pub storage: Arc<Storage>,
-    pub gossip: GossipHandle,
-    pub dm: DmHandler,
+/// Cryptographic identity and key material for this node.
+pub struct Identity {
     /// Master key secret bytes (permanent identity, cold storage).
     pub master_secret_key_bytes: [u8; 32],
     /// Master public key string (the permanent, unforgeable identity).
@@ -64,6 +56,19 @@ pub struct AppState {
     pub transport_node_id: String,
     /// The current signing key delegation (signed by master key).
     pub delegation: iroh_social_types::SigningKeyDelegation,
+}
+
+pub struct AppState {
+    pub identity: Identity,
+    pub endpoint: Endpoint,
+    /// Kept alive to maintain protocol handler registrations (DM, blobs, etc.)
+    #[allow(dead_code)]
+    pub router: Router,
+    pub blobs: BlobsProtocol,
+    pub store: FsStore,
+    pub storage: Arc<Storage>,
+    pub gossip: GossipHandle,
+    pub dm: DmHandler,
     /// Active device-linking session (if any).
     pub pending_link: PendingLinkState,
     /// Shared HTTP client for server API calls and link preview fetching.
