@@ -13,10 +13,9 @@ mod push;
 pub(crate) mod servers;
 mod social;
 
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
-use std::sync::Mutex;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostCounts {
@@ -44,7 +43,7 @@ pub struct Notification {
 }
 
 pub struct Storage {
-    db: Mutex<Connection>,
+    pool: SqlitePool,
 }
 
 impl std::fmt::Debug for Storage {
@@ -97,60 +96,50 @@ impl Storage {
         ),
     ];
 
-    pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let conn = Connection::open(path.as_ref())?;
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-        )?;
-        Self::run_migrations(&conn)?;
-        Ok(Self {
-            db: Mutex::new(conn),
-        })
+    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await?;
+
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await?;
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await?;
+
+        Self::run_migrations(&pool).await?;
+        Ok(Self { pool })
     }
 
-    pub(crate) fn with_db<T>(
-        &self,
-        f: impl FnOnce(&Connection) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        // block_in_place signals tokio to move other tasks off this thread while
-        // we hold the SQLite mutex, preventing thread starvation on the async runtime.
-        tokio::task::block_in_place(|| {
-            let db = self.db.lock().unwrap();
-            f(&db)
-        })
-    }
-
-    pub(crate) fn with_db_mut<T>(
-        &self,
-        f: impl FnOnce(&mut Connection) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        tokio::task::block_in_place(|| {
-            let mut db = self.db.lock().unwrap();
-            f(&mut db)
-        })
-    }
-
-    fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
-        conn.execute_batch(
+    async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
+        sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,
                 applied_at INTEGER NOT NULL
             )",
-        )?;
+        )
+        .execute(pool)
+        .await?;
 
         for (name, sql) in Self::MIGRATIONS {
-            let already_applied: bool = conn.query_row(
-                "SELECT COUNT(*) > 0 FROM schema_migrations WHERE name=?1",
-                params![name],
-                |row| row.get(0),
-            )?;
+            let already_applied: bool =
+                sqlx::query_scalar("SELECT COUNT(*) > 0 FROM schema_migrations WHERE name=?1")
+                    .bind(name)
+                    .fetch_one(pool)
+                    .await?;
             if !already_applied {
                 println!("[storage] applying migration: {name}");
-                conn.execute_batch(sql)?;
-                conn.execute(
+                sqlx::raw_sql(sql).execute(pool).await?;
+                sqlx::query(
                     "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, strftime('%s', 'now'))",
-                    params![name],
-                )?;
+                )
+                .bind(name)
+                .execute(pool)
+                .await?;
             }
         }
         Ok(())

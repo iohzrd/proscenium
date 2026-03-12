@@ -21,17 +21,19 @@ pub async fn handle_push(
     // Verify the sender is someone we expect content from
     let my_visibility = storage
         .get_visibility(node_id)
+        .await
         .unwrap_or(Visibility::Public);
 
     let allowed = match my_visibility {
         Visibility::Public | Visibility::Listed => {
-            storage.is_follower(remote_str).unwrap_or(false)
+            storage.is_follower(remote_str).await.unwrap_or(false)
                 || storage
                     .get_follows()
+                    .await
                     .map(|f| f.iter().any(|e| e.pubkey == remote_str))
                     .unwrap_or(false)
         }
-        Visibility::Private => storage.is_mutual(remote_str).unwrap_or(false),
+        Visibility::Private => storage.is_mutual(remote_str).await.unwrap_or(false),
     };
 
     if !allowed {
@@ -84,10 +86,10 @@ pub async fn handle_push(
         if post.author != remote_str {
             continue;
         }
-        if storage.is_hidden(remote_str).unwrap_or(false) {
+        if storage.is_hidden(remote_str).await.unwrap_or(false) {
             continue;
         }
-        if process_incoming_post(storage, post, "push-rx", node_id, app_handle) {
+        if process_incoming_post(storage, post, "push-rx", node_id, app_handle).await {
             received_post_ids.push(post.id.clone());
         }
     }
@@ -97,7 +99,7 @@ pub async fn handle_push(
         if interaction.author != remote_str {
             continue;
         }
-        if storage.is_hidden(remote_str).unwrap_or(false) {
+        if storage.is_hidden(remote_str).await.unwrap_or(false) {
             continue;
         }
         process_incoming_interaction(
@@ -107,7 +109,8 @@ pub async fn handle_push(
             "push-rx",
             node_id,
             app_handle,
-        );
+        )
+        .await;
         received_interaction_ids.push(interaction.id.clone());
     }
 
@@ -120,7 +123,7 @@ pub async fn handle_push(
             );
         } else {
             // Verify profile signature if we have a cached signing key
-            let signer_ok = match storage.get_peer_signing_pubkey(remote_str) {
+            let signer_ok = match storage.get_peer_signing_pubkey(remote_str).await {
                 Ok(Some(signing_pubkey)) => match signing_pubkey.parse::<iroh::PublicKey>() {
                     Ok(pk) => verify_profile_signature(profile, &pk).is_ok(),
                     Err(_) => true, // bad cached key, allow through
@@ -132,7 +135,7 @@ pub async fn handle_push(
                     "[push-rx] bad profile signature from {}",
                     short_id(remote_str)
                 );
-            } else if let Err(e) = storage.save_profile(remote_str, profile) {
+            } else if let Err(e) = storage.save_profile(remote_str, profile).await {
                 log::error!("[push-rx] failed to store profile: {e}");
             } else {
                 let _ = app_handle.emit("profile-updated", remote_str);

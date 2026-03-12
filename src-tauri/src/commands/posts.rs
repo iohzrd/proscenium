@@ -42,7 +42,7 @@ pub async fn create_post(
     let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_post(&mut post, &sk);
 
-    state.storage.insert_post(&post).str_err()?;
+    state.storage.insert_post(&post).await.str_err()?;
     log::info!(
         "[post] created post {} ({} media attachments)",
         &post.id,
@@ -59,7 +59,7 @@ pub async fn create_post(
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     let my_id = &state.master_pubkey;
 
-    let post = state.storage.get_post_by_id(&id).str_err()?;
+    let post = state.storage.get_post_by_id(&id).await.str_err()?;
     match post {
         Some(post) if post.author == *my_id => {}
         Some(_) => {
@@ -74,7 +74,7 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
     let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     let signature = sign_delete_post(&id, my_id, &sk);
 
-    let removed = state.storage.delete_post(&id).str_err()?;
+    let removed = state.storage.delete_post(&id).await.str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
     let feed = state.feed.lock().await;
     feed.broadcast_delete(&id, my_id, &signature)
@@ -95,7 +95,7 @@ pub async fn get_feed(
         limit: limit.unwrap_or(DEFAULT_FEED_LIMIT),
         before,
     };
-    let posts = state.storage.get_feed(&q).str_err()?;
+    let posts = state.storage.get_feed(&q).await.str_err()?;
     log::info!("[feed] loaded {} posts", posts.len());
     Ok(posts)
 }
@@ -116,12 +116,13 @@ pub async fn get_user_posts(
             before,
             media_filter.as_deref(),
         )
+        .await
         .str_err()
 }
 
 #[tauri::command]
 pub async fn get_post(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Post>, String> {
-    state.storage.get_post_by_id(&id).str_err()
+    state.storage.get_post_by_id(&id).await.str_err()
 }
 
 #[tauri::command]
@@ -138,6 +139,7 @@ pub async fn get_replies(
             limit.unwrap_or(DEFAULT_REPLY_LIMIT) as usize,
             before,
         )
+        .await
         .str_err()
 }
 

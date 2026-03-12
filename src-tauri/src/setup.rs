@@ -75,6 +75,7 @@ async fn sync_peer_posts(
     // Resolve transport NodeId from peer delegation cache
     let node_ids = storage
         .get_peer_transport_node_ids(pubkey)
+        .await
         .unwrap_or_default();
     let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
         match first.parse() {
@@ -113,7 +114,8 @@ async fn sync_peer_posts(
                     "startup-sync",
                     my_id,
                     handle,
-                );
+                )
+                .await;
 
                 if stored > 0 || sync_result.profile.is_some() {
                     let _ = handle.emit("feed-updated", ());
@@ -205,13 +207,6 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         now_millis(),
     );
 
-    let db_path = data_dir.join("social.db");
-    let storage = Arc::new(Storage::open(&db_path).expect("failed to open database"));
-    log::info!("[setup] database opened");
-
-    let follows = storage.get_follows().unwrap_or_default();
-    log::info!("[setup] loaded {} follows", follows.len());
-
     // Derive stable transport key from master key (device index 0 = primary device)
     let device_index: u32 = 0;
     let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, device_index);
@@ -221,8 +216,17 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let signing_pubkey_clone = signing_pubkey.clone();
     let dm_pubkey_clone = dm_pubkey.clone();
     let delegation_clone = delegation.clone();
-    let storage_clone = storage.clone();
+    let db_path = data_dir.join("social.db");
     tauri::async_runtime::spawn(async move {
+        let storage_clone = Arc::new(
+            Storage::open(&db_path)
+                .await
+                .expect("failed to open database"),
+        );
+        log::info!("[setup] database opened");
+
+        let follows = storage_clone.get_follows().await.unwrap_or_default();
+        log::info!("[setup] loaded {} follows", follows.len());
         log::info!("[setup] binding iroh endpoint...");
         let endpoint = Endpoint::builder()
             .secret_key(transport_secret)
@@ -318,7 +322,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             log::info!("[setup] own gossip feed started");
         }
 
-        if let Ok(Some(profile)) = storage_clone.get_profile(&master_pubkey_clone) {
+        if let Ok(Some(profile)) = storage_clone.get_profile(&master_pubkey_clone).await {
             if let Err(e) = feed.broadcast_profile(&profile).await {
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
@@ -329,13 +333,10 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         // Register this device and broadcast single-device announcement
         {
             let now = now_millis();
-            if let Err(e) = storage_clone.upsert_linked_device(
-                &transport_node_id,
-                "Primary Device",
-                true,
-                true,
-                now,
-            ) {
+            if let Err(e) = storage_clone
+                .upsert_linked_device(&transport_node_id, "Primary Device", true, true, now)
+                .await
+            {
                 log::error!("[setup] failed to register own device: {e}");
             }
 
@@ -395,6 +396,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             for f in &sync_follows {
                 let node_ids = sync_storage
                     .get_peer_transport_node_ids(&f.pubkey)
+                    .await
                     .unwrap_or_default();
                 if node_ids.is_empty() {
                     log::warn!(
@@ -443,12 +445,13 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
             // Drip sync: sequential periodic sync with all followed peers
             loop {
-                let follows = sync_storage.get_follows().unwrap_or_default();
+                let follows = sync_storage.get_follows().await.unwrap_or_default();
                 let mut any_work = false;
 
                 for f in &follows {
                     let node_ids = sync_storage
                         .get_peer_transport_node_ids(&f.pubkey)
+                        .await
                         .unwrap_or_default();
                     let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
                         match first.parse() {
@@ -481,7 +484,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                                 "drip-sync",
                                 &sync_my_id,
                                 &sync_handle,
-                            );
+                            )
+                            .await;
 
                             if stored > 0 {
                                 any_work = true;
@@ -522,7 +526,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(OUTBOX_FLUSH_INTERVAL).await;
-                let peers = match outbox_storage.get_all_outbox_peers() {
+                let peers = match outbox_storage.get_all_outbox_peers().await {
                     Ok(p) => p,
                     Err(e) => {
                         log::error!("[dm-outbox] failed to get peers: {e}");
@@ -556,7 +560,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL).await;
 
                 // Flush push outbox
-                let peers = match push_storage.get_push_outbox_peers() {
+                let peers = match push_storage.get_push_outbox_peers().await {
                     Ok(p) => p,
                     Err(e) => {
                         log::error!("[push-outbox] failed to get peers: {e}");
@@ -566,6 +570,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 for peer in peers {
                     let peer_node_ids = push_storage
                         .get_peer_transport_node_ids(&peer)
+                        .await
                         .unwrap_or_default();
                     let targets: Vec<iroh::EndpointId> = peer_node_ids
                         .iter()
@@ -577,12 +582,15 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
                     let profile_entries = push_storage
                         .get_pending_push_profile_ids(&peer)
+                        .await
                         .unwrap_or_default();
                     let post_entries = push_storage
                         .get_pending_push_post_ids(&peer)
+                        .await
                         .unwrap_or_default();
                     let interaction_entries = push_storage
                         .get_pending_push_interaction_ids(&peer)
+                        .await
                         .unwrap_or_default();
 
                     if profile_entries.is_empty()
@@ -595,7 +603,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     let mut posts = Vec::new();
                     let mut post_outbox_ids = Vec::new();
                     for (outbox_id, post_id) in &post_entries {
-                        if let Ok(Some(post)) = push_storage.get_post_by_id(post_id) {
+                        if let Ok(Some(post)) = push_storage.get_post_by_id(post_id).await {
                             posts.push(post);
                         }
                         post_outbox_ids.push(*outbox_id);
@@ -605,7 +613,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     let mut interaction_outbox_ids = Vec::new();
                     for (outbox_id, interaction_id) in &interaction_entries {
                         if let Ok(Some(interaction)) =
-                            push_storage.get_interaction_by_id(interaction_id)
+                            push_storage.get_interaction_by_id(interaction_id).await
                         {
                             interactions.push(interaction);
                         }
@@ -614,7 +622,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
                     // Include profile if there are profile-only entries
                     let profile = if !profile_entries.is_empty() {
-                        push_storage.get_profile(&push_my_id).ok().flatten()
+                        push_storage.get_profile(&push_my_id).await.ok().flatten()
                     } else {
                         None
                     };
@@ -660,21 +668,21 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         }
                     }
                     if delivered {
-                        let _ = push_storage.remove_push_outbox_entries(&all_ids);
+                        let _ = push_storage.remove_push_outbox_entries(&all_ids).await;
                     } else {
                         log::error!(
                             "[push-outbox] failed to push to {} (tried {} devices)",
                             short_id(&peer),
                             targets.len()
                         );
-                        let _ = push_storage.mark_push_attempted(&all_ids);
+                        let _ = push_storage.mark_push_attempted(&all_ids).await;
                     }
                 }
 
                 // Hourly housekeeping: prune expired push entries and follow requests
                 if last_prune.elapsed() >= HOUSEKEEPING_INTERVAL {
                     last_prune = std::time::Instant::now();
-                    match push_storage.prune_expired_push_entries() {
+                    match push_storage.prune_expired_push_entries().await {
                         Ok(count) if count > 0 => {
                             log::info!("[housekeeping] pruned {count} expired push entries");
                         }
@@ -683,7 +691,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                         }
                         _ => {}
                     }
-                    match push_storage.prune_expired_follow_requests() {
+                    match push_storage.prune_expired_follow_requests().await {
                         Ok(count) if count > 0 => {
                             log::info!("[housekeeping] pruned {count} expired follow requests");
                         }

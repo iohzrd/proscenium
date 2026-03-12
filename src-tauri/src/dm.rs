@@ -77,13 +77,14 @@ impl DmHandler {
         // Resolve the peer's DM pubkey from cached delegation.
         let peer_dm_pubkey = self
             .storage
-            .get_peer_dm_pubkey(peer_master_pubkey)?
+            .get_peer_dm_pubkey(peer_master_pubkey)
+            .await?
             .ok_or_else(|| {
                 anyhow::anyhow!("no DM pubkey cached for {}", short_id(peer_master_pubkey))
             })?;
 
         // Try loading existing session (keyed by DM pubkey)
-        if let Some(stored) = self.storage.get_ratchet_session(&peer_dm_pubkey)? {
+        if let Some(stored) = self.storage.get_ratchet_session(&peer_dm_pubkey).await? {
             log::info!(
                 "[dm] loaded existing ratchet session for {}",
                 short_id(peer_master_pubkey),
@@ -102,7 +103,8 @@ impl DmHandler {
         // Fail fast: resolve transport NodeId before doing any crypto work
         let node_ids = self
             .storage
-            .get_peer_transport_node_ids(peer_master_pubkey)?;
+            .get_peer_transport_node_ids(peer_master_pubkey)
+            .await?;
         let transport_id_str = node_ids.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("no transport NodeId for {}", short_id(peer_master_pubkey))
         })?;
@@ -183,7 +185,8 @@ impl DmHandler {
         let json = serde_json::to_string(&ratchet)?;
         let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
         self.storage
-            .save_ratchet_session(&peer_dm_pubkey, &sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &sealed, now_millis())
+            .await?;
 
         log::info!(
             "[dm] established and saved ratchet session with {}",
@@ -214,7 +217,8 @@ impl DmHandler {
         let ratchet_json = serde_json::to_string(&ratchet)?;
         let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
         self.storage
-            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())
+            .await?;
 
         let envelope = EncryptedEnvelope {
             sender: self.my_dm_pubkey_str.clone(),
@@ -237,7 +241,7 @@ impl DmHandler {
         {
             Ok(()) => {
                 log::info!("[dm] sent message to {}", short_id(peer_pubkey));
-                self.mark_delivered(&message_id);
+                self.mark_delivered(&message_id).await;
             }
             Err(e) => {
                 log::warn!(
@@ -246,13 +250,15 @@ impl DmHandler {
                 );
                 let envelope_json = serde_json::to_string(&envelope)?;
                 let id = uuid::Uuid::new_v4().to_string();
-                self.storage.insert_outbox_message(
-                    &id,
-                    peer_pubkey,
-                    &envelope_json,
-                    now_millis(),
-                    &message_id,
-                )?;
+                self.storage
+                    .insert_outbox_message(
+                        &id,
+                        peer_pubkey,
+                        &envelope_json,
+                        now_millis(),
+                        &message_id,
+                    )
+                    .await?;
             }
         }
 
@@ -260,8 +266,8 @@ impl DmHandler {
     }
 
     /// Mark a message as delivered in storage and notify the frontend.
-    fn mark_delivered(&self, message_id: &str) {
-        if let Err(e) = self.storage.mark_dm_delivered(message_id) {
+    async fn mark_delivered(&self, message_id: &str) {
+        if let Err(e) = self.storage.mark_dm_delivered(message_id).await {
             log::error!(
                 "[dm] failed to mark delivered {}: {e}",
                 short_id(message_id)
@@ -283,7 +289,8 @@ impl DmHandler {
     ) -> anyhow::Result<()> {
         let node_ids = self
             .storage
-            .get_peer_transport_node_ids(peer_master_pubkey)?;
+            .get_peer_transport_node_ids(peer_master_pubkey)
+            .await?;
         let transport_id_str = node_ids.into_iter().next().ok_or_else(|| {
             anyhow::anyhow!("no transport NodeId for {}", short_id(peer_master_pubkey))
         })?;
@@ -322,7 +329,7 @@ impl DmHandler {
         endpoint: &Endpoint,
         peer_pubkey: &str,
     ) -> anyhow::Result<(u32, u32)> {
-        let entries = self.storage.get_outbox_for_peer(peer_pubkey)?;
+        let entries = self.storage.get_outbox_for_peer(peer_pubkey).await?;
         if entries.is_empty() {
             return Ok((0, 0));
         }
@@ -334,7 +341,7 @@ impl DmHandler {
             let envelope: EncryptedEnvelope = match serde_json::from_str(envelope_json) {
                 Ok(e) => e,
                 Err(_) => {
-                    self.storage.remove_outbox_message(id)?;
+                    self.storage.remove_outbox_message(id).await?;
                     failed += 1;
                     continue;
                 }
@@ -345,8 +352,8 @@ impl DmHandler {
                 .await
             {
                 Ok(()) => {
-                    self.storage.remove_outbox_message(id)?;
-                    self.mark_delivered(message_id);
+                    self.storage.remove_outbox_message(id).await?;
+                    self.mark_delivered(message_id).await;
                     sent += 1;
                 }
                 Err(_) => {
@@ -382,7 +389,8 @@ impl DmHandler {
         let ratchet_json = serde_json::to_string(&ratchet)?;
         let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
         self.storage
-            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())?;
+            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())
+            .await?;
 
         let envelope = EncryptedEnvelope {
             sender: self.my_dm_pubkey_str.clone(),
@@ -398,7 +406,7 @@ impl DmHandler {
 
     /// Handle an incoming handshake (Noise IK responder side).
     /// `peer_dm_pubkey` is taken from `DmHandshake::Init.sender`.
-    fn handle_handshake(
+    async fn handle_handshake(
         &self,
         peer_dm_pubkey: &str,
         noise_message: Vec<u8>,
@@ -438,7 +446,8 @@ impl DmHandler {
         let json = serde_json::to_string(&ratchet)?;
         let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
         self.storage
-            .save_ratchet_session(peer_dm_pubkey, &sealed, now_millis())?;
+            .save_ratchet_session(peer_dm_pubkey, &sealed, now_millis())
+            .await?;
 
         log::info!("[dm] session established with {}", short_id(peer_dm_pubkey));
 
@@ -450,7 +459,7 @@ impl DmHandler {
 
     /// Handle an incoming encrypted message.
     /// `peer_dm_pubkey` is taken from `EncryptedEnvelope.sender`.
-    fn handle_encrypted_message(
+    async fn handle_encrypted_message(
         &self,
         peer_dm_pubkey: &str,
         envelope: EncryptedEnvelope,
@@ -466,7 +475,8 @@ impl DmHandler {
         // Load and decrypt ratchet session (keyed by DM pubkey)
         let stored = self
             .storage
-            .get_ratchet_session(peer_dm_pubkey)?
+            .get_ratchet_session(peer_dm_pubkey)
+            .await?
             .ok_or_else(|| anyhow::anyhow!("no session with {}", short_id(peer_dm_pubkey)))?;
         let json = open_ratchet_state(&self.ratchet_storage_key, &stored)?;
         let mut ratchet: RatchetState = serde_json::from_str(&json)?;
@@ -493,6 +503,7 @@ impl DmHandler {
                 let peer_master_pubkey = self
                     .storage
                     .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
+                    .await
                     .ok_or_else(|| {
                         anyhow::anyhow!("no master pubkey for DM key {}", short_id(peer_dm_pubkey))
                     })?;
@@ -519,14 +530,16 @@ impl DmHandler {
                 };
 
                 // Atomically save ratchet state + store message (single SQLite transaction)
-                self.storage.receive_dm_message_atomically(
-                    peer_dm_pubkey,
-                    &peer_master_pubkey,
-                    &ratchet_sealed,
-                    ratchet_ts,
-                    &stored_msg,
-                    &preview,
-                )?;
+                self.storage
+                    .receive_dm_message_atomically(
+                        peer_dm_pubkey,
+                        &peer_master_pubkey,
+                        &ratchet_sealed,
+                        ratchet_ts,
+                        &stored_msg,
+                        &preview,
+                    )
+                    .await?;
 
                 log::info!(
                     "[dm] received message from {}",
@@ -543,8 +556,9 @@ impl DmHandler {
             }
             DmPayload::Delivered { message_id } => {
                 self.storage
-                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
-                self.storage.mark_dm_delivered(&message_id)?;
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)
+                    .await?;
+                self.storage.mark_dm_delivered(&message_id).await?;
                 let _ = self.app_handle.emit(
                     "dm-delivered",
                     serde_json::json!({ "message_id": message_id }),
@@ -552,17 +566,21 @@ impl DmHandler {
             }
             DmPayload::Read { message_id } => {
                 self.storage
-                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
-                self.storage.mark_dm_read_by_id(&message_id)?;
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)
+                    .await?;
+                self.storage.mark_dm_read_by_id(&message_id).await?;
                 let _ = self
                     .app_handle
                     .emit("dm-read", serde_json::json!({ "message_id": message_id }));
             }
             DmPayload::Typing => {
                 self.storage
-                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)?;
-                if let Some(peer_master_pubkey) =
-                    self.storage.get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)
+                    .await?;
+                if let Some(peer_master_pubkey) = self
+                    .storage
+                    .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
+                    .await
                 {
                     let _ = self.app_handle.emit(
                         "typing-indicator",
@@ -583,7 +601,7 @@ impl ProtocolHandler for DmHandler {
         log::info!("[dm] incoming connection from {}", short_id(&remote_str));
 
         // Reject blocked peers
-        if self.storage.is_blocked(&remote_str).unwrap_or(false) {
+        if self.storage.is_blocked(&remote_str).await.unwrap_or(false) {
             log::warn!("[dm] rejecting blocked peer {}", short_id(&remote_str));
             return Err(AcceptError::from_err(std::io::Error::other("blocked")));
         }
@@ -605,6 +623,7 @@ impl ProtocolHandler for DmHandler {
                 } => {
                     let response = self
                         .handle_handshake(&sender, noise_message)
+                        .await
                         .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
                     send.write_all(&response)
                         .await
@@ -621,7 +640,7 @@ impl ProtocolHandler for DmHandler {
         } else if let Ok(envelope) = serde_json::from_slice::<EncryptedEnvelope>(&frame_bytes) {
             // envelope.sender is the peer's DM pubkey
             let sender = envelope.sender.clone();
-            if let Err(e) = self.handle_encrypted_message(&sender, envelope) {
+            if let Err(e) = self.handle_encrypted_message(&sender, envelope).await {
                 log::error!(
                     "[dm] failed to handle message from {}: {e}",
                     short_id(&remote_str)

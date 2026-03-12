@@ -93,12 +93,14 @@ pub async fn rotate_signing_key(
         let devices = state
             .storage
             .get_linked_devices()
+            .await
             .map_err(|e| format!("failed to get devices: {e}"))?;
         let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
         // Use own cached announcement version + 1, or device count as base
         let current_version = state
             .storage
             .get_peer_announcement_version(&state.master_pubkey)
+            .await
             .unwrap_or(None)
             .unwrap_or(devices.len() as u64);
         let version = current_version + 1;
@@ -115,6 +117,7 @@ pub async fn rotate_signing_key(
         if let Err(e) = state
             .storage
             .cache_peer_device_announcement(&state.master_pubkey, &announcement)
+            .await
         {
             log::error!("[rotate] failed to cache own announcement: {e}");
         }
@@ -127,6 +130,7 @@ pub async fn rotate_signing_key(
     let servers = state
         .storage
         .get_registered_servers()
+        .await
         .map_err(|e| format!("failed to get servers: {e}"))?;
     let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
     let new_delegation_for_reg = sign_delegation(

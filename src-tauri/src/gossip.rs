@@ -88,28 +88,30 @@ impl FeedManager {
         }
     }
 
-    fn my_visibility(&self) -> Visibility {
+    async fn my_visibility(&self) -> Visibility {
         self.storage
             .get_visibility(&self.master_pubkey)
+            .await
             .unwrap_or(Visibility::Public)
     }
 
     /// Get the list of recipients for direct push based on visibility.
     /// Listed: all followers. Private: only mutuals.
-    fn push_recipients(&self) -> Vec<String> {
-        let visibility = self.my_visibility();
+    async fn push_recipients(&self) -> Vec<String> {
+        let visibility = self.my_visibility().await;
         match visibility {
             Visibility::Public => vec![],
             Visibility::Listed => self
                 .storage
                 .get_followers()
+                .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|f| f.pubkey)
                 .collect(),
             Visibility::Private => {
-                let followers = self.storage.get_followers().unwrap_or_default();
-                let follows = self.storage.get_follows().unwrap_or_default();
+                let followers = self.storage.get_followers().await.unwrap_or_default();
+                let follows = self.storage.get_follows().await.unwrap_or_default();
                 let follow_set: std::collections::HashSet<&str> =
                     follows.iter().map(|f| f.pubkey.as_str()).collect();
                 followers
@@ -204,9 +206,9 @@ impl FeedManager {
                             {
                                 Ok(identity) => {
                                     let master = identity.master_pubkey.clone();
-                                    let _ = storage.cache_peer_identity(&identity);
+                                    let _ = storage.cache_peer_identity(&identity).await;
                                     if let Some(profile) = &identity.profile {
-                                        let _ = storage.save_profile(&master, profile);
+                                        let _ = storage.save_profile(&master, profile).await;
                                     }
                                     log::info!(
                                         "[gossip-own] resolved follower {} -> master={}",
@@ -225,13 +227,15 @@ impl FeedManager {
                             };
 
                             let now = now_millis();
-                            match storage.upsert_follower(&pubkey, now) {
+                            match storage.upsert_follower(&pubkey, now).await {
                                 Ok(is_new) => {
                                     let _ = app_handle.emit("follower-changed", &pubkey);
                                     if is_new {
-                                        let _ = storage.insert_notification(
-                                            "follower", &pubkey, None, None, now,
-                                        );
+                                        let _ = storage
+                                            .insert_notification(
+                                                "follower", &pubkey, None, None, now,
+                                            )
+                                            .await;
                                         let _ = app_handle.emit("new-follower", &pubkey);
                                         let _ = app_handle.emit("notification-received", ());
                                     }
@@ -245,7 +249,7 @@ impl FeedManager {
                             // their feed.  This fixes the startup race where we
                             // subscribed before they were reachable and ended up
                             // with zero gossip neighbors on their topic.
-                            if storage.is_following(&pubkey).unwrap_or(false) {
+                            if storage.is_following(&pubkey).await.unwrap_or(false) {
                                 log::info!(
                                     "[gossip-own] followed peer {} came online, requesting subscription refresh",
                                     short_id(&pubkey),
@@ -262,9 +266,10 @@ impl FeedManager {
                             // Try to resolve to master pubkey from cache
                             let pubkey = storage
                                 .get_master_pubkey_for_transport(&transport_id)
+                                .await
                                 .unwrap_or(transport_id);
 
-                            if let Err(e) = storage.set_follower_offline(&pubkey) {
+                            if let Err(e) = storage.set_follower_offline(&pubkey).await {
                                 log::error!("[gossip-own] failed to update follower: {e}");
                             }
                             let _ = app_handle.emit("follower-changed", &pubkey);
@@ -290,7 +295,7 @@ impl FeedManager {
     }
 
     pub async fn start_own_feed(&mut self) -> anyhow::Result<()> {
-        let visibility = self.my_visibility();
+        let visibility = self.my_visibility().await;
         if visibility != Visibility::Public {
             log::info!("[gossip] skipping own feed topic (visibility={visibility})");
             return Ok(());
@@ -305,9 +310,9 @@ impl FeedManager {
             sender.broadcast(Bytes::from(payload)).await?;
             log::info!("[gossip] broadcast profile: {}", profile.display_name);
         } else {
-            let recipients = self.push_recipients();
+            let recipients = self.push_recipients().await;
             for recipient in &recipients {
-                if let Err(e) = self.storage.enqueue_push_profile(recipient) {
+                if let Err(e) = self.storage.enqueue_push_profile(recipient).await {
                     log::error!(
                         "[push] failed to enqueue profile push for {}: {e}",
                         short_id(recipient)
@@ -334,9 +339,9 @@ impl FeedManager {
             log::info!("[gossip] broadcast post {}", &post.id);
         } else {
             // Enqueue to push outbox for each recipient
-            let recipients = self.push_recipients();
+            let recipients = self.push_recipients().await;
             for recipient in &recipients {
-                if let Err(e) = self.storage.enqueue_push_post(recipient, &post.id) {
+                if let Err(e) = self.storage.enqueue_push_post(recipient, &post.id).await {
                     log::error!(
                         "[push] failed to enqueue post {} for {}: {e}",
                         &post.id,
@@ -386,11 +391,12 @@ impl FeedManager {
                 &interaction.target_post_id
             );
         } else {
-            let recipients = self.push_recipients();
+            let recipients = self.push_recipients().await;
             for recipient in &recipients {
                 if let Err(e) = self
                     .storage
                     .enqueue_push_interaction(recipient, &interaction.id)
+                    .await
                 {
                     log::error!(
                         "[push] failed to enqueue interaction {} for {}: {e}",
@@ -534,7 +540,8 @@ impl FeedManager {
                                 &my_id,
                                 &app_handle,
                                 &msg.content,
-                            );
+                            )
+                            .await;
                         }
                         Event::NeighborUp(_) => {
                             has_neighbor_task.store(true, Ordering::Relaxed);
@@ -570,8 +577,8 @@ impl FeedManager {
 
     /// Resolve the signing public key for a peer from the delegation cache.
     /// Returns None if no delegation is cached (backward compat: skip verification).
-    fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<iroh::PublicKey> {
-        match storage.get_peer_signing_pubkey(master_pubkey) {
+    async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<iroh::PublicKey> {
+        match storage.get_peer_signing_pubkey(master_pubkey).await {
             Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
                 Ok(pk) => Some(pk),
                 Err(e) => {
@@ -586,7 +593,7 @@ impl FeedManager {
         }
     }
 
-    fn handle_follow_message(
+    async fn handle_follow_message(
         storage: &Storage,
         pk: &str,
         my_id: &str,
@@ -606,12 +613,14 @@ impl FeedManager {
                         short_id(&post.author),
                         short_id(pk)
                     );
-                } else if storage.is_hidden(pk).unwrap_or(false) {
+                } else if storage.is_hidden(pk).await.unwrap_or(false) {
                     log::info!(
                         "[gossip-rx] skipping post from muted/blocked {}",
                         short_id(pk)
                     );
-                } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle) {
+                } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle)
+                    .await
+                {
                     let _ = app_handle.emit("feed-updated", ());
                 }
             }
@@ -622,7 +631,7 @@ impl FeedManager {
             }) => {
                 if author == pk {
                     // Verify delete signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                    if let Some(signer) = Self::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_post_signature(&id, &author, &signature, &signer)
                     {
@@ -632,10 +641,10 @@ impl FeedManager {
                         );
                         return;
                     }
-                    match storage.get_post_by_id(&id) {
+                    match storage.get_post_by_id(&id).await {
                         Ok(Some(post)) if post.author == pk => {
                             log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
-                            if let Err(e) = storage.delete_post(&id) {
+                            if let Err(e) = storage.delete_post(&id).await {
                                 log::error!("[gossip-rx] failed to delete post: {e}");
                             }
                             let _ = app_handle.emit("feed-updated", ());
@@ -658,7 +667,7 @@ impl FeedManager {
                     );
                 } else {
                     // Verify profile signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                    if let Some(signer) = Self::resolve_signer(storage, pk).await
                         && let Err(reason) = verify_profile_signature(&profile, &signer)
                     {
                         log::warn!(
@@ -672,7 +681,7 @@ impl FeedManager {
                         short_id(pk),
                         profile.display_name
                     );
-                    if let Err(e) = storage.save_profile(pk, &profile) {
+                    if let Err(e) = storage.save_profile(pk, &profile).await {
                         log::error!("[gossip-rx] failed to store profile: {e}");
                     }
                     let _ = app_handle.emit("profile-updated", pk);
@@ -681,7 +690,7 @@ impl FeedManager {
             Ok(GossipMessage::NewInteraction(interaction)) => {
                 if interaction.author != pk {
                     // Ignore interactions not from the expected author
-                } else if storage.is_hidden(pk).unwrap_or(false) {
+                } else if storage.is_hidden(pk).await.unwrap_or(false) {
                     log::info!(
                         "[gossip-rx] skipping interaction from muted/blocked {}",
                         short_id(pk)
@@ -694,7 +703,8 @@ impl FeedManager {
                         "gossip-rx",
                         my_id,
                         app_handle,
-                    );
+                    )
+                    .await;
                     let _ = app_handle.emit("interaction-received", &interaction);
                 }
             }
@@ -705,7 +715,7 @@ impl FeedManager {
             }) => {
                 if author == pk {
                     // Verify delete signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk)
+                    if let Some(signer) = Self::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_interaction_signature(&id, &author, &signature, &signer)
                     {
@@ -716,7 +726,7 @@ impl FeedManager {
                         return;
                     }
                     log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
-                    if let Err(e) = storage.delete_interaction(&id, &author) {
+                    if let Err(e) = storage.delete_interaction(&id, &author).await {
                         log::error!("[gossip-rx] failed to delete interaction: {e}");
                     }
                     let _ = app_handle.emit(
@@ -745,6 +755,7 @@ impl FeedManager {
                 // Skip stale announcements
                 let cached_version = storage
                     .get_peer_announcement_version(pk)
+                    .await
                     .unwrap_or(None)
                     .unwrap_or(0);
                 if announcement.version <= cached_version {
@@ -756,7 +767,10 @@ impl FeedManager {
                     announcement.version,
                     announcement.devices.len()
                 );
-                if let Err(e) = storage.cache_peer_device_announcement(pk, &announcement) {
+                if let Err(e) = storage
+                    .cache_peer_device_announcement(pk, &announcement)
+                    .await
+                {
                     log::error!("[gossip-rx] failed to cache device announcement: {e}");
                 }
             }
@@ -778,7 +792,7 @@ impl FeedManager {
                     return;
                 }
                 // Reject replay/downgrade: new key index must be higher than cached
-                if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk)
+                if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk).await
                     && rotation.new_key_index <= cached_delegation.key_index
                 {
                     log::warn!(
@@ -798,10 +812,13 @@ impl FeedManager {
                 let response = iroh_social_types::IdentityResponse {
                     master_pubkey: rotation.master_pubkey.clone(),
                     delegation: rotation.new_delegation.clone(),
-                    transport_node_ids: storage.get_peer_transport_node_ids(pk).unwrap_or_default(),
+                    transport_node_ids: storage
+                        .get_peer_transport_node_ids(pk)
+                        .await
+                        .unwrap_or_default(),
                     profile: None,
                 };
-                if let Err(e) = storage.cache_peer_identity(&response) {
+                if let Err(e) = storage.cache_peer_identity(&response).await {
                     log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
                 }
                 // Note: signing key rotation does NOT invalidate DM sessions.
@@ -876,11 +893,12 @@ pub async fn gossip_reconnect_loop(
                 }
 
                 // Resubscribe to all follows
-                let follows = fm.storage.get_follows().unwrap_or_default();
+                let follows = fm.storage.get_follows().await.unwrap_or_default();
                 for f in &follows {
                     let node_ids = fm
                         .storage
                         .get_peer_transport_node_ids(&f.pubkey)
+                        .await
                         .unwrap_or_default();
                     if node_ids.is_empty() {
                         continue;
@@ -923,6 +941,7 @@ pub async fn gossip_reconnect_loop(
                 let node_ids = fm
                     .storage
                     .get_peer_transport_node_ids(&pubkey)
+                    .await
                     .unwrap_or_default();
                 if node_ids.is_empty() {
                     log::warn!(
@@ -955,6 +974,7 @@ pub async fn gossip_reconnect_loop(
                 let node_ids = fm
                     .storage
                     .get_peer_transport_node_ids(&pubkey)
+                    .await
                     .unwrap_or_default();
                 if node_ids.is_empty() {
                     log::error!(

@@ -1,136 +1,140 @@
 use iroh_social_types::{MediaAttachment, Post};
-use rusqlite::params;
+use sqlx::Row;
 
 use super::{FeedQuery, Storage};
 
 impl Storage {
-    pub(crate) fn row_to_post(row: &rusqlite::Row) -> anyhow::Result<Post> {
-        let media_json: String = row.get(4)?;
+    fn row_to_post(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Post> {
+        let media_json: String = row.get(4);
         let media: Vec<MediaAttachment> = serde_json::from_str(&media_json)?;
         Ok(Post {
-            id: row.get(0)?,
-            author: row.get(1)?,
-            content: row.get(2)?,
-            timestamp: row.get::<_, i64>(3)? as u64,
+            id: row.get(0),
+            author: row.get(1),
+            content: row.get(2),
+            timestamp: row.get::<i64, _>(3) as u64,
             media,
-            reply_to: row.get(5)?,
-            reply_to_author: row.get(6)?,
-            quote_of: row.get(7)?,
-            quote_of_author: row.get(8)?,
-            signature: row.get(9)?,
+            reply_to: row.get(5),
+            reply_to_author: row.get(6),
+            quote_of: row.get(7),
+            quote_of_author: row.get(8),
+            signature: row.get(9),
         })
     }
 
-    pub fn insert_post(&self, post: &Post) -> anyhow::Result<()> {
+    pub async fn insert_post(&self, post: &Post) -> anyhow::Result<()> {
         let media_json = serde_json::to_string(&post.media)?;
-        self.with_db(|db| {
-            db.execute(
-                "INSERT OR IGNORE INTO posts (id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    post.id,
-                    post.author,
-                    post.content,
-                    post.timestamp as i64,
-                    media_json,
-                    post.reply_to,
-                    post.reply_to_author,
-                    post.quote_of,
-                    post.quote_of_author,
-                    post.signature,
-                ],
-            )?;
-            Ok(())
-        })
+        sqlx::query(
+            "INSERT OR IGNORE INTO posts (id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(&post.id)
+        .bind(&post.author)
+        .bind(&post.content)
+        .bind(post.timestamp as i64)
+        .bind(&media_json)
+        .bind(&post.reply_to)
+        .bind(&post.reply_to_author)
+        .bind(&post.quote_of)
+        .bind(&post.quote_of_author)
+        .bind(&post.signature)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
-    pub fn get_post_by_id(&self, id: &str) -> anyhow::Result<Option<Post>> {
-        self.with_db(|db| {
-            let mut stmt =
-                db.prepare("SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts WHERE id=?1")?;
-            let mut rows = stmt.query(params![id])?;
-            match rows.next()? {
-                Some(row) => Ok(Some(Self::row_to_post(row)?)),
-                None => Ok(None),
+    pub async fn get_post_by_id(&self, id: &str) -> anyhow::Result<Option<Post>> {
+        let row = sqlx::query(
+            "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts WHERE id=?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(row) => Ok(Some(Self::row_to_post(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn get_feed(&self, q: &FeedQuery) -> anyhow::Result<Vec<Post>> {
+        let hidden =
+            "AND p.author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
+        let rows = match q.before {
+            Some(b) => {
+                let sql = format!(
+                    "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature FROM posts p
+                     WHERE p.timestamp < ?1 {hidden} ORDER BY p.timestamp DESC LIMIT ?2"
+                );
+                sqlx::query(&sql)
+                    .bind(b as i64)
+                    .bind(q.limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
             }
-        })
-    }
-
-    pub fn get_feed(&self, q: &FeedQuery) -> anyhow::Result<Vec<Post>> {
-        self.with_db(|db| {
-            let hidden =
-                "AND p.author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
-
-            let (sql, p): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match q.before {
-                Some(b) => (
-                    format!(
-                        "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature FROM posts p
-                         WHERE p.timestamp < ?1 {hidden} ORDER BY p.timestamp DESC LIMIT ?2"
-                    ),
-                    vec![Box::new(b as i64), Box::new(q.limit as i64)],
-                ),
-                None => (
-                    format!(
-                        "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature FROM posts p
-                         WHERE 1=1 {hidden} ORDER BY p.timestamp DESC LIMIT ?1"
-                    ),
-                    vec![Box::new(q.limit as i64)],
-                ),
-            };
-            let mut stmt = db.prepare(&sql)?;
-            let p_refs: Vec<&dyn rusqlite::types::ToSql> = p.iter().map(|b| b.as_ref()).collect();
-            let rows = stmt.query_and_then(p_refs.as_slice(), Self::row_to_post)?;
-            let mut posts = Vec::new();
-            for row in rows {
-                posts.push(row?);
+            None => {
+                let sql = format!(
+                    "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature FROM posts p
+                     WHERE 1=1 {hidden} ORDER BY p.timestamp DESC LIMIT ?1"
+                );
+                sqlx::query(&sql)
+                    .bind(q.limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
             }
-            Ok(posts)
-        })
+        };
+        let mut posts = Vec::new();
+        for row in &rows {
+            posts.push(Self::row_to_post(row)?);
+        }
+        Ok(posts)
     }
 
-    pub fn delete_post(&self, id: &str) -> anyhow::Result<bool> {
-        self.with_db(|db| {
-            db.execute(
-                "DELETE FROM notifications WHERE post_id=?1 OR target_post_id=?1",
-                params![id],
-            )?;
-            let count = db.execute("DELETE FROM posts WHERE id=?1", params![id])?;
-            Ok(count > 0)
-        })
+    pub async fn delete_post(&self, id: &str) -> anyhow::Result<bool> {
+        sqlx::query("DELETE FROM notifications WHERE post_id=?1 OR target_post_id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM posts WHERE id=?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
-    pub fn delete_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
-        self.with_db(|db| {
-            db.execute(
-                "DELETE FROM notifications WHERE post_id IN (SELECT id FROM posts WHERE author=?1) OR target_post_id IN (SELECT id FROM posts WHERE author=?1)",
-                params![author],
-            )?;
-            let count = db.execute("DELETE FROM posts WHERE author=?1", params![author])?;
-            Ok(count as u64)
-        })
+    pub async fn delete_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
+        sqlx::query(
+            "DELETE FROM notifications WHERE post_id IN (SELECT id FROM posts WHERE author=?1) OR target_post_id IN (SELECT id FROM posts WHERE author=?1)",
+        )
+        .bind(author)
+        .execute(&self.pool)
+        .await?;
+        let result = sqlx::query("DELETE FROM posts WHERE author=?1")
+            .bind(author)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
-    pub fn delete_repost_by_target(
+    pub async fn delete_repost_by_target(
         &self,
         author: &str,
         quote_of: &str,
     ) -> anyhow::Result<Option<String>> {
-        self.with_db(|db| {
-            let id: Option<String> = db
-                .query_row(
-                    "SELECT id FROM posts WHERE author=?1 AND quote_of=?2",
-                    params![author, quote_of],
-                    |row| row.get(0),
-                )
-                .ok();
-            if let Some(ref id) = id {
-                db.execute("DELETE FROM posts WHERE id=?1", params![id])?;
-            }
-            Ok(id)
-        })
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT id FROM posts WHERE author=?1 AND quote_of=?2")
+                .bind(author)
+                .bind(quote_of)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some(ref id) = id {
+            sqlx::query("DELETE FROM posts WHERE id=?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(id)
     }
 
-    pub fn get_posts_by_author(
+    pub async fn get_posts_by_author(
         &self,
         author: &str,
         limit: usize,
@@ -148,195 +152,197 @@ impl Storage {
             _ => "",
         };
 
-        self.with_db(|db| {
-            let mut posts = Vec::new();
-            match before {
-                Some(b) => {
-                    let sql = format!(
-                        "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
-                         WHERE author=?1 AND timestamp < ?2{filter_clause} ORDER BY timestamp DESC LIMIT ?3"
-                    );
-                    let mut stmt = db.prepare(&sql)?;
-                    let mut rows = stmt.query(params![author, b as i64, limit as i64])?;
-                    while let Some(row) = rows.next()? {
-                        posts.push(Self::row_to_post(row)?);
-                    }
-                }
-                None => {
-                    let sql = format!(
-                        "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
-                         WHERE author=?1{filter_clause} ORDER BY timestamp DESC LIMIT ?2"
-                    );
-                    let mut stmt = db.prepare(&sql)?;
-                    let mut rows = stmt.query(params![author, limit as i64])?;
-                    while let Some(row) = rows.next()? {
-                        posts.push(Self::row_to_post(row)?);
-                    }
-                }
+        let rows = match before {
+            Some(b) => {
+                let sql = format!(
+                    "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
+                     WHERE author=?1 AND timestamp < ?2{filter_clause} ORDER BY timestamp DESC LIMIT ?3"
+                );
+                sqlx::query(&sql)
+                    .bind(author)
+                    .bind(b as i64)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
             }
-            Ok(posts)
-        })
-    }
-
-    pub fn get_post_ids_by_author(&self, author: &str) -> anyhow::Result<Vec<String>> {
-        self.with_db(|db| {
-            let mut stmt =
-                db.prepare("SELECT id FROM posts WHERE author=?1 ORDER BY timestamp ASC")?;
-            let mut rows = stmt.query(params![author])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get(0)?);
+            None => {
+                let sql = format!(
+                    "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
+                     WHERE author=?1{filter_clause} ORDER BY timestamp DESC LIMIT ?2"
+                );
+                sqlx::query(&sql)
+                    .bind(author)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
             }
-            Ok(ids)
-        })
+        };
+        let mut posts = Vec::new();
+        for row in &rows {
+            posts.push(Self::row_to_post(row)?);
+        }
+        Ok(posts)
     }
 
-    pub fn count_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
-        self.with_db(|db| {
-            let count: i64 = db.query_row(
-                "SELECT COUNT(*) FROM posts WHERE author=?1",
-                params![author],
-                |row| row.get(0),
-            )?;
-            Ok(count as u64)
-        })
+    pub async fn get_post_ids_by_author(&self, author: &str) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT id FROM posts WHERE author=?1 ORDER BY timestamp ASC")
+            .bind(author)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    pub fn newest_post_timestamp(&self, author: &str) -> anyhow::Result<u64> {
-        self.with_db(|db| {
-            let ts: Option<i64> = db.query_row(
-                "SELECT MAX(timestamp) FROM posts WHERE author=?1",
-                params![author],
-                |row| row.get(0),
-            )?;
-            Ok(ts.unwrap_or(0) as u64)
-        })
+    pub async fn count_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE author=?1")
+            .bind(author)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as u64)
     }
 
-    pub fn count_posts_after(&self, author: &str, after_ts: u64) -> anyhow::Result<u64> {
-        self.with_db(|db| {
-            let count: i64 = db.query_row(
-                "SELECT COUNT(*) FROM posts WHERE author=?1 AND timestamp > ?2",
-                params![author, after_ts as i64],
-                |row| row.get(0),
-            )?;
-            Ok(count as u64)
-        })
+    pub async fn newest_post_timestamp(&self, author: &str) -> anyhow::Result<u64> {
+        let ts: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(timestamp) FROM posts WHERE author=?1")
+                .bind(author)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(ts.unwrap_or(0) as u64)
     }
 
-    pub fn get_posts_after(
+    pub async fn count_posts_after(&self, author: &str, after_ts: u64) -> anyhow::Result<u64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE author=?1 AND timestamp > ?2")
+                .bind(author)
+                .bind(after_ts as i64)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count as u64)
+    }
+
+    pub async fn get_posts_after(
         &self,
         author: &str,
         after_ts: u64,
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<Post>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
-                 FROM posts WHERE author=?1 AND timestamp > ?2
-                 ORDER BY timestamp ASC LIMIT ?3 OFFSET ?4",
-            )?;
-            let mut rows = stmt.query(params![
-                author,
-                after_ts as i64,
-                limit as i64,
-                offset as i64
-            ])?;
-            let mut posts = Vec::new();
-            while let Some(row) = rows.next()? {
-                posts.push(Self::row_to_post(row)?);
-            }
-            Ok(posts)
-        })
+        let rows = sqlx::query(
+            "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
+             FROM posts WHERE author=?1 AND timestamp > ?2
+             ORDER BY timestamp ASC LIMIT ?3 OFFSET ?4",
+        )
+        .bind(author)
+        .bind(after_ts as i64)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut posts = Vec::new();
+        for row in &rows {
+            posts.push(Self::row_to_post(row)?);
+        }
+        Ok(posts)
     }
 
-    pub fn get_posts_not_in(
+    pub async fn get_posts_not_in(
         &self,
         author: &str,
         known_ids: &[String],
         limit: usize,
         offset: usize,
     ) -> anyhow::Result<Vec<Post>> {
-        self.with_db(|db| {
-            if known_ids.is_empty() {
-                let mut stmt = db.prepare(
-                    "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
-                     FROM posts WHERE author=?1
-                     ORDER BY timestamp ASC LIMIT ?2 OFFSET ?3",
-                )?;
-                let mut rows = stmt.query(params![author, limit as i64, offset as i64])?;
-                let mut posts = Vec::new();
-                while let Some(row) = rows.next()? {
-                    posts.push(Self::row_to_post(row)?);
-                }
-                return Ok(posts);
-            }
-
-            db.execute_batch(
-                "CREATE TEMP TABLE IF NOT EXISTS _sync_known_ids (id TEXT PRIMARY KEY)",
-            )?;
-            db.execute_batch("DELETE FROM _sync_known_ids")?;
-
-            let mut insert =
-                db.prepare("INSERT OR IGNORE INTO _sync_known_ids (id) VALUES (?1)")?;
-            for id in known_ids {
-                insert.execute(params![id])?;
-            }
-            drop(insert);
-
-            let mut stmt = db.prepare(
-                "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature             FROM posts p
-                 WHERE p.author=?1 AND p.id NOT IN (SELECT id FROM _sync_known_ids)
-                 ORDER BY p.timestamp ASC LIMIT ?2 OFFSET ?3",
-            )?;
-            let mut rows = stmt.query(params![author, limit as i64, offset as i64])?;
+        if known_ids.is_empty() {
+            let rows = sqlx::query(
+                "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
+                 FROM posts WHERE author=?1
+                 ORDER BY timestamp ASC LIMIT ?2 OFFSET ?3",
+            )
+            .bind(author)
+            .bind(limit as i64)
+            .bind(offset as i64)
+            .fetch_all(&self.pool)
+            .await?;
             let mut posts = Vec::new();
-            while let Some(row) = rows.next()? {
+            for row in &rows {
                 posts.push(Self::row_to_post(row)?);
             }
+            return Ok(posts);
+        }
 
-            db.execute_batch("DROP TABLE IF EXISTS _sync_known_ids")?;
-            Ok(posts)
-        })
+        // Use a dedicated connection for temp table operations
+        let mut conn = self.pool.acquire().await?;
+
+        sqlx::query("CREATE TEMP TABLE IF NOT EXISTS _sync_known_ids (id TEXT PRIMARY KEY)")
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("DELETE FROM _sync_known_ids")
+            .execute(&mut *conn)
+            .await?;
+
+        for id in known_ids {
+            sqlx::query("INSERT OR IGNORE INTO _sync_known_ids (id) VALUES (?1)")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
+
+        let rows = sqlx::query(
+            "SELECT p.id, p.author, p.content, p.timestamp, p.media_json, p.reply_to, p.reply_to_author, p.quote_of, p.quote_of_author, p.signature FROM posts p
+             WHERE p.author=?1 AND p.id NOT IN (SELECT id FROM _sync_known_ids)
+             ORDER BY p.timestamp ASC LIMIT ?2 OFFSET ?3",
+        )
+        .bind(author)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut posts = Vec::new();
+        for row in &rows {
+            posts.push(Self::row_to_post(row)?);
+        }
+
+        sqlx::query("DROP TABLE IF EXISTS _sync_known_ids")
+            .execute(&mut *conn)
+            .await?;
+        Ok(posts)
     }
 
-    pub fn get_replies(
+    pub async fn get_replies(
         &self,
         parent_post_id: &str,
         limit: usize,
         before: Option<u64>,
     ) -> anyhow::Result<Vec<Post>> {
-        self.with_db(|db| {
-            let hidden =
-                "AND author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
-            let mut posts = Vec::new();
-            match before {
-                Some(b) => {
-                    let sql = format!(
-                        "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
-                         WHERE reply_to=?1 AND timestamp < ?2 {hidden} ORDER BY timestamp ASC LIMIT ?3"
-                    );
-                    let mut stmt = db.prepare(&sql)?;
-                    let mut rows =
-                        stmt.query(params![parent_post_id, b as i64, limit as i64])?;
-                    while let Some(row) = rows.next()? {
-                        posts.push(Self::row_to_post(row)?);
-                    }
-                }
-                None => {
-                    let sql = format!(
-                        "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
-                         WHERE reply_to=?1 {hidden} ORDER BY timestamp ASC LIMIT ?2"
-                    );
-                    let mut stmt = db.prepare(&sql)?;
-                    let mut rows = stmt.query(params![parent_post_id, limit as i64])?;
-                    while let Some(row) = rows.next()? {
-                        posts.push(Self::row_to_post(row)?);
-                    }
-                }
+        let hidden = "AND author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
+        let rows = match before {
+            Some(b) => {
+                let sql = format!(
+                    "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
+                     WHERE reply_to=?1 AND timestamp < ?2 {hidden} ORDER BY timestamp ASC LIMIT ?3"
+                );
+                sqlx::query(&sql)
+                    .bind(parent_post_id)
+                    .bind(b as i64)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
             }
-            Ok(posts)
-        })
+            None => {
+                let sql = format!(
+                    "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts
+                     WHERE reply_to=?1 {hidden} ORDER BY timestamp ASC LIMIT ?2"
+                );
+                sqlx::query(&sql)
+                    .bind(parent_post_id)
+                    .bind(limit as i64)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+        };
+        let mut posts = Vec::new();
+        for row in &rows {
+            posts.push(Self::row_to_post(row)?);
+        }
+        Ok(posts)
     }
 }

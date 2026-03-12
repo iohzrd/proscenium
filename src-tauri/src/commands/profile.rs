@@ -19,7 +19,7 @@ pub async fn get_pubkey(state: State<'_, Arc<AppState>>) -> Result<String, Strin
 #[tauri::command]
 pub async fn get_my_profile(state: State<'_, Arc<AppState>>) -> Result<Option<Profile>, String> {
     let node_id = state.master_pubkey.clone();
-    state.storage.get_profile(&node_id).str_err()
+    state.storage.get_profile(&node_id).await.str_err()
 }
 
 #[tauri::command]
@@ -50,6 +50,7 @@ pub async fn save_my_profile(
     let old_visibility = state
         .storage
         .get_visibility(&node_id)
+        .await
         .unwrap_or(Visibility::Public);
 
     let mut feed = state.feed.lock().await;
@@ -62,14 +63,18 @@ pub async fn save_my_profile(
         log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
     }
 
-    state.storage.save_profile(&node_id, &profile).str_err()?;
+    state
+        .storage
+        .save_profile(&node_id, &profile)
+        .await
+        .str_err()?;
     log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
 
     // Broadcast profile update (gossip for Public, push outbox for Listed/Private)
     feed.broadcast_profile(&profile).await.str_err()?;
 
     // Sync profile to all registered discovery servers
-    if let Ok(servers) = state.storage.get_servers() {
+    if let Ok(servers) = state.storage.get_servers().await {
         for server in servers {
             if server.registered_at.is_some() {
                 let _ = sync_profile_inner(&state, &server.url).await;
@@ -85,7 +90,7 @@ pub async fn get_remote_profile(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> Result<Option<Profile>, String> {
-    state.storage.get_profile(&pubkey).str_err()
+    state.storage.get_profile(&pubkey).await.str_err()
 }
 
 #[tauri::command]
@@ -95,7 +100,12 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
     let has_relay = relay_url.is_some();
     let feed = state.feed.lock().await;
     let follow_count = feed.subscriptions.len();
-    let follower_count = state.storage.get_followers().map(|f| f.len()).unwrap_or(0);
+    let follower_count = state
+        .storage
+        .get_followers()
+        .await
+        .map(|f| f.len())
+        .unwrap_or(0);
 
     Ok(NodeStatus {
         node_id: state.transport_node_id.clone(),

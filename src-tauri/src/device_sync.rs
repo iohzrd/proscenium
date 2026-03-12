@@ -55,6 +55,7 @@ pub async fn handle_device_sync(
     // Build our own vector
     let our_vector = storage
         .build_device_sync_vector(master_pubkey)
+        .await
         .map_err(map_err)?;
 
     // Sign the challenge back to prove we also have the signing key
@@ -108,7 +109,7 @@ pub async fn sync_with_device(
     let challenge_sig = sign_device_sync_challenge(&challenge, &signing_secret);
 
     // Build our sync vector
-    let our_vector = storage.build_device_sync_vector(master_pubkey)?;
+    let our_vector = storage.build_device_sync_vector(master_pubkey).await?;
 
     // Connect and send request
     let addr = EndpointAddr::from(target);
@@ -195,6 +196,7 @@ async fn send_deltas(
                     BATCH_SIZE,
                     offset,
                 )
+                .await
                 .map_err(map_err)?;
             if batch.is_empty() {
                 break;
@@ -210,6 +212,7 @@ async fn send_deltas(
         loop {
             let batch = storage
                 .get_posts_after(master_pubkey, 0, BATCH_SIZE, offset)
+                .await
                 .map_err(map_err)?;
             if batch.is_empty() {
                 break;
@@ -232,6 +235,7 @@ async fn send_deltas(
                     BATCH_SIZE,
                     offset,
                 )
+                .await
                 .map_err(map_err)?;
             if batch.is_empty() {
                 break;
@@ -246,6 +250,7 @@ async fn send_deltas(
         loop {
             let batch = storage
                 .get_interactions_paged(master_pubkey, BATCH_SIZE, offset)
+                .await
                 .map_err(map_err)?;
             if batch.is_empty() {
                 break;
@@ -260,6 +265,7 @@ async fn send_deltas(
     // Build our vector once for follows/mutes/blocks/bookmarks
     let our_vector = storage
         .build_device_sync_vector(master_pubkey)
+        .await
         .map_err(map_err)?;
 
     // Follows: send entries that are newer than what peer has
@@ -335,7 +341,7 @@ async fn send_deltas(
         .iter()
         .map(|r| (r.peer_pubkey.as_str(), r.updated_at))
         .collect();
-    let our_ratchets = storage.export_ratchet_sessions().map_err(map_err)?;
+    let our_ratchets = storage.export_ratchet_sessions().await.map_err(map_err)?;
     let ratchet_deltas: Vec<_> = our_ratchets
         .into_iter()
         .filter(|r| match peer_ratchet_map.get(r.peer_pubkey.as_str()) {
@@ -364,7 +370,9 @@ async fn send_deltas_client(
     let after_ts = peer_vector.newest_post_ts;
     let mut offset = 0;
     loop {
-        let batch = storage.get_posts_after(master_pubkey, after_ts, BATCH_SIZE, offset)?;
+        let batch = storage
+            .get_posts_after(master_pubkey, after_ts, BATCH_SIZE, offset)
+            .await?;
         if batch.is_empty() {
             break;
         }
@@ -380,7 +388,9 @@ async fn send_deltas_client(
     let after_ts = peer_vector.newest_interaction_ts;
     let mut offset = 0;
     loop {
-        let batch = storage.get_interactions_after(master_pubkey, after_ts, BATCH_SIZE, offset)?;
+        let batch = storage
+            .get_interactions_after(master_pubkey, after_ts, BATCH_SIZE, offset)
+            .await?;
         if batch.is_empty() {
             break;
         }
@@ -393,7 +403,7 @@ async fn send_deltas_client(
     }
 
     // Follows
-    let our_vector = storage.build_device_sync_vector(master_pubkey)?;
+    let our_vector = storage.build_device_sync_vector(master_pubkey).await?;
     let follow_deltas: Vec<_> = our_vector
         .follows
         .into_iter()
@@ -474,7 +484,7 @@ async fn send_deltas_client(
         .iter()
         .map(|r| (r.peer_pubkey.as_str(), r.updated_at))
         .collect();
-    let our_ratchets = storage.export_ratchet_sessions()?;
+    let our_ratchets = storage.export_ratchet_sessions().await?;
     let ratchet_deltas: Vec<_> = our_ratchets
         .into_iter()
         .filter(|r| match peer_ratchet_map.get(r.peer_pubkey.as_str()) {
@@ -534,7 +544,7 @@ async fn import_deltas(
                     if post.author != master_pubkey {
                         continue;
                     }
-                    storage.insert_post(post).map_err(map_err)?;
+                    storage.insert_post(post).await.map_err(map_err)?;
                     stats.posts_imported += 1;
                 }
             }
@@ -543,25 +553,30 @@ async fn import_deltas(
                     if interaction.author != master_pubkey {
                         continue;
                     }
-                    storage.save_interaction(interaction).map_err(map_err)?;
+                    storage
+                        .save_interaction(interaction)
+                        .await
+                        .map_err(map_err)?;
                     stats.interactions_imported += 1;
                 }
             }
             DeviceSyncFrame::Follows(entries) => {
-                stats.follows_merged += storage.merge_follows_lww(&entries).map_err(map_err)?;
+                stats.follows_merged +=
+                    storage.merge_follows_lww(&entries).await.map_err(map_err)?;
             }
             DeviceSyncFrame::Mutes(entries) => {
-                stats.mutes_merged += storage.merge_mutes_lww(&entries).map_err(map_err)?;
+                stats.mutes_merged += storage.merge_mutes_lww(&entries).await.map_err(map_err)?;
             }
             DeviceSyncFrame::Blocks(entries) => {
-                stats.blocks_merged += storage.merge_blocks_lww(&entries).map_err(map_err)?;
+                stats.blocks_merged += storage.merge_blocks_lww(&entries).await.map_err(map_err)?;
             }
             DeviceSyncFrame::Bookmarks(ids) => {
-                stats.bookmarks_added += storage.merge_bookmarks(&ids).map_err(map_err)?;
+                stats.bookmarks_added += storage.merge_bookmarks(&ids).await.map_err(map_err)?;
             }
             DeviceSyncFrame::RatchetSessions(sessions) => {
                 stats.ratchets_merged += storage
                     .merge_ratchet_sessions_lww(&sessions)
+                    .await
                     .map_err(map_err)?;
             }
         }
@@ -577,7 +592,7 @@ pub async fn sync_all_devices(
     master_pubkey: &str,
     signing_secret_key_bytes: &[u8; 32],
 ) {
-    let device_ids = match storage.get_other_device_node_ids() {
+    let device_ids = match storage.get_other_device_node_ids().await {
         Ok(ids) => ids,
         Err(e) => {
             log::error!("[device-sync] failed to get device list: {e}");

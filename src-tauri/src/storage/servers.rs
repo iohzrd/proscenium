@@ -1,7 +1,6 @@
 use crate::storage::Storage;
-use rusqlite::OptionalExtension;
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerEntry {
@@ -15,128 +14,99 @@ pub struct ServerEntry {
     pub last_synced_at: Option<i64>,
 }
 
+fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> ServerEntry {
+    ServerEntry {
+        url: row.get(0),
+        name: row.get(1),
+        description: row.get(2),
+        node_id: row.get(3),
+        registered_at: row.get(4),
+        visibility: row.get(5),
+        added_at: row.get(6),
+        last_synced_at: row.get(7),
+    }
+}
+
 impl Storage {
-    pub fn add_server(&self, url: &str) -> anyhow::Result<()> {
+    pub async fn add_server(&self, url: &str) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis() as i64;
-        self.with_db(|db| {
-            db.execute(
-                "INSERT OR IGNORE INTO servers (url, added_at) VALUES (?1, ?2)",
-                params![url, now],
-            )?;
-            Ok(())
-        })
+        sqlx::query("INSERT OR IGNORE INTO servers (url, added_at) VALUES (?1, ?2)")
+            .bind(url)
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
-    pub fn remove_server(&self, url: &str) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            db.execute("DELETE FROM servers WHERE url = ?1", params![url])?;
-            Ok(())
-        })
+    pub async fn remove_server(&self, url: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM servers WHERE url = ?1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
-    pub fn get_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers ORDER BY added_at DESC",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(ServerEntry {
-                        url: row.get(0)?,
-                        name: row.get(1)?,
-                        description: row.get(2)?,
-                        node_id: row.get(3)?,
-                        registered_at: row.get(4)?,
-                        visibility: row.get(5)?,
-                        added_at: row.get(6)?,
-                        last_synced_at: row.get(7)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+    pub async fn get_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
+        let rows = sqlx::query(
+            "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers ORDER BY added_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_server).collect())
     }
 
-    pub fn get_server(&self, url: &str) -> anyhow::Result<Option<ServerEntry>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE url = ?1",
-            )?;
-            let entry = stmt
-                .query_row(params![url], |row| {
-                    Ok(ServerEntry {
-                        url: row.get(0)?,
-                        name: row.get(1)?,
-                        description: row.get(2)?,
-                        node_id: row.get(3)?,
-                        registered_at: row.get(4)?,
-                        visibility: row.get(5)?,
-                        added_at: row.get(6)?,
-                        last_synced_at: row.get(7)?,
-                    })
-                })
-                .optional()?;
-            Ok(entry)
-        })
+    pub async fn get_server(&self, url: &str) -> anyhow::Result<Option<ServerEntry>> {
+        let row = sqlx::query(
+            "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE url = ?1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.as_ref().map(row_to_server))
     }
 
-    pub fn update_server_info(
+    pub async fn update_server_info(
         &self,
         url: &str,
         name: &str,
         description: &str,
         node_id: &str,
     ) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            db.execute(
-                "UPDATE servers SET name = ?2, description = ?3, node_id = ?4 WHERE url = ?1",
-                params![url, name, description, node_id],
-            )?;
-            Ok(())
-        })
+        sqlx::query("UPDATE servers SET name = ?2, description = ?3, node_id = ?4 WHERE url = ?1")
+            .bind(url)
+            .bind(name)
+            .bind(description)
+            .bind(node_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
-    pub fn mark_server_registered(&self, url: &str, visibility: &str) -> anyhow::Result<()> {
+    pub async fn mark_server_registered(&self, url: &str, visibility: &str) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis() as i64;
-        self.with_db(|db| {
-            db.execute(
-                "UPDATE servers SET registered_at = ?2, visibility = ?3 WHERE url = ?1",
-                params![url, now, visibility],
-            )?;
-            Ok(())
-        })
+        sqlx::query("UPDATE servers SET registered_at = ?2, visibility = ?3 WHERE url = ?1")
+            .bind(url)
+            .bind(now)
+            .bind(visibility)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
-    pub fn get_registered_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE registered_at IS NOT NULL ORDER BY added_at DESC",
-            )?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok(ServerEntry {
-                        url: row.get(0)?,
-                        name: row.get(1)?,
-                        description: row.get(2)?,
-                        node_id: row.get(3)?,
-                        registered_at: row.get(4)?,
-                        visibility: row.get(5)?,
-                        added_at: row.get(6)?,
-                        last_synced_at: row.get(7)?,
-                    })
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(rows)
-        })
+    pub async fn get_registered_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
+        let rows = sqlx::query(
+            "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE registered_at IS NOT NULL ORDER BY added_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(row_to_server).collect())
     }
 
-    pub fn mark_server_unregistered(&self, url: &str) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            db.execute(
-                "UPDATE servers SET registered_at = NULL WHERE url = ?1",
-                params![url],
-            )?;
-            Ok(())
-        })
+    pub async fn mark_server_unregistered(&self, url: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE servers SET registered_at = NULL WHERE url = ?1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

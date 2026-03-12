@@ -53,11 +53,12 @@ pub async fn handle_sync(
     // Enforce visibility-based sync access control
     let visibility = storage
         .get_visibility(node_id)
+        .await
         .unwrap_or(Visibility::Public);
     match visibility {
         Visibility::Public => {} // anyone can sync
         Visibility::Listed => {
-            if !storage.is_follower(remote_str).unwrap_or(false) {
+            if !storage.is_follower(remote_str).await.unwrap_or(false) {
                 log::warn!(
                     "[sync-server] rejecting non-follower {} (listed profile)",
                     short_id(remote_str)
@@ -66,7 +67,7 @@ pub async fn handle_sync(
             }
         }
         Visibility::Private => {
-            if !storage.is_mutual(remote_str).unwrap_or(false) {
+            if !storage.is_mutual(remote_str).await.unwrap_or(false) {
                 log::warn!(
                     "[sync-server] rejecting non-mutual {} (private profile)",
                     short_id(remote_str)
@@ -80,13 +81,16 @@ pub async fn handle_sync(
 
     let server_post_count = storage
         .count_posts_by_author(&req.author)
+        .await
         .map_err(map_err)?;
     let server_interaction_count = storage
         .count_interactions_by_author(&req.author)
+        .await
         .map_err(map_err)?;
     let posts_after_count = if req.newest_timestamp > 0 {
         storage
             .count_posts_after(&req.author, req.newest_timestamp)
+            .await
             .map_err(map_err)?
     } else {
         server_post_count
@@ -94,6 +98,7 @@ pub async fn handle_sync(
     let interactions_after_count = if req.newest_interaction_timestamp > 0 {
         storage
             .count_interactions_after(&req.author, req.newest_interaction_timestamp)
+            .await
             .map_err(map_err)?
     } else {
         server_interaction_count
@@ -112,7 +117,7 @@ pub async fn handle_sync(
         SyncMode::NeedIdDiff
     };
 
-    let profile = storage.get_profile(node_id).ok().flatten();
+    let profile = storage.get_profile(node_id).await.ok().flatten();
 
     log::info!(
         "[sync-server] author={}, client=({}/{}/ts={}/its={}), server=({}/{}/after={}/iafter={}), mode={:?}",
@@ -169,9 +174,11 @@ pub async fn handle_sync(
         let batch = match mode {
             SyncMode::TimestampCatchUp => storage
                 .get_posts_after(&req.author, req.newest_timestamp, BATCH_SIZE, offset)
+                .await
                 .map_err(map_err)?,
             SyncMode::NeedIdDiff => storage
                 .get_posts_not_in(&req.author, &known_ids, BATCH_SIZE, offset)
+                .await
                 .map_err(map_err)?,
             SyncMode::UpToDate => break,
         };
@@ -203,10 +210,12 @@ pub async fn handle_sync(
                         BATCH_SIZE,
                         ioffset,
                     )
+                    .await
                     .map_err(map_err)?
             } else {
                 storage
                     .get_interactions_paged(&req.author, BATCH_SIZE, ioffset)
+                    .await
                     .map_err(map_err)?
             };
 
@@ -281,10 +290,16 @@ pub async fn sync_from_peer(
     // Phase 1: Send PeerRequest::Sync
     let (mut send, mut recv) = conn.open_bi().await?;
 
-    let post_count = storage.count_posts_by_author(author).unwrap_or(0);
-    let interaction_count = storage.count_interactions_by_author(author).unwrap_or(0);
-    let newest_timestamp = storage.newest_post_timestamp(author).unwrap_or(0);
-    let newest_interaction_timestamp = storage.newest_interaction_timestamp(author).unwrap_or(0);
+    let post_count = storage.count_posts_by_author(author).await.unwrap_or(0);
+    let interaction_count = storage
+        .count_interactions_by_author(author)
+        .await
+        .unwrap_or(0);
+    let newest_timestamp = storage.newest_post_timestamp(author).await.unwrap_or(0);
+    let newest_interaction_timestamp = storage
+        .newest_interaction_timestamp(author)
+        .await
+        .unwrap_or(0);
 
     let req = SyncRequest {
         author: author.to_string(),
@@ -327,7 +342,10 @@ pub async fn sync_from_peer(
     let (mut data_send, mut data_recv) = conn.open_bi().await?;
 
     if summary.mode == SyncMode::NeedIdDiff {
-        let known_ids = storage.get_post_ids_by_author(author).unwrap_or_default();
+        let known_ids = storage
+            .get_post_ids_by_author(author)
+            .await
+            .unwrap_or_default();
         let ids_bytes = serde_json::to_vec(&known_ids)?;
         data_send.write_all(&ids_bytes).await?;
     }
@@ -355,8 +373,9 @@ pub async fn sync_from_peer(
                             {
                                 continue;
                             }
-                            if let Err(e) =
-                                storage.cache_peer_device_announcement(author, &announcement)
+                            if let Err(e) = storage
+                                .cache_peer_device_announcement(author, &announcement)
+                                .await
                             {
                                 log::error!(
                                     "[sync-client] failed to cache device announcement: {e}"

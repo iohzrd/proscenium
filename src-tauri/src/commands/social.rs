@@ -20,9 +20,12 @@ async fn resolve_peer_identity(
                 short_id(node_id),
                 short_id(&identity.master_pubkey),
             );
-            let _ = state.storage.cache_peer_identity(&identity);
+            let _ = state.storage.cache_peer_identity(&identity).await;
             if let Some(profile) = &identity.profile {
-                let _ = state.storage.save_profile(&identity.master_pubkey, profile);
+                let _ = state
+                    .storage
+                    .save_profile(&identity.master_pubkey, profile)
+                    .await;
             }
             Ok(identity)
         }
@@ -67,7 +70,7 @@ pub async fn follow_user(
         alias: None,
         followed_at: now_millis(),
     };
-    state.storage.follow(&entry).str_err()?;
+    state.storage.follow(&entry).await.str_err()?;
 
     {
         let mut feed = state.feed.lock().await;
@@ -93,7 +96,8 @@ pub async fn follow_user(
                     "follow-sync",
                     &my_id,
                     &app_handle,
-                );
+                )
+                .await;
                 log::info!(
                     "[follow-sync] stored {stored}/{} posts, {} interactions from {} (mode={:?})",
                     result.posts.len(),
@@ -117,10 +121,14 @@ pub async fn follow_user(
 #[tauri::command]
 pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Result<(), String> {
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
-    state.storage.unfollow(&pubkey).str_err()?;
+    state.storage.unfollow(&pubkey).await.str_err()?;
     let mut feed = state.feed.lock().await;
     feed.unfollow_user(&pubkey);
-    let deleted = state.storage.delete_posts_by_author(&pubkey).unwrap_or(0);
+    let deleted = state
+        .storage
+        .delete_posts_by_author(&pubkey)
+        .await
+        .unwrap_or(0);
     log::info!(
         "[follow] unfollowed {}, deleted {deleted} posts",
         short_id(&pubkey)
@@ -137,17 +145,18 @@ pub async fn update_follow_alias(
     state
         .storage
         .update_follow_alias(&pubkey, alias.as_deref())
+        .await
         .str_err()
 }
 
 #[tauri::command]
 pub async fn get_follows(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowEntry>, String> {
-    state.storage.get_follows().str_err()
+    state.storage.get_follows().await.str_err()
 }
 
 #[tauri::command]
 pub async fn get_followers(state: State<'_, Arc<AppState>>) -> Result<Vec<FollowerEntry>, String> {
-    state.storage.get_followers().str_err()
+    state.storage.get_followers().await.str_err()
 }
 
 #[tauri::command]
@@ -155,5 +164,9 @@ pub async fn get_peer_node_ids(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> Result<Vec<String>, String> {
-    state.storage.get_peer_transport_node_ids(&pubkey).str_err()
+    state
+        .storage
+        .get_peer_transport_node_ids(&pubkey)
+        .await
+        .str_err()
 }

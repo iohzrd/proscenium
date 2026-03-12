@@ -9,14 +9,18 @@ use tauri::State;
 pub async fn get_follow_requests(
     state: State<'_, Arc<AppState>>,
 ) -> Result<Vec<FollowRequestEntry>, String> {
-    state.storage.get_follow_requests().str_err()
+    state.storage.get_follow_requests().await.str_err()
 }
 
 #[tauri::command]
 pub async fn get_pending_follow_request_count(
     state: State<'_, Arc<AppState>>,
 ) -> Result<u64, String> {
-    state.storage.get_pending_follow_request_count().str_err()
+    state
+        .storage
+        .get_pending_follow_request_count()
+        .await
+        .str_err()
 }
 
 #[tauri::command]
@@ -25,11 +29,15 @@ pub async fn approve_follow_request(
     pubkey: String,
 ) -> Result<bool, String> {
     log::info!("[follow-req] approving request from {}", short_id(&pubkey));
-    let approved = state.storage.approve_follow_request(&pubkey).str_err()?;
+    let approved = state
+        .storage
+        .approve_follow_request(&pubkey)
+        .await
+        .str_err()?;
     if approved {
         // Also add them as a follower
         let now = now_millis();
-        let _ = state.storage.upsert_follower(&pubkey, now);
+        let _ = state.storage.upsert_follower(&pubkey, now).await;
     }
     Ok(approved)
 }
@@ -40,7 +48,7 @@ pub async fn deny_follow_request(
     pubkey: String,
 ) -> Result<bool, String> {
     log::info!("[follow-req] denying request from {}", short_id(&pubkey));
-    state.storage.deny_follow_request(&pubkey).str_err()
+    state.storage.deny_follow_request(&pubkey).await.str_err()
 }
 
 #[tauri::command]
@@ -57,6 +65,7 @@ pub async fn send_follow_request_to_peer(
     let node_ids = state
         .storage
         .get_peer_transport_node_ids(&pubkey)
+        .await
         .str_err()?;
     let first_node_id = node_ids
         .first()

@@ -27,7 +27,11 @@ pub async fn like_post(
     };
     let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_interaction(&mut interaction, &sk);
-    state.storage.save_interaction(&interaction).str_err()?;
+    state
+        .storage
+        .save_interaction(&interaction)
+        .await
+        .str_err()?;
     let feed = state.feed.lock().await;
     feed.broadcast_interaction(&interaction).await.str_err()?;
     Ok(interaction)
@@ -42,6 +46,7 @@ pub async fn unlike_post(
     let id = state
         .storage
         .delete_interaction_by_target(&my_id, "Like", &target_post_id)
+        .await
         .str_err()?;
     if let Some(id) = id {
         let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
@@ -79,7 +84,7 @@ pub async fn repost(
     let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
     sign_post(&mut post, &sk);
 
-    state.storage.insert_post(&post).str_err()?;
+    state.storage.insert_post(&post).await.str_err()?;
     let feed = state.feed.lock().await;
     feed.broadcast_post(&post).await.str_err()?;
     Ok(post)
@@ -94,6 +99,7 @@ pub async fn unrepost(
     let id = state
         .storage
         .delete_repost_by_target(&my_id, &target_post_id)
+        .await
         .str_err()?;
     if let Some(id) = id {
         let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
@@ -115,5 +121,6 @@ pub async fn get_post_counts(
     state
         .storage
         .get_post_counts(&my_id, &target_post_id)
+        .await
         .str_err()
 }

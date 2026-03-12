@@ -172,6 +172,7 @@ pub async fn link_with_device(
     state
         .storage
         .import_link_bundle(&state.master_pubkey, &bundle)
+        .await
         .map_err(|e| format!("import failed: {e}"))?;
 
     // Store the new transport key and device index for future use
@@ -241,6 +242,7 @@ pub async fn get_linked_devices(
     state
         .storage
         .get_linked_devices()
+        .await
         .map_err(|e| format!("failed to get linked devices: {e}"))
 }
 

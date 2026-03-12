@@ -1,141 +1,135 @@
-use rusqlite::params;
+use sqlx::Row;
 
 use super::Storage;
 
 const PUSH_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 impl Storage {
-    /// Enqueue a profile-only push (both post_id and interaction_id NULL).
-    pub fn enqueue_push_profile(&self, recipient: &str) -> anyhow::Result<()> {
+    pub async fn enqueue_push_profile(&self, recipient: &str) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis();
         let expires_at = now + PUSH_TTL_MS;
-        self.with_db(|db| {
-            db.execute(
-                "INSERT INTO push_outbox (recipient, created_at, expires_at) VALUES (?1, ?2, ?3)",
-                params![recipient, now as i64, expires_at as i64],
-            )?;
-            Ok(())
-        })
+        sqlx::query(
+            "INSERT INTO push_outbox (recipient, created_at, expires_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(recipient)
+        .bind(now as i64)
+        .bind(expires_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
-    pub fn enqueue_push_post(&self, recipient: &str, post_id: &str) -> anyhow::Result<()> {
+    pub async fn enqueue_push_post(&self, recipient: &str, post_id: &str) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis();
         let expires_at = now + PUSH_TTL_MS;
-        self.with_db(|db| {
-            db.execute(
-                "INSERT INTO push_outbox (recipient, post_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-                params![recipient, post_id, now as i64, expires_at as i64],
-            )?;
-            Ok(())
-        })
+        sqlx::query(
+            "INSERT INTO push_outbox (recipient, post_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(recipient)
+        .bind(post_id)
+        .bind(now as i64)
+        .bind(expires_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
-    pub fn enqueue_push_interaction(
+    pub async fn enqueue_push_interaction(
         &self,
         recipient: &str,
         interaction_id: &str,
     ) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis();
         let expires_at = now + PUSH_TTL_MS;
-        self.with_db(|db| {
-            db.execute(
-                "INSERT INTO push_outbox (recipient, interaction_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-                params![recipient, interaction_id, now as i64, expires_at as i64],
-            )?;
-            Ok(())
-        })
+        sqlx::query(
+            "INSERT INTO push_outbox (recipient, interaction_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(recipient)
+        .bind(interaction_id)
+        .bind(now as i64)
+        .bind(expires_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
-    pub fn get_push_outbox_peers(&self) -> anyhow::Result<Vec<String>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT DISTINCT recipient FROM push_outbox WHERE attempts < max_attempts ORDER BY created_at ASC",
-            )?;
-            let mut rows = stmt.query([])?;
-            let mut peers = Vec::new();
-            while let Some(row) = rows.next()? {
-                peers.push(row.get(0)?);
-            }
-            Ok(peers)
-        })
+    pub async fn get_push_outbox_peers(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT recipient FROM push_outbox WHERE attempts < max_attempts ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    /// Get profile-only push entries (both post_id and interaction_id NULL).
-    pub fn get_pending_push_profile_ids(&self, recipient: &str) -> anyhow::Result<Vec<i64>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT id FROM push_outbox WHERE recipient=?1 AND post_id IS NULL AND interaction_id IS NULL AND attempts < max_attempts",
-            )?;
-            let mut rows = stmt.query(params![recipient])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get(0)?);
-            }
-            Ok(ids)
-        })
+    pub async fn get_pending_push_profile_ids(&self, recipient: &str) -> anyhow::Result<Vec<i64>> {
+        let rows = sqlx::query(
+            "SELECT id FROM push_outbox WHERE recipient=?1 AND post_id IS NULL AND interaction_id IS NULL AND attempts < max_attempts",
+        )
+        .bind(recipient)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    pub fn get_pending_push_post_ids(&self, recipient: &str) -> anyhow::Result<Vec<(i64, String)>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT id, post_id FROM push_outbox WHERE recipient=?1 AND post_id IS NOT NULL AND attempts < max_attempts ORDER BY created_at ASC LIMIT 50",
-            )?;
-            let mut rows = stmt.query(params![recipient])?;
-            let mut items = Vec::new();
-            while let Some(row) = rows.next()? {
-                items.push((row.get(0)?, row.get(1)?));
-            }
-            Ok(items)
-        })
-    }
-
-    pub fn get_pending_push_interaction_ids(
+    pub async fn get_pending_push_post_ids(
         &self,
         recipient: &str,
     ) -> anyhow::Result<Vec<(i64, String)>> {
-        self.with_db(|db| {
-            let mut stmt = db.prepare(
-                "SELECT id, interaction_id FROM push_outbox WHERE recipient=?1 AND interaction_id IS NOT NULL AND attempts < max_attempts ORDER BY created_at ASC LIMIT 200",
-            )?;
-            let mut rows = stmt.query(params![recipient])?;
-            let mut items = Vec::new();
-            while let Some(row) = rows.next()? {
-                items.push((row.get(0)?, row.get(1)?));
-            }
-            Ok(items)
-        })
+        let rows = sqlx::query(
+            "SELECT id, post_id FROM push_outbox WHERE recipient=?1 AND post_id IS NOT NULL AND attempts < max_attempts ORDER BY created_at ASC LIMIT 50",
+        )
+        .bind(recipient)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
     }
 
-    pub fn mark_push_attempted(&self, outbox_ids: &[i64]) -> anyhow::Result<()> {
+    pub async fn get_pending_push_interaction_ids(
+        &self,
+        recipient: &str,
+    ) -> anyhow::Result<Vec<(i64, String)>> {
+        let rows = sqlx::query(
+            "SELECT id, interaction_id FROM push_outbox WHERE recipient=?1 AND interaction_id IS NOT NULL AND attempts < max_attempts ORDER BY created_at ASC LIMIT 200",
+        )
+        .bind(recipient)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
+    pub async fn mark_push_attempted(&self, outbox_ids: &[i64]) -> anyhow::Result<()> {
         let now = iroh_social_types::now_millis();
-        self.with_db(|db| {
-            for id in outbox_ids {
-                db.execute(
-                    "UPDATE push_outbox SET attempts = attempts + 1, last_attempt_at = ?2 WHERE id = ?1",
-                    params![id, now as i64],
-                )?;
-            }
-            Ok(())
-        })
+        for id in outbox_ids {
+            sqlx::query(
+                "UPDATE push_outbox SET attempts = attempts + 1, last_attempt_at = ?2 WHERE id = ?1",
+            )
+            .bind(id)
+            .bind(now as i64)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
     }
 
-    pub fn remove_push_outbox_entries(&self, outbox_ids: &[i64]) -> anyhow::Result<()> {
-        self.with_db(|db| {
-            for id in outbox_ids {
-                db.execute("DELETE FROM push_outbox WHERE id = ?1", params![id])?;
-            }
-            Ok(())
-        })
+    pub async fn remove_push_outbox_entries(&self, outbox_ids: &[i64]) -> anyhow::Result<()> {
+        for id in outbox_ids {
+            sqlx::query("DELETE FROM push_outbox WHERE id = ?1")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
     }
 
-    pub fn prune_expired_push_entries(&self) -> anyhow::Result<u64> {
+    pub async fn prune_expired_push_entries(&self) -> anyhow::Result<u64> {
         let now = iroh_social_types::now_millis();
-        self.with_db(|db| {
-            let count = db.execute(
-                "DELETE FROM push_outbox WHERE expires_at < ?1 OR attempts >= max_attempts",
-                params![now as i64],
-            )?;
-            Ok(count as u64)
-        })
+        let result = sqlx::query(
+            "DELETE FROM push_outbox WHERE expires_at < ?1 OR attempts >= max_attempts",
+        )
+        .bind(now as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

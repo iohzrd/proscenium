@@ -62,31 +62,33 @@ pub async fn add_server(
     url: String,
 ) -> Result<ServerEntry, String> {
     let url = url.trim_end_matches('/').to_string();
-    state.storage.add_server(&url).str_err()?;
+    state.storage.add_server(&url).await.str_err()?;
 
     // Try to fetch server info
     if let Ok(info) = fetch_server_info_inner(&url).await {
         state
             .storage
             .update_server_info(&url, &info.name, &info.description, &info.node_id)
+            .await
             .str_err()?;
     }
 
     state
         .storage
         .get_server(&url)
+        .await
         .str_err()?
         .ok_or_else(|| "server not found after adding".to_string())
 }
 
 #[tauri::command]
 pub async fn remove_server(state: State<'_, Arc<AppState>>, url: String) -> Result<(), String> {
-    state.storage.remove_server(&url).str_err()
+    state.storage.remove_server(&url).await.str_err()
 }
 
 #[tauri::command]
 pub async fn list_servers(state: State<'_, Arc<AppState>>) -> Result<Vec<ServerEntry>, String> {
-    state.storage.get_servers().str_err()
+    state.storage.get_servers().await.str_err()
 }
 
 #[tauri::command]
@@ -98,6 +100,7 @@ pub async fn refresh_server_info(
     state
         .storage
         .update_server_info(&url, &info.name, &info.description, &info.node_id)
+        .await
         .str_err()?;
     Ok(info)
 }
@@ -151,6 +154,7 @@ pub async fn register_with_server(
     state
         .storage
         .mark_server_registered(&url, &vis.to_string())
+        .await
         .str_err()?;
 
     // Auto-sync profile to the server after registration
@@ -203,7 +207,7 @@ pub async fn unregister_from_server(
         return Err(format!("unregistration failed ({status}): {body}"));
     }
 
-    state.storage.mark_server_unregistered(&url).str_err()
+    state.storage.mark_server_unregistered(&url).await.str_err()
 }
 
 #[tauri::command]
@@ -411,12 +415,14 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
     let profile = state
         .storage
         .get_profile(&master_pubkey)
+        .await
         .str_err()?
         .ok_or("no profile to sync")?;
 
     let vis = state
         .storage
         .get_server(url)
+        .await
         .str_err()?
         .map(|s| s.visibility)
         .unwrap_or_else(|| "public".to_string());

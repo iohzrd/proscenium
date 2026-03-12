@@ -14,15 +14,20 @@ pub async fn get_notifications(
     state
         .storage
         .get_notifications(limit.unwrap_or(DEFAULT_NOTIFICATION_LIMIT), before)
+        .await
         .str_err()
 }
 
 #[tauri::command]
 pub async fn get_unread_notification_count(state: State<'_, Arc<AppState>>) -> Result<u32, String> {
-    state.storage.get_unread_notification_count().str_err()
+    state
+        .storage
+        .get_unread_notification_count()
+        .await
+        .str_err()
 }
 
 #[tauri::command]
 pub async fn mark_notifications_read(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    state.storage.mark_notifications_read().str_err()
+    state.storage.mark_notifications_read().await.str_err()
 }

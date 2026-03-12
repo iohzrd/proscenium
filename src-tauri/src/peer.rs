@@ -60,8 +60,13 @@ impl PeerHandler {
     }
 
     /// Build an IdentityResponse for this node.
-    fn identity_response(&self) -> IdentityResponse {
-        let profile = self.storage.get_profile(&self.master_pubkey).ok().flatten();
+    async fn identity_response(&self) -> IdentityResponse {
+        let profile = self
+            .storage
+            .get_profile(&self.master_pubkey)
+            .await
+            .ok()
+            .flatten();
         IdentityResponse {
             master_pubkey: self.master_pubkey.clone(),
             delegation: self.delegation.clone(),
@@ -124,12 +129,15 @@ impl PeerHandler {
         }
 
         // Cache the peer's delegation and transport NodeId
-        let _ = self.storage.cache_peer_identity(&IdentityResponse {
-            master_pubkey: req.requester.clone(),
-            delegation: req.delegation.clone(),
-            transport_node_ids: vec![remote_str.to_string()],
-            profile: None,
-        });
+        let _ = self
+            .storage
+            .cache_peer_identity(&IdentityResponse {
+                master_pubkey: req.requester.clone(),
+                delegation: req.delegation.clone(),
+                transport_node_ids: vec![remote_str.to_string()],
+                profile: None,
+            })
+            .await;
 
         // Use master pubkey (permanent identity) for all storage lookups, not transport NodeId
         let requester_pubkey = &req.requester;
@@ -138,6 +146,7 @@ impl PeerHandler {
         let visibility = self
             .storage
             .get_visibility(&self.master_pubkey)
+            .await
             .unwrap_or(Visibility::Public);
 
         let response = match visibility {
@@ -146,34 +155,37 @@ impl PeerHandler {
                 if self
                     .storage
                     .is_approved_follower(requester_pubkey)
+                    .await
                     .unwrap_or(false)
                 {
                     log::info!(
                         "[follow-req] already approved: {}",
                         short_id(requester_pubkey)
                     );
-                    FollowResponse::Approved(Box::new(self.identity_response()))
+                    FollowResponse::Approved(Box::new(self.identity_response().await))
                 } else {
                     let now = now_millis();
                     let expires_at = now + FOLLOW_REQUEST_TTL_MS;
-                    match self.storage.insert_follow_request(
-                        requester_pubkey,
-                        req.timestamp,
-                        now,
-                        expires_at,
-                    ) {
+                    match self
+                        .storage
+                        .insert_follow_request(requester_pubkey, req.timestamp, now, expires_at)
+                        .await
+                    {
                         Ok(true) => {
                             log::info!(
                                 "[follow-req] stored pending request from {}",
                                 short_id(requester_pubkey)
                             );
-                            let _ = self.storage.insert_notification(
-                                "follow_request",
-                                requester_pubkey,
-                                None,
-                                None,
-                                now,
-                            );
+                            let _ = self
+                                .storage
+                                .insert_notification(
+                                    "follow_request",
+                                    requester_pubkey,
+                                    None,
+                                    None,
+                                    now,
+                                )
+                                .await;
                             let _ = self
                                 .app_handle
                                 .emit("follow-request-received", requester_pubkey);
@@ -182,7 +194,7 @@ impl PeerHandler {
                         }
                         Ok(false) => {
                             // Already approved (race condition)
-                            FollowResponse::Approved(Box::new(self.identity_response()))
+                            FollowResponse::Approved(Box::new(self.identity_response().await))
                         }
                         Err(e) => {
                             log::error!("[follow-req] failed to store request: {e}");
@@ -199,7 +211,7 @@ impl PeerHandler {
                     "[follow-req] auto-approving for public profile: {}",
                     short_id(requester_pubkey)
                 );
-                FollowResponse::Approved(Box::new(self.identity_response()))
+                FollowResponse::Approved(Box::new(self.identity_response().await))
             }
             Visibility::Private => {
                 // Private users deny follow requests
@@ -226,7 +238,7 @@ impl PeerHandler {
         mut send: iroh::endpoint::SendStream,
         conn: &Connection,
     ) -> Result<(), AcceptError> {
-        let response = PeerResponse::Identity(self.identity_response());
+        let response = PeerResponse::Identity(self.identity_response().await);
 
         let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
         send.write_all(&resp_bytes)
@@ -283,7 +295,7 @@ impl PeerHandler {
         })?;
 
         // Derive a transport key for the new device
-        let new_device_index = self.storage.next_device_index().map_err(|e| {
+        let new_device_index = self.storage.next_device_index().await.map_err(|e| {
             AcceptError::from_err(std::io::Error::other(format!(
                 "failed to get next device index: {e}"
             )))
@@ -309,6 +321,7 @@ impl PeerHandler {
                 new_device_index,
                 master_key_to_send,
             )
+            .await
             .map_err(|e| {
                 AcceptError::from_err(std::io::Error::other(format!(
                     "failed to export link bundle: {e}"
@@ -342,13 +355,11 @@ impl PeerHandler {
 
         let device_name = format!("Device {}", new_device_index);
         let now = now_millis();
-        if let Err(e) = self.storage.upsert_linked_device(
-            &new_transport_node_id,
-            &device_name,
-            false,
-            false,
-            now,
-        ) {
+        if let Err(e) = self
+            .storage
+            .upsert_linked_device(&new_transport_node_id, &device_name, false, false, now)
+            .await
+        {
             log::error!("[link] failed to register new device: {e}");
         } else {
             log::info!(
@@ -359,7 +370,7 @@ impl PeerHandler {
         }
 
         // Build and broadcast updated announcement with all devices
-        if let Ok(all_devices) = self.storage.get_linked_devices() {
+        if let Ok(all_devices) = self.storage.get_linked_devices().await {
             let signing_sk = iroh::SecretKey::from_bytes(&self.signing_secret_key_bytes);
             let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
                 master_pubkey: self.master_pubkey.clone(),
@@ -401,7 +412,7 @@ impl ProtocolHandler for PeerHandler {
         let remote_str = remote.to_string();
 
         // Reject blocked peers
-        if self.storage.is_blocked(&remote_str).unwrap_or(false) {
+        if self.storage.is_blocked(&remote_str).await.unwrap_or(false) {
             log::warn!("[peer] rejecting blocked peer {}", short_id(&remote_str));
             return Err(AcceptError::from_err(std::io::Error::other("blocked")));
         }
@@ -518,7 +529,7 @@ pub async fn send_follow_request(
 
     // Cache the responder's identity if approved
     if let FollowResponse::Approved(ref identity) = response {
-        let _ = storage.cache_peer_identity(identity);
+        let _ = storage.cache_peer_identity(identity).await;
     }
 
     Ok(response)
