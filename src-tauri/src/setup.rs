@@ -586,7 +586,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let dm_pubkey_clone = dm_pubkey.clone();
     let delegation_clone = delegation.clone();
     let db_path = data_dir.join("social.db");
-    tauri::async_runtime::spawn(async move {
+    tauri::async_runtime::block_on(async move {
         let storage_clone = Arc::new(
             Storage::open(&db_path)
                 .await
