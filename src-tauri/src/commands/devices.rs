@@ -186,35 +186,40 @@ pub async fn link_with_device(
     let signing_key_bytes = b64
         .decode(&bundle.signing_secret_key)
         .map_err(|e| format!("invalid signing key: {e}"))?;
-    std::fs::write(data_dir.join("signing_key.key"), &signing_key_bytes)
+    tokio::fs::write(data_dir.join("signing_key.key"), &signing_key_bytes)
+        .await
         .map_err(|e| format!("failed to save signing key: {e}"))?;
 
     // Save the signing key index so setup.rs re-derives the correct key on restart
-    std::fs::write(
+    tokio::fs::write(
         data_dir.join("signing_key_index"),
         bundle.delegation.key_index.to_string(),
     )
+    .await
     .map_err(|e| format!("failed to save signing_key_index: {e}"))?;
 
     // Save the DM key index so setup.rs re-derives the correct DM key on restart
-    std::fs::write(
+    tokio::fs::write(
         data_dir.join("dm_key_index"),
         bundle.delegation.dm_key_index.to_string(),
     )
+    .await
     .map_err(|e| format!("failed to save dm_key_index: {e}"))?;
 
     // Save the transport key for this device
     let transport_key_bytes = b64
         .decode(&bundle.transport_secret_key)
         .map_err(|e| format!("invalid transport key: {e}"))?;
-    std::fs::write(data_dir.join("transport_key.key"), &transport_key_bytes)
+    tokio::fs::write(data_dir.join("transport_key.key"), &transport_key_bytes)
+        .await
         .map_err(|e| format!("failed to save transport key: {e}"))?;
 
     // Save device index
-    std::fs::write(
+    tokio::fs::write(
         data_dir.join("device_index"),
         bundle.device_index.to_string(),
     )
+    .await
     .map_err(|e| format!("failed to save device index: {e}"))?;
 
     // Optionally save the master key
@@ -222,7 +227,8 @@ pub async fn link_with_device(
         let master_bytes = b64
             .decode(master_key_b64)
             .map_err(|e| format!("invalid master key: {e}"))?;
-        std::fs::write(data_dir.join("master_key.key"), &master_bytes)
+        tokio::fs::write(data_dir.join("master_key.key"), &master_bytes)
+            .await
             .map_err(|e| format!("failed to save master key: {e}"))?;
     }
 

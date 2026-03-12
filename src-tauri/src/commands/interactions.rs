@@ -1,7 +1,7 @@
 use crate::ext::ResultExt;
-use crate::state::{AppState, generate_id};
+use crate::state::AppState;
 use crate::storage::PostCounts;
-use iroh::SecretKey;
+use crate::util::generate_id;
 use iroh_social_types::{
     Interaction, InteractionKind, Post, now_millis, sign_delete_interaction, sign_delete_post,
     sign_interaction, sign_post, validate_post,
@@ -25,15 +25,17 @@ pub async fn like_post(
         timestamp: now_millis(),
         signature: String::new(),
     };
-    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-    sign_interaction(&mut interaction, &sk);
+    sign_interaction(&mut interaction, &state.signing_key);
     state
         .storage
         .save_interaction(&interaction)
         .await
         .str_err()?;
-    let feed = state.feed.read().await;
-    feed.broadcast_interaction(&interaction).await.str_err()?;
+    state
+        .gossip
+        .broadcast_interaction(&interaction)
+        .await
+        .str_err()?;
     Ok(interaction)
 }
 
@@ -49,10 +51,10 @@ pub async fn unlike_post(
         .await
         .str_err()?;
     if let Some(id) = id {
-        let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-        let signature = sign_delete_interaction(&id, &my_id, &sk);
-        let feed = state.feed.read().await;
-        feed.broadcast_delete_interaction(&id, &my_id, &signature)
+        let signature = sign_delete_interaction(&id, &my_id, &state.signing_key);
+        state
+            .gossip
+            .broadcast_delete_interaction(&id, &my_id, &signature)
             .await
             .str_err()?;
     }
@@ -81,12 +83,10 @@ pub async fn repost(
 
     validate_post(&post)?;
 
-    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-    sign_post(&mut post, &sk);
+    sign_post(&mut post, &state.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
-    let feed = state.feed.read().await;
-    feed.broadcast_post(&post).await.str_err()?;
+    state.gossip.broadcast_post(&post).await.str_err()?;
     Ok(post)
 }
 
@@ -102,10 +102,10 @@ pub async fn unrepost(
         .await
         .str_err()?;
     if let Some(id) = id {
-        let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-        let signature = sign_delete_post(&id, &my_id, &sk);
-        let feed = state.feed.read().await;
-        feed.broadcast_delete(&id, &my_id, &signature)
+        let signature = sign_delete_post(&id, &my_id, &state.signing_key);
+        state
+            .gossip
+            .broadcast_delete(&id, &my_id, &signature)
             .await
             .str_err()?;
     }

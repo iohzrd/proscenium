@@ -13,6 +13,7 @@ mod setup;
 mod state;
 mod storage;
 mod sync;
+mod util;
 
 use commands::*;
 
@@ -143,6 +144,15 @@ pub fn run() {
             get_linked_devices,
             force_device_sync,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            use tauri::Manager;
+            if let tauri::RunEvent::Exit = event
+                && let Some(state) = app.try_state::<std::sync::Arc<crate::state::AppState>>()
+            {
+                log::info!("[shutdown] cancelling background tasks");
+                state.shutdown_token.cancel();
+            }
+        });
 }

@@ -1,5 +1,5 @@
-use crate::commands::sync::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
+use crate::sync::{process_incoming_interaction, process_incoming_post};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
 use iroh_social_types::{
     MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,

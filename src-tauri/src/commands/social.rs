@@ -4,8 +4,6 @@ use iroh_social_types::{FollowEntry, FollowerEntry, now_millis, short_id};
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
-use super::sync::process_sync_result;
-
 /// Resolve a peer's identity from a transport NodeId.
 /// Connects to the peer, queries identity, caches the result.
 async fn resolve_peer_identity(
@@ -72,47 +70,29 @@ pub async fn follow_user(
     };
     state.storage.follow(&entry).await.str_err()?;
 
-    {
-        let mut feed = state.feed.write().await;
-        feed.follow_user(pubkey.clone(), &node_ids)
-            .await
-            .str_err()?;
-    }
+    state
+        .gossip
+        .follow_user(pubkey.clone(), node_ids.clone())
+        .await
+        .str_err()?;
     log::info!("[follow] subscribed to gossip for {}", short_id(&pubkey));
 
-    // Sync posts using the first available transport NodeId
+    // Sync posts from the followed peer
     log::info!("[follow] syncing posts from {}...", short_id(&pubkey));
-    let endpoint = state.endpoint.clone();
-    let storage = state.storage.clone();
-    if let Some(first_node_id) = node_ids.first()
-        && let Ok(target) = first_node_id.parse::<iroh::EndpointId>()
+    if let Err(e) = crate::sync::sync_one_peer(
+        &state.endpoint,
+        &state.storage,
+        &pubkey,
+        &my_id,
+        &app_handle,
+        "follow-sync",
+    )
+    .await
     {
-        match crate::sync::sync_from_peer(&endpoint, &storage, target, &pubkey).await {
-            Ok(result) => {
-                let stored = process_sync_result(
-                    &storage,
-                    &pubkey,
-                    &result,
-                    "follow-sync",
-                    &my_id,
-                    &app_handle,
-                )
-                .await;
-                log::info!(
-                    "[follow-sync] stored {stored}/{} posts, {} interactions from {} (mode={:?})",
-                    result.posts.len(),
-                    result.interactions.len(),
-                    short_id(&pubkey),
-                    result.mode,
-                );
-            }
-            Err(e) => {
-                log::error!(
-                    "[follow-sync] failed to sync from {}: {e}",
-                    short_id(&pubkey)
-                );
-            }
-        }
+        log::error!(
+            "[follow-sync] failed to sync from {}: {e}",
+            short_id(&pubkey)
+        );
     }
 
     Ok(())
@@ -122,8 +102,7 @@ pub async fn follow_user(
 pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Result<(), String> {
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
     state.storage.unfollow(&pubkey).await.str_err()?;
-    let mut feed = state.feed.write().await;
-    feed.unfollow_user(&pubkey);
+    state.gossip.unfollow_user(&pubkey);
     let deleted = state
         .storage
         .delete_posts_by_author(&pubkey)

@@ -1,4 +1,4 @@
-use crate::framing::{read_frame, write_frame_anyhow};
+use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
 use iroh::protocol::AcceptError;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection};
@@ -74,7 +74,7 @@ pub async fn handle_device_sync(
     .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
 
     // End-of-stream marker
-    write_frame_anyhow(&mut data_send, &[])
+    write_frame(&mut data_send, &[])
         .await
         .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
     data_send.finish().map_err(AcceptError::from_err)?;
@@ -159,7 +159,7 @@ pub async fn sync_with_device(
     .await?;
 
     // End-of-stream marker
-    write_frame_anyhow(&mut data_send, &[]).await?;
+    write_frame(&mut data_send, &[]).await?;
     data_send.finish()?;
 
     conn.close(0u32.into(), b"done");
@@ -207,7 +207,7 @@ async fn send_deltas(
             offset += batch.len();
             let frame = DeviceSyncFrame::Posts(batch);
             let frame_bytes = serde_json::to_vec(&frame)?;
-            write_frame_anyhow(data_send, &frame_bytes).await?;
+            write_frame(data_send, &frame_bytes).await?;
         }
     }
 
@@ -236,7 +236,7 @@ async fn send_deltas(
             offset += batch.len();
             let frame = DeviceSyncFrame::Interactions(batch);
             let frame_bytes = serde_json::to_vec(&frame)?;
-            write_frame_anyhow(data_send, &frame_bytes).await?;
+            write_frame(data_send, &frame_bytes).await?;
         }
     }
 
@@ -255,7 +255,7 @@ async fn send_deltas(
     if !follow_deltas.is_empty() {
         let frame = DeviceSyncFrame::Follows(follow_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame_anyhow(data_send, &frame_bytes).await?;
+        write_frame(data_send, &frame_bytes).await?;
     }
 
     // Mutes: send newer entries
@@ -273,7 +273,7 @@ async fn send_deltas(
     if !mute_deltas.is_empty() {
         let frame = DeviceSyncFrame::Mutes(mute_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame_anyhow(data_send, &frame_bytes).await?;
+        write_frame(data_send, &frame_bytes).await?;
     }
 
     // Blocks: send newer entries
@@ -291,7 +291,7 @@ async fn send_deltas(
     if !block_deltas.is_empty() {
         let frame = DeviceSyncFrame::Blocks(block_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame_anyhow(data_send, &frame_bytes).await?;
+        write_frame(data_send, &frame_bytes).await?;
     }
 
     // Bookmarks: send ones the peer doesn't have
@@ -304,7 +304,7 @@ async fn send_deltas(
     if !bookmark_deltas.is_empty() {
         let frame = DeviceSyncFrame::Bookmarks(bookmark_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame_anyhow(data_send, &frame_bytes).await?;
+        write_frame(data_send, &frame_bytes).await?;
     }
 
     // Ratchet sessions: send sessions with updated_at newer than what peer reports
@@ -324,7 +324,7 @@ async fn send_deltas(
     if !ratchet_deltas.is_empty() {
         let frame = DeviceSyncFrame::RatchetSessions(ratchet_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame_anyhow(data_send, &frame_bytes).await?;
+        write_frame(data_send, &frame_bytes).await?;
     }
 
     Ok(())

@@ -7,12 +7,69 @@ use tokio::sync::Mutex;
 
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"')\]]+"#).unwrap());
 
-static CACHE: LazyLock<Mutex<HashMap<String, Option<LinkPreview>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
 const MAX_PREVIEWS: usize = 3;
 const MAX_CACHE_ENTRIES: usize = 512;
 const MAX_BODY_BYTES: usize = 512 * 1024;
+const CACHE_TTL_SECS: u64 = 3600; // 1 hour
+
+struct CacheEntry {
+    value: Option<LinkPreview>,
+    inserted_at: u64,
+}
+
+pub struct OgCache {
+    entries: Mutex<HashMap<String, CacheEntry>>,
+}
+
+impl OgCache {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub async fn get_link_preview(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Option<LinkPreview> {
+        let now = iroh_social_types::now_millis() / 1000;
+
+        // Check cache
+        {
+            let cache = self.entries.lock().await;
+            if let Some(entry) = cache.get(url)
+                && now - entry.inserted_at < CACHE_TTL_SECS
+            {
+                return entry.value.clone();
+            }
+        }
+
+        let result = fetch_og(client, url).await;
+
+        // Cache the result (including None to avoid re-fetching failures)
+        let mut cache = self.entries.lock().await;
+
+        // Evict expired entries first, then oldest half if still over capacity
+        cache.retain(|_, entry| now - entry.inserted_at < CACHE_TTL_SECS);
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            let evict: Vec<String> = cache.keys().take(MAX_CACHE_ENTRIES / 2).cloned().collect();
+            for k in evict {
+                cache.remove(&k);
+            }
+        }
+
+        cache.insert(
+            url.to_string(),
+            CacheEntry {
+                value: result.clone(),
+                inserted_at: now,
+            },
+        );
+
+        result
+    }
+}
 
 pub fn extract_urls(content: &str) -> Vec<String> {
     URL_RE
@@ -20,28 +77,6 @@ pub fn extract_urls(content: &str) -> Vec<String> {
         .map(|m| m.as_str().to_string())
         .take(MAX_PREVIEWS)
         .collect()
-}
-
-pub async fn get_link_preview(client: &reqwest::Client, url: &str) -> Option<LinkPreview> {
-    // Check cache
-    if let Some(cached) = CACHE.lock().await.get(url) {
-        return cached.clone();
-    }
-
-    let result = fetch_og(client, url).await;
-
-    // Cache the result (including None to avoid re-fetching failures)
-    let mut cache = CACHE.lock().await;
-    if cache.len() >= MAX_CACHE_ENTRIES {
-        // Evict oldest half when at capacity (simple but effective)
-        let evict: Vec<String> = cache.keys().take(MAX_CACHE_ENTRIES / 2).cloned().collect();
-        for k in evict {
-            cache.remove(&k);
-        }
-    }
-    cache.insert(url.to_string(), result.clone());
-
-    result
 }
 
 async fn fetch_og(client: &reqwest::Client, url: &str) -> Option<LinkPreview> {

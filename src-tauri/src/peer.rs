@@ -383,14 +383,10 @@ impl PeerHandler {
             iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
             if let Some(state) = self.app_handle.try_state::<Arc<crate::state::AppState>>() {
-                let feed = state.feed.clone();
+                let gossip = state.gossip.clone();
                 let announcement_clone = announcement.clone();
                 tokio::spawn(async move {
-                    let feed_lock = feed.read().await;
-                    if let Err(e) = feed_lock
-                        .broadcast_linked_devices(&announcement_clone)
-                        .await
-                    {
+                    if let Err(e) = gossip.broadcast_linked_devices(&announcement_clone).await {
                         log::error!("[link] failed to broadcast device announcement: {e}");
                     } else {
                         log::info!("[link] broadcast updated device announcement");

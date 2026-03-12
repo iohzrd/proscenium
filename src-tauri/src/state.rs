@@ -1,11 +1,21 @@
 use crate::dm::DmHandler;
-use crate::gossip::FeedManager;
+use crate::gossip::GossipHandle;
+use crate::opengraph::OgCache;
 use crate::storage::Storage;
-use iroh::{Endpoint, protocol::Router};
+use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+/// Commands that can be sent to the sync task to trigger on-demand syncs.
+#[allow(dead_code)]
+pub enum SyncCommand {
+    /// Sync a specific peer immediately.
+    SyncPeer(String),
+    /// Sync all followed peers immediately.
+    SyncAll,
+}
 
 /// Active device-linking session on the existing device.
 /// Created when the user taps "Link New Device", consumed when a new device connects.
@@ -31,7 +41,7 @@ pub struct AppState {
     pub blobs: BlobsProtocol,
     pub store: FsStore,
     pub storage: Arc<Storage>,
-    pub feed: Arc<RwLock<FeedManager>>,
+    pub gossip: GossipHandle,
     pub dm: DmHandler,
     /// Master key secret bytes (permanent identity, cold storage).
     pub master_secret_key_bytes: [u8; 32],
@@ -39,6 +49,8 @@ pub struct AppState {
     pub master_pubkey: String,
     /// Signing key secret bytes (derived from master, signs content).
     pub signing_secret_key_bytes: [u8; 32],
+    /// Pre-constructed signing SecretKey (avoids repeated from_bytes).
+    pub signing_key: SecretKey,
     /// Signing public key string.
     #[allow(dead_code)]
     pub signing_pubkey: String,
@@ -56,19 +68,12 @@ pub struct AppState {
     pub pending_link: PendingLinkState,
     /// Shared HTTP client for server API calls and link preview fetching.
     pub http_client: reqwest::Client,
+    /// Cache for OpenGraph link previews (TTL-based eviction).
+    pub og_cache: OgCache,
+    /// Send commands to the sync task (trigger on-demand syncs).
+    #[allow(dead_code)]
+    pub sync_tx: mpsc::Sender<SyncCommand>,
     /// Cancellation token for graceful shutdown of background tasks.
     /// Held here so child tokens stay alive; cancel via `shutdown_token.cancel()`.
-    #[allow(dead_code)]
     pub shutdown_token: CancellationToken,
-}
-
-pub fn generate_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("failed to generate random bytes");
-    let (a, b) = bytes.split_at(8);
-    format!(
-        "{:016x}{:016x}",
-        u64::from_le_bytes(a.try_into().unwrap()),
-        u64::from_le_bytes(b.try_into().unwrap())
-    )
 }

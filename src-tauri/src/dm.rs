@@ -31,6 +31,8 @@ pub struct DmHandler {
     my_dm_pubkey_str: String,
     /// Key derived from DM secret for encrypting ratchet state at rest.
     ratchet_storage_key: [u8; 32],
+    /// Notify the outbox flush task when a message is queued.
+    outbox_notify: Arc<tokio::sync::Notify>,
 }
 
 impl DmHandler {
@@ -40,6 +42,7 @@ impl DmHandler {
         dm_secret: [u8; 32],
         master_pubkey_str: String,
         dm_pubkey_str: String,
+        outbox_notify: Arc<tokio::sync::Notify>,
     ) -> Self {
         let (my_x25519_private, my_x25519_public) = x25519_keypair_from_raw(&dm_secret);
 
@@ -58,6 +61,7 @@ impl DmHandler {
             my_master_pubkey_str: master_pubkey_str,
             my_dm_pubkey_str: dm_pubkey_str,
             ratchet_storage_key,
+            outbox_notify,
         }
     }
 
@@ -259,6 +263,7 @@ impl DmHandler {
                         &message_id,
                     )
                     .await?;
+                self.outbox_notify.notify_one();
             }
         }
 
@@ -600,9 +605,21 @@ impl ProtocolHandler for DmHandler {
         let remote_str = remote.to_string();
         log::info!("[dm] incoming connection from {}", short_id(&remote_str));
 
+        // Resolve transport NodeId to master pubkey for block check
+        let remote_pubkey = self
+            .storage
+            .get_master_pubkey_for_transport(&remote_str)
+            .await
+            .unwrap_or_else(|| remote_str.clone());
+
         // Reject blocked peers
-        if self.storage.is_blocked(&remote_str).await.unwrap_or(false) {
-            log::warn!("[dm] rejecting blocked peer {}", short_id(&remote_str));
+        if self
+            .storage
+            .is_blocked(&remote_pubkey)
+            .await
+            .unwrap_or(false)
+        {
+            log::warn!("[dm] rejecting blocked peer {}", short_id(&remote_pubkey));
             return Err(AcceptError::from_err(std::io::Error::other("blocked")));
         }
 

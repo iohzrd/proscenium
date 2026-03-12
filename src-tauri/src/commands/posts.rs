@@ -1,7 +1,7 @@
 use crate::ext::ResultExt;
-use crate::state::{AppState, generate_id};
+use crate::state::AppState;
 use crate::storage::FeedQuery;
-use iroh::SecretKey;
+use crate::util::generate_id;
 use iroh_social_types::{
     LinkPreview, MediaAttachment, Post, now_millis, sign_delete_post, sign_post, validate_post,
 };
@@ -39,8 +39,7 @@ pub async fn create_post(
     validate_post(&post)?;
 
     // Sign with signing key (not master key)
-    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-    sign_post(&mut post, &sk);
+    sign_post(&mut post, &state.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
     log::info!(
@@ -48,8 +47,7 @@ pub async fn create_post(
         &post.id,
         media_count
     );
-    let feed = state.feed.read().await;
-    feed.broadcast_post(&post).await.str_err()?;
+    state.gossip.broadcast_post(&post).await.str_err()?;
     log::info!("[post] broadcast post {}", &post.id);
 
     Ok(post)
@@ -71,13 +69,13 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
     }
 
     // Sign the delete action
-    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-    let signature = sign_delete_post(&id, my_id, &sk);
+    let signature = sign_delete_post(&id, my_id, &state.signing_key);
 
     let removed = state.storage.delete_post(&id).await.str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
-    let feed = state.feed.read().await;
-    feed.broadcast_delete(&id, my_id, &signature)
+    state
+        .gossip
+        .broadcast_delete(&id, my_id, &signature)
         .await
         .str_err()?;
     log::info!("[post] broadcast delete {id}");
@@ -151,7 +149,11 @@ pub async fn fetch_link_previews(
     let urls = crate::opengraph::extract_urls(&content);
     let mut previews = Vec::new();
     for url in &urls {
-        if let Some(preview) = crate::opengraph::get_link_preview(&state.http_client, url).await {
+        if let Some(preview) = state
+            .og_cache
+            .get_link_preview(&state.http_client, url)
+            .await
+        {
             previews.push(preview);
         }
     }

@@ -1,7 +1,6 @@
-use crate::commands::sync::process_sync_result;
 use crate::constants::*;
 use crate::dm::DmHandler;
-use crate::gossip::FeedManager;
+use crate::gossip::{GossipActor, GossipHandle};
 use crate::peer::PeerHandler;
 use crate::push;
 use crate::state::AppState;
@@ -16,7 +15,6 @@ use iroh_social_types::{
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 /// Load raw key bytes from a file, or generate new ones.
@@ -73,24 +71,6 @@ async fn sync_peer_posts(
     my_id: &str,
     handle: &AppHandle,
 ) {
-    // Resolve transport NodeId from peer delegation cache
-    let node_ids = storage
-        .get_peer_transport_node_ids(pubkey)
-        .await
-        .unwrap_or_default();
-    let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
-        match first.parse() {
-            Ok(t) => t,
-            Err(_) => return,
-        }
-    } else {
-        log::warn!(
-            "[startup-sync] no cached transport NodeIds for {}, skipping",
-            short_id(pubkey)
-        );
-        return;
-    };
-
     for attempt in 1..=SYNC_MAX_RETRIES {
         log::info!(
             "[startup-sync] syncing from {} (attempt {}/{})...",
@@ -98,54 +78,20 @@ async fn sync_peer_posts(
             attempt,
             SYNC_MAX_RETRIES,
         );
-        let start = std::time::Instant::now();
-        let result = tokio::time::timeout(
-            SYNC_TIMEOUT,
-            sync::sync_from_peer(endpoint, storage, target, pubkey),
-        )
-        .await;
-        let elapsed = start.elapsed();
-
-        match result {
-            Ok(Ok(sync_result)) => {
-                let stored = process_sync_result(
-                    storage,
-                    pubkey,
-                    &sync_result,
-                    "startup-sync",
-                    my_id,
-                    handle,
-                )
-                .await;
-
-                if stored > 0 || sync_result.profile.is_some() {
+        match sync::sync_one_peer(endpoint, storage, pubkey, my_id, handle, "startup-sync").await {
+            Ok(result) => {
+                if result.stored > 0 || result.profile.is_some() {
                     let _ = handle.emit("feed-updated", ());
                 }
-                log::info!(
-                    "[startup-sync] stored {stored}/{} posts from {} in {:.1}s (mode={:?})",
-                    sync_result.posts.len(),
-                    short_id(pubkey),
-                    elapsed.as_secs_f64(),
-                    sync_result.mode,
-                );
                 return;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
                 log::error!(
-                    "[startup-sync] attempt {attempt} failed for {} after {:.1}s: {e:?}",
+                    "[startup-sync] attempt {attempt} failed for {}: {e}",
                     short_id(pubkey),
-                    elapsed.as_secs_f64()
-                );
-            }
-            Err(_) => {
-                log::error!(
-                    "[startup-sync] attempt {attempt} timed out for {} after {:.1}s",
-                    short_id(pubkey),
-                    elapsed.as_secs_f64()
                 );
             }
         }
-
         if attempt < SYNC_MAX_RETRIES {
             let delay = attempt as u64 * 5;
             log::info!(
@@ -161,11 +107,13 @@ async fn dm_outbox_flush_task(
     dm_handler: DmHandler,
     endpoint: Endpoint,
     storage: Arc<Storage>,
+    outbox_notify: Arc<tokio::sync::Notify>,
     token: CancellationToken,
 ) {
     loop {
         tokio::select! {
             _ = token.cancelled() => break,
+            _ = outbox_notify.notified() => {}
             _ = tokio::time::sleep(OUTBOX_FLUSH_INTERVAL) => {}
         }
         let peers = match storage.get_all_outbox_peers().await {
@@ -198,19 +146,17 @@ async fn push_outbox_flush_task(
     my_id: String,
     token: CancellationToken,
 ) {
-    let mut last_prune = std::time::Instant::now();
     loop {
         tokio::select! {
             _ = token.cancelled() => break,
             _ = tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL) => {}
         }
 
-        // Flush push outbox
         let peers = match storage.get_push_outbox_peers().await {
             Ok(p) => p,
             Err(e) => {
                 log::error!("[push-outbox] failed to get peers: {e}");
-                Vec::new()
+                continue;
             }
         };
         for peer in peers {
@@ -264,7 +210,6 @@ async fn push_outbox_flush_task(
                 interaction_outbox_ids.push(*outbox_id);
             }
 
-            // Include profile if there are profile-only entries
             let profile = if !profile_entries.is_empty() {
                 storage.get_profile(&my_id).await.ok().flatten()
             } else {
@@ -322,28 +267,32 @@ async fn push_outbox_flush_task(
                 let _ = storage.mark_push_attempted(&all_ids).await;
             }
         }
+    }
+}
 
-        // Hourly housekeeping: prune expired push entries and follow requests
-        if last_prune.elapsed() >= HOUSEKEEPING_INTERVAL {
-            last_prune = std::time::Instant::now();
-            match storage.prune_expired_push_entries().await {
-                Ok(count) if count > 0 => {
-                    log::info!("[housekeeping] pruned {count} expired push entries");
-                }
-                Err(e) => {
-                    log::error!("[housekeeping] push prune error: {e}");
-                }
-                _ => {}
+async fn housekeeping_task(storage: Arc<Storage>, token: CancellationToken) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(HOUSEKEEPING_INTERVAL) => {}
+        }
+        match storage.prune_expired_push_entries().await {
+            Ok(count) if count > 0 => {
+                log::info!("[housekeeping] pruned {count} expired push entries");
             }
-            match storage.prune_expired_follow_requests().await {
-                Ok(count) if count > 0 => {
-                    log::info!("[housekeeping] pruned {count} expired follow requests");
-                }
-                Err(e) => {
-                    log::error!("[housekeeping] follow request prune error: {e}");
-                }
-                _ => {}
+            Err(e) => {
+                log::error!("[housekeeping] push prune error: {e}");
             }
+            _ => {}
+        }
+        match storage.prune_expired_follow_requests().await {
+            Ok(count) if count > 0 => {
+                log::info!("[housekeeping] pruned {count} expired follow requests");
+            }
+            Err(e) => {
+                log::error!("[housekeeping] follow request prune error: {e}");
+            }
+            _ => {}
         }
     }
 }
@@ -374,12 +323,7 @@ async fn device_sync_task(
     }
 }
 
-async fn network_health_task(
-    endpoint: Endpoint,
-    reconnect_tx: tokio::sync::mpsc::UnboundedSender<crate::gossip::ReconnectRequest>,
-    feed: Arc<RwLock<FeedManager>>,
-    token: CancellationToken,
-) {
+async fn network_health_task(endpoint: Endpoint, gossip: GossipHandle, token: CancellationToken) {
     let mut last_tick = std::time::Instant::now();
     let mut last_heartbeat = std::time::Instant::now();
     loop {
@@ -399,18 +343,186 @@ async fn network_health_task(
                 HEALTH_TICK_INTERVAL.as_secs_f64(),
             );
             endpoint.network_change().await;
-            let _ = reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
+            gossip.refresh_all();
         }
 
         // Heartbeat broadcast
         if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
             last_heartbeat = std::time::Instant::now();
-            let feed = feed.read().await;
-            if let Err(e) = feed.broadcast_heartbeat().await {
+            if let Err(e) = gossip.broadcast_heartbeat().await {
                 log::error!("[heartbeat] broadcast failed: {e}");
             }
         }
     }
+}
+
+/// Gossip follow subscriptions + startup sync + drip sync.
+/// All in one task so drip naturally starts after startup-sync finishes,
+/// avoiding concurrent syncs to the same peer.
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_and_sync_task(
+    gossip: GossipHandle,
+    endpoint: Endpoint,
+    storage: Arc<Storage>,
+    app_handle: AppHandle,
+    my_id: String,
+    follows: Vec<iroh_social_types::FollowEntry>,
+    mut sync_rx: tokio::sync::mpsc::Receiver<crate::state::SyncCommand>,
+    token: CancellationToken,
+) {
+    // Wait for relay connectivity before subscribing to follows
+    log::info!("[startup] waiting for relay connectivity...");
+    let mut has_relay = false;
+    for i in 0..RELAY_WAIT_ATTEMPTS {
+        if token.is_cancelled() {
+            log::info!("[startup] shutdown during relay wait");
+            return;
+        }
+        let addr = endpoint.addr();
+        if addr.relay_urls().next().is_some() {
+            log::info!("[startup] relay connected after {}s", i);
+            has_relay = true;
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(RELAY_CHECK_INTERVAL) => {}
+            _ = token.cancelled() => {
+                log::info!("[startup] shutdown during relay wait");
+                return;
+            }
+        }
+    }
+    if !has_relay {
+        log::error!("[startup] no relay after 10s, attempting subscriptions anyway");
+    }
+
+    // Subscribe to followed users' gossip topics
+    for f in &follows {
+        let node_ids = storage
+            .get_peer_transport_node_ids(&f.pubkey)
+            .await
+            .unwrap_or_default();
+        if node_ids.is_empty() {
+            log::warn!(
+                "[setup] no cached transport NodeIds for {}, skipping gossip subscribe",
+                short_id(&f.pubkey)
+            );
+            continue;
+        }
+        log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
+        if let Err(e) = gossip.follow_user(f.pubkey.clone(), node_ids).await {
+            log::error!(
+                "[setup] failed to resubscribe to {}: {e}",
+                short_id(&f.pubkey)
+            );
+        } else {
+            log::info!("[setup] resubscribed to {}", short_id(&f.pubkey));
+        }
+    }
+
+    // Startup sync: parallel fetch from all followed peers
+    log::info!("[startup-sync] waiting 5s for peers to be ready...");
+    tokio::select! {
+        _ = tokio::time::sleep(PEER_READY_DELAY) => {}
+        _ = token.cancelled() => {
+            log::info!("[startup-sync] shutdown before sync");
+            return;
+        }
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(SYNC_CONCURRENCY));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for f in &follows {
+        let ep = endpoint.clone();
+        let st = storage.clone();
+        let hdl = app_handle.clone();
+        let sem = semaphore.clone();
+        let mid = my_id.clone();
+        let pk = f.pubkey.clone();
+        join_set.spawn(async move {
+            let _permit = sem.acquire().await;
+            sync_peer_posts(&ep, &st, &pk, &mid, &hdl).await;
+        });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        if let Err(e) = result {
+            log::error!("[startup-sync] task panicked: {e}");
+        }
+    }
+    log::info!("[startup-sync] done, starting drip sync");
+
+    // Drip sync: periodic sync with all followed peers, interruptible by SyncCommand.
+    loop {
+        if token.is_cancelled() {
+            break;
+        }
+
+        // Wait for either a command or the idle interval, whichever comes first.
+        let cmd = tokio::select! {
+            _ = token.cancelled() => break,
+            cmd = tokio::time::timeout(DRIP_IDLE_INTERVAL, sync_rx.recv()) => {
+                match cmd {
+                    Ok(Some(cmd)) => Some(cmd),
+                    Ok(None) => break, // channel closed
+                    Err(_) => None,    // timeout => periodic drip
+                }
+            }
+        };
+
+        let peers_to_sync: Vec<String> = match cmd {
+            Some(crate::state::SyncCommand::SyncPeer(pubkey)) => vec![pubkey],
+            Some(crate::state::SyncCommand::SyncAll) | None => storage
+                .get_follows()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| f.pubkey)
+                .collect(),
+        };
+
+        let mut any_work = false;
+        for pubkey in &peers_to_sync {
+            if token.is_cancelled() {
+                break;
+            }
+
+            match sync::sync_one_peer(
+                &endpoint,
+                &storage,
+                pubkey,
+                &my_id,
+                &app_handle,
+                "drip-sync",
+            )
+            .await
+            {
+                Ok(result) if result.stored > 0 => {
+                    any_work = true;
+                    let _ = app_handle.emit("feed-updated", ());
+                }
+                Err(e) => {
+                    log::error!("[drip-sync] failed for {}: {e}", short_id(pubkey));
+                }
+                _ => {}
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(DRIP_PEER_PACE) => {}
+                _ = token.cancelled() => break,
+            }
+        }
+
+        // If work was done, use a shorter interval before the next round
+        if any_work && !token.is_cancelled() {
+            tokio::select! {
+                _ = tokio::time::sleep(DRIP_ACTIVE_INTERVAL) => {}
+                _ = token.cancelled() => break,
+            }
+        }
+    }
+    log::info!("[drip-sync] task exited cleanly");
 }
 
 pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -531,12 +643,14 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         log::info!("[setup] gossip started");
 
         // DM handler: dedicated X25519 key for Noise IK + Double Ratchet.
+        let dm_outbox_notify = Arc::new(tokio::sync::Notify::new());
         let dm_handler = DmHandler::new(
             storage_clone.clone(),
             handle.clone(),
             dm_secret_key_bytes,
             master_pubkey_clone.clone(),
             dm_pubkey_clone.clone(),
+            dm_outbox_notify.clone(),
         );
         // Shared pending link state for device pairing
         let pending_link: crate::state::PendingLinkState = Arc::new(tokio::sync::Mutex::new(None));
@@ -562,9 +676,10 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             .spawn();
         log::info!("[setup] router spawned");
 
-        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
-        let reconnect_tx_loop = reconnect_tx.clone();
-        let mut feed = FeedManager::new(
+        // The reconnect_tx is only needed for the initial GossipActor construction.
+        // The actor's run() loop creates its own internal reconnect channel.
+        let (reconnect_tx, _reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut actor = GossipActor::new(
             gossip,
             endpoint.clone(),
             master_pubkey_clone.clone(),
@@ -573,14 +688,15 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             reconnect_tx,
         );
 
-        if let Err(e) = feed.start_own_feed().await {
+        // Start own feed and broadcast profile before spawning the actor
+        if let Err(e) = actor.start_own_feed().await {
             log::error!("[setup] failed to start own feed: {e}");
         } else {
             log::info!("[setup] own gossip feed started");
         }
 
         if let Ok(Some(profile)) = storage_clone.get_profile(&master_pubkey_clone).await {
-            if let Err(e) = feed.broadcast_profile(&profile).await {
+            if let Err(e) = actor.broadcast_profile(&profile).await {
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
                 log::info!("[setup] broadcast profile: {}", profile.display_name);
@@ -613,175 +729,36 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             };
             sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
-            if let Err(e) = feed.broadcast_linked_devices(&announcement).await {
+            if let Err(e) = actor.broadcast_linked_devices(&announcement).await {
                 log::error!("[setup] failed to broadcast device announcement: {e}");
             } else {
                 log::info!("[setup] broadcast single-device announcement");
             }
         }
 
-        // Wrap feed in Arc<Mutex> early so the spawned subscription task can use it
-        let shared_feed = Arc::new(RwLock::new(feed));
-
-        // Gossip follow subscriptions + startup sync + drip sync
-        // All in one task so drip naturally starts after startup-sync finishes,
-        // avoiding concurrent syncs to the same peer.
-        let sync_feed = shared_feed.clone();
-        let sync_endpoint = endpoint.clone();
-        let sync_storage = storage_clone.clone();
-        let sync_handle = handle.clone();
-        let sync_my_id = master_pubkey_clone.clone();
-        let sync_follows = follows.clone();
-        tokio::spawn(async move {
-            // Wait for relay connectivity before subscribing to follows
-            log::info!("[startup] waiting for relay connectivity...");
-            let mut has_relay = false;
-            for i in 0..RELAY_WAIT_ATTEMPTS {
-                let addr = sync_endpoint.addr();
-                if addr.relay_urls().next().is_some() {
-                    log::info!("[startup] relay connected after {}s", i);
-                    has_relay = true;
-                    break;
-                }
-                tokio::time::sleep(RELAY_CHECK_INTERVAL).await;
-            }
-            if !has_relay {
-                log::error!("[startup] no relay after 10s, attempting subscriptions anyway");
-            }
-
-            // Subscribe to followed users' gossip topics
-            for f in &sync_follows {
-                let node_ids = sync_storage
-                    .get_peer_transport_node_ids(&f.pubkey)
-                    .await
-                    .unwrap_or_default();
-                if node_ids.is_empty() {
-                    log::warn!(
-                        "[setup] no cached transport NodeIds for {}, skipping gossip subscribe",
-                        short_id(&f.pubkey)
-                    );
-                    continue;
-                }
-                log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
-                let mut feed = sync_feed.write().await;
-                if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
-                    log::error!(
-                        "[setup] failed to resubscribe to {}: {e}",
-                        short_id(&f.pubkey)
-                    );
-                } else {
-                    log::info!("[setup] resubscribed to {}", short_id(&f.pubkey));
-                }
-            }
-
-            // Startup sync: parallel fetch from all followed peers
-            log::info!("[startup-sync] waiting 5s for peers to be ready...");
-            tokio::time::sleep(PEER_READY_DELAY).await;
-
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(SYNC_CONCURRENCY));
-            let mut join_set = tokio::task::JoinSet::new();
-
-            for f in sync_follows {
-                let ep = sync_endpoint.clone();
-                let st = sync_storage.clone();
-                let hdl = sync_handle.clone();
-                let sem = semaphore.clone();
-                let mid = sync_my_id.clone();
-                join_set.spawn(async move {
-                    let _permit = sem.acquire().await;
-                    sync_peer_posts(&ep, &st, &f.pubkey, &mid, &hdl).await;
-                });
-            }
-
-            while let Some(result) = join_set.join_next().await {
-                if let Err(e) = result {
-                    log::error!("[startup-sync] task panicked: {e}");
-                }
-            }
-            log::info!("[startup-sync] done, starting drip sync");
-
-            // Drip sync: sequential periodic sync with all followed peers
-            loop {
-                let follows = sync_storage.get_follows().await.unwrap_or_default();
-                let mut any_work = false;
-
-                for f in &follows {
-                    let node_ids = sync_storage
-                        .get_peer_transport_node_ids(&f.pubkey)
-                        .await
-                        .unwrap_or_default();
-                    let target: iroh::EndpointId = if let Some(first) = node_ids.first() {
-                        match first.parse() {
-                            Ok(t) => t,
-                            Err(_) => continue,
-                        }
-                    } else {
-                        continue;
-                    };
-
-                    log::info!("[drip-sync] syncing {}", short_id(&f.pubkey));
-
-                    let result = tokio::time::timeout(
-                        SYNC_TIMEOUT,
-                        sync::sync_from_peer(&sync_endpoint, &sync_storage, target, &f.pubkey),
-                    )
-                    .await;
-
-                    match result {
-                        Ok(Ok(sync_result)) => {
-                            if sync_result.posts.is_empty() && sync_result.interactions.is_empty() {
-                                log::info!("[drip-sync] {} up to date", short_id(&f.pubkey));
-                                continue;
-                            }
-
-                            let stored = process_sync_result(
-                                &sync_storage,
-                                &f.pubkey,
-                                &sync_result,
-                                "drip-sync",
-                                &sync_my_id,
-                                &sync_handle,
-                            )
-                            .await;
-
-                            if stored > 0 {
-                                any_work = true;
-                                let _ = sync_handle.emit("feed-updated", ());
-                            }
-
-                            log::info!(
-                                "[drip-sync] stored {stored}/{} posts from {} (mode={:?})",
-                                sync_result.posts.len(),
-                                short_id(&f.pubkey),
-                                sync_result.mode,
-                            );
-                        }
-                        Ok(Err(e)) => {
-                            log::error!("[drip-sync] failed for {}: {e}", short_id(&f.pubkey));
-                        }
-                        Err(_) => {
-                            log::error!("[drip-sync] timed out for {}", short_id(&f.pubkey));
-                        }
-                    }
-
-                    tokio::time::sleep(DRIP_PEER_PACE).await;
-                }
-
-                let delay = if any_work {
-                    DRIP_ACTIVE_INTERVAL
-                } else {
-                    DRIP_IDLE_INTERVAL
-                };
-                tokio::time::sleep(delay).await;
-            }
-        });
+        // Spawn the actor -- returns a cloneable handle
+        let gossip_handle = actor.spawn();
 
         let shutdown_token = CancellationToken::new();
+        let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(16);
+
+        // Gossip follow subscriptions + startup sync + drip sync
+        tokio::spawn(subscribe_and_sync_task(
+            gossip_handle.clone(),
+            endpoint.clone(),
+            storage_clone.clone(),
+            handle.clone(),
+            master_pubkey_clone.clone(),
+            follows.clone(),
+            sync_rx,
+            shutdown_token.child_token(),
+        ));
 
         tokio::spawn(dm_outbox_flush_task(
             dm_handler.clone(),
             endpoint.clone(),
             storage_clone.clone(),
+            dm_outbox_notify,
             shutdown_token.child_token(),
         ));
 
@@ -789,6 +766,11 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             endpoint.clone(),
             storage_clone.clone(),
             master_pubkey_clone.clone(),
+            shutdown_token.child_token(),
+        ));
+
+        tokio::spawn(housekeeping_task(
+            storage_clone.clone(),
             shutdown_token.child_token(),
         ));
 
@@ -802,8 +784,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
         tokio::spawn(network_health_task(
             endpoint.clone(),
-            reconnect_tx_loop.clone(),
-            shared_feed.clone(),
+            gossip_handle.clone(),
             shutdown_token.child_token(),
         ));
 
@@ -820,11 +801,12 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             blobs,
             store,
             storage: storage_clone,
-            feed: shared_feed,
+            gossip: gossip_handle,
             dm: dm_handler,
             master_secret_key_bytes,
             master_pubkey: master_pubkey_clone.clone(),
             signing_secret_key_bytes,
+            signing_key: SecretKey::from_bytes(&signing_secret_key_bytes),
             signing_pubkey: signing_pubkey_clone,
             signing_key_index,
             dm_pubkey: dm_pubkey_clone,
@@ -833,14 +815,9 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             delegation: delegation_clone,
             pending_link,
             http_client,
+            og_cache: crate::opengraph::OgCache::new(),
+            sync_tx,
             shutdown_token,
-        });
-
-        // Gossip reconnection loop: restarts dead gossip tasks on demand
-        let reconnect_feed = state.feed.clone();
-        tokio::spawn(async move {
-            crate::gossip::gossip_reconnect_loop(reconnect_rx, reconnect_feed, reconnect_tx_loop)
-                .await;
         });
 
         handle.manage(state);

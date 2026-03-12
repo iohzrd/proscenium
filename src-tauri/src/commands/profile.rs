@@ -1,7 +1,6 @@
 use crate::commands::servers::sync_profile_inner;
 use crate::ext::ResultExt;
 use crate::state::AppState;
-use iroh::SecretKey;
 use iroh_social_types::{Profile, Visibility, sign_profile, validate_profile};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -54,8 +53,7 @@ pub async fn save_my_profile(
     validate_profile(&profile)?;
 
     // Sign with signing key
-    let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-    sign_profile(&mut profile, &sk);
+    sign_profile(&mut profile, &state.signing_key);
 
     let old_visibility = state
         .storage
@@ -63,11 +61,11 @@ pub async fn save_my_profile(
         .await
         .unwrap_or(Visibility::Public);
 
-    let mut feed = state.feed.write().await;
-
     if old_visibility != new_visibility {
         // Handle gossip feed start/stop BEFORE saving new visibility
-        feed.handle_visibility_change(old_visibility, new_visibility, &profile)
+        state
+            .gossip
+            .handle_visibility_change(old_visibility, new_visibility, profile.clone())
             .await
             .str_err()?;
         log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
@@ -81,7 +79,7 @@ pub async fn save_my_profile(
     log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
 
     // Broadcast profile update (gossip for Public, push outbox for Listed/Private)
-    feed.broadcast_profile(&profile).await.str_err()?;
+    state.gossip.broadcast_profile(&profile).await.str_err()?;
 
     // Sync profile to all registered discovery servers
     if let Ok(servers) = state.storage.get_servers().await {
@@ -108,8 +106,7 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
     let addr = state.endpoint.addr();
     let relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let has_relay = relay_url.is_some();
-    let feed = state.feed.read().await;
-    let follow_count = feed.subscriptions.len();
+    let follow_count = state.gossip.get_subscription_count().await;
     let follower_count = state
         .storage
         .get_followers()

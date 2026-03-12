@@ -1,10 +1,15 @@
+use crate::constants::SYNC_TIMEOUT;
 use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, PublicKey, endpoint::Connection, protocol::AcceptError,
+};
 use iroh_social_types::{
     Interaction, PEER_ALPN, PeerRequest, Post, Profile, SyncFrame, SyncMode, SyncRequest,
-    SyncSummary, Visibility, short_id,
+    SyncSummary, Visibility, parse_mentions, short_id, validate_interaction, validate_post,
+    verify_interaction_signature, verify_post_signature,
 };
+use tauri::{AppHandle, Emitter};
 
 const BATCH_SIZE: usize = 200;
 
@@ -167,7 +172,9 @@ pub async fn handle_sync(
 
         let frame = SyncFrame::Posts(batch);
         let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(&mut data_send, &frame_bytes).await?;
+        write_frame(&mut data_send, &frame_bytes)
+            .await
+            .map_err(map_err)?;
     }
 
     // Stream interactions
@@ -202,12 +209,14 @@ pub async fn handle_sync(
 
             let frame = SyncFrame::Interactions(batch);
             let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-            write_frame(&mut data_send, &frame_bytes).await?;
+            write_frame(&mut data_send, &frame_bytes)
+                .await
+                .map_err(map_err)?;
         }
     }
 
     // End-of-stream marker
-    write_frame(&mut data_send, &[]).await?;
+    write_frame(&mut data_send, &[]).await.map_err(map_err)?;
     data_send.finish().map_err(AcceptError::from_err)?;
 
     log::info!(
@@ -389,4 +398,259 @@ pub async fn sync_from_peer(
         remote_post_count: summary.server_post_count,
         mode: summary.mode,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Ingestion helpers (moved from commands/sync.rs -- used by sync, gossip, push)
+// ---------------------------------------------------------------------------
+
+/// Resolve the signing public key for a peer from the delegation cache.
+/// Falls back to the master pubkey for backward compat with pre-delegation content.
+pub async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
+    // Try cached signing key first (from peer_delegations)
+    if let Ok(Some(signing_pubkey)) = storage.get_peer_signing_pubkey(master_pubkey).await
+        && let Ok(pk) = signing_pubkey.parse()
+    {
+        return Some(pk);
+    }
+    // Fall back to master pubkey (backward compat: pre-delegation content was signed by master key)
+    master_pubkey.parse().ok()
+}
+
+/// Validate, verify signature, and store a single incoming post.
+/// Returns `true` if the post was stored successfully.
+pub async fn process_incoming_post(
+    storage: &Storage,
+    post: &Post,
+    label: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+) -> bool {
+    if let Err(reason) = validate_post(post) {
+        log::error!("[{label}] rejected post {}: {reason}", &post.id);
+        return false;
+    }
+    let signer = match resolve_signer(storage, &post.author).await {
+        Some(pk) => pk,
+        None => {
+            log::error!(
+                "[{label}] rejected post {} (cannot resolve signer for {})",
+                &post.id,
+                short_id(&post.author),
+            );
+            return false;
+        }
+    };
+    if let Err(reason) = verify_post_signature(post, &signer) {
+        log::error!("[{label}] rejected post {} (bad sig): {reason}", &post.id);
+        return false;
+    }
+    if let Err(e) = storage.insert_post(post).await {
+        log::error!("[{label}] failed to store post: {e}");
+        return false;
+    }
+    if post.author != my_id {
+        if parse_mentions(&post.content).contains(&my_id.to_string()) {
+            let _ = storage
+                .insert_notification(
+                    "mention",
+                    &post.author,
+                    None,
+                    Some(&post.id),
+                    post.timestamp,
+                )
+                .await;
+            let _ = app_handle.emit("mentioned-in-post", post);
+            let _ = app_handle.emit("notification-received", ());
+        }
+        if post.reply_to_author.as_deref() == Some(my_id) {
+            let _ = storage
+                .insert_notification(
+                    "reply",
+                    &post.author,
+                    post.reply_to.as_deref(),
+                    Some(&post.id),
+                    post.timestamp,
+                )
+                .await;
+            let _ = app_handle.emit("notification-received", ());
+        }
+        if post.quote_of_author.as_deref() == Some(my_id) {
+            let _ = storage
+                .insert_notification(
+                    "quote",
+                    &post.author,
+                    post.quote_of.as_deref(),
+                    Some(&post.id),
+                    post.timestamp,
+                )
+                .await;
+            let _ = app_handle.emit("notification-received", ());
+        }
+    }
+    true
+}
+
+/// Validate, verify signature, and store a single incoming interaction.
+pub async fn process_incoming_interaction(
+    storage: &Storage,
+    interaction: &Interaction,
+    expected_author: &str,
+    label: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+) {
+    if interaction.author != expected_author {
+        return;
+    }
+    if let Err(reason) = validate_interaction(interaction) {
+        log::error!(
+            "[{label}] rejected interaction {}: {reason}",
+            &interaction.id
+        );
+        return;
+    }
+    let signer = match resolve_signer(storage, &interaction.author).await {
+        Some(pk) => pk,
+        None => {
+            log::error!(
+                "[{label}] rejected interaction {} (cannot resolve signer for {})",
+                &interaction.id,
+                short_id(&interaction.author),
+            );
+            return;
+        }
+    };
+    if let Err(reason) = verify_interaction_signature(interaction, &signer) {
+        log::error!(
+            "[{label}] rejected interaction {} (bad sig): {reason}",
+            &interaction.id
+        );
+        return;
+    }
+    let _ = storage.save_interaction(interaction).await;
+    if interaction.target_author == my_id && interaction.author != my_id {
+        let _ = storage
+            .insert_notification(
+                "like",
+                &interaction.author,
+                Some(&interaction.target_post_id),
+                None,
+                interaction.timestamp,
+            )
+            .await;
+        let _ = app_handle.emit("notification-received", ());
+    }
+}
+
+/// Validate and store posts/interactions/profile from a sync result.
+/// Returns the number of posts actually stored.
+pub async fn process_sync_result(
+    storage: &Storage,
+    pubkey: &str,
+    result: &SyncResult,
+    label: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+) -> usize {
+    let mut stored = 0;
+    for post in &result.posts {
+        if process_incoming_post(storage, post, label, my_id, app_handle).await {
+            stored += 1;
+        }
+    }
+    if let Some(profile) = &result.profile
+        && let Err(e) = storage.save_profile(pubkey, profile).await
+    {
+        log::error!("[{label}] failed to store profile: {e}");
+    }
+    for interaction in &result.interactions {
+        process_incoming_interaction(storage, interaction, pubkey, label, my_id, app_handle).await;
+    }
+    stored
+}
+
+// ---------------------------------------------------------------------------
+// Unified sync-one-peer (used by startup sync, drip sync, manual sync, follow sync)
+// ---------------------------------------------------------------------------
+
+/// Stats returned from `sync_one_peer`.
+#[allow(dead_code)]
+pub struct SyncOneResult {
+    pub stored: usize,
+    pub posts: Vec<Post>,
+    pub interactions: Vec<Interaction>,
+    pub remote_post_count: u64,
+    pub mode: SyncMode,
+    pub profile: Option<Profile>,
+}
+
+/// Sync from a single peer: resolve transport NodeIds, try each, run sync protocol,
+/// process and store results. Returns `SyncOneResult` on first successful NodeId.
+pub async fn sync_one_peer(
+    endpoint: &Endpoint,
+    storage: &Storage,
+    pubkey: &str,
+    my_id: &str,
+    app_handle: &AppHandle,
+    label: &str,
+) -> anyhow::Result<SyncOneResult> {
+    let node_ids = storage.get_peer_transport_node_ids(pubkey).await?;
+    if node_ids.is_empty() {
+        anyhow::bail!("no cached transport NodeId for {}", short_id(pubkey));
+    }
+
+    let mut last_err = String::new();
+    for node_id in &node_ids {
+        let target: EndpointId = match node_id.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("[{label}] bad transport NodeId {}: {e}", short_id(node_id));
+                continue;
+            }
+        };
+
+        let result = tokio::time::timeout(
+            SYNC_TIMEOUT,
+            sync_from_peer(endpoint, storage, target, pubkey),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(sync_result)) => {
+                let stored =
+                    process_sync_result(storage, pubkey, &sync_result, label, my_id, app_handle)
+                        .await;
+                log::info!(
+                    "[{label}] stored {stored}/{} posts from {} via {} (mode={:?})",
+                    sync_result.posts.len(),
+                    short_id(pubkey),
+                    short_id(node_id),
+                    sync_result.mode,
+                );
+                return Ok(SyncOneResult {
+                    stored,
+                    posts: sync_result.posts,
+                    interactions: sync_result.interactions,
+                    remote_post_count: sync_result.remote_post_count,
+                    mode: sync_result.mode,
+                    profile: sync_result.profile,
+                });
+            }
+            Ok(Err(e)) => {
+                log::warn!("[{label}] failed via {}: {e}", short_id(node_id));
+                last_err = e.to_string();
+            }
+            Err(_) => {
+                log::warn!("[{label}] timed out via {}", short_id(node_id));
+                last_err = "timeout".to_string();
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "sync failed for {} (tried {} node(s)): {last_err}",
+        short_id(pubkey),
+        node_ids.len(),
+    )
 }

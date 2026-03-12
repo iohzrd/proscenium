@@ -1,7 +1,6 @@
 use crate::ext::ResultExt;
 use crate::state::AppState;
 use crate::storage::servers::ServerEntry;
-use iroh::SecretKey;
 use iroh_social_types::{
     RegistrationPayload, RegistrationRequest, Visibility, now_millis, sign_registration,
 };
@@ -114,8 +113,6 @@ pub async fn register_with_server(
     let vis: Visibility = visibility.parse().map_err(|_| "invalid visibility")?;
     let master_pubkey = state.master_pubkey.clone();
     let transport_node_id = state.transport_node_id.clone();
-    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
         transport_node_id: transport_node_id.clone(),
@@ -124,7 +121,7 @@ pub async fn register_with_server(
         visibility: vis,
         action: None,
     };
-    let signature = sign_registration(&payload, &secret_key);
+    let signature = sign_registration(&payload, &state.signing_key);
 
     let request = RegistrationRequest {
         master_pubkey,
@@ -170,8 +167,6 @@ pub async fn unregister_from_server(
 ) -> Result<(), String> {
     let master_pubkey = state.master_pubkey.clone();
     let transport_node_id = state.transport_node_id.clone();
-    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-
     let payload = RegistrationPayload {
         master_pubkey: master_pubkey.clone(),
         transport_node_id: transport_node_id.clone(),
@@ -180,7 +175,7 @@ pub async fn unregister_from_server(
         visibility: Visibility::Public,
         action: Some("unregister".to_string()),
     };
-    let signature = sign_registration(&payload, &secret_key);
+    let signature = sign_registration(&payload, &state.signing_key);
 
     let request = RegistrationRequest {
         master_pubkey,
@@ -415,8 +410,6 @@ pub async fn sync_profile_to_server(
 
 pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), String> {
     let master_pubkey = state.master_pubkey.clone();
-    let secret_key = SecretKey::from_bytes(&state.signing_secret_key_bytes);
-
     let profile = state
         .storage
         .get_profile(&master_pubkey)
@@ -440,7 +433,7 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         visibility: vis.parse().unwrap_or_default(),
         action: None,
     };
-    let signature = sign_registration(&payload, &secret_key);
+    let signature = sign_registration(&payload, &state.signing_key);
 
     #[derive(Serialize)]
     struct ProfileUpdate {

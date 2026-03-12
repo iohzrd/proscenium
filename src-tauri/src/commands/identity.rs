@@ -32,7 +32,8 @@ pub async fn mark_seed_phrase_backed_up(app_handle: tauri::AppHandle) -> Result<
         .path()
         .app_data_dir()
         .map_err(|e| format!("failed to resolve data dir: {e}"))?;
-    std::fs::write(data_dir.join(".seed_backed_up"), b"1")
+    tokio::fs::write(data_dir.join(".seed_backed_up"), b"1")
+        .await
         .map_err(|e| format!("failed to write marker: {e}"))
 }
 
@@ -83,48 +84,49 @@ pub async fn rotate_signing_key(
     );
 
     // Broadcast via gossip
-    {
-        let feed = state.feed.read().await;
-        feed.broadcast_signing_key_rotation(&rotation)
-            .await
-            .map_err(|e| format!("failed to broadcast rotation: {e}"))?;
+    state
+        .gossip
+        .broadcast_signing_key_rotation(&rotation)
+        .await
+        .map_err(|e| format!("failed to broadcast rotation: {e}"))?;
 
-        // Also broadcast updated linked devices announcement with new delegation
-        let devices = state
-            .storage
-            .get_linked_devices()
-            .await
-            .map_err(|e| format!("failed to get devices: {e}"))?;
-        let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
-        // Use own cached announcement version + 1, or device count as base
-        let current_version = state
-            .storage
-            .get_peer_announcement_version(&state.master_pubkey)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(devices.len() as u64);
-        let version = current_version + 1;
-        let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
-            master_pubkey: state.master_pubkey.clone(),
-            delegation: new_delegation,
-            devices,
-            version,
-            timestamp: now,
-            signature: String::new(),
-        };
-        iroh_social_types::sign_linked_devices_announcement(&mut announcement, &new_signing_sk);
-        // Cache our own announcement so version tracking works
-        if let Err(e) = state
-            .storage
-            .cache_peer_device_announcement(&state.master_pubkey, &announcement)
-            .await
-        {
-            log::error!("[rotate] failed to cache own announcement: {e}");
-        }
-        feed.broadcast_linked_devices(&announcement)
-            .await
-            .map_err(|e| format!("failed to broadcast updated announcement: {e}"))?;
+    // Also broadcast updated linked devices announcement with new delegation
+    let devices = state
+        .storage
+        .get_linked_devices()
+        .await
+        .map_err(|e| format!("failed to get devices: {e}"))?;
+    let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
+    // Use own cached announcement version + 1, or device count as base
+    let current_version = state
+        .storage
+        .get_peer_announcement_version(&state.master_pubkey)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(devices.len() as u64);
+    let version = current_version + 1;
+    let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
+        master_pubkey: state.master_pubkey.clone(),
+        delegation: new_delegation,
+        devices,
+        version,
+        timestamp: now,
+        signature: String::new(),
+    };
+    iroh_social_types::sign_linked_devices_announcement(&mut announcement, &new_signing_sk);
+    // Cache our own announcement so version tracking works
+    if let Err(e) = state
+        .storage
+        .cache_peer_device_announcement(&state.master_pubkey, &announcement)
+        .await
+    {
+        log::error!("[rotate] failed to cache own announcement: {e}");
     }
+    state
+        .gossip
+        .broadcast_linked_devices(&announcement)
+        .await
+        .map_err(|e| format!("failed to broadcast updated announcement: {e}"))?;
 
     // Re-register with all servers using the new signing key
     let servers = state
@@ -167,8 +169,8 @@ pub async fn rotate_signing_key(
             signature,
             delegation: new_delegation_for_reg.clone(),
         };
-        let client = reqwest::Client::new();
-        match client
+        match state
+            .http_client
             .post(format!("{}/api/v1/register", server.url))
             .json(&request)
             .send()
