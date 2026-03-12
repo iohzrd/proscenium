@@ -1,3 +1,4 @@
+use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
 use iroh_social_types::{
@@ -6,38 +7,6 @@ use iroh_social_types::{
 };
 
 const BATCH_SIZE: usize = 200;
-
-/// Write a length-prefixed frame: [4-byte big-endian len][payload].
-/// A zero-length frame signals end of stream.
-async fn write_frame(
-    send: &mut iroh::endpoint::SendStream,
-    data: &[u8],
-) -> Result<(), AcceptError> {
-    let len = data.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(AcceptError::from_err)?;
-    if !data.is_empty() {
-        send.write_all(data).await.map_err(AcceptError::from_err)?;
-    }
-    Ok(())
-}
-
-/// Read a length-prefixed frame. Returns None on zero-length (end of stream).
-async fn read_frame(recv: &mut iroh::endpoint::RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
-    let mut len_buf = [0u8; 4];
-    recv.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 {
-        return Ok(None);
-    }
-    if len > 10_000_000 {
-        anyhow::bail!("frame too large: {len} bytes");
-    }
-    let mut buf = vec![0u8; len];
-    recv.read_exact(&mut buf).await?;
-    Ok(Some(buf))
-}
 
 /// Server-side sync handler, dispatched from the unified PeerHandler.
 /// The initial PeerRequest::Sync has already been read; `send` is the response side
@@ -50,6 +19,12 @@ pub async fn handle_sync(
     mut send: iroh::endpoint::SendStream,
     req: SyncRequest,
 ) -> Result<(), AcceptError> {
+    // Resolve transport NodeId to master pubkey for access control checks
+    let remote_pubkey = storage
+        .get_master_pubkey_for_transport(remote_str)
+        .await
+        .unwrap_or_else(|| remote_str.to_string());
+
     // Enforce visibility-based sync access control
     let visibility = storage
         .get_visibility(node_id)
@@ -58,19 +33,19 @@ pub async fn handle_sync(
     match visibility {
         Visibility::Public => {} // anyone can sync
         Visibility::Listed => {
-            if !storage.is_follower(remote_str).await.unwrap_or(false) {
+            if !storage.is_follower(&remote_pubkey).await.unwrap_or(false) {
                 log::warn!(
                     "[sync-server] rejecting non-follower {} (listed profile)",
-                    short_id(remote_str)
+                    short_id(&remote_pubkey)
                 );
                 return Err(AcceptError::from_err(std::io::Error::other("listed")));
             }
         }
         Visibility::Private => {
-            if !storage.is_mutual(remote_str).await.unwrap_or(false) {
+            if !storage.is_mutual(&remote_pubkey).await.unwrap_or(false) {
                 log::warn!(
                     "[sync-server] rejecting non-mutual {} (private profile)",
-                    short_id(remote_str)
+                    short_id(&remote_pubkey)
                 );
                 return Err(AcceptError::from_err(std::io::Error::other("private")));
             }

@@ -1,10 +1,20 @@
 use crate::commands::servers::sync_profile_inner;
 use crate::ext::ResultExt;
-use crate::state::{AppState, NodeStatus};
+use crate::state::AppState;
 use iroh::SecretKey;
 use iroh_social_types::{Profile, Visibility, sign_profile, validate_profile};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub has_relay: bool,
+    pub relay_url: Option<String>,
+    pub follow_count: usize,
+    pub follower_count: usize,
+}
 
 #[tauri::command]
 pub async fn get_node_id(state: State<'_, Arc<AppState>>) -> Result<String, String> {
@@ -53,7 +63,7 @@ pub async fn save_my_profile(
         .await
         .unwrap_or(Visibility::Public);
 
-    let mut feed = state.feed.lock().await;
+    let mut feed = state.feed.write().await;
 
     if old_visibility != new_visibility {
         // Handle gossip feed start/stop BEFORE saving new visibility
@@ -98,7 +108,7 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStat
     let addr = state.endpoint.addr();
     let relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let has_relay = relay_url.is_some();
-    let feed = state.feed.lock().await;
+    let feed = state.feed.read().await;
     let follow_count = feed.subscriptions.len();
     let follower_count = state
         .storage

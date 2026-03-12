@@ -2,8 +2,8 @@ use iroh_social_types::LinkPreview;
 use regex::Regex;
 use scraper::{Html, Selector};
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
 
 static URL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"https?://[^\s<>"')\]]+"#).unwrap());
 
@@ -12,7 +12,6 @@ static CACHE: LazyLock<Mutex<HashMap<String, Option<LinkPreview>>>> =
 
 const MAX_PREVIEWS: usize = 3;
 const MAX_CACHE_ENTRIES: usize = 512;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
 pub fn extract_urls(content: &str) -> Vec<String> {
@@ -23,16 +22,16 @@ pub fn extract_urls(content: &str) -> Vec<String> {
         .collect()
 }
 
-pub async fn get_link_preview(url: &str) -> Option<LinkPreview> {
+pub async fn get_link_preview(client: &reqwest::Client, url: &str) -> Option<LinkPreview> {
     // Check cache
-    if let Some(cached) = CACHE.lock().unwrap().get(url) {
+    if let Some(cached) = CACHE.lock().await.get(url) {
         return cached.clone();
     }
 
-    let result = fetch_og(url).await;
+    let result = fetch_og(client, url).await;
 
     // Cache the result (including None to avoid re-fetching failures)
-    let mut cache = CACHE.lock().unwrap();
+    let mut cache = CACHE.lock().await;
     if cache.len() >= MAX_CACHE_ENTRIES {
         // Evict oldest half when at capacity (simple but effective)
         let evict: Vec<String> = cache.keys().take(MAX_CACHE_ENTRIES / 2).cloned().collect();
@@ -45,19 +44,8 @@ pub async fn get_link_preview(url: &str) -> Option<LinkPreview> {
     result
 }
 
-async fn fetch_og(url: &str) -> Option<LinkPreview> {
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .ok()?;
-
-    let resp = client
-        .get(url)
-        .header("User-Agent", "iroh-social/1.0 (link-preview)")
-        .send()
-        .await
-        .ok()?;
+async fn fetch_og(client: &reqwest::Client, url: &str) -> Option<LinkPreview> {
+    let resp = client.get(url).send().await.ok()?;
 
     if !resp.status().is_success() {
         return None;

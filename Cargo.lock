@@ -3405,6 +3405,7 @@ dependencies = [
  "tauri-plugin-os",
  "tauri-plugin-single-instance",
  "tokio",
+ "tokio-util",
  "urlencoding",
  "uuid",
  "x25519-dalek",

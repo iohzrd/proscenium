@@ -3,9 +3,9 @@ use crate::gossip::FeedManager;
 use crate::storage::Storage;
 use iroh::{Endpoint, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Active device-linking session on the existing device.
 /// Created when the user taps "Link New Device", consumed when a new device connects.
@@ -21,7 +21,7 @@ pub struct PendingLink {
     pub transfer_master_key: bool,
 }
 
-pub type PendingLinkState = Arc<Mutex<Option<PendingLink>>>;
+pub type PendingLinkState = Arc<tokio::sync::Mutex<Option<PendingLink>>>;
 
 pub struct AppState {
     pub endpoint: Endpoint,
@@ -31,7 +31,7 @@ pub struct AppState {
     pub blobs: BlobsProtocol,
     pub store: FsStore,
     pub storage: Arc<Storage>,
-    pub feed: Arc<Mutex<FeedManager>>,
+    pub feed: Arc<RwLock<FeedManager>>,
     pub dm: DmHandler,
     /// Master key secret bytes (permanent identity, cold storage).
     pub master_secret_key_bytes: [u8; 32],
@@ -54,26 +54,12 @@ pub struct AppState {
     pub delegation: iroh_social_types::SigningKeyDelegation,
     /// Active device-linking session (if any).
     pub pending_link: PendingLinkState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FrontendSyncResult {
-    pub posts: Vec<iroh_social_types::Post>,
-    pub remote_total: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SyncStatus {
-    pub local_count: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeStatus {
-    pub node_id: String,
-    pub has_relay: bool,
-    pub relay_url: Option<String>,
-    pub follow_count: usize,
-    pub follower_count: usize,
+    /// Shared HTTP client for server API calls and link preview fetching.
+    pub http_client: reqwest::Client,
+    /// Cancellation token for graceful shutdown of background tasks.
+    /// Held here so child tokens stay alive; cancel via `shutdown_token.cancel()`.
+    #[allow(dead_code)]
+    pub shutdown_token: CancellationToken,
 }
 
 pub fn generate_id() -> String {

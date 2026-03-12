@@ -1,3 +1,4 @@
+use crate::framing::{read_frame, write_frame_anyhow};
 use crate::storage::Storage;
 use iroh::protocol::AcceptError;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection};
@@ -9,22 +10,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 const BATCH_SIZE: usize = 200;
-
-/// Write a length-prefixed frame: [4-byte big-endian len][payload].
-/// A zero-length frame signals end of stream.
-async fn write_frame(
-    send: &mut iroh::endpoint::SendStream,
-    data: &[u8],
-) -> Result<(), AcceptError> {
-    let len = data.len() as u32;
-    send.write_all(&len.to_be_bytes())
-        .await
-        .map_err(AcceptError::from_err)?;
-    if !data.is_empty() {
-        send.write_all(data).await.map_err(AcceptError::from_err)?;
-    }
-    Ok(())
-}
 
 /// Handle an incoming DeviceSyncRequest from another linked device.
 /// Verifies the challenge, sends our vector + deltas, then imports the initiator's deltas.
@@ -78,14 +63,26 @@ pub async fn handle_device_sync(
     let (mut data_send, mut data_recv) = conn.open_bi().await.map_err(AcceptError::from_err)?;
 
     // Compute and send deltas that the peer needs
-    send_deltas(storage, master_pubkey, &peer_vector, &mut data_send).await?;
+    send_deltas(
+        storage,
+        master_pubkey,
+        our_vector,
+        &peer_vector,
+        &mut data_send,
+    )
+    .await
+    .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
 
     // End-of-stream marker
-    write_frame(&mut data_send, &[]).await?;
+    write_frame_anyhow(&mut data_send, &[])
+        .await
+        .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
     data_send.finish().map_err(AcceptError::from_err)?;
 
     // Receive and import deltas from the initiator
-    import_deltas(storage, master_pubkey, &mut data_recv).await?;
+    import_deltas(storage, master_pubkey, &mut data_recv)
+        .await
+        .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
 
     log::info!("[device-sync] completed sync with peer device");
     conn.closed().await;
@@ -152,11 +149,17 @@ pub async fn sync_with_device(
     let imported = import_deltas(storage, master_pubkey, &mut data_recv).await?;
 
     // Compute and send our deltas
-    send_deltas_client(storage, master_pubkey, &peer_vector, &mut data_send).await?;
+    send_deltas(
+        storage,
+        master_pubkey,
+        our_vector,
+        &peer_vector,
+        &mut data_send,
+    )
+    .await?;
 
     // End-of-stream marker
-    let eos_len = 0u32;
-    data_send.write_all(&eos_len.to_be_bytes()).await?;
+    write_frame_anyhow(&mut data_send, &[]).await?;
     data_send.finish()?;
 
     conn.close(0u32.into(), b"done");
@@ -176,97 +179,66 @@ pub struct DeviceSyncStats {
     pub ratchets_merged: u32,
 }
 
-/// Send deltas that the peer needs (server/responder side).
+/// Compute and send deltas that the peer needs.
+/// Uses the pre-built `our_vector` to avoid redundant DB queries.
 async fn send_deltas(
     storage: &Storage,
     master_pubkey: &str,
+    our_vector: DeviceSyncVector,
     peer_vector: &DeviceSyncVector,
     data_send: &mut iroh::endpoint::SendStream,
-) -> Result<(), AcceptError> {
-    let map_err = |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
-
+) -> anyhow::Result<()> {
     // Posts: stream posts with timestamp > peer's newest
-    if peer_vector.newest_post_ts > 0 {
+    let post_after_ts = if peer_vector.newest_post_ts > 0 || peer_vector.post_count == 0 {
+        peer_vector.newest_post_ts
+    } else {
+        // Peer has posts but no newest timestamp -- skip
+        u64::MAX
+    };
+    if post_after_ts < u64::MAX {
         let mut offset = 0;
         loop {
             let batch = storage
-                .get_posts_after(
-                    master_pubkey,
-                    peer_vector.newest_post_ts,
-                    BATCH_SIZE,
-                    offset,
-                )
-                .await
-                .map_err(map_err)?;
+                .get_posts_after(master_pubkey, post_after_ts, BATCH_SIZE, offset)
+                .await?;
             if batch.is_empty() {
                 break;
             }
             offset += batch.len();
             let frame = DeviceSyncFrame::Posts(batch);
-            let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-            write_frame(data_send, &frame_bytes).await?;
-        }
-    } else if peer_vector.post_count == 0 {
-        // Peer has nothing, send all
-        let mut offset = 0;
-        loop {
-            let batch = storage
-                .get_posts_after(master_pubkey, 0, BATCH_SIZE, offset)
-                .await
-                .map_err(map_err)?;
-            if batch.is_empty() {
-                break;
-            }
-            offset += batch.len();
-            let frame = DeviceSyncFrame::Posts(batch);
-            let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-            write_frame(data_send, &frame_bytes).await?;
+            let frame_bytes = serde_json::to_vec(&frame)?;
+            write_frame_anyhow(data_send, &frame_bytes).await?;
         }
     }
 
     // Interactions: stream after peer's newest
-    if peer_vector.newest_interaction_ts > 0 {
+    let interaction_after_ts =
+        if peer_vector.newest_interaction_ts > 0 || peer_vector.interaction_count == 0 {
+            peer_vector.newest_interaction_ts
+        } else {
+            u64::MAX
+        };
+    if interaction_after_ts < u64::MAX {
         let mut offset = 0;
         loop {
-            let batch = storage
-                .get_interactions_after(
-                    master_pubkey,
-                    peer_vector.newest_interaction_ts,
-                    BATCH_SIZE,
-                    offset,
-                )
-                .await
-                .map_err(map_err)?;
+            let batch = if interaction_after_ts > 0 {
+                storage
+                    .get_interactions_after(master_pubkey, interaction_after_ts, BATCH_SIZE, offset)
+                    .await?
+            } else {
+                storage
+                    .get_interactions_paged(master_pubkey, BATCH_SIZE, offset)
+                    .await?
+            };
             if batch.is_empty() {
                 break;
             }
             offset += batch.len();
             let frame = DeviceSyncFrame::Interactions(batch);
-            let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-            write_frame(data_send, &frame_bytes).await?;
-        }
-    } else if peer_vector.interaction_count == 0 {
-        let mut offset = 0;
-        loop {
-            let batch = storage
-                .get_interactions_paged(master_pubkey, BATCH_SIZE, offset)
-                .await
-                .map_err(map_err)?;
-            if batch.is_empty() {
-                break;
-            }
-            offset += batch.len();
-            let frame = DeviceSyncFrame::Interactions(batch);
-            let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-            write_frame(data_send, &frame_bytes).await?;
+            let frame_bytes = serde_json::to_vec(&frame)?;
+            write_frame_anyhow(data_send, &frame_bytes).await?;
         }
     }
-
-    // Build our vector once for follows/mutes/blocks/bookmarks
-    let our_vector = storage
-        .build_device_sync_vector(master_pubkey)
-        .await
-        .map_err(map_err)?;
 
     // Follows: send entries that are newer than what peer has
     let follow_deltas: Vec<_> = our_vector
@@ -282,8 +254,8 @@ async fn send_deltas(
         .collect();
     if !follow_deltas.is_empty() {
         let frame = DeviceSyncFrame::Follows(follow_deltas);
-        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(data_send, &frame_bytes).await?;
+        let frame_bytes = serde_json::to_vec(&frame)?;
+        write_frame_anyhow(data_send, &frame_bytes).await?;
     }
 
     // Mutes: send newer entries
@@ -300,8 +272,8 @@ async fn send_deltas(
         .collect();
     if !mute_deltas.is_empty() {
         let frame = DeviceSyncFrame::Mutes(mute_deltas);
-        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(data_send, &frame_bytes).await?;
+        let frame_bytes = serde_json::to_vec(&frame)?;
+        write_frame_anyhow(data_send, &frame_bytes).await?;
     }
 
     // Blocks: send newer entries
@@ -318,8 +290,8 @@ async fn send_deltas(
         .collect();
     if !block_deltas.is_empty() {
         let frame = DeviceSyncFrame::Blocks(block_deltas);
-        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(data_send, &frame_bytes).await?;
+        let frame_bytes = serde_json::to_vec(&frame)?;
+        write_frame_anyhow(data_send, &frame_bytes).await?;
     }
 
     // Bookmarks: send ones the peer doesn't have
@@ -331,154 +303,11 @@ async fn send_deltas(
         .collect();
     if !bookmark_deltas.is_empty() {
         let frame = DeviceSyncFrame::Bookmarks(bookmark_deltas);
-        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(data_send, &frame_bytes).await?;
+        let frame_bytes = serde_json::to_vec(&frame)?;
+        write_frame_anyhow(data_send, &frame_bytes).await?;
     }
 
     // Ratchet sessions: send sessions with updated_at newer than what peer reports
-    let peer_ratchet_map: std::collections::HashMap<&str, u64> = peer_vector
-        .ratchet_summaries
-        .iter()
-        .map(|r| (r.peer_pubkey.as_str(), r.updated_at))
-        .collect();
-    let our_ratchets = storage.export_ratchet_sessions().await.map_err(map_err)?;
-    let ratchet_deltas: Vec<_> = our_ratchets
-        .into_iter()
-        .filter(|r| match peer_ratchet_map.get(r.peer_pubkey.as_str()) {
-            Some(&peer_ts) => r.updated_at > peer_ts,
-            None => true,
-        })
-        .collect();
-    if !ratchet_deltas.is_empty() {
-        let frame = DeviceSyncFrame::RatchetSessions(ratchet_deltas);
-        let frame_bytes = serde_json::to_vec(&frame).map_err(AcceptError::from_err)?;
-        write_frame(data_send, &frame_bytes).await?;
-    }
-
-    Ok(())
-}
-
-/// Send deltas that the peer needs (client/initiator side).
-async fn send_deltas_client(
-    storage: &Arc<Storage>,
-    master_pubkey: &str,
-    peer_vector: &DeviceSyncVector,
-    data_send: &mut iroh::endpoint::SendStream,
-) -> anyhow::Result<()> {
-    // Reuse the same delta logic, just with anyhow errors
-    // Posts
-    let after_ts = peer_vector.newest_post_ts;
-    let mut offset = 0;
-    loop {
-        let batch = storage
-            .get_posts_after(master_pubkey, after_ts, BATCH_SIZE, offset)
-            .await?;
-        if batch.is_empty() {
-            break;
-        }
-        offset += batch.len();
-        let frame = DeviceSyncFrame::Posts(batch);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Interactions
-    let after_ts = peer_vector.newest_interaction_ts;
-    let mut offset = 0;
-    loop {
-        let batch = storage
-            .get_interactions_after(master_pubkey, after_ts, BATCH_SIZE, offset)
-            .await?;
-        if batch.is_empty() {
-            break;
-        }
-        offset += batch.len();
-        let frame = DeviceSyncFrame::Interactions(batch);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Follows
-    let our_vector = storage.build_device_sync_vector(master_pubkey).await?;
-    let follow_deltas: Vec<_> = our_vector
-        .follows
-        .into_iter()
-        .filter(|f| {
-            if let Some(peer_entry) = peer_vector.follows.iter().find(|pf| pf.pubkey == f.pubkey) {
-                f.last_changed_at > peer_entry.last_changed_at
-            } else {
-                true
-            }
-        })
-        .collect();
-    if !follow_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Follows(follow_deltas);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Mutes
-    let mute_deltas: Vec<_> = our_vector
-        .mutes
-        .into_iter()
-        .filter(|m| {
-            if let Some(peer_entry) = peer_vector.mutes.iter().find(|pm| pm.pubkey == m.pubkey) {
-                m.last_changed_at > peer_entry.last_changed_at
-            } else {
-                true
-            }
-        })
-        .collect();
-    if !mute_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Mutes(mute_deltas);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Blocks
-    let block_deltas: Vec<_> = our_vector
-        .blocks
-        .into_iter()
-        .filter(|b| {
-            if let Some(peer_entry) = peer_vector.blocks.iter().find(|pb| pb.pubkey == b.pubkey) {
-                b.last_changed_at > peer_entry.last_changed_at
-            } else {
-                true
-            }
-        })
-        .collect();
-    if !block_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Blocks(block_deltas);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Bookmarks
-    let peer_bookmarks: HashSet<&str> = peer_vector.bookmarks.iter().map(|b| b.as_str()).collect();
-    let bookmark_deltas: Vec<String> = our_vector
-        .bookmarks
-        .into_iter()
-        .filter(|b| !peer_bookmarks.contains(b.as_str()))
-        .collect();
-    if !bookmark_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Bookmarks(bookmark_deltas);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
-    }
-
-    // Ratchet sessions
     let peer_ratchet_map: std::collections::HashMap<&str, u64> = peer_vector
         .ratchet_summaries
         .iter()
@@ -495,9 +324,7 @@ async fn send_deltas_client(
     if !ratchet_deltas.is_empty() {
         let frame = DeviceSyncFrame::RatchetSessions(ratchet_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
-        let len = frame_bytes.len() as u32;
-        data_send.write_all(&len.to_be_bytes()).await?;
-        data_send.write_all(&frame_bytes).await?;
+        write_frame_anyhow(data_send, &frame_bytes).await?;
     }
 
     Ok(())
@@ -508,43 +335,23 @@ async fn import_deltas(
     storage: &Storage,
     master_pubkey: &str,
     data_recv: &mut iroh::endpoint::RecvStream,
-) -> Result<DeviceSyncStats, AcceptError> {
-    let map_err = |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
+) -> anyhow::Result<DeviceSyncStats> {
     let mut stats = DeviceSyncStats::default();
 
     loop {
-        let mut len_buf = [0u8; 4];
-        if data_recv
-            .read_exact(&mut len_buf)
-            .await
-            .map_err(AcceptError::from_err)
-            .is_err()
-        {
-            break;
-        }
-        let len = u32::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            break;
-        }
-        if len > 10_000_000 {
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "frame too large",
-            )));
-        }
-        let mut buf = vec![0u8; len];
-        data_recv
-            .read_exact(&mut buf)
-            .await
-            .map_err(AcceptError::from_err)?;
+        let buf = match read_frame(data_recv).await? {
+            Some(buf) => buf,
+            None => break,
+        };
 
-        let frame: DeviceSyncFrame = serde_json::from_slice(&buf).map_err(AcceptError::from_err)?;
+        let frame: DeviceSyncFrame = serde_json::from_slice(&buf)?;
         match frame {
             DeviceSyncFrame::Posts(posts) => {
                 for post in &posts {
                     if post.author != master_pubkey {
                         continue;
                     }
-                    storage.insert_post(post).await.map_err(map_err)?;
+                    storage.insert_post(post).await?;
                     stats.posts_imported += 1;
                 }
             }
@@ -553,31 +360,24 @@ async fn import_deltas(
                     if interaction.author != master_pubkey {
                         continue;
                     }
-                    storage
-                        .save_interaction(interaction)
-                        .await
-                        .map_err(map_err)?;
+                    storage.save_interaction(interaction).await?;
                     stats.interactions_imported += 1;
                 }
             }
             DeviceSyncFrame::Follows(entries) => {
-                stats.follows_merged +=
-                    storage.merge_follows_lww(&entries).await.map_err(map_err)?;
+                stats.follows_merged += storage.merge_follows_lww(&entries).await?;
             }
             DeviceSyncFrame::Mutes(entries) => {
-                stats.mutes_merged += storage.merge_mutes_lww(&entries).await.map_err(map_err)?;
+                stats.mutes_merged += storage.merge_mutes_lww(&entries).await?;
             }
             DeviceSyncFrame::Blocks(entries) => {
-                stats.blocks_merged += storage.merge_blocks_lww(&entries).await.map_err(map_err)?;
+                stats.blocks_merged += storage.merge_blocks_lww(&entries).await?;
             }
             DeviceSyncFrame::Bookmarks(ids) => {
-                stats.bookmarks_added += storage.merge_bookmarks(&ids).await.map_err(map_err)?;
+                stats.bookmarks_added += storage.merge_bookmarks(&ids).await?;
             }
             DeviceSyncFrame::RatchetSessions(sessions) => {
-                stats.ratchets_merged += storage
-                    .merge_ratchet_sessions_lww(&sessions)
-                    .await
-                    .map_err(map_err)?;
+                stats.ratchets_merged += storage.merge_ratchet_sessions_lww(&sessions).await?;
             }
         }
     }

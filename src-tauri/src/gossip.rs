@@ -18,7 +18,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 
 /// Sent by gossip tasks when their stream dies, so the reconnect loop can restart them.
@@ -575,24 +575,6 @@ impl FeedManager {
         Ok(())
     }
 
-    /// Resolve the signing public key for a peer from the delegation cache.
-    /// Returns None if no delegation is cached (backward compat: skip verification).
-    async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<iroh::PublicKey> {
-        match storage.get_peer_signing_pubkey(master_pubkey).await {
-            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
-                Ok(pk) => Some(pk),
-                Err(e) => {
-                    log::warn!(
-                        "[gossip-rx] bad signing pubkey for {}: {e}",
-                        short_id(master_pubkey)
-                    );
-                    None
-                }
-            },
-            _ => None,
-        }
-    }
-
     async fn handle_follow_message(
         storage: &Storage,
         pk: &str,
@@ -631,7 +613,7 @@ impl FeedManager {
             }) => {
                 if author == pk {
                     // Verify delete signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::commands::sync::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_post_signature(&id, &author, &signature, &signer)
                     {
@@ -667,7 +649,7 @@ impl FeedManager {
                     );
                 } else {
                     // Verify profile signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::commands::sync::resolve_signer(storage, pk).await
                         && let Err(reason) = verify_profile_signature(&profile, &signer)
                     {
                         log::warn!(
@@ -715,7 +697,7 @@ impl FeedManager {
             }) => {
                 if author == pk {
                     // Verify delete signature
-                    if let Some(signer) = Self::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::commands::sync::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_interaction_signature(&id, &author, &signature, &signer)
                     {
@@ -862,7 +844,7 @@ impl FeedManager {
 /// Reconnection loop: receives notifications from dead gossip tasks and restarts them.
 pub async fn gossip_reconnect_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ReconnectRequest>,
-    feed: Arc<Mutex<FeedManager>>,
+    feed: Arc<RwLock<FeedManager>>,
     tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
 ) {
     while let Some(req) = rx.recv().await {
@@ -871,7 +853,7 @@ pub async fn gossip_reconnect_loop(
                 let delay = backoff_secs(attempt);
                 log::info!("[reconnect] own feed died, restarting in {delay}s (attempt {attempt})");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                let mut fm = feed.lock().await;
+                let mut fm = feed.write().await;
                 fm.own_feed_handle = None;
                 fm.my_sender = None;
                 if let Err(e) = fm.start_own_feed().await {
@@ -884,7 +866,7 @@ pub async fn gossip_reconnect_loop(
             }
             ReconnectRequest::RefreshAll => {
                 log::info!("[reconnect] refreshing all gossip connections");
-                let mut fm = feed.lock().await;
+                let mut fm = feed.write().await;
                 fm.teardown_all();
 
                 // Restart own feed
@@ -910,7 +892,7 @@ pub async fn gossip_reconnect_loop(
                 log::info!("[reconnect] refreshed own feed + {} follows", follows.len());
             }
             ReconnectRequest::RefreshFollow { pubkey } => {
-                let mut fm = feed.lock().await;
+                let mut fm = feed.write().await;
                 // Skip if the subscription is alive AND already has a neighbor.
                 // A live subscription with 0 neighbors means the gossip mesh is not
                 // connected (startup race), so we must allow the refresh in that case.
@@ -967,7 +949,7 @@ pub async fn gossip_reconnect_loop(
                     short_id(&pubkey)
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                let mut fm = feed.lock().await;
+                let mut fm = feed.write().await;
                 if let Some((handle, _)) = fm.subscriptions.remove(&pubkey) {
                     handle.abort();
                 }

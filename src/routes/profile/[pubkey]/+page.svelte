@@ -174,7 +174,7 @@
   async function fetchFromRemote() {
     fetchingRemote = true;
     try {
-      const result: SyncResult = await invoke("fetch_older_posts", {
+      const result: SyncResult = await invoke("sync_posts", {
         pubkey,
       });
       remoteTotal = result.remote_total;

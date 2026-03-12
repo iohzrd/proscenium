@@ -65,7 +65,7 @@ pub async fn add_server(
     state.storage.add_server(&url).await.str_err()?;
 
     // Try to fetch server info
-    if let Ok(info) = fetch_server_info_inner(&url).await {
+    if let Ok(info) = fetch_server_info_inner(&state.http_client, &url).await {
         state
             .storage
             .update_server_info(&url, &info.name, &info.description, &info.node_id)
@@ -96,7 +96,7 @@ pub async fn refresh_server_info(
     state: State<'_, Arc<AppState>>,
     url: String,
 ) -> Result<ServerInfo, String> {
-    let info = fetch_server_info_inner(&url).await?;
+    let info = fetch_server_info_inner(&state.http_client, &url).await?;
     state
         .storage
         .update_server_info(&url, &info.name, &info.description, &info.node_id)
@@ -137,8 +137,8 @@ pub async fn register_with_server(
         delegation: state.delegation.clone(),
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .post(format!("{url}/api/v1/register"))
         .json(&request)
         .send()
@@ -193,8 +193,8 @@ pub async fn unregister_from_server(
         delegation: state.delegation.clone(),
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .delete(format!("{url}/api/v1/register"))
         .json(&request)
         .send()
@@ -212,6 +212,7 @@ pub async fn unregister_from_server(
 
 #[tauri::command]
 pub async fn server_get_feed(
+    state: State<'_, Arc<AppState>>,
     url: String,
     limit: Option<i64>,
     before: Option<i64>,
@@ -221,8 +222,8 @@ pub async fn server_get_feed(
         endpoint.push_str(&format!("&before={b}"));
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .get(&endpoint)
         .send()
         .await
@@ -239,13 +240,14 @@ pub async fn server_get_feed(
 
 #[tauri::command]
 pub async fn server_get_trending(
+    state: State<'_, Arc<AppState>>,
     url: String,
     limit: Option<i64>,
 ) -> Result<TrendingResponse, String> {
     let endpoint = format!("{url}/api/v1/trending?limit={}", limit.unwrap_or(10));
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .get(&endpoint)
         .send()
         .await
@@ -303,6 +305,7 @@ pub struct PostSearchResponse {
 
 #[tauri::command]
 pub async fn server_search_users(
+    state: State<'_, Arc<AppState>>,
     url: String,
     query: String,
     limit: Option<i64>,
@@ -313,8 +316,8 @@ pub async fn server_search_users(
         limit.unwrap_or(20)
     );
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .get(&endpoint)
         .send()
         .await
@@ -331,6 +334,7 @@ pub async fn server_search_users(
 
 #[tauri::command]
 pub async fn server_search_posts(
+    state: State<'_, Arc<AppState>>,
     url: String,
     query: String,
     limit: Option<i64>,
@@ -345,8 +349,8 @@ pub async fn server_search_posts(
         endpoint.push_str(&format!("&offset={o}"));
     }
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .get(&endpoint)
         .send()
         .await
@@ -363,6 +367,7 @@ pub async fn server_search_posts(
 
 #[tauri::command]
 pub async fn server_list_users(
+    state: State<'_, Arc<AppState>>,
     url: String,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -373,8 +378,8 @@ pub async fn server_list_users(
         offset.unwrap_or(0)
     );
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .get(&endpoint)
         .send()
         .await
@@ -464,8 +469,8 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
         delegation: state.delegation.clone(),
     };
 
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = state
+        .http_client
         .put(format!("{url}/api/v1/register"))
         .json(&update)
         .send()
@@ -481,8 +486,10 @@ pub async fn sync_profile_inner(state: &AppState, url: &str) -> Result<(), Strin
     Ok(())
 }
 
-async fn fetch_server_info_inner(url: &str) -> Result<ServerInfo, String> {
-    let client = reqwest::Client::new();
+async fn fetch_server_info_inner(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<ServerInfo, String> {
     let resp = client
         .get(format!("{url}/api/v1/info"))
         .send()

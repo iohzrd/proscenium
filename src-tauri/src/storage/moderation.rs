@@ -119,10 +119,8 @@ impl Storage {
 
     pub async fn is_hidden(&self, pubkey: &str) -> anyhow::Result<bool> {
         let exists: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM mutes WHERE pubkey=?1 AND state='active'
-             UNION ALL
-             SELECT COUNT(*) > 0 FROM blocks WHERE pubkey=?1 AND state='active'
-             LIMIT 1",
+            "SELECT EXISTS(SELECT 1 FROM mutes WHERE pubkey=?1 AND state='active')
+                 OR EXISTS(SELECT 1 FROM blocks WHERE pubkey=?1 AND state='active')",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)

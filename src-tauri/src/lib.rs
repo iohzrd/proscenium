@@ -4,8 +4,9 @@ mod crypto;
 mod device_sync;
 mod dm;
 mod ext;
+mod framing;
 mod gossip;
-mod og;
+mod opengraph;
 mod peer;
 mod push;
 mod setup;
@@ -76,7 +77,6 @@ pub fn run() {
             get_user_posts,
             sync_posts,
             get_sync_status,
-            fetch_older_posts,
             like_post,
             unlike_post,
             repost,

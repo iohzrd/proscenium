@@ -32,7 +32,7 @@ pub async fn like_post(
         .save_interaction(&interaction)
         .await
         .str_err()?;
-    let feed = state.feed.lock().await;
+    let feed = state.feed.read().await;
     feed.broadcast_interaction(&interaction).await.str_err()?;
     Ok(interaction)
 }
@@ -51,7 +51,7 @@ pub async fn unlike_post(
     if let Some(id) = id {
         let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
         let signature = sign_delete_interaction(&id, &my_id, &sk);
-        let feed = state.feed.lock().await;
+        let feed = state.feed.read().await;
         feed.broadcast_delete_interaction(&id, &my_id, &signature)
             .await
             .str_err()?;
@@ -85,7 +85,7 @@ pub async fn repost(
     sign_post(&mut post, &sk);
 
     state.storage.insert_post(&post).await.str_err()?;
-    let feed = state.feed.lock().await;
+    let feed = state.feed.read().await;
     feed.broadcast_post(&post).await.str_err()?;
     Ok(post)
 }
@@ -104,7 +104,7 @@ pub async fn unrepost(
     if let Some(id) = id {
         let sk = SecretKey::from_bytes(&state.signing_secret_key_bytes);
         let signature = sign_delete_post(&id, &my_id, &sk);
-        let feed = state.feed.lock().await;
+        let feed = state.feed.read().await;
         feed.broadcast_delete(&id, &my_id, &signature)
             .await
             .str_err()?;

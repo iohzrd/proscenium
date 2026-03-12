@@ -84,7 +84,7 @@ pub async fn rotate_signing_key(
 
     // Broadcast via gossip
     {
-        let feed = state.feed.lock().await;
+        let feed = state.feed.read().await;
         feed.broadcast_signing_key_rotation(&rotation)
             .await
             .map_err(|e| format!("failed to broadcast rotation: {e}"))?;

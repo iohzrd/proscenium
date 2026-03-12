@@ -1,6 +1,5 @@
 use crate::storage::Storage;
 use iroh_social_types::{IdentityResponse, SigningKeyDelegation, now_millis};
-use sqlx::Row;
 
 impl Storage {
     pub async fn cache_peer_identity(&self, response: &IdentityResponse) -> anyhow::Result<()> {
@@ -73,25 +72,16 @@ impl Storage {
     }
 
     pub async fn get_master_pubkey_for_transport(&self, transport_id: &str) -> Option<String> {
-        let rows =
-            sqlx::query("SELECT master_pubkey, transport_node_ids_json FROM peer_delegations")
-                .fetch_all(&self.pool)
-                .await
-                .ok()?;
-        for row in &rows {
-            let Ok(master) = row.try_get::<String, _>(0) else {
-                continue;
-            };
-            let Ok(json) = row.try_get::<String, _>(1) else {
-                continue;
-            };
-            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&json)
-                && ids.iter().any(|id| id == transport_id)
-            {
-                return Some(master);
-            }
-        }
-        None
+        sqlx::query_scalar::<_, String>(
+            "SELECT p.master_pubkey FROM peer_delegations p, json_each(p.transport_node_ids_json) j
+             WHERE j.value = ?1
+             LIMIT 1",
+        )
+        .bind(transport_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten()
     }
 
     pub async fn get_peer_signing_pubkey(

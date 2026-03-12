@@ -48,7 +48,7 @@ pub async fn create_post(
         &post.id,
         media_count
     );
-    let feed = state.feed.lock().await;
+    let feed = state.feed.read().await;
     feed.broadcast_post(&post).await.str_err()?;
     log::info!("[post] broadcast post {}", &post.id);
 
@@ -76,7 +76,7 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
 
     let removed = state.storage.delete_post(&id).await.str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
-    let feed = state.feed.lock().await;
+    let feed = state.feed.read().await;
     feed.broadcast_delete(&id, my_id, &signature)
         .await
         .str_err()?;
@@ -144,11 +144,14 @@ pub async fn get_replies(
 }
 
 #[tauri::command]
-pub async fn fetch_link_previews(content: String) -> Result<Vec<LinkPreview>, String> {
-    let urls = crate::og::extract_urls(&content);
+pub async fn fetch_link_previews(
+    state: State<'_, Arc<AppState>>,
+    content: String,
+) -> Result<Vec<LinkPreview>, String> {
+    let urls = crate::opengraph::extract_urls(&content);
     let mut previews = Vec::new();
     for url in &urls {
-        if let Some(preview) = crate::og::get_link_preview(url).await {
+        if let Some(preview) = crate::opengraph::get_link_preview(&state.http_client, url).await {
             previews.push(preview);
         }
     }

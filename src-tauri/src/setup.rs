@@ -16,7 +16,8 @@ use iroh_social_types::{
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Load raw key bytes from a file, or generate new ones.
 fn load_or_create_key_bytes(path: &std::path::Path) -> [u8; 32] {
@@ -152,6 +153,262 @@ async fn sync_peer_posts(
                 short_id(pubkey)
             );
             tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+        }
+    }
+}
+
+async fn dm_outbox_flush_task(
+    dm_handler: DmHandler,
+    endpoint: Endpoint,
+    storage: Arc<Storage>,
+    token: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(OUTBOX_FLUSH_INTERVAL) => {}
+        }
+        let peers = match storage.get_all_outbox_peers().await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[dm-outbox] failed to get peers: {e}");
+                continue;
+            }
+        };
+        for peer in peers {
+            match dm_handler.flush_outbox_for_peer(&endpoint, &peer).await {
+                Ok((sent, _)) if sent > 0 => {
+                    log::info!(
+                        "[dm-outbox] flushed {sent} queued messages to {}",
+                        short_id(&peer)
+                    );
+                }
+                Err(e) => {
+                    log::error!("[dm-outbox] flush error for {}: {e}", short_id(&peer));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn push_outbox_flush_task(
+    endpoint: Endpoint,
+    storage: Arc<Storage>,
+    my_id: String,
+    token: CancellationToken,
+) {
+    let mut last_prune = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL) => {}
+        }
+
+        // Flush push outbox
+        let peers = match storage.get_push_outbox_peers().await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[push-outbox] failed to get peers: {e}");
+                Vec::new()
+            }
+        };
+        for peer in peers {
+            let peer_node_ids = storage
+                .get_peer_transport_node_ids(&peer)
+                .await
+                .unwrap_or_default();
+            let targets: Vec<iroh::EndpointId> = peer_node_ids
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+
+            let profile_entries = storage
+                .get_pending_push_profile_ids(&peer)
+                .await
+                .unwrap_or_default();
+            let post_entries = storage
+                .get_pending_push_post_ids(&peer)
+                .await
+                .unwrap_or_default();
+            let interaction_entries = storage
+                .get_pending_push_interaction_ids(&peer)
+                .await
+                .unwrap_or_default();
+
+            if profile_entries.is_empty()
+                && post_entries.is_empty()
+                && interaction_entries.is_empty()
+            {
+                continue;
+            }
+
+            let mut posts = Vec::new();
+            let mut post_outbox_ids = Vec::new();
+            for (outbox_id, post_id) in &post_entries {
+                if let Ok(Some(post)) = storage.get_post_by_id(post_id).await {
+                    posts.push(post);
+                }
+                post_outbox_ids.push(*outbox_id);
+            }
+
+            let mut interactions = Vec::new();
+            let mut interaction_outbox_ids = Vec::new();
+            for (outbox_id, interaction_id) in &interaction_entries {
+                if let Ok(Some(interaction)) = storage.get_interaction_by_id(interaction_id).await {
+                    interactions.push(interaction);
+                }
+                interaction_outbox_ids.push(*outbox_id);
+            }
+
+            // Include profile if there are profile-only entries
+            let profile = if !profile_entries.is_empty() {
+                storage.get_profile(&my_id).await.ok().flatten()
+            } else {
+                None
+            };
+
+            let msg = iroh_social_types::PushMessage {
+                author: my_id.clone(),
+                posts,
+                interactions,
+                profile,
+            };
+
+            let mut all_ids: Vec<i64> = post_outbox_ids
+                .iter()
+                .chain(interaction_outbox_ids.iter())
+                .copied()
+                .collect();
+            all_ids.extend_from_slice(&profile_entries);
+
+            let mut delivered = false;
+            for target in &targets {
+                match push::push_to_peer(&endpoint, *target, &msg).await {
+                    Ok(ack) => {
+                        log::info!(
+                            "[push-outbox] delivered {} posts, {} interactions to {}{}",
+                            ack.received_post_ids.len(),
+                            ack.received_interaction_ids.len(),
+                            short_id(&peer),
+                            if profile_entries.is_empty() {
+                                ""
+                            } else {
+                                " (+ profile)"
+                            },
+                        );
+                        delivered = true;
+                        break;
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "[push-outbox] failed to push to {} device: {e}",
+                            short_id(&peer)
+                        );
+                    }
+                }
+            }
+            if delivered {
+                let _ = storage.remove_push_outbox_entries(&all_ids).await;
+            } else {
+                log::error!(
+                    "[push-outbox] failed to push to {} (tried {} devices)",
+                    short_id(&peer),
+                    targets.len()
+                );
+                let _ = storage.mark_push_attempted(&all_ids).await;
+            }
+        }
+
+        // Hourly housekeeping: prune expired push entries and follow requests
+        if last_prune.elapsed() >= HOUSEKEEPING_INTERVAL {
+            last_prune = std::time::Instant::now();
+            match storage.prune_expired_push_entries().await {
+                Ok(count) if count > 0 => {
+                    log::info!("[housekeeping] pruned {count} expired push entries");
+                }
+                Err(e) => {
+                    log::error!("[housekeeping] push prune error: {e}");
+                }
+                _ => {}
+            }
+            match storage.prune_expired_follow_requests().await {
+                Ok(count) if count > 0 => {
+                    log::info!("[housekeeping] pruned {count} expired follow requests");
+                }
+                Err(e) => {
+                    log::error!("[housekeeping] follow request prune error: {e}");
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn device_sync_task(
+    endpoint: Endpoint,
+    storage: Arc<Storage>,
+    master_pubkey: String,
+    signing_secret_key_bytes: [u8; 32],
+    token: CancellationToken,
+) {
+    tokio::select! {
+        _ = token.cancelled() => return,
+        _ = tokio::time::sleep(DEVICE_SYNC_INITIAL_DELAY) => {}
+    }
+    loop {
+        crate::device_sync::sync_all_devices(
+            &endpoint,
+            &storage,
+            &master_pubkey,
+            &signing_secret_key_bytes,
+        )
+        .await;
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(DEVICE_SYNC_INTERVAL) => {}
+        }
+    }
+}
+
+async fn network_health_task(
+    endpoint: Endpoint,
+    reconnect_tx: tokio::sync::mpsc::UnboundedSender<crate::gossip::ReconnectRequest>,
+    feed: Arc<RwLock<FeedManager>>,
+    token: CancellationToken,
+) {
+    let mut last_tick = std::time::Instant::now();
+    let mut last_heartbeat = std::time::Instant::now();
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => break,
+            _ = tokio::time::sleep(HEALTH_TICK_INTERVAL) => {}
+        }
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(last_tick);
+        last_tick = now;
+
+        // Sleep/wake detection
+        if elapsed > WAKE_THRESHOLD {
+            log::info!(
+                "[wake] detected sleep/wake (elapsed {:.0}s, expected {:.0}s), refreshing network",
+                elapsed.as_secs_f64(),
+                HEALTH_TICK_INTERVAL.as_secs_f64(),
+            );
+            endpoint.network_change().await;
+            let _ = reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
+        }
+
+        // Heartbeat broadcast
+        if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
+            last_heartbeat = std::time::Instant::now();
+            let feed = feed.read().await;
+            if let Err(e) = feed.broadcast_heartbeat().await {
+                log::error!("[heartbeat] broadcast failed: {e}");
+            }
         }
     }
 }
@@ -364,7 +621,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         }
 
         // Wrap feed in Arc<Mutex> early so the spawned subscription task can use it
-        let shared_feed = Arc::new(Mutex::new(feed));
+        let shared_feed = Arc::new(RwLock::new(feed));
 
         // Gossip follow subscriptions + startup sync + drip sync
         // All in one task so drip naturally starts after startup-sync finishes,
@@ -406,7 +663,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                     continue;
                 }
                 log::info!("[setup] resubscribing to {}...", short_id(&f.pubkey));
-                let mut feed = sync_feed.lock().await;
+                let mut feed = sync_feed.write().await;
                 if let Err(e) = feed.follow_user(f.pubkey.clone(), &node_ids).await {
                     log::error!(
                         "[setup] failed to resubscribe to {}: {e}",
@@ -519,245 +776,43 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             }
         });
 
-        // DM outbox flush task
-        let outbox_dm = dm_handler.clone();
-        let outbox_ep = endpoint.clone();
-        let outbox_storage = storage_clone.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(OUTBOX_FLUSH_INTERVAL).await;
-                let peers = match outbox_storage.get_all_outbox_peers().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("[dm-outbox] failed to get peers: {e}");
-                        continue;
-                    }
-                };
-                for peer in peers {
-                    match outbox_dm.flush_outbox_for_peer(&outbox_ep, &peer).await {
-                        Ok((sent, _)) if sent > 0 => {
-                            log::info!(
-                                "[dm-outbox] flushed {sent} queued messages to {}",
-                                short_id(&peer)
-                            );
-                        }
-                        Err(e) => {
-                            log::error!("[dm-outbox] flush error for {}: {e}", short_id(&peer));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
+        let shutdown_token = CancellationToken::new();
 
-        // Push outbox flush + periodic housekeeping (prune expired push entries & follow requests)
-        let push_ep = endpoint.clone();
-        let push_storage = storage_clone.clone();
-        let push_my_id = master_pubkey_clone.clone();
-        tokio::spawn(async move {
-            let mut last_prune = std::time::Instant::now();
-            loop {
-                tokio::time::sleep(PUSH_OUTBOX_FLUSH_INTERVAL).await;
+        tokio::spawn(dm_outbox_flush_task(
+            dm_handler.clone(),
+            endpoint.clone(),
+            storage_clone.clone(),
+            shutdown_token.child_token(),
+        ));
 
-                // Flush push outbox
-                let peers = match push_storage.get_push_outbox_peers().await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        log::error!("[push-outbox] failed to get peers: {e}");
-                        Vec::new()
-                    }
-                };
-                for peer in peers {
-                    let peer_node_ids = push_storage
-                        .get_peer_transport_node_ids(&peer)
-                        .await
-                        .unwrap_or_default();
-                    let targets: Vec<iroh::EndpointId> = peer_node_ids
-                        .iter()
-                        .filter_map(|id| id.parse().ok())
-                        .collect();
-                    if targets.is_empty() {
-                        continue;
-                    }
+        tokio::spawn(push_outbox_flush_task(
+            endpoint.clone(),
+            storage_clone.clone(),
+            master_pubkey_clone.clone(),
+            shutdown_token.child_token(),
+        ));
 
-                    let profile_entries = push_storage
-                        .get_pending_push_profile_ids(&peer)
-                        .await
-                        .unwrap_or_default();
-                    let post_entries = push_storage
-                        .get_pending_push_post_ids(&peer)
-                        .await
-                        .unwrap_or_default();
-                    let interaction_entries = push_storage
-                        .get_pending_push_interaction_ids(&peer)
-                        .await
-                        .unwrap_or_default();
+        tokio::spawn(device_sync_task(
+            endpoint.clone(),
+            storage_clone.clone(),
+            master_pubkey_clone.clone(),
+            signing_secret_key_bytes,
+            shutdown_token.child_token(),
+        ));
 
-                    if profile_entries.is_empty()
-                        && post_entries.is_empty()
-                        && interaction_entries.is_empty()
-                    {
-                        continue;
-                    }
+        tokio::spawn(network_health_task(
+            endpoint.clone(),
+            reconnect_tx_loop.clone(),
+            shared_feed.clone(),
+            shutdown_token.child_token(),
+        ));
 
-                    let mut posts = Vec::new();
-                    let mut post_outbox_ids = Vec::new();
-                    for (outbox_id, post_id) in &post_entries {
-                        if let Ok(Some(post)) = push_storage.get_post_by_id(post_id).await {
-                            posts.push(post);
-                        }
-                        post_outbox_ids.push(*outbox_id);
-                    }
-
-                    let mut interactions = Vec::new();
-                    let mut interaction_outbox_ids = Vec::new();
-                    for (outbox_id, interaction_id) in &interaction_entries {
-                        if let Ok(Some(interaction)) =
-                            push_storage.get_interaction_by_id(interaction_id).await
-                        {
-                            interactions.push(interaction);
-                        }
-                        interaction_outbox_ids.push(*outbox_id);
-                    }
-
-                    // Include profile if there are profile-only entries
-                    let profile = if !profile_entries.is_empty() {
-                        push_storage.get_profile(&push_my_id).await.ok().flatten()
-                    } else {
-                        None
-                    };
-
-                    let msg = iroh_social_types::PushMessage {
-                        author: push_my_id.clone(),
-                        posts,
-                        interactions,
-                        profile,
-                    };
-
-                    let mut all_ids: Vec<i64> = post_outbox_ids
-                        .iter()
-                        .chain(interaction_outbox_ids.iter())
-                        .copied()
-                        .collect();
-                    all_ids.extend_from_slice(&profile_entries);
-
-                    let mut delivered = false;
-                    for target in &targets {
-                        match push::push_to_peer(&push_ep, *target, &msg).await {
-                            Ok(ack) => {
-                                log::info!(
-                                    "[push-outbox] delivered {} posts, {} interactions to {}{}",
-                                    ack.received_post_ids.len(),
-                                    ack.received_interaction_ids.len(),
-                                    short_id(&peer),
-                                    if profile_entries.is_empty() {
-                                        ""
-                                    } else {
-                                        " (+ profile)"
-                                    },
-                                );
-                                delivered = true;
-                                break;
-                            }
-                            Err(e) => {
-                                log::debug!(
-                                    "[push-outbox] failed to push to {} device: {e}",
-                                    short_id(&peer)
-                                );
-                            }
-                        }
-                    }
-                    if delivered {
-                        let _ = push_storage.remove_push_outbox_entries(&all_ids).await;
-                    } else {
-                        log::error!(
-                            "[push-outbox] failed to push to {} (tried {} devices)",
-                            short_id(&peer),
-                            targets.len()
-                        );
-                        let _ = push_storage.mark_push_attempted(&all_ids).await;
-                    }
-                }
-
-                // Hourly housekeeping: prune expired push entries and follow requests
-                if last_prune.elapsed() >= HOUSEKEEPING_INTERVAL {
-                    last_prune = std::time::Instant::now();
-                    match push_storage.prune_expired_push_entries().await {
-                        Ok(count) if count > 0 => {
-                            log::info!("[housekeeping] pruned {count} expired push entries");
-                        }
-                        Err(e) => {
-                            log::error!("[housekeeping] push prune error: {e}");
-                        }
-                        _ => {}
-                    }
-                    match push_storage.prune_expired_follow_requests().await {
-                        Ok(count) if count > 0 => {
-                            log::info!("[housekeeping] pruned {count} expired follow requests");
-                        }
-                        Err(e) => {
-                            log::error!("[housekeeping] follow request prune error: {e}");
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-
-        // Periodic device sync task
-        let dsync_ep = endpoint.clone();
-        let dsync_storage = storage_clone.clone();
-        let dsync_master = master_pubkey_clone.clone();
-        let dsync_signing = signing_secret_key_bytes;
-        tokio::spawn(async move {
-            tokio::time::sleep(DEVICE_SYNC_INITIAL_DELAY).await;
-            loop {
-                crate::device_sync::sync_all_devices(
-                    &dsync_ep,
-                    &dsync_storage,
-                    &dsync_master,
-                    &dsync_signing,
-                )
-                .await;
-                tokio::time::sleep(DEVICE_SYNC_INTERVAL).await;
-            }
-        });
-
-        // Network health: sleep/wake detection + periodic heartbeat broadcast.
-        // Single 5s tick loop handles both concerns.
-        let health_ep = endpoint.clone();
-        let health_reconnect_tx = reconnect_tx_loop.clone();
-        let health_feed = shared_feed.clone();
-        tokio::spawn(async move {
-            let mut last_tick = std::time::Instant::now();
-            let mut last_heartbeat = std::time::Instant::now();
-            loop {
-                tokio::time::sleep(HEALTH_TICK_INTERVAL).await;
-                let now = std::time::Instant::now();
-                let elapsed = now.duration_since(last_tick);
-                last_tick = now;
-
-                // Sleep/wake detection
-                if elapsed > WAKE_THRESHOLD {
-                    log::info!(
-                        "[wake] detected sleep/wake (elapsed {:.0}s, expected {:.0}s), refreshing network",
-                        elapsed.as_secs_f64(),
-                        HEALTH_TICK_INTERVAL.as_secs_f64(),
-                    );
-                    health_ep.network_change().await;
-                    let _ = health_reconnect_tx.send(crate::gossip::ReconnectRequest::RefreshAll);
-                }
-
-                // Heartbeat broadcast
-                if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
-                    last_heartbeat = std::time::Instant::now();
-                    let feed = health_feed.lock().await;
-                    if let Err(e) = feed.broadcast_heartbeat().await {
-                        log::error!("[heartbeat] broadcast failed: {e}");
-                    }
-                }
-            }
-        });
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .user_agent("iroh-social/1.0")
+            .build()
+            .expect("failed to build HTTP client");
 
         let state = Arc::new(AppState {
             endpoint,
@@ -777,6 +832,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             transport_node_id: transport_node_id.clone(),
             delegation: delegation_clone,
             pending_link,
+            http_client,
+            shutdown_token,
         });
 
         // Gossip reconnection loop: restarts dead gossip tasks on demand

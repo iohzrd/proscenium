@@ -386,7 +386,7 @@ impl PeerHandler {
                 let feed = state.feed.clone();
                 let announcement_clone = announcement.clone();
                 tokio::spawn(async move {
-                    let feed_lock = feed.lock().await;
+                    let feed_lock = feed.read().await;
                     if let Err(e) = feed_lock
                         .broadcast_linked_devices(&announcement_clone)
                         .await
@@ -411,9 +411,21 @@ impl ProtocolHandler for PeerHandler {
         let remote = conn.remote_id();
         let remote_str = remote.to_string();
 
+        // Resolve transport NodeId to master pubkey for block check
+        let remote_pubkey = self
+            .storage
+            .get_master_pubkey_for_transport(&remote_str)
+            .await
+            .unwrap_or_else(|| remote_str.clone());
+
         // Reject blocked peers
-        if self.storage.is_blocked(&remote_str).await.unwrap_or(false) {
-            log::warn!("[peer] rejecting blocked peer {}", short_id(&remote_str));
+        if self
+            .storage
+            .is_blocked(&remote_pubkey)
+            .await
+            .unwrap_or(false)
+        {
+            log::warn!("[peer] rejecting blocked peer {}", short_id(&remote_pubkey));
             return Err(AcceptError::from_err(std::io::Error::other("blocked")));
         }
 

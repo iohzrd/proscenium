@@ -1,17 +1,29 @@
 use crate::ext::ResultExt;
-use crate::state::{AppState, FrontendSyncResult, SyncStatus};
+use crate::state::AppState;
 use crate::storage::Storage;
 use iroh::PublicKey;
 use iroh_social_types::{
     parse_mentions, short_id, validate_interaction, validate_post, verify_interaction_signature,
     verify_post_signature,
 };
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendSyncResult {
+    pub posts: Vec<iroh_social_types::Post>,
+    pub remote_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub local_count: u64,
+}
+
 /// Resolve the signing public key for a peer from the delegation cache.
 /// Falls back to the master pubkey for backward compat with pre-delegation content.
-async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
+pub(crate) async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
     // Try cached signing key first (from peer_delegations)
     if let Ok(Some(signing_pubkey)) = storage.get_peer_signing_pubkey(master_pubkey).await
         && let Ok(pk) = signing_pubkey.parse()
@@ -249,13 +261,4 @@ pub async fn get_sync_status(
         .await
         .str_err()?;
     Ok(SyncStatus { local_count })
-}
-
-#[tauri::command]
-pub async fn fetch_older_posts(
-    app_handle: AppHandle,
-    state: State<'_, Arc<AppState>>,
-    pubkey: String,
-) -> Result<FrontendSyncResult, String> {
-    sync_posts(app_handle, state, pubkey).await
 }

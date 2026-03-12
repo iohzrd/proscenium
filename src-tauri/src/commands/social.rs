@@ -73,7 +73,7 @@ pub async fn follow_user(
     state.storage.follow(&entry).await.str_err()?;
 
     {
-        let mut feed = state.feed.lock().await;
+        let mut feed = state.feed.write().await;
         feed.follow_user(pubkey.clone(), &node_ids)
             .await
             .str_err()?;
@@ -122,7 +122,7 @@ pub async fn follow_user(
 pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Result<(), String> {
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
     state.storage.unfollow(&pubkey).await.str_err()?;
-    let mut feed = state.feed.lock().await;
+    let mut feed = state.feed.write().await;
     feed.unfollow_user(&pubkey);
     let deleted = state
         .storage

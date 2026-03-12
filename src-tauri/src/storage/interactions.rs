@@ -92,39 +92,24 @@ impl Storage {
         my_pubkey: &str,
         target_post_id: &str,
     ) -> anyhow::Result<PostCounts> {
-        let likes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM interactions WHERE target_post_id=?1 AND kind='Like'",
+        let row = sqlx::query(
+            "SELECT
+                (SELECT COUNT(*) FROM interactions WHERE target_post_id=?1 AND kind='Like') AS likes,
+                (SELECT COUNT(*) FROM posts WHERE reply_to=?1) AS replies,
+                (SELECT COUNT(*) FROM posts WHERE quote_of=?1) AS reposts,
+                EXISTS(SELECT 1 FROM interactions WHERE author=?2 AND kind='Like' AND target_post_id=?1) AS liked_by_me,
+                EXISTS(SELECT 1 FROM posts WHERE author=?2 AND quote_of=?1) AS reposted_by_me",
         )
         .bind(target_post_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let reposts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE quote_of=?1")
-            .bind(target_post_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let replies: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE reply_to=?1")
-            .bind(target_post_id)
-            .fetch_one(&self.pool)
-            .await?;
-        let liked_by_me: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM interactions WHERE author=?1 AND kind='Like' AND target_post_id=?2",
-        )
         .bind(my_pubkey)
-        .bind(target_post_id)
         .fetch_one(&self.pool)
         .await?;
-        let reposted_by_me: bool =
-            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM posts WHERE author=?1 AND quote_of=?2")
-                .bind(my_pubkey)
-                .bind(target_post_id)
-                .fetch_one(&self.pool)
-                .await?;
         Ok(PostCounts {
-            likes: likes as u32,
-            replies: replies as u32,
-            reposts: reposts as u32,
-            liked_by_me,
-            reposted_by_me,
+            likes: row.get::<i64, _>(0) as u32,
+            replies: row.get::<i64, _>(1) as u32,
+            reposts: row.get::<i64, _>(2) as u32,
+            liked_by_me: row.get::<bool, _>(3),
+            reposted_by_me: row.get::<bool, _>(4),
         })
     }
 

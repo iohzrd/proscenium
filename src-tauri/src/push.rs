@@ -18,6 +18,24 @@ pub async fn handle_push(
     msg: PushMessage,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
+    // Resolve transport NodeId to master pubkey for access control
+    let remote_pubkey = storage
+        .get_master_pubkey_for_transport(remote_str)
+        .await
+        .unwrap_or_else(|| remote_str.to_string());
+
+    // Validate author matches the resolved master pubkey
+    if msg.author != remote_pubkey {
+        log::warn!(
+            "[push-rx] author mismatch: msg.author={}, remote={}",
+            short_id(&msg.author),
+            short_id(&remote_pubkey)
+        );
+        return Err(AcceptError::from_err(std::io::Error::other(
+            "author mismatch",
+        )));
+    }
+
     // Verify the sender is someone we expect content from
     let my_visibility = storage
         .get_visibility(node_id)
@@ -26,34 +44,22 @@ pub async fn handle_push(
 
     let allowed = match my_visibility {
         Visibility::Public | Visibility::Listed => {
-            storage.is_follower(remote_str).await.unwrap_or(false)
+            storage.is_follower(&remote_pubkey).await.unwrap_or(false)
                 || storage
                     .get_follows()
                     .await
-                    .map(|f| f.iter().any(|e| e.pubkey == remote_str))
+                    .map(|f| f.iter().any(|e| e.pubkey == remote_pubkey))
                     .unwrap_or(false)
         }
-        Visibility::Private => storage.is_mutual(remote_str).await.unwrap_or(false),
+        Visibility::Private => storage.is_mutual(&remote_pubkey).await.unwrap_or(false),
     };
 
     if !allowed {
         log::warn!(
             "[push-rx] rejecting push from {} (not authorized)",
-            short_id(remote_str)
+            short_id(&remote_pubkey)
         );
         return Err(AcceptError::from_err(std::io::Error::other("unauthorized")));
-    }
-
-    // Validate author matches remote peer
-    if msg.author != remote_str {
-        log::warn!(
-            "[push-rx] author mismatch: msg.author={}, remote={}",
-            short_id(&msg.author),
-            short_id(remote_str)
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "author mismatch",
-        )));
     }
 
     // Enforce batch size limits
@@ -83,10 +89,10 @@ pub async fn handle_push(
 
     // Process posts
     for post in &msg.posts {
-        if post.author != remote_str {
+        if post.author != remote_pubkey {
             continue;
         }
-        if storage.is_hidden(remote_str).await.unwrap_or(false) {
+        if storage.is_hidden(&remote_pubkey).await.unwrap_or(false) {
             continue;
         }
         if process_incoming_post(storage, post, "push-rx", node_id, app_handle).await {
@@ -96,16 +102,16 @@ pub async fn handle_push(
 
     // Process interactions
     for interaction in &msg.interactions {
-        if interaction.author != remote_str {
+        if interaction.author != remote_pubkey {
             continue;
         }
-        if storage.is_hidden(remote_str).await.unwrap_or(false) {
+        if storage.is_hidden(&remote_pubkey).await.unwrap_or(false) {
             continue;
         }
         process_incoming_interaction(
             storage,
             interaction,
-            remote_str,
+            &remote_pubkey,
             "push-rx",
             node_id,
             app_handle,
@@ -119,11 +125,11 @@ pub async fn handle_push(
         if let Err(reason) = validate_profile(profile) {
             log::error!(
                 "[push-rx] rejected profile from {}: {reason}",
-                short_id(remote_str)
+                short_id(&remote_pubkey)
             );
         } else {
             // Verify profile signature if we have a cached signing key
-            let signer_ok = match storage.get_peer_signing_pubkey(remote_str).await {
+            let signer_ok = match storage.get_peer_signing_pubkey(&remote_pubkey).await {
                 Ok(Some(signing_pubkey)) => match signing_pubkey.parse::<iroh::PublicKey>() {
                     Ok(pk) => verify_profile_signature(profile, &pk).is_ok(),
                     Err(_) => true, // bad cached key, allow through
@@ -133,12 +139,12 @@ pub async fn handle_push(
             if !signer_ok {
                 log::warn!(
                     "[push-rx] bad profile signature from {}",
-                    short_id(remote_str)
+                    short_id(&remote_pubkey)
                 );
-            } else if let Err(e) = storage.save_profile(remote_str, profile).await {
+            } else if let Err(e) = storage.save_profile(&remote_pubkey, profile).await {
                 log::error!("[push-rx] failed to store profile: {e}");
             } else {
-                let _ = app_handle.emit("profile-updated", remote_str);
+                let _ = app_handle.emit("profile-updated", remote_pubkey.as_str());
             }
         }
     }
@@ -151,7 +157,7 @@ pub async fn handle_push(
         "[push-rx] processed {} posts, {} interactions from {}",
         received_post_ids.len(),
         received_interaction_ids.len(),
-        short_id(remote_str)
+        short_id(&remote_pubkey)
     );
 
     // Send ack
