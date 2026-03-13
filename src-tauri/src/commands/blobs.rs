@@ -15,9 +15,9 @@ async fn add_blob_inner(state: &AppState, data: &[u8]) -> Result<serde_json::Val
     }
 
     let size = data.len();
-    let tag = state.store.add_slice(data).await.str_err()?;
+    let tag = state.blob_store.add_slice(data).await.str_err()?;
 
-    let addr = state.endpoint.addr();
+    let addr = state.net.endpoint.addr();
     let ticket = BlobTicket::new(addr, tag.hash, tag.format);
     log::info!("[blob] added blob {} ({size} bytes)", tag.hash);
 
@@ -29,6 +29,7 @@ async fn add_blob_inner(state: &AppState, data: &[u8]) -> Result<serde_json::Val
 
 async fn fetch_blob_inner(state: &AppState, ticket: &BlobTicket) -> Result<Vec<u8>, String> {
     let conn = state
+        .net
         .endpoint
         .connect(ticket.addr().clone(), iroh_blobs::ALPN)
         .await
@@ -36,13 +37,14 @@ async fn fetch_blob_inner(state: &AppState, ticket: &BlobTicket) -> Result<Vec<u
 
     let hash_and_format: HashAndFormat = ticket.hash_and_format();
     state
+        .net
         .blobs
         .remote()
         .fetch(conn, hash_and_format)
         .await
         .str_err()?;
 
-    let bytes = state.store.get_bytes(ticket.hash()).await.str_err()?;
+    let bytes = state.blob_store.get_bytes(ticket.hash()).await.str_err()?;
     Ok(bytes.to_vec())
 }
 
@@ -82,7 +84,7 @@ pub async fn fetch_blob_bytes(
 ) -> Result<Vec<u8>, String> {
     let ticket: BlobTicket = ticket.parse().str_err()?;
 
-    if let Ok(bytes) = state.store.get_bytes(ticket.hash()).await {
+    if let Ok(bytes) = state.blob_store.get_bytes(ticket.hash()).await {
         return Ok(bytes.to_vec());
     }
 

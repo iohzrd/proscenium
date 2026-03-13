@@ -85,6 +85,7 @@ pub async fn rotate_signing_key(
 
     // Broadcast via gossip
     state
+        .net
         .gossip
         .broadcast_signing_key_rotation(&rotation)
         .await
@@ -123,6 +124,7 @@ pub async fn rotate_signing_key(
         log::error!("[rotate] failed to cache own announcement: {e}");
     }
     state
+        .net
         .gossip
         .broadcast_linked_devices(&announcement)
         .await

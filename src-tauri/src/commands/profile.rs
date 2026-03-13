@@ -27,8 +27,11 @@ pub async fn get_pubkey(state: State<'_, Arc<AppState>>) -> Result<String, Strin
 
 #[tauri::command]
 pub async fn get_my_profile(state: State<'_, Arc<AppState>>) -> Result<Option<Profile>, String> {
-    let node_id = state.identity.master_pubkey.clone();
-    state.storage.get_profile(&node_id).await.str_err()
+    state
+        .storage
+        .get_profile(&state.identity.master_pubkey)
+        .await
+        .str_err()
 }
 
 #[tauri::command]
@@ -52,7 +55,6 @@ pub async fn save_my_profile(
     };
     validate_profile(&profile)?;
 
-    // Sign with signing key
     sign_profile(&mut profile, &state.identity.signing_key);
 
     let old_visibility = state
@@ -62,10 +64,10 @@ pub async fn save_my_profile(
         .unwrap_or(Visibility::Public);
 
     if old_visibility != new_visibility {
-        // Handle gossip feed start/stop BEFORE saving new visibility
         state
+            .net
             .gossip
-            .handle_visibility_change(old_visibility, new_visibility, profile.clone())
+            .handle_visibility_change(old_visibility, new_visibility, &profile)
             .await
             .str_err()?;
         log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
@@ -78,10 +80,13 @@ pub async fn save_my_profile(
         .str_err()?;
     log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
 
-    // Broadcast profile update (gossip for Public, push outbox for Listed/Private)
-    state.gossip.broadcast_profile(&profile).await.str_err()?;
+    state
+        .net
+        .gossip
+        .broadcast_profile(&profile)
+        .await
+        .str_err()?;
 
-    // Sync profile to all registered discovery servers
     if let Ok(servers) = state.storage.get_servers().await {
         for server in servers {
             if server.registered_at.is_some() {
@@ -103,10 +108,10 @@ pub async fn get_remote_profile(
 
 #[tauri::command]
 pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> Result<NodeStatus, String> {
-    let addr = state.endpoint.addr();
+    let addr = state.net.endpoint.addr();
     let relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let has_relay = relay_url.is_some();
-    let follow_count = state.gossip.get_subscription_count().await;
+    let follow_count = state.net.gossip.get_subscription_count().await;
     let follower_count = state
         .storage
         .get_followers()

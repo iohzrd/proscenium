@@ -1,11 +1,11 @@
 use crate::constants::{GOSSIP_HEARTBEAT_INTERVAL, HEALTH_TICK_INTERVAL, WAKE_THRESHOLD};
-use crate::gossip::GossipHandle;
+use crate::gossip::GossipService;
 use iroh::Endpoint;
 use tokio_util::sync::CancellationToken;
 
 pub async fn network_health_task(
     endpoint: Endpoint,
-    gossip: GossipHandle,
+    gossip: GossipService,
     token: CancellationToken,
 ) {
     let mut last_tick = std::time::Instant::now();

@@ -45,7 +45,7 @@ pub async fn block_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Resu
 
     if is_following {
         state.storage.unfollow(&pubkey).await.str_err()?;
-        state.gossip.unfollow_user(&pubkey);
+        state.net.gossip.unfollow_user(&pubkey).await;
     }
 
     state.storage.block_user(&pubkey).await.str_err()

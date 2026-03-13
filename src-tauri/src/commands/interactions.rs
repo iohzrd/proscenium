@@ -32,6 +32,7 @@ pub async fn like_post(
         .await
         .str_err()?;
     state
+        .net
         .gossip
         .broadcast_interaction(&interaction)
         .await
@@ -53,6 +54,7 @@ pub async fn unlike_post(
     if let Some(id) = id {
         let signature = sign_delete_interaction(&id, &my_id, &state.identity.signing_key);
         state
+            .net
             .gossip
             .broadcast_delete_interaction(&id, &my_id, &signature)
             .await
@@ -86,7 +88,7 @@ pub async fn repost(
     sign_post(&mut post, &state.identity.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
-    state.gossip.broadcast_post(&post).await.str_err()?;
+    state.net.gossip.broadcast_post(&post).await.str_err()?;
     Ok(post)
 }
 
@@ -104,6 +106,7 @@ pub async fn unrepost(
     if let Some(id) = id {
         let signature = sign_delete_post(&id, &my_id, &state.identity.signing_key);
         state
+            .net
             .gossip
             .broadcast_delete(&id, &my_id, &signature)
             .await
@@ -117,10 +120,9 @@ pub async fn get_post_counts(
     state: State<'_, Arc<AppState>>,
     target_post_id: String,
 ) -> Result<PostCounts, String> {
-    let my_id = state.identity.master_pubkey.clone();
     state
         .storage
-        .get_post_counts(&my_id, &target_post_id)
+        .get_post_counts(&state.identity.master_pubkey, &target_post_id)
         .await
         .str_err()
 }

@@ -383,7 +383,7 @@ impl PeerHandler {
             iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
             if let Some(state) = self.app_handle.try_state::<Arc<crate::state::AppState>>() {
-                let gossip = state.gossip.clone();
+                let gossip = state.net.gossip.clone();
                 let announcement_clone = announcement.clone();
                 tokio::spawn(async move {
                     if let Err(e) = gossip.broadcast_linked_devices(&announcement_clone).await {

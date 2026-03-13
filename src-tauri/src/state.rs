@@ -1,5 +1,5 @@
 use crate::dm::DmHandler;
-use crate::gossip::GossipHandle;
+use crate::gossip::GossipService;
 use crate::opengraph::OgCache;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
@@ -43,9 +43,6 @@ pub struct Identity {
     pub signing_secret_key_bytes: [u8; 32],
     /// Pre-constructed signing SecretKey (avoids repeated from_bytes).
     pub signing_key: SecretKey,
-    /// Signing public key string.
-    #[allow(dead_code)]
-    pub signing_pubkey: String,
     /// Signing key derivation index (0 for initial, incremented on rotation).
     pub signing_key_index: u32,
     /// DM public key string (hex-encoded X25519).
@@ -58,27 +55,49 @@ pub struct Identity {
     pub delegation: iroh_social_types::SigningKeyDelegation,
 }
 
+/// All network-layer services: QUIC endpoint, protocol handles, and the router
+/// that keeps protocol handlers registered and alive.
+pub struct Net {
+    pub endpoint: Endpoint,
+    pub gossip: GossipService,
+    pub dm: DmHandler,
+    pub blobs: BlobsProtocol,
+    // Held alive to keep all protocol handler registrations active.
+    // Not used directly after construction.
+    _router: Router,
+}
+
+impl Net {
+    pub fn new(
+        endpoint: Endpoint,
+        gossip: GossipService,
+        dm: DmHandler,
+        blobs: BlobsProtocol,
+        router: Router,
+    ) -> Self {
+        Self {
+            endpoint,
+            gossip,
+            dm,
+            blobs,
+            _router: router,
+        }
+    }
+}
+
 pub struct AppState {
     pub identity: Identity,
-    pub endpoint: Endpoint,
-    /// Kept alive to maintain protocol handler registrations (DM, blobs, etc.)
-    #[allow(dead_code)]
-    pub router: Router,
-    pub blobs: BlobsProtocol,
-    pub store: FsStore,
+    pub net: Net,
     pub storage: Arc<Storage>,
-    pub gossip: GossipHandle,
-    pub dm: DmHandler,
+    /// Local blob storage (add/get bytes). For fetching remote blobs use net.blobs.
+    pub blob_store: FsStore,
+    pub http_client: reqwest::Client,
+    pub og_cache: OgCache,
     /// Active device-linking session (if any).
     pub pending_link: PendingLinkState,
-    /// Shared HTTP client for server API calls and link preview fetching.
-    pub http_client: reqwest::Client,
-    /// Cache for OpenGraph link previews (TTL-based eviction).
-    pub og_cache: OgCache,
     /// Send commands to the sync task (trigger on-demand syncs).
     #[allow(dead_code)]
     pub sync_tx: mpsc::Sender<SyncCommand>,
     /// Cancellation token for graceful shutdown of background tasks.
-    /// Held here so child tokens stay alive; cancel via `shutdown_token.cancel()`.
     pub shutdown_token: CancellationToken,
 }

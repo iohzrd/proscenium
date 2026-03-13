@@ -11,6 +11,7 @@ use tauri::State;
 use crate::constants::{DEFAULT_FEED_LIMIT, DEFAULT_REPLY_LIMIT};
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn create_post(
     state: State<'_, Arc<AppState>>,
     content: String,
@@ -20,7 +21,6 @@ pub async fn create_post(
     quote_of: Option<String>,
     quote_of_author: Option<String>,
 ) -> Result<Post, String> {
-    // author = master pubkey (permanent identity)
     let author = state.identity.master_pubkey.clone();
     let media_count = media.as_ref().map_or(0, |m| m.len());
     let mut post = Post {
@@ -38,7 +38,6 @@ pub async fn create_post(
 
     validate_post(&post)?;
 
-    // Sign with signing key (not master key)
     sign_post(&mut post, &state.identity.signing_key);
 
     state.storage.insert_post(&post).await.str_err()?;
@@ -47,7 +46,7 @@ pub async fn create_post(
         &post.id,
         media_count
     );
-    state.gossip.broadcast_post(&post).await.str_err()?;
+    state.net.gossip.broadcast_post(&post).await.str_err()?;
     log::info!("[post] broadcast post {}", &post.id);
 
     Ok(post)
@@ -55,11 +54,11 @@ pub async fn create_post(
 
 #[tauri::command]
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    let my_id = &state.identity.master_pubkey;
+    let my_id = state.identity.master_pubkey.clone();
 
     let post = state.storage.get_post_by_id(&id).await.str_err()?;
     match post {
-        Some(post) if post.author == *my_id => {}
+        Some(post) if post.author == my_id => {}
         Some(_) => {
             return Err("cannot delete posts authored by other users".to_string());
         }
@@ -68,14 +67,14 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> Result<
         }
     }
 
-    // Sign the delete action
-    let signature = sign_delete_post(&id, my_id, &state.identity.signing_key);
+    let signature = sign_delete_post(&id, &my_id, &state.identity.signing_key);
 
     let removed = state.storage.delete_post(&id).await.str_err()?;
     log::info!("[post] delete post {id}: removed={removed}");
     state
+        .net
         .gossip
-        .broadcast_delete(&id, my_id, &signature)
+        .broadcast_delete(&id, &my_id, &signature)
         .await
         .str_err()?;
     log::info!("[post] broadcast delete {id}");

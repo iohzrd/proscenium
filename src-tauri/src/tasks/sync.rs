@@ -1,5 +1,5 @@
 use crate::constants::*;
-use crate::gossip::GossipHandle;
+use crate::gossip::GossipService;
 use crate::storage::Storage;
 use crate::sync;
 use iroh::Endpoint;
@@ -52,7 +52,7 @@ async fn sync_peer_posts(
 /// avoiding concurrent syncs to the same peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn subscribe_and_sync_task(
-    gossip: GossipHandle,
+    gossip: GossipService,
     endpoint: Endpoint,
     storage: Arc<Storage>,
     app_handle: AppHandle,

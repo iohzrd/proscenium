@@ -73,7 +73,7 @@ pub async fn send_follow_request_to_peer(
     let target: iroh::EndpointId = first_node_id.parse().str_err()?;
 
     let response = crate::peer::send_follow_request(
-        &state.endpoint,
+        &state.net.endpoint,
         &state.storage,
         target,
         &state.identity.master_pubkey,

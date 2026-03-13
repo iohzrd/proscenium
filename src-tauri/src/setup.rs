@@ -1,7 +1,7 @@
 use crate::dm::DmHandler;
-use crate::gossip::GossipActor;
+use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
-use crate::state::AppState;
+use crate::state::{AppState, Net};
 use crate::storage::Storage;
 use crate::tasks;
 use iroh::{Endpoint, SecretKey, protocol::Router};
@@ -121,7 +121,6 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     let transport_secret = SecretKey::from_bytes(&transport_key_bytes);
 
     let master_pubkey_clone = master_pubkey.clone();
-    let signing_pubkey_clone = signing_pubkey.clone();
     let dm_pubkey_clone = dm_pubkey.clone();
     let delegation_clone = delegation.clone();
     let db_path = data_dir.join("social.db");
@@ -172,12 +171,12 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         }
 
         let blobs_dir = data_dir.join("blobs");
-        let store = FsStore::load(&blobs_dir)
+        let blob_store = FsStore::load(&blobs_dir)
             .await
             .expect("failed to open blob store");
         log::info!("[setup] blob store opened at {}", blobs_dir.display());
 
-        let blobs = BlobsProtocol::new(&store, None);
+        let blobs = BlobsProtocol::new(&blob_store, None);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         log::info!("[setup] gossip started");
 
@@ -215,27 +214,23 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             .spawn();
         log::info!("[setup] router spawned");
 
-        // The reconnect_tx is only needed for the initial GossipActor construction.
-        // The actor's run() loop creates its own internal reconnect channel.
-        let (reconnect_tx, _reconnect_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut actor = GossipActor::new(
+        let (gossip_service, reconnect_rx) = GossipService::new(
             gossip,
             endpoint.clone(),
             master_pubkey_clone.clone(),
             storage_clone.clone(),
             handle.clone(),
-            reconnect_tx,
         );
 
-        // Start own feed and broadcast profile before spawning the actor
-        if let Err(e) = actor.start_own_feed().await {
+        // Start own feed and broadcast profile before spawning the reconnect loop
+        if let Err(e) = gossip_service.start_own_feed().await {
             log::error!("[setup] failed to start own feed: {e}");
         } else {
             log::info!("[setup] own gossip feed started");
         }
 
         if let Ok(Some(profile)) = storage_clone.get_profile(&master_pubkey_clone).await {
-            if let Err(e) = actor.broadcast_profile(&profile).await {
+            if let Err(e) = gossip_service.broadcast_profile(&profile).await {
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
                 log::info!("[setup] broadcast profile: {}", profile.display_name);
@@ -268,23 +263,28 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
             };
             sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
-            if let Err(e) = actor.broadcast_linked_devices(&announcement).await {
+            if let Err(e) = gossip_service.broadcast_linked_devices(&announcement).await {
                 log::error!("[setup] failed to broadcast device announcement: {e}");
             } else {
                 log::info!("[setup] broadcast single-device announcement");
             }
         }
 
-        // Spawn the actor -- returns a cloneable handle
-        let gossip_handle = actor.spawn();
-
         let shutdown_token = CancellationToken::new();
         let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(16);
 
+        // Spawn the reconnect loop before cloning gossip_service into tasks/Net.
+        gossip_service.spawn_reconnect_loop(reconnect_rx, shutdown_token.child_token());
+
+        // Clone handles needed by background tasks before they're moved into Net.
+        let task_endpoint = endpoint.clone();
+        let task_gossip = gossip_service.clone();
+        let task_dm = dm_handler.clone();
+
         // Spawn background tasks
         tokio::spawn(tasks::subscribe_and_sync_task(
-            gossip_handle.clone(),
-            endpoint.clone(),
+            task_gossip.clone(),
+            task_endpoint.clone(),
             storage_clone.clone(),
             handle.clone(),
             master_pubkey_clone.clone(),
@@ -294,15 +294,15 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         ));
 
         tokio::spawn(tasks::dm_outbox_flush_task(
-            dm_handler.clone(),
-            endpoint.clone(),
+            task_dm,
+            task_endpoint.clone(),
             storage_clone.clone(),
             dm_outbox_notify,
             shutdown_token.child_token(),
         ));
 
         tokio::spawn(tasks::push_outbox_flush_task(
-            endpoint.clone(),
+            task_endpoint.clone(),
             storage_clone.clone(),
             master_pubkey_clone.clone(),
             shutdown_token.child_token(),
@@ -314,7 +314,7 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         ));
 
         tokio::spawn(tasks::device_sync_task(
-            endpoint.clone(),
+            task_endpoint.clone(),
             storage_clone.clone(),
             master_pubkey_clone.clone(),
             signing_secret_key_bytes,
@@ -322,8 +322,8 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         ));
 
         tokio::spawn(tasks::network_health_task(
-            endpoint.clone(),
-            gossip_handle.clone(),
+            task_endpoint,
+            task_gossip,
             shutdown_token.child_token(),
         ));
 
@@ -340,23 +340,18 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
                 master_pubkey: master_pubkey_clone.clone(),
                 signing_secret_key_bytes,
                 signing_key: SecretKey::from_bytes(&signing_secret_key_bytes),
-                signing_pubkey: signing_pubkey_clone,
                 signing_key_index,
                 dm_pubkey: dm_pubkey_clone,
                 dm_key_index,
                 transport_node_id: transport_node_id.clone(),
                 delegation: delegation_clone,
             },
-            endpoint,
-            router,
-            blobs,
-            store,
+            net: Net::new(endpoint, gossip_service, dm_handler, blobs, router),
             storage: storage_clone,
-            gossip: gossip_handle,
-            dm: dm_handler,
-            pending_link,
+            blob_store,
             http_client,
             og_cache: crate::opengraph::OgCache::new(),
+            pending_link,
             sync_tx,
             shutdown_token,
         });

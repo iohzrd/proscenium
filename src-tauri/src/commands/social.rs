@@ -11,7 +11,7 @@ async fn resolve_peer_identity(
     node_id: &str,
 ) -> Result<iroh_social_types::IdentityResponse, String> {
     let target: iroh::EndpointId = node_id.parse().str_err()?;
-    match crate::peer::query_identity(&state.endpoint, target).await {
+    match crate::peer::query_identity(&state.net.endpoint, target).await {
         Ok(identity) => {
             log::info!(
                 "[identity] resolved {} -> master={}",
@@ -48,17 +48,17 @@ pub async fn follow_user(
     log::info!("[follow] resolving identity for {}...", short_id(&node_id));
 
     // Connect to the transport NodeId and resolve identity
-    let identity = resolve_peer_identity(&state, &node_id).await?;
-    let pubkey = identity.master_pubkey.clone();
+    let peer_identity = resolve_peer_identity(&state, &node_id).await?;
+    let pubkey = peer_identity.master_pubkey.clone();
 
     if pubkey == my_id {
         return Err("cannot follow yourself".to_string());
     }
 
-    let node_ids = if identity.transport_node_ids.is_empty() {
+    let node_ids = if peer_identity.transport_node_ids.is_empty() {
         vec![node_id.clone()]
     } else {
-        identity.transport_node_ids.clone()
+        peer_identity.transport_node_ids.clone()
     };
 
     log::info!("[follow] following {}...", short_id(&pubkey));
@@ -71,6 +71,7 @@ pub async fn follow_user(
     state.storage.follow(&entry).await.str_err()?;
 
     state
+        .net
         .gossip
         .follow_user(pubkey.clone(), node_ids.clone())
         .await
@@ -80,7 +81,7 @@ pub async fn follow_user(
     // Sync posts from the followed peer
     log::info!("[follow] syncing posts from {}...", short_id(&pubkey));
     if let Err(e) = crate::sync::sync_one_peer(
-        &state.endpoint,
+        &state.net.endpoint,
         &state.storage,
         &pubkey,
         &my_id,
@@ -102,7 +103,7 @@ pub async fn follow_user(
 pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> Result<(), String> {
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
     state.storage.unfollow(&pubkey).await.str_err()?;
-    state.gossip.unfollow_user(&pubkey);
+    state.net.gossip.unfollow_user(&pubkey).await;
     let deleted = state
         .storage
         .delete_posts_by_author(&pubkey)

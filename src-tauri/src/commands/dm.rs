@@ -77,8 +77,8 @@ pub async fn send_dm(
 
     log::info!("[dm-cmd] stored message {} locally", short_id(&msg_id));
 
-    let endpoint = state.endpoint.clone();
-    let dm_handler = state.dm.clone();
+    let endpoint = state.net.endpoint.clone();
+    let dm_handler = state.net.dm.clone();
     let to_clone = to.clone();
     tokio::spawn(async move {
         log::info!("[dm-cmd] async send starting to {}", short_id(&to_clone));
@@ -107,8 +107,7 @@ pub async fn get_dm_messages(
     limit: Option<usize>,
     before: Option<u64>,
 ) -> Result<Vec<StoredMessage>, String> {
-    let my_id = state.identity.master_pubkey.clone();
-    let conv_id = Storage::conversation_id(&my_id, &peer_pubkey);
+    let conv_id = Storage::conversation_id(&state.identity.master_pubkey, &peer_pubkey);
     let msgs = state
         .storage
         .get_dm_messages(&conv_id, limit.unwrap_or(DEFAULT_DM_LIMIT), before)
@@ -128,10 +127,9 @@ pub async fn mark_dm_read(
     state: State<'_, Arc<AppState>>,
     peer_pubkey: String,
 ) -> Result<(), String> {
-    let my_id = state.identity.master_pubkey.clone();
     state
         .storage
-        .mark_conversation_read(&peer_pubkey, &my_id)
+        .mark_conversation_read(&peer_pubkey, &state.identity.master_pubkey)
         .await
         .str_err()
 }
@@ -152,8 +150,8 @@ pub async fn delete_dm_message(
 #[tauri::command]
 pub async fn flush_dm_outbox(state: State<'_, Arc<AppState>>) -> Result<serde_json::Value, String> {
     let peers = state.storage.get_all_outbox_peers().await.str_err()?;
-    let endpoint = state.endpoint.clone();
-    let dm_handler = state.dm.clone();
+    let endpoint = state.net.endpoint.clone();
+    let dm_handler = state.net.dm.clone();
 
     let mut total_sent = 0u32;
     let mut total_failed = 0u32;
@@ -197,8 +195,8 @@ pub async fn send_dm_signal(
         other => return Err(format!("unknown signal type: {other}")),
     };
 
-    let dm_handler = state.dm.clone();
-    let endpoint = state.endpoint.clone();
+    let dm_handler = state.net.dm.clone();
+    let endpoint = state.net.endpoint.clone();
 
     tokio::spawn(async move {
         if let Err(e) = dm_handler.send_signal(&endpoint, &to, payload).await {

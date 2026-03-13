@@ -42,6 +42,7 @@ pub async fn start_device_link(
 
     // Build the QR payload
     let relay_url = state
+        .net
         .endpoint
         .addr()
         .relay_urls()
@@ -90,7 +91,7 @@ pub async fn link_with_device(
     let mut psk = [0u8; 32];
     psk.copy_from_slice(&psk_bytes);
 
-    // Get the state (we need the endpoint to connect)
+    // Get the state
     let state = app_handle
         .try_state::<Arc<AppState>>()
         .ok_or("app state not ready")?;
@@ -118,7 +119,7 @@ pub async fn link_with_device(
     let addr = iroh::EndpointAddr::from(target);
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        state.endpoint.connect(addr, PEER_ALPN),
+        state.net.endpoint.connect(addr, PEER_ALPN),
     )
     .await
     .map_err(|_| "connection timeout")?
@@ -175,8 +176,6 @@ pub async fn link_with_device(
         .await
         .map_err(|e| format!("import failed: {e}"))?;
 
-    // Store the new transport key and device index for future use
-    // The new device will use this transport key on next restart
     let data_dir = app_handle
         .path()
         .app_data_dir()
@@ -256,7 +255,7 @@ pub async fn get_linked_devices(
 #[tauri::command]
 pub async fn force_device_sync(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     crate::device_sync::sync_all_devices(
-        &state.endpoint,
+        &state.net.endpoint,
         &state.storage,
         &state.identity.master_pubkey,
         &state.identity.signing_secret_key_bytes,

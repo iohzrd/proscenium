@@ -19,8 +19,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Sent by gossip tasks when their stream dies, so the reconnect loop can restart them.
 pub enum ReconnectRequest {
@@ -49,245 +50,75 @@ fn backoff_secs(attempt: u32) -> u64 {
     (5 * 2u64.pow(attempt)).min(60)
 }
 
-/// Commands sent to the GossipActor via its mpsc channel.
-#[allow(dead_code)]
-pub enum GossipCommand {
-    Follow {
-        pubkey: String,
-        node_ids: Vec<String>,
-        reply: oneshot::Sender<anyhow::Result<()>>,
-    },
-    Unfollow {
-        pubkey: String,
-    },
-    StartOwnFeed {
-        reply: oneshot::Sender<anyhow::Result<()>>,
-    },
-    StopOwnFeed,
-    HandleVisibilityChange {
-        old: Visibility,
-        new: Visibility,
-        profile: Profile,
-        reply: oneshot::Sender<anyhow::Result<()>>,
-    },
-    BroadcastPost(Post),
-    BroadcastInteraction(Interaction),
-    BroadcastDelete {
-        id: String,
-        author: String,
-        signature: String,
-    },
-    BroadcastDeleteInteraction {
-        id: String,
-        author: String,
-        signature: String,
-    },
-    BroadcastHeartbeat,
-    BroadcastProfile(Profile),
-    BroadcastLinkedDevices(LinkedDevicesAnnouncement),
-    BroadcastSigningKeyRotation(SigningKeyRotation),
-    GetSubscriptionCount(oneshot::Sender<usize>),
-    TeardownAll,
-    /// Tear down all subscriptions and re-establish them (sleep/wake recovery).
-    RefreshAll,
-}
-
-/// Thin, cloneable handle for sending commands to the GossipActor.
-#[derive(Clone)]
-pub struct GossipHandle {
-    cmd_tx: mpsc::Sender<GossipCommand>,
-}
-
-impl GossipHandle {
-    pub async fn follow_user(&self, pubkey: String, node_ids: Vec<String>) -> anyhow::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(GossipCommand::Follow {
-                pubkey,
-                node_ids,
-                reply: tx,
-            })
-            .await?;
-        rx.await?
-    }
-
-    pub fn unfollow_user(&self, pubkey: &str) {
-        let _ = self.cmd_tx.try_send(GossipCommand::Unfollow {
-            pubkey: pubkey.to_string(),
-        });
-    }
-
-    #[allow(dead_code)]
-    pub async fn start_own_feed(&self) -> anyhow::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(GossipCommand::StartOwnFeed { reply: tx })
-            .await?;
-        rx.await?
-    }
-
-    #[allow(dead_code)]
-    pub fn stop_own_feed(&self) {
-        let _ = self.cmd_tx.try_send(GossipCommand::StopOwnFeed);
-    }
-
-    pub async fn handle_visibility_change(
-        &self,
-        old: Visibility,
-        new: Visibility,
-        profile: Profile,
-    ) -> anyhow::Result<()> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(GossipCommand::HandleVisibilityChange {
-                old,
-                new,
-                profile,
-                reply: tx,
-            })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn broadcast_post(&self, post: &Post) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastPost(post.clone()))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastInteraction(interaction.clone()))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_delete(
-        &self,
-        id: &str,
-        author: &str,
-        signature: &str,
-    ) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastDelete {
-                id: id.to_string(),
-                author: author.to_string(),
-                signature: signature.to_string(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_delete_interaction(
-        &self,
-        id: &str,
-        author: &str,
-        signature: &str,
-    ) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastDeleteInteraction {
-                id: id.to_string(),
-                author: author.to_string(),
-                signature: signature.to_string(),
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
-        self.cmd_tx.send(GossipCommand::BroadcastHeartbeat).await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_profile(&self, profile: &Profile) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastProfile(profile.clone()))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_linked_devices(
-        &self,
-        announcement: &LinkedDevicesAnnouncement,
-    ) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastLinkedDevices(announcement.clone()))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_signing_key_rotation(
-        &self,
-        rotation: &SigningKeyRotation,
-    ) -> anyhow::Result<()> {
-        self.cmd_tx
-            .send(GossipCommand::BroadcastSigningKeyRotation(rotation.clone()))
-            .await?;
-        Ok(())
-    }
-
-    pub async fn get_subscription_count(&self) -> usize {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(GossipCommand::GetSubscriptionCount(tx))
-            .await
-            .is_err()
-        {
-            return 0;
-        }
-        rx.await.unwrap_or(0)
-    }
-
-    #[allow(dead_code)]
-    pub fn teardown_all(&self) {
-        let _ = self.cmd_tx.try_send(GossipCommand::TeardownAll);
-    }
-
-    pub fn refresh_all(&self) {
-        let _ = self.cmd_tx.try_send(GossipCommand::RefreshAll);
-    }
-}
-
-pub struct GossipActor {
-    pub gossip: Gossip,
-    #[allow(dead_code)]
-    pub endpoint: Endpoint,
-    /// The permanent identity (master public key).
-    pub master_pubkey: String,
+struct GossipInner {
     my_sender: Option<GossipSender>,
     own_feed_handle: Option<JoinHandle<()>>,
     /// Maps peer master pubkey to (task_handle, has_neighbor_flag).
     /// The flag is set to true when the subscription has received at least one NeighborUp event,
     /// meaning the gossip mesh is actually connected. Used to distinguish "alive but isolated"
     /// from "alive and connected" when deciding whether to refresh.
-    pub subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
-    pub storage: Arc<Storage>,
-    pub app_handle: AppHandle,
-    reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
+    subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
 }
 
-impl GossipActor {
+/// Cloneable gossip service — direct async methods, no command channel.
+#[derive(Clone)]
+pub struct GossipService {
+    gossip: Gossip,
+    endpoint: Endpoint,
+    /// The permanent identity (master public key).
+    master_pubkey: String,
+    storage: Arc<Storage>,
+    app_handle: AppHandle,
+    reconnect_tx: mpsc::UnboundedSender<ReconnectRequest>,
+    inner: Arc<tokio::sync::Mutex<GossipInner>>,
+}
+
+impl GossipService {
     pub fn new(
         gossip: Gossip,
         endpoint: Endpoint,
         master_pubkey: String,
         storage: Arc<Storage>,
         app_handle: AppHandle,
-        reconnect_tx: tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
-    ) -> Self {
-        Self {
+    ) -> (Self, mpsc::UnboundedReceiver<ReconnectRequest>) {
+        let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
+        let service = Self {
             gossip,
             endpoint,
             master_pubkey,
-            my_sender: None,
-            own_feed_handle: None,
-            subscriptions: HashMap::new(),
             storage,
             app_handle,
             reconnect_tx,
-        }
+            inner: Arc::new(tokio::sync::Mutex::new(GossipInner {
+                my_sender: None,
+                own_feed_handle: None,
+                subscriptions: HashMap::new(),
+            })),
+        };
+        (service, reconnect_rx)
+    }
+
+    /// Spawn the background reconnect loop. Call once after construction.
+    pub fn spawn_reconnect_loop(
+        &self,
+        mut reconnect_rx: mpsc::UnboundedReceiver<ReconnectRequest>,
+        shutdown: CancellationToken,
+    ) {
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        log::info!("[gossip-reconnect] shutting down");
+                        service.teardown_all().await;
+                        break;
+                    }
+                    Some(req) = reconnect_rx.recv() => {
+                        service.handle_reconnect(req).await;
+                    }
+                }
+            }
+        });
     }
 
     async fn my_visibility(&self) -> Visibility {
@@ -329,7 +160,7 @@ impl GossipActor {
     /// visibility to the database so that `broadcast_profile` can still reach
     /// gossip subscribers when downgrading from Public.
     pub async fn handle_visibility_change(
-        &mut self,
+        &self,
         old: Visibility,
         new: Visibility,
         profile: &Profile,
@@ -344,7 +175,7 @@ impl GossipActor {
             (Visibility::Public, _) => {
                 // Broadcast profile update via gossip before stopping feed
                 self.broadcast_profile(profile).await?;
-                self.stop_own_feed();
+                self.stop_own_feed().await;
             }
             (_, Visibility::Public) => {
                 // Start gossip feed, then broadcast
@@ -360,16 +191,18 @@ impl GossipActor {
         Ok(())
     }
 
-    fn stop_own_feed(&mut self) {
-        if let Some(handle) = self.own_feed_handle.take() {
+    pub async fn stop_own_feed(&self) {
+        let mut inner = self.inner.lock().await;
+        if let Some(handle) = inner.own_feed_handle.take() {
             handle.abort();
-            self.my_sender = None;
+            inner.my_sender = None;
             log::info!("[gossip] stopped own feed topic");
         }
     }
 
-    async fn start_own_feed_unconditional(&mut self) -> anyhow::Result<()> {
-        if self
+    async fn start_own_feed_unconditional(&self) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().await;
+        if inner
             .own_feed_handle
             .as_ref()
             .is_some_and(|h| !h.is_finished())
@@ -383,7 +216,7 @@ impl GossipActor {
 
         let topic_handle = self.gossip.subscribe(topic, vec![]).await?;
         let (sender, receiver) = topic_handle.split();
-        self.my_sender = Some(sender);
+        inner.my_sender = Some(sender);
 
         let storage = self.storage.clone();
         let endpoint = self.endpoint.clone();
@@ -492,11 +325,11 @@ impl GossipActor {
             let _ = reconnect_tx.send(ReconnectRequest::OwnFeed { attempt: 0 });
         });
 
-        self.own_feed_handle = Some(handle);
+        inner.own_feed_handle = Some(handle);
         Ok(())
     }
 
-    pub async fn start_own_feed(&mut self) -> anyhow::Result<()> {
+    pub async fn start_own_feed(&self) -> anyhow::Result<()> {
         let visibility = self.my_visibility().await;
         if visibility != Visibility::Public {
             log::info!("[gossip] skipping own feed topic (visibility={visibility})");
@@ -508,7 +341,8 @@ impl GossipActor {
     /// Serialize and broadcast a gossip message if we have an active sender.
     /// Returns `true` if the message was broadcast, `false` if no sender is active.
     async fn broadcast_msg(&self, msg: &GossipMessage, label: &str) -> anyhow::Result<bool> {
-        if let Some(sender) = self.my_sender.as_ref() {
+        let sender = self.inner.lock().await.my_sender.clone();
+        if let Some(sender) = sender {
             let payload = serde_json::to_vec(msg)?;
             sender.broadcast(Bytes::from(payload)).await?;
             log::info!("[gossip] broadcast {label}");
@@ -635,7 +469,7 @@ impl GossipActor {
 
     pub async fn broadcast_linked_devices(
         &self,
-        announcement: &iroh_social_types::LinkedDevicesAnnouncement,
+        announcement: &LinkedDevicesAnnouncement,
     ) -> anyhow::Result<()> {
         let msg = GossipMessage::LinkedDevices(announcement.clone());
         self.broadcast_msg(
@@ -648,7 +482,7 @@ impl GossipActor {
 
     pub async fn broadcast_signing_key_rotation(
         &self,
-        rotation: &iroh_social_types::SigningKeyRotation,
+        rotation: &SigningKeyRotation,
     ) -> anyhow::Result<()> {
         let msg = GossipMessage::SigningKeyRotation(rotation.clone());
         self.broadcast_msg(
@@ -660,7 +494,8 @@ impl GossipActor {
     }
 
     pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
-        if let Some(sender) = self.my_sender.as_ref() {
+        let sender = self.inner.lock().await.my_sender.clone();
+        if let Some(sender) = sender {
             let payload = serde_json::to_vec(&GossipMessage::Heartbeat)?;
             sender.broadcast(Bytes::from(payload)).await?;
         }
@@ -671,11 +506,12 @@ impl GossipActor {
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
     pub async fn follow_user(
-        &mut self,
+        &self,
         pubkey: String,
-        transport_node_ids: &[String],
+        transport_node_ids: Vec<String>,
     ) -> anyhow::Result<()> {
-        if self.subscriptions.contains_key(&pubkey) {
+        let mut inner = self.inner.lock().await;
+        if inner.subscriptions.contains_key(&pubkey) {
             log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
             return Ok(());
         }
@@ -756,7 +592,7 @@ impl GossipActor {
             });
         });
 
-        self.subscriptions.insert(pubkey, (handle, has_neighbor));
+        inner.subscriptions.insert(pubkey, (handle, has_neighbor));
         Ok(())
     }
 
@@ -1004,11 +840,16 @@ impl GossipActor {
 
     /// Tear down own feed and all follow subscriptions so they can be
     /// re-established with fresh connections (e.g. after sleep/wake).
-    pub fn teardown_all(&mut self) {
-        self.stop_own_feed();
-        let keys: Vec<String> = self.subscriptions.keys().cloned().collect();
+    pub async fn teardown_all(&self) {
+        let mut inner = self.inner.lock().await;
+        if let Some(handle) = inner.own_feed_handle.take() {
+            handle.abort();
+            inner.my_sender = None;
+            log::info!("[gossip] stopped own feed topic");
+        }
+        let keys: Vec<String> = inner.subscriptions.keys().cloned().collect();
         for key in &keys {
-            if let Some((handle, _)) = self.subscriptions.remove(key) {
+            if let Some((handle, _)) = inner.subscriptions.remove(key) {
                 handle.abort();
             }
         }
@@ -1018,161 +859,44 @@ impl GossipActor {
         );
     }
 
-    pub fn unfollow_user(&mut self, pubkey: &str) {
-        if let Some((handle, _)) = self.subscriptions.remove(pubkey) {
+    pub async fn unfollow_user(&self, pubkey: &str) {
+        let mut inner = self.inner.lock().await;
+        if let Some((handle, _)) = inner.subscriptions.remove(pubkey) {
             log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
             handle.abort();
         }
     }
 
-    /// Spawn the actor, returning a GossipHandle for callers.
-    pub fn spawn(self) -> GossipHandle {
-        let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        tokio::spawn(self.run(cmd_rx));
-        GossipHandle { cmd_tx }
+    pub async fn get_subscription_count(&self) -> usize {
+        self.inner.lock().await.subscriptions.len()
     }
 
-    /// Actor event loop: processes commands and reconnection requests.
-    async fn run(mut self, mut cmd_rx: mpsc::Receiver<GossipCommand>) {
-        let (reconnect_tx, mut reconnect_rx) =
-            tokio::sync::mpsc::unbounded_channel::<ReconnectRequest>();
-        // Replace the reconnect_tx so spawned gossip tasks send to OUR channel
-        self.reconnect_tx = reconnect_tx.clone();
-
-        loop {
-            tokio::select! {
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(cmd) => self.handle_command(cmd).await,
-                        None => {
-                            log::info!("[gossip-actor] command channel closed, shutting down");
-                            break;
-                        }
-                    }
-                }
-                Some(req) = reconnect_rx.recv() => {
-                    self.handle_reconnect(req, &reconnect_tx).await;
-                }
-            }
-        }
-        self.teardown_all();
+    /// Trigger a full refresh of all gossip connections (sync, safe to call from sync context).
+    pub fn refresh_all(&self) {
+        let _ = self.reconnect_tx.send(ReconnectRequest::RefreshAll);
     }
 
-    async fn handle_command(&mut self, cmd: GossipCommand) {
-        match cmd {
-            GossipCommand::Follow {
-                pubkey,
-                node_ids,
-                reply,
-            } => {
-                let result = self.follow_user(pubkey, &node_ids).await;
-                let _ = reply.send(result);
-            }
-            GossipCommand::Unfollow { pubkey } => {
-                self.unfollow_user(&pubkey);
-            }
-            GossipCommand::StartOwnFeed { reply } => {
-                let result = self.start_own_feed().await;
-                let _ = reply.send(result);
-            }
-            GossipCommand::StopOwnFeed => {
-                self.stop_own_feed();
-            }
-            GossipCommand::HandleVisibilityChange {
-                old,
-                new,
-                profile,
-                reply,
-            } => {
-                let result = self.handle_visibility_change(old, new, &profile).await;
-                let _ = reply.send(result);
-            }
-            GossipCommand::BroadcastPost(post) => {
-                if let Err(e) = self.broadcast_post(&post).await {
-                    log::error!("[gossip-actor] broadcast post failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastInteraction(interaction) => {
-                if let Err(e) = self.broadcast_interaction(&interaction).await {
-                    log::error!("[gossip-actor] broadcast interaction failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastDelete {
-                id,
-                author,
-                signature,
-            } => {
-                if let Err(e) = self.broadcast_delete(&id, &author, &signature).await {
-                    log::error!("[gossip-actor] broadcast delete failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastDeleteInteraction {
-                id,
-                author,
-                signature,
-            } => {
-                if let Err(e) = self
-                    .broadcast_delete_interaction(&id, &author, &signature)
-                    .await
-                {
-                    log::error!("[gossip-actor] broadcast delete interaction failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastHeartbeat => {
-                if let Err(e) = self.broadcast_heartbeat().await {
-                    log::error!("[heartbeat] broadcast failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastProfile(profile) => {
-                if let Err(e) = self.broadcast_profile(&profile).await {
-                    log::error!("[gossip-actor] broadcast profile failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastLinkedDevices(announcement) => {
-                if let Err(e) = self.broadcast_linked_devices(&announcement).await {
-                    log::error!("[gossip-actor] broadcast linked devices failed: {e}");
-                }
-            }
-            GossipCommand::BroadcastSigningKeyRotation(rotation) => {
-                if let Err(e) = self.broadcast_signing_key_rotation(&rotation).await {
-                    log::error!("[gossip-actor] broadcast key rotation failed: {e}");
-                }
-            }
-            GossipCommand::GetSubscriptionCount(reply) => {
-                let _ = reply.send(self.subscriptions.len());
-            }
-            GossipCommand::TeardownAll => {
-                self.teardown_all();
-            }
-            GossipCommand::RefreshAll => {
-                self.handle_reconnect(ReconnectRequest::RefreshAll, &self.reconnect_tx.clone())
-                    .await;
-            }
-        }
-    }
-
-    async fn handle_reconnect(
-        &mut self,
-        req: ReconnectRequest,
-        reconnect_tx: &tokio::sync::mpsc::UnboundedSender<ReconnectRequest>,
-    ) {
+    async fn handle_reconnect(&self, req: ReconnectRequest) {
         match req {
             ReconnectRequest::OwnFeed { attempt } => {
                 let delay = backoff_secs(attempt);
                 log::info!("[reconnect] own feed died, restarting in {delay}s (attempt {attempt})");
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                self.own_feed_handle = None;
-                self.my_sender = None;
+                {
+                    let mut inner = self.inner.lock().await;
+                    inner.own_feed_handle = None;
+                    inner.my_sender = None;
+                }
                 if let Err(e) = self.start_own_feed().await {
                     log::error!("[reconnect] own feed restart failed: {e}");
-                    let _ = reconnect_tx.send(ReconnectRequest::OwnFeed {
+                    let _ = self.reconnect_tx.send(ReconnectRequest::OwnFeed {
                         attempt: attempt + 1,
                     });
                 }
             }
             ReconnectRequest::RefreshAll => {
                 log::info!("[reconnect] refreshing all gossip connections");
-                self.teardown_all();
+                self.teardown_all().await;
 
                 if let Err(e) = self.start_own_feed().await {
                     log::error!("[reconnect] own feed restart failed: {e}");
@@ -1188,33 +912,40 @@ impl GossipActor {
                     if node_ids.is_empty() {
                         continue;
                     }
-                    if let Err(e) = self.follow_user(f.pubkey.clone(), &node_ids).await {
+                    if let Err(e) = self.follow_user(f.pubkey.clone(), node_ids).await {
                         log::error!("[reconnect] re-follow {} failed: {e}", short_id(&f.pubkey));
                     }
                 }
                 log::info!("[reconnect] refreshed own feed + {} follows", follows.len());
             }
             ReconnectRequest::RefreshFollow { pubkey } => {
-                if self
-                    .subscriptions
-                    .get(&pubkey)
-                    .is_some_and(|(h, has_neighbor)| {
-                        !h.is_finished() && has_neighbor.load(Ordering::Relaxed)
-                    })
                 {
-                    log::info!(
-                        "[reconnect] skipping refresh for {} (subscription alive with neighbors)",
-                        short_id(&pubkey)
-                    );
-                    return;
+                    let inner = self.inner.lock().await;
+                    if inner
+                        .subscriptions
+                        .get(&pubkey)
+                        .is_some_and(|(h, has_neighbor)| {
+                            !h.is_finished() && has_neighbor.load(Ordering::Relaxed)
+                        })
+                    {
+                        log::info!(
+                            "[reconnect] skipping refresh for {} (subscription alive with neighbors)",
+                            short_id(&pubkey)
+                        );
+                        return;
+                    }
+                    if let Some((handle, _)) = inner.subscriptions.get(&pubkey) {
+                        handle.abort();
+                    }
                 }
-                if let Some((handle, _)) = self.subscriptions.remove(&pubkey) {
-                    handle.abort();
-                    log::info!(
-                        "[reconnect] removed isolated/dead subscription for {}",
-                        short_id(&pubkey)
-                    );
+                {
+                    let mut inner = self.inner.lock().await;
+                    inner.subscriptions.remove(&pubkey);
                 }
+                log::info!(
+                    "[reconnect] removed isolated/dead subscription for {}",
+                    short_id(&pubkey)
+                );
                 let node_ids = self
                     .storage
                     .get_peer_transport_node_ids(&pubkey)
@@ -1225,7 +956,7 @@ impl GossipActor {
                         "[reconnect] no transport NodeIds for {}, cannot refresh",
                         short_id(&pubkey)
                     );
-                } else if let Err(e) = self.follow_user(pubkey.clone(), &node_ids).await {
+                } else if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
                     log::error!(
                         "[reconnect] refresh follow for {} failed: {e}",
                         short_id(&pubkey)
@@ -1244,8 +975,11 @@ impl GossipActor {
                     short_id(&pubkey)
                 );
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                if let Some((handle, _)) = self.subscriptions.remove(&pubkey) {
-                    handle.abort();
+                {
+                    let mut inner = self.inner.lock().await;
+                    if let Some((handle, _)) = inner.subscriptions.remove(&pubkey) {
+                        handle.abort();
+                    }
                 }
                 let node_ids = self
                     .storage
@@ -1257,13 +991,13 @@ impl GossipActor {
                         "[reconnect] no cached transport NodeIds for {}, cannot restart",
                         short_id(&pubkey)
                     );
-                    let _ = reconnect_tx.send(ReconnectRequest::Follow {
+                    let _ = self.reconnect_tx.send(ReconnectRequest::Follow {
                         pubkey,
                         attempt: attempt + 1,
                     });
-                } else if let Err(e) = self.follow_user(pubkey.clone(), &node_ids).await {
+                } else if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
                     log::error!("[reconnect] {} restart failed: {e}", short_id(&pubkey));
-                    let _ = reconnect_tx.send(ReconnectRequest::Follow {
+                    let _ = self.reconnect_tx.send(ReconnectRequest::Follow {
                         pubkey,
                         attempt: attempt + 1,
                     });
