@@ -1,67 +1,104 @@
+use crate::constants::OUTBOX_FLUSH_INTERVAL;
 use crate::crypto::{
     RatchetHeader, RatchetState, noise_complete_initiator, noise_complete_responder,
-    noise_initiate, noise_respond, x25519_keypair_from_raw,
+    noise_initiate, noise_respond,
 };
+use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use base64::Engine as _;
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
-use hkdf::Hkdf;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
 use iroh_social_types::{
-    DM_ALPN, DirectMessage, DmHandshake, DmPayload, EncryptedEnvelope, RatchetHeaderWire,
-    StoredMessage, now_millis, short_id,
+    DM_ALPN, DirectMessage, DmAck, DmHandshake, DmMessage, DmPayload, EncryptedEnvelope,
+    RatchetHeaderWire, StoredMessage, now_millis, short_id,
 };
-use sha2::Sha256;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
 pub struct DmHandler {
     storage: Arc<Storage>,
     app_handle: AppHandle,
-    my_x25519_private: [u8; 32],
-    my_x25519_public: [u8; 32],
-    /// Master pubkey -- used for conversation/message storage identifiers.
-    my_master_pubkey_str: String,
-    /// DM pubkey (hex-encoded X25519) -- used as the DM identity sent on the wire.
-    my_dm_pubkey_str: String,
-    /// Key derived from DM secret for encrypting ratchet state at rest.
-    ratchet_storage_key: [u8; 32],
-    /// Notify the outbox flush task when a message is queued.
-    outbox_notify: Arc<tokio::sync::Notify>,
+    endpoint: Endpoint,
+    identity: SharedIdentity,
+    outbox_notify: Arc<Notify>,
 }
 
 impl DmHandler {
     pub fn new(
         storage: Arc<Storage>,
         app_handle: AppHandle,
-        dm_secret: [u8; 32],
-        master_pubkey_str: String,
-        dm_pubkey_str: String,
-        outbox_notify: Arc<tokio::sync::Notify>,
+        endpoint: Endpoint,
+        identity: SharedIdentity,
     ) -> Self {
-        let (my_x25519_private, my_x25519_public) = x25519_keypair_from_raw(&dm_secret);
-
-        // Derive ratchet storage key from the DM secret (not master).
-        // This allows secondary devices without the master key to encrypt/decrypt ratchet state.
-        let hk = Hkdf::<Sha256>::new(None, &dm_secret);
-        let mut ratchet_storage_key = [0u8; 32];
-        hk.expand(b"iroh-social-ratchet-storage-v1", &mut ratchet_storage_key)
-            .expect("HKDF expand valid length");
-
         Self {
             storage,
             app_handle,
-            my_x25519_private,
-            my_x25519_public,
-            my_master_pubkey_str: master_pubkey_str,
-            my_dm_pubkey_str: dm_pubkey_str,
-            ratchet_storage_key,
-            outbox_notify,
+            endpoint,
+            identity,
+            outbox_notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Spawn the outbox flush loop. Select on immediate notify (from send_dm on peer-offline)
+    /// or the periodic fallback timer so no messages are stranded indefinitely.
+    pub fn start_background(&self, token: CancellationToken) {
+        let handler = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    _ = handler.outbox_notify.notified() => {}
+                    _ = tokio::time::sleep(OUTBOX_FLUSH_INTERVAL) => {}
+                }
+                handler.flush_all_outbox().await;
+            }
+            log::info!("[dm] outbox flush loop stopped");
+        });
+    }
+
+    /// Attempt delivery of all queued outbox messages. Entries that succeed are removed;
+    /// entries that fail are left for the next flush.
+    async fn flush_all_outbox(&self) {
+        let entries = match self.storage.get_all_outbox_messages().await {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("[dm] failed to read outbox: {e}");
+                return;
+            }
+        };
+        for (id, peer_pubkey, envelope_json, message_id) in entries {
+            let envelope: EncryptedEnvelope = match serde_json::from_str(&envelope_json) {
+                Ok(e) => e,
+                Err(e) => {
+                    log::error!("[dm] invalid outbox entry {}: {e}", short_id(&id));
+                    continue;
+                }
+            };
+            match self.try_send_envelope(&peer_pubkey, &envelope).await {
+                Ok(()) => {
+                    log::info!(
+                        "[dm] outbox delivered to {}, removing entry",
+                        short_id(&peer_pubkey)
+                    );
+                    if let Err(e) = self.storage.remove_outbox_message(&id).await {
+                        log::error!("[dm] failed to remove outbox entry {}: {e}", short_id(&id));
+                    }
+                    self.mark_delivered(&message_id).await;
+                }
+                Err(e) => {
+                    log::debug!(
+                        "[dm] outbox flush: {} still offline: {e}",
+                        short_id(&peer_pubkey)
+                    );
+                }
+            }
         }
     }
 
@@ -70,7 +107,6 @@ impl DmHandler {
     /// as the key for any subsequent `save_ratchet_session` calls.
     async fn get_or_establish_session(
         &self,
-        endpoint: &Endpoint,
         peer_master_pubkey: &str,
     ) -> anyhow::Result<(RatchetState, String)> {
         log::info!(
@@ -87,13 +123,23 @@ impl DmHandler {
                 anyhow::anyhow!("no DM pubkey cached for {}", short_id(peer_master_pubkey))
             })?;
 
+        // Read all identity fields needed before any await points.
+        let (my_x25519_private, my_dm_pubkey, ratchet_storage_key) = {
+            let id = self.identity.read().await;
+            (
+                id.dm_x25519_private,
+                id.dm_pubkey.clone(),
+                id.ratchet_storage_key,
+            )
+        };
+
         // Try loading existing session (keyed by DM pubkey)
         if let Some(stored) = self.storage.get_ratchet_session(&peer_dm_pubkey).await? {
             log::info!(
                 "[dm] loaded existing ratchet session for {}",
                 short_id(peer_master_pubkey),
             );
-            let json = open_ratchet_state(&self.ratchet_storage_key, &stored)?;
+            let json = open_ratchet_state(&ratchet_storage_key, &stored)?;
             let state: RatchetState = serde_json::from_str(&json)?;
             return Ok((state, peer_dm_pubkey));
         }
@@ -120,7 +166,7 @@ impl DmHandler {
         log::info!("[dm] resolved peer DM X25519 key");
 
         // Noise IK handshake: initiator
-        let (initiator_hs, msg1) = noise_initiate(&self.my_x25519_private, &peer_x25519_public)
+        let (initiator_hs, msg1) = noise_initiate(&my_x25519_private, &peer_x25519_public)
             .map_err(|e| anyhow::anyhow!("noise init: {e}"))?;
         log::info!("[dm] noise init message created ({} bytes)", msg1.len());
 
@@ -130,7 +176,7 @@ impl DmHandler {
         );
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            endpoint.connect(addr, DM_ALPN),
+            self.endpoint.connect(addr, DM_ALPN),
         )
         .await
         .map_err(|_| {
@@ -154,14 +200,14 @@ impl DmHandler {
         // Send handshake init -- sender is our DM pubkey
         let handshake = DmHandshake::Init {
             noise_message: msg1,
-            sender: self.my_dm_pubkey_str.clone(),
+            sender: my_dm_pubkey,
         };
-        let bytes = serde_json::to_vec(&handshake)?;
+        let bytes = serde_json::to_vec(&DmMessage::Handshake(handshake))?;
         log::info!("[dm] sending handshake init ({} bytes)...", bytes.len());
         send.write_all(&bytes).await?;
         send.finish()?;
 
-        // Read handshake response
+        // Read handshake response (acceptor sends DmHandshake::Response directly)
         log::info!("[dm] waiting for handshake response...");
         let resp_bytes = recv.read_to_end(65536).await?;
         log::info!(
@@ -187,7 +233,7 @@ impl DmHandler {
 
         // Encrypt and save session keyed by peer's DM pubkey
         let json = serde_json::to_string(&ratchet)?;
-        let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
+        let sealed = seal_ratchet_state(&ratchet_storage_key, &json)?;
         self.storage
             .save_ratchet_session(&peer_dm_pubkey, &sealed, now_millis())
             .await?;
@@ -202,30 +248,29 @@ impl DmHandler {
     /// Send a DM to a peer. Encrypts with Double Ratchet and sends over QUIC.
     /// If the peer is offline, queues to outbox.
     /// On successful delivery, marks the message as delivered and emits `dm-delivered`.
-    pub async fn send_dm(
-        &self,
-        endpoint: &Endpoint,
-        peer_pubkey: &str,
-        message: DirectMessage,
-    ) -> anyhow::Result<()> {
+    pub async fn send_dm(&self, peer_pubkey: &str, message: DirectMessage) -> anyhow::Result<()> {
         let message_id = message.id.clone();
-        let (mut ratchet, peer_dm_pubkey) =
-            self.get_or_establish_session(endpoint, peer_pubkey).await?;
+        let (mut ratchet, peer_dm_pubkey) = self.get_or_establish_session(peer_pubkey).await?;
 
         // Encrypt the message
         let payload = DmPayload::Message(message);
         let plaintext = serde_json::to_vec(&payload)?;
         let (header, ciphertext) = ratchet.encrypt(&plaintext);
 
+        let (dm_pubkey, ratchet_storage_key) = {
+            let id = self.identity.read().await;
+            (id.dm_pubkey.clone(), id.ratchet_storage_key)
+        };
+
         // Encrypt and save updated ratchet state (keyed by DM pubkey)
         let ratchet_json = serde_json::to_string(&ratchet)?;
-        let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
+        let ratchet_sealed = seal_ratchet_state(&ratchet_storage_key, &ratchet_json)?;
         self.storage
             .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())
             .await?;
 
         let envelope = EncryptedEnvelope {
-            sender: self.my_dm_pubkey_str.clone(),
+            sender: dm_pubkey,
             ratchet_header: ratchet_header_to_wire(&header),
             ciphertext,
         };
@@ -239,10 +284,7 @@ impl DmHandler {
         );
 
         // Try to send
-        match self
-            .try_send_envelope(endpoint, peer_pubkey, &envelope)
-            .await
-        {
+        match self.try_send_envelope(peer_pubkey, &envelope).await {
             Ok(()) => {
                 log::info!("[dm] sent message to {}", short_id(peer_pubkey));
                 self.mark_delivered(&message_id).await;
@@ -288,7 +330,6 @@ impl DmHandler {
     /// Try to send an encrypted envelope to a peer over QUIC.
     async fn try_send_envelope(
         &self,
-        endpoint: &Endpoint,
         peer_master_pubkey: &str,
         envelope: &EncryptedEnvelope,
     ) -> anyhow::Result<()> {
@@ -304,107 +345,54 @@ impl DmHandler {
 
         let conn = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            endpoint.connect(addr, DM_ALPN),
+            self.endpoint.connect(addr, DM_ALPN),
         )
         .await
         .map_err(|_| anyhow::anyhow!("connection timeout"))??;
 
         let (mut send, mut recv) = conn.open_bi().await?;
 
-        let bytes = serde_json::to_vec(envelope)?;
+        let bytes = serde_json::to_vec(&DmMessage::Envelope(envelope.clone()))?;
         send.write_all(&bytes).await?;
         send.finish()?;
 
         // Wait for ACK
-        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(1024))
-            .await
-            .map_err(|_| anyhow::anyhow!("ack timeout"))??;
-
-        if ack != b"ok" {
-            return Err(anyhow::anyhow!("unexpected ack: {:?}", ack));
-        }
+        let ack_bytes =
+            tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(256))
+                .await
+                .map_err(|_| anyhow::anyhow!("ack timeout"))??;
+        serde_json::from_slice::<DmAck>(&ack_bytes)
+            .map_err(|e| anyhow::anyhow!("unexpected ack: {e}"))?;
 
         conn.close(0u32.into(), b"done");
         Ok(())
     }
 
-    /// Flush all pending outbox messages for a peer.
-    pub async fn flush_outbox_for_peer(
-        &self,
-        endpoint: &Endpoint,
-        peer_pubkey: &str,
-    ) -> anyhow::Result<(u32, u32)> {
-        let entries = self.storage.get_outbox_for_peer(peer_pubkey).await?;
-        if entries.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let mut sent = 0u32;
-        let mut failed = 0u32;
-
-        for (id, envelope_json, message_id) in &entries {
-            let envelope: EncryptedEnvelope = match serde_json::from_str(envelope_json) {
-                Ok(e) => e,
-                Err(_) => {
-                    self.storage.remove_outbox_message(id).await?;
-                    failed += 1;
-                    continue;
-                }
-            };
-
-            match self
-                .try_send_envelope(endpoint, peer_pubkey, &envelope)
-                .await
-            {
-                Ok(()) => {
-                    self.storage.remove_outbox_message(id).await?;
-                    self.mark_delivered(message_id).await;
-                    sent += 1;
-                }
-                Err(_) => {
-                    failed += 1;
-                    // Stop trying this peer if first message fails (they're offline)
-                    break;
-                }
-            }
-        }
-
-        if sent > 0 {
-            log::info!(
-                "[dm-outbox] flushed {sent} messages to {}",
-                short_id(peer_pubkey)
-            );
-        }
-        Ok((sent, failed))
-    }
-
     /// Send a lightweight DM signal (typing, read receipt) without storing a message.
-    pub async fn send_signal(
-        &self,
-        endpoint: &Endpoint,
-        peer_pubkey: &str,
-        payload: DmPayload,
-    ) -> anyhow::Result<()> {
-        let (mut ratchet, peer_dm_pubkey) =
-            self.get_or_establish_session(endpoint, peer_pubkey).await?;
+    pub async fn send_signal(&self, peer_pubkey: &str, payload: DmPayload) -> anyhow::Result<()> {
+        let (mut ratchet, peer_dm_pubkey) = self.get_or_establish_session(peer_pubkey).await?;
 
         let plaintext = serde_json::to_vec(&payload)?;
         let (header, ciphertext) = ratchet.encrypt(&plaintext);
 
+        let (dm_pubkey, ratchet_storage_key) = {
+            let id = self.identity.read().await;
+            (id.dm_pubkey.clone(), id.ratchet_storage_key)
+        };
+
         let ratchet_json = serde_json::to_string(&ratchet)?;
-        let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
+        let ratchet_sealed = seal_ratchet_state(&ratchet_storage_key, &ratchet_json)?;
         self.storage
             .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())
             .await?;
 
         let envelope = EncryptedEnvelope {
-            sender: self.my_dm_pubkey_str.clone(),
+            sender: dm_pubkey,
             ratchet_header: ratchet_header_to_wire(&header),
             ciphertext,
         };
 
-        self.try_send_envelope(endpoint, peer_pubkey, &envelope)
-            .await?;
+        self.try_send_envelope(peer_pubkey, &envelope).await?;
 
         Ok(())
     }
@@ -418,8 +406,17 @@ impl DmHandler {
     ) -> anyhow::Result<Vec<u8>> {
         log::info!("[dm] handling handshake from {}", short_id(peer_dm_pubkey));
 
+        let (my_x25519_private, my_x25519_public, ratchet_storage_key) = {
+            let id = self.identity.read().await;
+            (
+                id.dm_x25519_private,
+                id.dm_x25519_public,
+                id.ratchet_storage_key,
+            )
+        };
+
         // Noise IK responder
-        let (responder_hs, response_msg) = noise_respond(&self.my_x25519_private, &noise_message)
+        let (responder_hs, response_msg) = noise_respond(&my_x25519_private, &noise_message)
             .map_err(|e| anyhow::anyhow!("noise respond: {e}"))?;
 
         let (shared_secret, initiator_dm_pubkey) = noise_complete_responder(responder_hs)
@@ -442,14 +439,11 @@ impl DmHandler {
         }
 
         // Initialize Double Ratchet as Bob (responder)
-        let ratchet = RatchetState::init_bob(
-            &shared_secret,
-            (self.my_x25519_private, self.my_x25519_public),
-        );
+        let ratchet = RatchetState::init_bob(&shared_secret, (my_x25519_private, my_x25519_public));
 
         // Save session keyed by peer's DM pubkey
         let json = serde_json::to_string(&ratchet)?;
-        let sealed = seal_ratchet_state(&self.ratchet_storage_key, &json)?;
+        let sealed = seal_ratchet_state(&ratchet_storage_key, &json)?;
         self.storage
             .save_ratchet_session(peer_dm_pubkey, &sealed, now_millis())
             .await?;
@@ -477,13 +471,18 @@ impl DmHandler {
             &envelope.ratchet_header.dh_public[..8],
             envelope.ciphertext.len(),
         );
+        let (ratchet_storage_key, my_master_pubkey) = {
+            let id = self.identity.read().await;
+            (id.ratchet_storage_key, id.master_pubkey.clone())
+        };
+
         // Load and decrypt ratchet session (keyed by DM pubkey)
         let stored = self
             .storage
             .get_ratchet_session(peer_dm_pubkey)
             .await?
             .ok_or_else(|| anyhow::anyhow!("no session with {}", short_id(peer_dm_pubkey)))?;
-        let json = open_ratchet_state(&self.ratchet_storage_key, &stored)?;
+        let json = open_ratchet_state(&ratchet_storage_key, &stored)?;
         let mut ratchet: RatchetState = serde_json::from_str(&json)?;
 
         // Convert wire header to crypto header
@@ -496,7 +495,7 @@ impl DmHandler {
 
         // Serialize updated ratchet state (encrypted)
         let ratchet_json = serde_json::to_string(&ratchet)?;
-        let ratchet_sealed = seal_ratchet_state(&self.ratchet_storage_key, &ratchet_json)?;
+        let ratchet_sealed = seal_ratchet_state(&ratchet_storage_key, &ratchet_json)?;
         let ratchet_ts = now_millis();
 
         // Parse payload
@@ -513,8 +512,7 @@ impl DmHandler {
                         anyhow::anyhow!("no master pubkey for DM key {}", short_id(peer_dm_pubkey))
                     })?;
 
-                let conv_id =
-                    Storage::conversation_id(&self.my_master_pubkey_str, &peer_master_pubkey);
+                let conv_id = Storage::conversation_id(&my_master_pubkey, &peer_master_pubkey);
                 let preview = if msg.content.len() > 80 {
                     format!("{}...", &msg.content[..77])
                 } else {
@@ -525,7 +523,7 @@ impl DmHandler {
                     id: msg.id.clone(),
                     conversation_id: conv_id.clone(),
                     from_pubkey: peer_master_pubkey.clone(),
-                    to_pubkey: self.my_master_pubkey_str.clone(),
+                    to_pubkey: my_master_pubkey.clone(),
                     content: msg.content,
                     timestamp: msg.timestamp,
                     media: msg.media,
@@ -630,44 +628,41 @@ impl ProtocolHandler for DmHandler {
             .await
             .map_err(AcceptError::from_err)?;
 
-        // Try handshake first, then encrypted message.
-        // In both cases, sender = peer's DM pubkey (hex X25519).
-        if let Ok(handshake) = serde_json::from_slice::<DmHandshake>(&frame_bytes) {
-            match handshake {
-                DmHandshake::Init {
-                    noise_message,
-                    sender,
-                } => {
-                    let response = self
-                        .handle_handshake(&sender, noise_message)
-                        .await
-                        .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
-                    send.write_all(&response)
-                        .await
-                        .map_err(AcceptError::from_err)?;
-                    send.finish().map_err(AcceptError::from_err)?;
-                }
-                DmHandshake::Response { .. } => {
-                    log::error!(
-                        "[dm] unexpected handshake response from {}",
-                        short_id(&remote_str)
-                    );
-                }
+        let msg: DmMessage = serde_json::from_slice(&frame_bytes)
+            .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
+
+        match msg {
+            DmMessage::Handshake(DmHandshake::Init {
+                noise_message,
+                sender,
+            }) => {
+                let response = self
+                    .handle_handshake(&sender, noise_message)
+                    .await
+                    .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
+                send.write_all(&response)
+                    .await
+                    .map_err(AcceptError::from_err)?;
+                send.finish().map_err(AcceptError::from_err)?;
             }
-        } else if let Ok(envelope) = serde_json::from_slice::<EncryptedEnvelope>(&frame_bytes) {
-            // envelope.sender is the peer's DM pubkey
-            let sender = envelope.sender.clone();
-            if let Err(e) = self.handle_encrypted_message(&sender, envelope).await {
+            DmMessage::Handshake(DmHandshake::Response { .. }) => {
                 log::error!(
-                    "[dm] failed to handle message from {}: {e}",
+                    "[dm] unexpected handshake response from {}",
                     short_id(&remote_str)
                 );
             }
-            // Send ACK
-            send.write_all(b"ok").await.map_err(AcceptError::from_err)?;
-            send.finish().map_err(AcceptError::from_err)?;
-        } else {
-            log::error!("[dm] unknown frame from {}", short_id(&remote_str));
+            DmMessage::Envelope(envelope) => {
+                let sender = envelope.sender.clone();
+                if let Err(e) = self.handle_encrypted_message(&sender, envelope).await {
+                    log::error!(
+                        "[dm] failed to handle message from {}: {e}",
+                        short_id(&remote_str)
+                    );
+                }
+                let ack = serde_json::to_vec(&DmAck).map_err(AcceptError::from_err)?;
+                send.write_all(&ack).await.map_err(AcceptError::from_err)?;
+                send.finish().map_err(AcceptError::from_err)?;
+            }
         }
 
         conn.closed().await;

@@ -1,3 +1,4 @@
+use crate::constants::BATCH_SIZE;
 use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
 use iroh::protocol::AcceptError;
@@ -8,8 +9,6 @@ use iroh_social_types::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-
-const BATCH_SIZE: usize = 200;
 
 /// Handle an incoming DeviceSyncRequest from another linked device.
 /// Verifies the challenge, sends our vector + deltas, then imports the initiator's deltas.

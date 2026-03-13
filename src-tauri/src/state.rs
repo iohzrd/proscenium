@@ -1,41 +1,25 @@
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
-use crate::opengraph::OgCache;
+use crate::peer::PeerHandler;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
-use tokio::task::{Id, JoinSet};
+use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-/// Commands that can be sent to the sync task to trigger on-demand syncs.
-#[allow(dead_code)]
+/// Commands sent to the peer sync task to trigger on-demand syncs.
 pub enum SyncCommand {
-    /// Sync a specific peer immediately.
+    /// Sync a specific peer immediately (e.g. after following).
     SyncPeer(String),
-    /// Sync all followed peers immediately.
+    /// Sync all followed peers immediately (e.g. app foreground, manual refresh).
     SyncAll,
 }
 
-/// Active device-linking session on the existing device.
-/// Created when the user taps "Link New Device", consumed when a new device connects.
-#[derive(Debug)]
-pub struct PendingLink {
-    /// The one-time PSK (32 bytes) for Noise IK+PSK handshake.
-    pub psk: [u8; 32],
-    /// The existing device's X25519 private key (for Noise handshake).
-    pub x25519_private: [u8; 32],
-    /// When this pending link expires (Unix timestamp ms).
-    pub expires_at: u64,
-    /// Whether to include the master secret key in the bundle.
-    pub transfer_master_key: bool,
-}
-
-pub type PendingLinkState = Arc<tokio::sync::Mutex<Option<PendingLink>>>;
-
 /// Cryptographic identity and key material for this node.
+/// Wrapped in `SharedIdentity` (Arc<RwLock<Identity>>) so key material can be
+/// updated in place when signing keys or DM keys are rotated at runtime.
+#[derive(Debug)]
 pub struct Identity {
     /// Master key secret bytes (permanent identity, cold storage).
     pub master_secret_key_bytes: [u8; 32],
@@ -53,139 +37,72 @@ pub struct Identity {
     pub dm_pubkey: String,
     /// DM key derivation index.
     pub dm_key_index: u32,
+    /// X25519 private key bytes (derived from dm_secret_key_bytes).
+    pub dm_x25519_private: [u8; 32],
+    /// X25519 public key bytes (derived from dm_secret_key_bytes).
+    pub dm_x25519_public: [u8; 32],
+    /// Key for encrypting ratchet state at rest (derived from dm_secret_key_bytes).
+    pub ratchet_storage_key: [u8; 32],
     /// Transport NodeId string (iroh's own key, for QUIC networking).
     pub transport_node_id: String,
     /// The current signing key delegation (signed by master key).
     pub delegation: iroh_social_types::SigningKeyDelegation,
 }
 
-/// All network-layer services: QUIC endpoint, protocol handles, and the router
-/// that keeps protocol handlers registered and alive.
-pub struct Net {
-    pub endpoint: Endpoint,
-    pub gossip: GossipService,
-    pub dm: DmHandler,
-    pub blobs: BlobsProtocol,
+/// Shared, mutable identity — the canonical source for all key material.
+pub type SharedIdentity = Arc<RwLock<Identity>>;
+
+pub struct AppState {
+    pub(crate) app_handle: tauri::AppHandle,
+    pub(crate) identity: SharedIdentity,
+    pub(crate) storage: Arc<Storage>,
+    /// Local blob storage (add/get bytes). For fetching remote blobs use `blobs`.
+    pub(crate) blob_store: FsStore,
+    pub(crate) http_client: reqwest::Client,
+    pub(crate) gossip: GossipService,
+    pub(crate) dm: DmHandler,
+    pub(crate) peer: PeerHandler,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) blobs: BlobsProtocol,
+    /// Send on-demand sync commands to the peer sync task.
+    pub(crate) sync_tx: mpsc::Sender<SyncCommand>,
+    /// Cancellation token for graceful shutdown of all background tasks.
+    pub(crate) shutdown: CancellationToken,
     // Held alive to keep all protocol handler registrations active.
-    // Not used directly after construction.
     _router: Router,
 }
 
-impl Net {
+impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        endpoint: Endpoint,
+        app_handle: tauri::AppHandle,
+        identity: SharedIdentity,
+        storage: Arc<Storage>,
+        blob_store: FsStore,
+        http_client: reqwest::Client,
         gossip: GossipService,
         dm: DmHandler,
+        peer: PeerHandler,
+        endpoint: Endpoint,
         blobs: BlobsProtocol,
         router: Router,
+        sync_tx: mpsc::Sender<SyncCommand>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
-            endpoint,
+            app_handle,
+            identity,
+            storage,
+            blob_store,
+            http_client,
             gossip,
             dm,
+            peer,
+            endpoint,
             blobs,
+            sync_tx,
+            shutdown,
             _router: router,
         }
     }
-}
-
-/// Tracks all background tasks by name for structured shutdown.
-pub struct TaskManager {
-    tasks: JoinSet<()>,
-    names: HashMap<Id, &'static str>,
-}
-
-impl TaskManager {
-    pub fn new() -> Self {
-        Self {
-            tasks: JoinSet::new(),
-            names: HashMap::new(),
-        }
-    }
-
-    /// Spawn a named background task and track it.
-    pub fn spawn(
-        &mut self,
-        name: &'static str,
-        fut: impl std::future::Future<Output = ()> + Send + 'static,
-    ) {
-        let handle = self.tasks.spawn(fut);
-        self.names.insert(handle.id(), name);
-    }
-
-    /// Drain all tasks with a timeout. Returns names of tasks that were force-killed.
-    pub async fn shutdown(mut self, timeout: std::time::Duration) -> Vec<&'static str> {
-        let total = self.tasks.len();
-        let mut completed = 0;
-        let deadline = tokio::time::Instant::now() + timeout;
-
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match tokio::time::timeout(remaining, self.tasks.join_next_with_id()).await {
-                Ok(Some(Ok((id, ())))) => {
-                    completed += 1;
-                    let name = self.names.get(&id).copied().unwrap_or("unknown");
-                    log::info!(
-                        "[shutdown] task '{}' completed ({}/{})",
-                        name,
-                        completed,
-                        total
-                    );
-                }
-                Ok(Some(Err(e))) => {
-                    completed += 1;
-                    let name = self.names.get(&e.id()).copied().unwrap_or("unknown");
-                    log::error!("[shutdown] task '{}' panicked: {}", name, e);
-                }
-                Ok(None) => {
-                    log::info!("[shutdown] all {} tasks completed cleanly", total);
-                    return Vec::new();
-                }
-                Err(_) => break,
-            }
-        }
-
-        // Force-abort remaining tasks
-        let mut timed_out = Vec::new();
-        self.tasks.abort_all();
-        while let Some(result) = self.tasks.join_next_with_id().await {
-            match result {
-                Ok((id, ())) => {
-                    let name = self.names.get(&id).copied().unwrap_or("unknown");
-                    log::info!("[shutdown] task '{}' finished during abort", name);
-                }
-                Err(e) => {
-                    let name = self.names.get(&e.id()).copied().unwrap_or("unknown");
-                    if e.is_cancelled() {
-                        log::warn!("[shutdown] task '{}' force-killed after timeout", name);
-                        timed_out.push(name);
-                    }
-                }
-            }
-        }
-
-        timed_out
-    }
-}
-
-pub struct AppState {
-    pub identity: Arc<Identity>,
-    pub net: Net,
-    pub storage: Arc<Storage>,
-    /// Local blob storage (add/get bytes). For fetching remote blobs use net.blobs.
-    pub blob_store: FsStore,
-    pub http_client: reqwest::Client,
-    pub og_cache: OgCache,
-    /// Active device-linking session (if any).
-    pub pending_link: PendingLinkState,
-    /// Send commands to the sync task (trigger on-demand syncs).
-    #[allow(dead_code)]
-    pub sync_tx: mpsc::Sender<SyncCommand>,
-    /// Cancellation token for graceful shutdown of background tasks.
-    pub shutdown_token: CancellationToken,
-    /// Tracked background tasks for structured shutdown.
-    pub task_manager: tokio::sync::Mutex<Option<TaskManager>>,
 }

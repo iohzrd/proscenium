@@ -1,0 +1,59 @@
+# iroh
+
+## Docs
+
+- [Changelog](https://docs.iroh.computer/about/changelog.md)
+- [FAQ](https://docs.iroh.computer/about/faq.md)
+- [Roadmap](https://docs.iroh.computer/about/roadmap.md)
+- [Discovery](https://docs.iroh.computer/concepts/discovery.md)
+- [Endpoints](https://docs.iroh.computer/concepts/endpoints.md)
+- [Holepunching](https://docs.iroh.computer/concepts/holepunching.md)
+- [Protocols](https://docs.iroh.computer/concepts/protocols.md)
+- [Relays](https://docs.iroh.computer/concepts/relays.md)
+- [Tickets](https://docs.iroh.computer/concepts/tickets.md)
+- [Creating an Endpoint](https://docs.iroh.computer/connecting/creating-endpoint.md)
+- [null](https://docs.iroh.computer/connecting/custom-relays.md)
+- [DHT](https://docs.iroh.computer/connecting/dht-discovery.md)
+- [DNS](https://docs.iroh.computer/connecting/dns-discovery.md)
+- [Observing & Rejecting Connections](https://docs.iroh.computer/connecting/endpoint-hooks.md)
+- [Gossip Broadcast](https://docs.iroh.computer/connecting/gossip.md)
+- [mDNS and Bluetooth](https://docs.iroh.computer/connecting/local-discovery.md)
+- [Dedicated Infrastructure](https://docs.iroh.computer/deployment/dedicated-infrastructure.md)
+- [Metrics](https://docs.iroh.computer/deployment/metrics.md)
+- [Using Iroh in Other Languages](https://docs.iroh.computer/deployment/other-languages.md)
+- [Security & Privacy](https://docs.iroh.computer/deployment/security-privacy.md)
+- [Troubleshooting](https://docs.iroh.computer/deployment/troubleshooting.md)
+- [null](https://docs.iroh.computer/examples/chat.md)
+- [Examples & Apps](https://docs.iroh.computer/examples/examples.md)
+- [Access Control](https://docs.iroh.computer/iroh-services/access.md): Manage authorization and API keys for your Iroh Services project
+- [Control Your Costs](https://docs.iroh.computer/iroh-services/billing/control-costs.md): Set spend caps and monitor usage to keep your Iroh Services costs predictable
+- [Billing FAQ](https://docs.iroh.computer/iroh-services/billing/faq.md): Frequently asked questions about Iroh Services billing
+- [Overview](https://docs.iroh.computer/iroh-services/billing/index.md): Understand how billing works for Iroh Services
+- [Manage Your Subscription](https://docs.iroh.computer/iroh-services/billing/manage-subscription.md): Upgrade, downgrade, or cancel your Iroh Services subscription
+- [Welcome to Iroh Services](https://docs.iroh.computer/iroh-services/index.md): Iroh Services is a web platform for managing and monitoring iroh infrastructure and networks.
+- [Endpoint Metrics](https://docs.iroh.computer/iroh-services/metrics/endpoint.md): Detailed metrics at the endpoint level for Enterprise plans
+- [Metrics Glossary](https://docs.iroh.computer/iroh-services/metrics/glossary.md): Complete reference of all available metrics in Iroh Services
+- [How Metrics Work](https://docs.iroh.computer/iroh-services/metrics/how-it-works.md): Understanding how Iroh Services collects and processes metrics
+- [Overview](https://docs.iroh.computer/iroh-services/metrics/index.md): Monitor your network with comprehensive metrics collection
+- [Quickstart](https://docs.iroh.computer/iroh-services/net-diagnostics/quickstart.md): Diagnose user connectivity issues with remote diagnostic reporting
+- [null](https://docs.iroh.computer/iroh-services/net-diagnostics/reports.md)
+- [Usage](https://docs.iroh.computer/iroh-services/net-diagnostics/usage.md): Diagnose user connectivity issues with remote diagnostic reporting
+- [Projects](https://docs.iroh.computer/iroh-services/projects.md): Your Iroh Services project is an always-online service that helps keep your devices connected
+- [Quickstart](https://docs.iroh.computer/iroh-services/quickstart.md): Get started with Iroh Services in minutes
+- [Overview](https://docs.iroh.computer/iroh-services/relays/index.md): Deploy dedicated relay infrastructure for your iroh project
+- [Managed Hosting](https://docs.iroh.computer/iroh-services/relays/managed.md): Deploy and configure dedicated relay infrastructure through Iroh Services
+- [Public Relays](https://docs.iroh.computer/iroh-services/relays/public.md): Free shared relays for development and hobby use
+- [Support](https://docs.iroh.computer/iroh-services/support.md): Get help from the n0 computer team
+- [Automerge](https://docs.iroh.computer/protocols/automerge.md)
+- [Blobs](https://docs.iroh.computer/protocols/blobs.md)
+- [Key-value Store](https://docs.iroh.computer/protocols/kv-crdts.md)
+- [RPC](https://docs.iroh.computer/protocols/rpc.md)
+- [Streaming](https://docs.iroh.computer/protocols/streaming.md)
+- [Using QUIC](https://docs.iroh.computer/protocols/using-quic.md)
+- [Write your own Protocol](https://docs.iroh.computer/protocols/writing-a-protocol.md)
+- [Quickstart](https://docs.iroh.computer/quickstart.md): Start building with iroh in minutes
+- [What is iroh?](https://docs.iroh.computer/what-is-iroh.md)
+
+## OpenAPI Specs
+
+- [openapi](https://docs.iroh.computer/api-reference/openapi.json)

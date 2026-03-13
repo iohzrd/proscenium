@@ -5,6 +5,20 @@ pub const DM_ALPN: &[u8] = b"iroh-social/dm/1";
 
 // -- Wire types (sent over QUIC) --
 
+/// Top-level discriminant for initiator→acceptor DM protocol messages.
+/// Sent as a single JSON frame (write_all + finish) on a QUIC bi-stream.
+/// Eliminates the need for the acceptor to type-sniff between message variants.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DmMessage {
+    Handshake(DmHandshake),
+    Envelope(EncryptedEnvelope),
+}
+
+/// Sent by the acceptor→initiator after successfully receiving and processing
+/// a DmMessage::Envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmAck;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DmHandshake {
     Init {

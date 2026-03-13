@@ -1,11 +1,42 @@
+use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
-use crate::sync::{process_incoming_interaction, process_incoming_post};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
 use iroh_social_types::{
     MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,
     Visibility, short_id, validate_profile, verify_profile_signature,
 };
 use tauri::{AppHandle, Emitter};
+
+/// Connect to a peer and deliver a `PushMessage`. Returns the peer's `PushAck`.
+/// Caller should treat errors as "peer offline" and not retry — sync is the reliable path.
+pub async fn push_to_peer(
+    endpoint: &Endpoint,
+    target: EndpointId,
+    msg: &PushMessage,
+) -> anyhow::Result<PushAck> {
+    let addr = EndpointAddr::from(target);
+    let conn = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        endpoint.connect(addr, PEER_ALPN),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("push connect timeout"))??;
+
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let req_bytes = serde_json::to_vec(&PeerRequest::Push(msg.clone()))?;
+    send.write_all(&req_bytes).await?;
+    send.finish()?;
+
+    let ack_bytes =
+        tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(65536))
+            .await
+            .map_err(|_| anyhow::anyhow!("push ack timeout"))??;
+    let ack: PushAck = serde_json::from_slice(&ack_bytes)?;
+
+    conn.close(0u32.into(), b"done");
+    Ok(ack)
+}
 
 /// Server-side push handler, dispatched from the unified PeerHandler.
 /// The initial PeerRequest::Push has already been read and parsed.
@@ -173,26 +204,4 @@ pub async fn handle_push(
 
     conn.closed().await;
     Ok(())
-}
-
-/// Send a PushMessage to a remote peer.
-pub async fn push_to_peer(
-    endpoint: &Endpoint,
-    target: EndpointId,
-    msg: &PushMessage,
-) -> anyhow::Result<PushAck> {
-    let addr = EndpointAddr::from(target);
-    let conn = endpoint.connect(addr, PEER_ALPN).await?;
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    let peer_req = PeerRequest::Push(msg.clone());
-    let msg_bytes = serde_json::to_vec(&peer_req)?;
-    send.write_all(&msg_bytes).await?;
-    send.finish()?;
-
-    let ack_bytes = recv.read_to_end(1_000_000).await?;
-    let ack: PushAck = serde_json::from_slice(&ack_bytes)?;
-
-    conn.close(0u32.into(), b"done");
-    Ok(ack)
 }

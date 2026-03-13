@@ -1,5 +1,5 @@
 use crate::gossip::GossipService;
-use crate::state::{Identity, PendingLinkState};
+use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
@@ -7,17 +7,31 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use iroh_social_types::{
-    FollowRequest, FollowResponse, IdentityResponse, PEER_ALPN, PeerRequest, PeerResponse,
-    SigningKeyDelegation, Visibility, derive_transport_key, now_millis, short_id,
+    FollowRequest, FollowResponse, IdentityResponse, LinkQrPayload, PEER_ALPN, PeerRequest,
+    PeerResponse, SigningKeyDelegation, Visibility, derive_transport_key, now_millis, short_id,
     sign_follow_request, verify_follow_request,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 
+/// Active device-linking session on the existing device.
+/// Created when the user initiates "Link New Device", consumed when a new device connects.
+struct PendingLink {
+    psk: [u8; 32],
+    x25519_private: [u8; 32],
+    expires_at: u64,
+    transfer_master_key: bool,
+}
+
+type PendingLinkState = Arc<tokio::sync::Mutex<Option<PendingLink>>>;
+
+const LINK_SESSION_TTL_MS: u64 = 60_000; // 60 seconds
+const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
+
 #[derive(Clone)]
 pub struct PeerHandler {
     storage: Arc<Storage>,
-    identity: Arc<Identity>,
+    identity: SharedIdentity,
     gossip: GossipService,
     pending_link: PendingLinkState,
     app_handle: AppHandle,
@@ -26,32 +40,87 @@ pub struct PeerHandler {
 impl PeerHandler {
     pub fn new(
         storage: Arc<Storage>,
-        identity: Arc<Identity>,
+        identity: SharedIdentity,
         gossip: GossipService,
-        pending_link: PendingLinkState,
         app_handle: AppHandle,
     ) -> Self {
         Self {
             storage,
             identity,
             gossip,
-            pending_link,
+            pending_link: Arc::new(tokio::sync::Mutex::new(None)),
             app_handle,
         }
     }
 
+    /// Begin a device-link session. Returns the QR payload the initiating device displays.
+    /// `relay_url` should come from `endpoint.addr().relay_urls().next()`.
+    pub async fn start_link_session(
+        &self,
+        transfer_master_key: bool,
+        relay_url: Option<String>,
+    ) -> Result<LinkQrPayload, String> {
+        let mut psk = [0u8; 32];
+        getrandom::fill(&mut psk).map_err(|e| format!("failed to generate PSK: {e}"))?;
+
+        let (master_secret_key_bytes, transport_node_id) = {
+            let id = self.identity.read().await;
+            (id.master_secret_key_bytes, id.transport_node_id.clone())
+        };
+
+        let transport_secret_bytes = derive_transport_key(&master_secret_key_bytes, 0);
+        let x25519_private = crate::crypto::ed25519_secret_to_x25519(&transport_secret_bytes);
+
+        let expires_at = now_millis() + LINK_SESSION_TTL_MS;
+
+        {
+            let mut lock = self.pending_link.lock().await;
+            *lock = Some(PendingLink {
+                psk,
+                x25519_private,
+                expires_at,
+                transfer_master_key,
+            });
+        }
+
+        use base64::Engine;
+        let payload = LinkQrPayload {
+            node_id: transport_node_id,
+            secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(psk),
+            relay_url,
+        };
+
+        log::info!("[link] started device link session (expires in 60s)");
+        Ok(payload)
+    }
+
+    /// Cancel an active device-link session.
+    pub async fn cancel_link_session(&self) {
+        let mut lock = self.pending_link.lock().await;
+        *lock = None;
+        log::info!("[link] cancelled device link session");
+    }
+
     /// Build an IdentityResponse for this node.
     async fn identity_response(&self) -> IdentityResponse {
+        let (master_pubkey, delegation, transport_node_id) = {
+            let id = self.identity.read().await;
+            (
+                id.master_pubkey.clone(),
+                id.delegation.clone(),
+                id.transport_node_id.clone(),
+            )
+        };
         let profile = self
             .storage
-            .get_profile(&self.identity.master_pubkey)
+            .get_profile(&master_pubkey)
             .await
             .ok()
             .flatten();
         IdentityResponse {
-            master_pubkey: self.identity.master_pubkey.clone(),
-            delegation: self.identity.delegation.clone(),
-            transport_node_ids: vec![self.identity.transport_node_id.clone()],
+            master_pubkey,
+            delegation,
+            transport_node_ids: vec![transport_node_id],
             profile,
         }
     }
@@ -126,7 +195,7 @@ impl PeerHandler {
         // Only Listed users accept follow requests
         let visibility = self
             .storage
-            .get_visibility(&self.identity.master_pubkey)
+            .get_visibility(&self.identity.read().await.master_pubkey)
             .await
             .unwrap_or(Visibility::Public);
 
@@ -281,12 +350,30 @@ impl PeerHandler {
                 "failed to get next device index: {e}"
             )))
         })?;
+
+        let (
+            master_secret_key_bytes,
+            master_pubkey,
+            signing_secret_key_bytes,
+            dm_secret_key_bytes,
+            delegation,
+        ) = {
+            let id = self.identity.read().await;
+            (
+                id.master_secret_key_bytes,
+                id.master_pubkey.clone(),
+                id.signing_secret_key_bytes,
+                id.dm_secret_key_bytes,
+                id.delegation.clone(),
+            )
+        };
+
         let new_transport_key_bytes =
-            derive_transport_key(&self.identity.master_secret_key_bytes, new_device_index);
+            derive_transport_key(&master_secret_key_bytes, new_device_index);
 
         // Build the link bundle
         let master_key_to_send = if link_session.transfer_master_key {
-            Some(&self.identity.master_secret_key_bytes)
+            Some(&master_secret_key_bytes)
         } else {
             None
         };
@@ -294,10 +381,10 @@ impl PeerHandler {
         let bundle = self
             .storage
             .export_link_bundle(
-                &self.identity.master_pubkey,
-                &self.identity.signing_secret_key_bytes,
-                &self.identity.dm_secret_key_bytes,
-                &self.identity.delegation,
+                &master_pubkey,
+                &signing_secret_key_bytes,
+                &dm_secret_key_bytes,
+                &delegation,
                 &new_transport_key_bytes,
                 new_device_index,
                 master_key_to_send,
@@ -352,10 +439,10 @@ impl PeerHandler {
 
         // Build and broadcast updated announcement with all devices
         if let Ok(all_devices) = self.storage.get_linked_devices().await {
-            let signing_sk = iroh::SecretKey::from_bytes(&self.identity.signing_secret_key_bytes);
+            let signing_sk = iroh::SecretKey::from_bytes(&signing_secret_key_bytes);
             let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
-                master_pubkey: self.identity.master_pubkey.clone(),
-                delegation: self.identity.delegation.clone(),
+                master_pubkey: master_pubkey.clone(),
+                delegation: delegation.clone(),
                 devices: all_devices,
                 version: (new_device_index + 1) as u64,
                 timestamp: now,
@@ -363,15 +450,11 @@ impl PeerHandler {
             };
             iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
-            let gossip = self.gossip.clone();
-            let announcement_clone = announcement.clone();
-            tokio::spawn(async move {
-                if let Err(e) = gossip.broadcast_linked_devices(&announcement_clone).await {
-                    log::error!("[link] failed to broadcast device announcement: {e}");
-                } else {
-                    log::info!("[link] broadcast updated device announcement");
-                }
-            });
+            if let Err(e) = self.gossip.broadcast_linked_devices(&announcement).await {
+                log::error!("[link] failed to broadcast device announcement: {e}");
+            } else {
+                log::info!("[link] broadcast updated device announcement");
+            }
         }
 
         conn.closed().await;
@@ -379,12 +462,15 @@ impl PeerHandler {
     }
 }
 
-const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
-
 impl std::fmt::Debug for PeerHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let master_pubkey = self
+            .identity
+            .try_read()
+            .map(|id| id.master_pubkey.clone())
+            .unwrap_or_default();
         f.debug_struct("PeerHandler")
-            .field("master_pubkey", &self.identity.master_pubkey)
+            .field("master_pubkey", &master_pubkey)
             .finish_non_exhaustive()
     }
 }
@@ -434,11 +520,16 @@ impl ProtocolHandler for PeerHandler {
             short_id(&remote_str)
         );
 
+        let (my_pubkey, signing_secret_key_bytes) = {
+            let id = self.identity.read().await;
+            (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        };
+
         match req {
             PeerRequest::Sync(sync_req) => {
                 crate::sync::handle_sync(
                     &self.storage,
-                    &self.identity.master_pubkey,
+                    &my_pubkey,
                     &remote_str,
                     &conn,
                     send,
@@ -449,7 +540,7 @@ impl ProtocolHandler for PeerHandler {
             PeerRequest::Push(push_msg) => {
                 crate::push::handle_push(
                     &self.storage,
-                    &self.identity.master_pubkey,
+                    &my_pubkey,
                     &remote_str,
                     &self.app_handle,
                     send,
@@ -473,8 +564,8 @@ impl ProtocolHandler for PeerHandler {
             } => {
                 crate::device_sync::handle_device_sync(
                     &self.storage,
-                    &self.identity.master_pubkey,
-                    &self.identity.signing_secret_key_bytes,
+                    &my_pubkey,
+                    &signing_secret_key_bytes,
                     send,
                     challenge,
                     challenge_sig,

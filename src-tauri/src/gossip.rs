@@ -1,5 +1,9 @@
+#[cfg(target_os = "android")]
+use crate::constants::ANDROID_NET_INTERVAL;
+use crate::constants::{GOSSIP_HEARTBEAT_INTERVAL, HEALTH_TICK_INTERVAL, WAKE_THRESHOLD};
+use crate::ingest::{process_incoming_interaction, process_incoming_post};
+use crate::state::SharedIdentity;
 use crate::storage::Storage;
-use crate::sync::{process_incoming_interaction, process_incoming_post};
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointId};
@@ -8,8 +12,8 @@ use iroh_gossip::{
     api::{Event, GossipSender},
 };
 use iroh_social_types::{
-    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, SigningKeyRotation,
-    Visibility, now_millis, short_id, user_feed_topic, validate_profile,
+    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, PushMessage,
+    SigningKeyRotation, Visibility, now_millis, short_id, user_feed_topic, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
     verify_linked_devices_announcement, verify_profile_signature, verify_rotation,
 };
@@ -23,41 +27,13 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// Sent by gossip tasks when their stream dies, so the reconnect loop can restart them.
-pub enum ReconnectRequest {
-    OwnFeed {
-        attempt: u32,
-    },
-    Follow {
-        pubkey: String,
-        attempt: u32,
-    },
-    /// A followed peer appeared as a neighbor on our own feed -- refresh our
-    /// subscription to their feed so the gossip overlay is connected in both
-    /// directions.  This handles the startup race where we subscribe to their
-    /// topic before they are reachable, ending up with zero neighbors.
-    RefreshFollow {
-        pubkey: String,
-    },
-    /// Tear down and re-establish all gossip connections (own feed + every
-    /// follow).  Triggered after detecting a sleep/wake cycle where the
-    /// underlying network connections have gone stale.
-    RefreshAll,
-}
-
-fn backoff_secs(attempt: u32) -> u64 {
-    // 5, 10, 20, 40, 60, 60, ...
-    (5 * 2u64.pow(attempt)).min(60)
-}
-
 struct GossipInner {
     my_sender: Option<GossipSender>,
     own_feed_handle: Option<JoinHandle<()>>,
     /// Maps peer master pubkey to (task_handle, has_neighbor_flag).
-    /// The flag is set to true when the subscription has received at least one NeighborUp event,
-    /// meaning the gossip mesh is actually connected. Used to distinguish "alive but isolated"
-    /// from "alive and connected" when deciding whether to refresh.
     subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
+    /// Receiver for reconnect signals — moved out by start_background.
+    reconnect_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 /// Cloneable gossip service — direct async methods, no command channel.
@@ -65,27 +41,27 @@ struct GossipInner {
 pub struct GossipService {
     gossip: Gossip,
     endpoint: Endpoint,
-    /// The permanent identity (master public key).
-    master_pubkey: String,
+    identity: SharedIdentity,
     storage: Arc<Storage>,
     app_handle: AppHandle,
-    reconnect_tx: mpsc::UnboundedSender<ReconnectRequest>,
     inner: Arc<tokio::sync::Mutex<GossipInner>>,
+    /// Sender for reconnect signals — cloned into each subscription task.
+    reconnect_tx: mpsc::UnboundedSender<String>,
 }
 
 impl GossipService {
     pub fn new(
         gossip: Gossip,
         endpoint: Endpoint,
-        master_pubkey: String,
+        identity: SharedIdentity,
         storage: Arc<Storage>,
         app_handle: AppHandle,
-    ) -> (Self, mpsc::UnboundedReceiver<ReconnectRequest>) {
+    ) -> Self {
         let (reconnect_tx, reconnect_rx) = mpsc::unbounded_channel();
-        let service = Self {
+        Self {
             gossip,
             endpoint,
-            master_pubkey,
+            identity,
             storage,
             app_handle,
             reconnect_tx,
@@ -93,37 +69,159 @@ impl GossipService {
                 my_sender: None,
                 own_feed_handle: None,
                 subscriptions: HashMap::new(),
+                reconnect_rx: Some(reconnect_rx),
             })),
-        };
-        (service, reconnect_rx)
+        }
     }
 
-    /// Build the reconnect loop future. The caller is responsible for spawning it.
-    pub fn reconnect_loop(
-        &self,
-        mut reconnect_rx: mpsc::UnboundedReceiver<ReconnectRequest>,
-        shutdown: CancellationToken,
-    ) -> impl std::future::Future<Output = ()> + Send + 'static {
-        let service = self.clone();
-        async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        log::info!("[gossip-reconnect] shutting down");
-                        service.teardown_all().await;
-                        break;
+    /// Subscribe to all current follows, then spawn the reconnect loop and
+    /// network-health task. Must be called once after setup is complete.
+    pub async fn start_background(&self, token: CancellationToken) {
+        // Subscribe to all current follows.
+        let follows = self.storage.get_follows().await.unwrap_or_default();
+        for f in follows {
+            let node_ids = self
+                .storage
+                .get_peer_transport_node_ids(&f.pubkey)
+                .await
+                .unwrap_or_default();
+            if node_ids.is_empty() {
+                log::warn!(
+                    "[gossip] no NodeIds for {}, skipping startup subscribe",
+                    short_id(&f.pubkey)
+                );
+                continue;
+            }
+            if let Err(e) = self.follow_user(f.pubkey.clone(), node_ids).await {
+                log::error!(
+                    "[gossip] failed to subscribe to {} at startup: {e}",
+                    short_id(&f.pubkey)
+                );
+            }
+        }
+
+        // Take the reconnect receiver and spawn the reconnect loop.
+        let rx = self
+            .inner
+            .lock()
+            .await
+            .reconnect_rx
+            .take()
+            .expect("start_background called twice");
+        let this = self.clone();
+        let reconnect_token = token.child_token();
+        tokio::spawn(async move {
+            this.reconnect_loop(rx, reconnect_token).await;
+        });
+
+        // Spawn network-health task (sleep/wake detection + heartbeat).
+        let this = self.clone();
+        let health_token = token.child_token();
+        tokio::spawn(async move {
+            this.network_health_task(health_token).await;
+        });
+
+        // Android: periodic network_change() since the OS doesn't notify the QUIC stack.
+        #[cfg(target_os = "android")]
+        {
+            let ep = self.endpoint.clone();
+            let android_token = token.child_token();
+            tokio::spawn(async move {
+                ep.network_change().await;
+                log::info!("[android-net] initial network_change() sent");
+                loop {
+                    tokio::select! {
+                        _ = android_token.cancelled() => break,
+                        _ = tokio::time::sleep(ANDROID_NET_INTERVAL) => {
+                            ep.network_change().await;
+                        }
                     }
-                    Some(req) = reconnect_rx.recv() => {
-                        service.handle_reconnect(req).await;
+                }
+            });
+        }
+    }
+
+    async fn reconnect_loop(
+        &self,
+        mut rx: mpsc::UnboundedReceiver<String>,
+        token: CancellationToken,
+    ) {
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                Some(pubkey) = rx.recv() => {
+                    // Brief backoff before reconnecting.
+                    tokio::select! {
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
+                    let node_ids = self
+                        .storage
+                        .get_peer_transport_node_ids(&pubkey)
+                        .await
+                        .unwrap_or_default();
+                    if node_ids.is_empty() {
+                        log::warn!(
+                            "[gossip-reconnect] no NodeIds for {}, skipping",
+                            short_id(&pubkey)
+                        );
+                        continue;
+                    }
+                    log::info!("[gossip-reconnect] reconnecting to {}", short_id(&pubkey));
+                    if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
+                        log::error!(
+                            "[gossip-reconnect] failed to reconnect to {}: {e}",
+                            short_id(&pubkey)
+                        );
                     }
                 }
             }
         }
     }
 
+    async fn network_health_task(&self, token: CancellationToken) {
+        let mut last_tick = std::time::Instant::now();
+        let mut last_heartbeat = std::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = token.cancelled() => break,
+                _ = tokio::time::sleep(HEALTH_TICK_INTERVAL) => {}
+            }
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_tick);
+            last_tick = now;
+
+            if elapsed > WAKE_THRESHOLD {
+                log::info!(
+                    "[wake] sleep/wake detected ({:.0}s elapsed), refreshing network",
+                    elapsed.as_secs_f64()
+                );
+                self.endpoint.network_change().await;
+                self.refresh_all().await;
+            }
+
+            if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
+                last_heartbeat = std::time::Instant::now();
+                if let Err(e) = self.broadcast_heartbeat().await {
+                    log::error!("[heartbeat] broadcast failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Re-queue reconnect for all subscriptions whose tasks have exited.
+    pub async fn refresh_all(&self) {
+        let inner = self.inner.lock().await;
+        for (pubkey, (handle, _)) in &inner.subscriptions {
+            if handle.is_finished() {
+                let _ = self.reconnect_tx.send(pubkey.clone());
+            }
+        }
+    }
+
     async fn my_visibility(&self) -> Visibility {
         self.storage
-            .get_visibility(&self.master_pubkey)
+            .get_visibility(&self.identity.read().await.master_pubkey)
             .await
             .unwrap_or(Visibility::Public)
     }
@@ -156,6 +254,41 @@ impl GossipService {
         }
     }
 
+    /// Fire-and-forget: attempt direct push to all visibility-appropriate recipients.
+    /// If a recipient is offline the message is dropped — sync is the reliable fallback.
+    async fn attempt_push(&self, msg: PushMessage) {
+        let recipients = self.push_recipients().await;
+        if recipients.is_empty() {
+            return;
+        }
+        let endpoint = self.endpoint.clone();
+        let storage = self.storage.clone();
+        tokio::spawn(async move {
+            for recipient in &recipients {
+                let node_ids = storage
+                    .get_peer_transport_node_ids(recipient)
+                    .await
+                    .unwrap_or_default();
+                let mut delivered = false;
+                for node_id_str in &node_ids {
+                    let Ok(target) = node_id_str.parse() else {
+                        continue;
+                    };
+                    if crate::push::push_to_peer(&endpoint, target, &msg)
+                        .await
+                        .is_ok()
+                    {
+                        delivered = true;
+                        break;
+                    }
+                }
+                if !delivered {
+                    log::debug!("[push] {} offline, will sync later", short_id(recipient));
+                }
+            }
+        });
+    }
+
     /// Handle a visibility transition. Must be called BEFORE saving the new
     /// visibility to the database so that `broadcast_profile` can still reach
     /// gossip subscribers when downgrading from Public.
@@ -173,18 +306,15 @@ impl GossipService {
 
         match (old, new) {
             (Visibility::Public, _) => {
-                // Broadcast profile update via gossip before stopping feed
                 self.broadcast_profile(profile).await?;
                 self.stop_own_feed().await;
             }
             (_, Visibility::Public) => {
-                // Start gossip feed, then broadcast
                 self.start_own_feed_unconditional().await?;
                 self.broadcast_profile(profile).await?;
             }
             _ => {
-                // Listed <-> Private: both use push, just broadcast profile via push
-                // (push_recipients will reflect new visibility after DB save)
+                // Listed <-> Private: both use push
             }
         }
 
@@ -210,7 +340,7 @@ impl GossipService {
             return Ok(());
         }
 
-        let my_id = self.master_pubkey.clone();
+        let my_id = self.identity.read().await.master_pubkey.clone();
         let topic = user_feed_topic(&my_id);
         log::info!("[gossip] starting own feed topic for {}", short_id(&my_id));
 
@@ -221,7 +351,6 @@ impl GossipService {
         let storage = self.storage.clone();
         let endpoint = self.endpoint.clone();
         let app_handle = self.app_handle.clone();
-        let reconnect_tx = self.reconnect_tx.clone();
         let handle = tokio::spawn(async move {
             log::info!("[gossip-own] listener started for own feed neighbors");
             let mut receiver = receiver;
@@ -235,31 +364,29 @@ impl GossipService {
                                 short_id(&transport_id)
                             );
 
-                            // Resolve master pubkey from transport NodeId
-                            let pubkey = match crate::peer::query_identity(&endpoint, *endpoint_id)
-                                .await
-                            {
-                                Ok(identity) => {
-                                    let master = identity.master_pubkey.clone();
-                                    let _ = storage.cache_peer_identity(&identity).await;
-                                    if let Some(profile) = &identity.profile {
-                                        let _ = storage.save_profile(&master, profile).await;
+                            let pubkey =
+                                match crate::peer::query_identity(&endpoint, *endpoint_id).await {
+                                    Ok(identity) => {
+                                        let master = identity.master_pubkey.clone();
+                                        let _ = storage.cache_peer_identity(&identity).await;
+                                        if let Some(profile) = &identity.profile {
+                                            let _ = storage.save_profile(&master, profile).await;
+                                        }
+                                        log::info!(
+                                            "[gossip-own] resolved follower {} -> master={}",
+                                            short_id(&transport_id),
+                                            short_id(&master),
+                                        );
+                                        master
                                     }
-                                    log::info!(
-                                        "[gossip-own] resolved follower {} -> master={}",
-                                        short_id(&transport_id),
-                                        short_id(&master),
-                                    );
-                                    master
-                                }
-                                Err(e) => {
-                                    log::warn!(
-                                        "[gossip-own] failed to resolve identity for {}: {e}, using transport id",
-                                        short_id(&transport_id),
-                                    );
-                                    transport_id.clone()
-                                }
-                            };
+                                    Err(e) => {
+                                        log::warn!(
+                                            "[gossip-own] failed to resolve identity for {}: {e}",
+                                            short_id(&transport_id),
+                                        );
+                                        transport_id.clone()
+                                    }
+                                };
 
                             let now = now_millis();
                             match storage.upsert_follower(&pubkey, now).await {
@@ -280,25 +407,17 @@ impl GossipService {
                                 }
                             }
 
-                            // If we follow this peer, refresh our subscription to
-                            // their feed.  This fixes the startup race where we
-                            // subscribed before they were reachable and ended up
-                            // with zero gossip neighbors on their topic.
                             if storage.is_following(&pubkey).await.unwrap_or(false) {
                                 log::info!(
-                                    "[gossip-own] followed peer {} came online, requesting subscription refresh",
+                                    "[gossip-own] followed peer {} came online",
                                     short_id(&pubkey),
                                 );
-                                let _ = reconnect_tx.send(ReconnectRequest::RefreshFollow {
-                                    pubkey: pubkey.clone(),
-                                });
                             }
                         }
                         Event::NeighborDown(endpoint_id) => {
                             let transport_id = endpoint_id.to_string();
                             log::info!("[gossip-own] follower left: {}", short_id(&transport_id));
 
-                            // Try to resolve to master pubkey from cache
                             let pubkey = storage
                                 .get_master_pubkey_for_transport(&transport_id)
                                 .await
@@ -321,8 +440,7 @@ impl GossipService {
                     }
                 }
             }
-            // Task died naturally -- request reconnection
-            let _ = reconnect_tx.send(ReconnectRequest::OwnFeed { attempt: 0 });
+            log::warn!("[gossip-own] own feed stream ended");
         });
 
         inner.own_feed_handle = Some(handle);
@@ -352,27 +470,10 @@ impl GossipService {
         }
     }
 
-    /// Enqueue a push-outbox entry for each follower when gossip is unavailable.
-    async fn enqueue_push<F, Fut>(&self, label: &str, enqueue_fn: F)
-    where
-        F: Fn(String) -> Fut,
-        Fut: std::future::Future<Output = Result<(), anyhow::Error>>,
-    {
-        let recipients = self.push_recipients().await;
-        for recipient in &recipients {
-            if let Err(e) = enqueue_fn(recipient.clone()).await {
-                log::error!(
-                    "[push] failed to enqueue {label} for {}: {e}",
-                    short_id(recipient)
-                );
-            }
-        }
-        if !recipients.is_empty() {
-            log::info!(
-                "[push] enqueued {label} for {} recipients",
-                recipients.len()
-            );
-        }
+    pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
+        self.broadcast_msg(&GossipMessage::Heartbeat, "heartbeat")
+            .await?;
+        Ok(())
     }
 
     pub async fn broadcast_profile(&self, profile: &Profile) -> anyhow::Result<()> {
@@ -381,10 +482,12 @@ impl GossipService {
             .broadcast_msg(&msg, &format!("profile: {}", profile.display_name))
             .await?
         {
-            let storage = self.storage.clone();
-            self.enqueue_push("profile", |r| {
-                let s = storage.clone();
-                async move { s.enqueue_push_profile(&r).await }
+            let my_id = self.identity.read().await.master_pubkey.clone();
+            self.attempt_push(PushMessage {
+                author: my_id,
+                posts: vec![],
+                interactions: vec![],
+                profile: Some(profile.clone()),
             })
             .await;
         }
@@ -397,12 +500,12 @@ impl GossipService {
             .broadcast_msg(&msg, &format!("post {}", &post.id))
             .await?
         {
-            let storage = self.storage.clone();
-            let post_id = post.id.clone();
-            self.enqueue_push(&format!("post {}", &post.id), |r| {
-                let s = storage.clone();
-                let pid = post_id.clone();
-                async move { s.enqueue_push_post(&r, &pid).await }
+            let my_id = self.identity.read().await.master_pubkey.clone();
+            self.attempt_push(PushMessage {
+                author: my_id,
+                posts: vec![post.clone()],
+                interactions: vec![],
+                profile: None,
             })
             .await;
         }
@@ -421,7 +524,7 @@ impl GossipService {
             signature: signature.to_string(),
         };
         if !self.broadcast_msg(&msg, &format!("delete {id}")).await? {
-            log::info!("[push] delete post {id} (pending pushes will skip missing post)");
+            log::debug!("[gossip] delete post {id}: no gossip sender, peers will sync");
         }
         Ok(())
     }
@@ -433,12 +536,12 @@ impl GossipService {
             interaction.kind, &interaction.target_post_id
         );
         if !self.broadcast_msg(&msg, &label).await? {
-            let storage = self.storage.clone();
-            let iid = interaction.id.clone();
-            self.enqueue_push(&format!("interaction {}", &interaction.id), |r| {
-                let s = storage.clone();
-                let id = iid.clone();
-                async move { s.enqueue_push_interaction(&r, &id).await }
+            let my_id = self.identity.read().await.master_pubkey.clone();
+            self.attempt_push(PushMessage {
+                author: my_id,
+                posts: vec![],
+                interactions: vec![interaction.clone()],
+                profile: None,
             })
             .await;
         }
@@ -460,9 +563,7 @@ impl GossipService {
             .broadcast_msg(&msg, &format!("delete interaction {id}"))
             .await?
         {
-            log::info!(
-                "[push] delete interaction {id} (pending pushes will skip missing interaction)"
-            );
+            log::debug!("[gossip] delete interaction {id}: no gossip sender, peers will sync");
         }
         Ok(())
     }
@@ -493,15 +594,6 @@ impl GossipService {
         Ok(())
     }
 
-    pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
-        let sender = self.inner.lock().await.my_sender.clone();
-        if let Some(sender) = sender {
-            let payload = serde_json::to_vec(&GossipMessage::Heartbeat)?;
-            sender.broadcast(Bytes::from(payload)).await?;
-        }
-        Ok(())
-    }
-
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
@@ -511,9 +603,14 @@ impl GossipService {
         transport_node_ids: Vec<String>,
     ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().await;
-        if inner.subscriptions.contains_key(&pubkey) {
-            log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
-            return Ok(());
+
+        // Skip if already subscribed with a live task; clean up finished handles.
+        if let Some((handle, _)) = inner.subscriptions.get(&pubkey) {
+            if !handle.is_finished() {
+                log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
+                return Ok(());
+            }
+            inner.subscriptions.remove(&pubkey);
         }
 
         let topic = user_feed_topic(&pubkey);
@@ -530,10 +627,9 @@ impl GossipService {
         }
 
         log::info!(
-            "[gossip] subscribing to {} with {} bootstrap nodes (topic: {})",
+            "[gossip] subscribing to {} with {} bootstrap nodes",
             short_id(&pubkey),
             bootstrap.len(),
-            &format!("{:?}", topic)[..12]
         );
         let topic_handle = self.gossip.subscribe(topic, bootstrap).await?;
         let (sender, receiver) = topic_handle.split();
@@ -541,11 +637,11 @@ impl GossipService {
 
         let storage = self.storage.clone();
         let pk = pubkey.clone();
-        let my_id = self.master_pubkey.clone();
+        let my_id = self.identity.read().await.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
-        let reconnect_tx = self.reconnect_tx.clone();
         let has_neighbor = Arc::new(AtomicBool::new(false));
         let has_neighbor_task = has_neighbor.clone();
+        let reconnect_tx = self.reconnect_tx.clone();
 
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
@@ -566,10 +662,10 @@ impl GossipService {
                         }
                         Event::NeighborUp(_) => {
                             has_neighbor_task.store(true, Ordering::Relaxed);
-                            log::info!("[gossip-rx] event from {}: {event:?}", short_id(&pk));
+                            log::info!("[gossip-rx] neighbor up for {}", short_id(&pk));
                         }
                         Event::NeighborDown(_) => {
-                            log::info!("[gossip-rx] event from {}: {event:?}", short_id(&pk));
+                            log::info!("[gossip-rx] neighbor down for {}", short_id(&pk));
                         }
                         other => {
                             log::info!("[gossip-rx] event from {}: {other:?}", short_id(&pk));
@@ -585,11 +681,11 @@ impl GossipService {
                     }
                 }
             }
-            // Task died naturally -- request reconnection
-            let _ = reconnect_tx.send(ReconnectRequest::Follow {
-                pubkey: pk,
-                attempt: 0,
-            });
+            log::warn!(
+                "[gossip-rx] stream for {} ended, requesting reconnect",
+                short_id(&pk)
+            );
+            let _ = reconnect_tx.send(pk);
         });
 
         inner.subscriptions.insert(pubkey, (handle, has_neighbor));
@@ -633,8 +729,7 @@ impl GossipService {
                 signature,
             }) => {
                 if author == pk {
-                    // Verify delete signature
-                    if let Some(signer) = crate::sync::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_post_signature(&id, &author, &signature, &signer)
                     {
@@ -669,8 +764,7 @@ impl GossipService {
                         short_id(pk)
                     );
                 } else {
-                    // Verify profile signature
-                    if let Some(signer) = crate::sync::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
                         && let Err(reason) = verify_profile_signature(&profile, &signer)
                     {
                         log::warn!(
@@ -717,8 +811,7 @@ impl GossipService {
                 signature,
             }) => {
                 if author == pk {
-                    // Verify delete signature
-                    if let Some(signer) = crate::sync::resolve_signer(storage, pk).await
+                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
                         && let Err(reason) =
                             verify_delete_interaction_signature(&id, &author, &signature, &signer)
                     {
@@ -747,7 +840,6 @@ impl GossipService {
                     );
                     return;
                 }
-                // Verify the announcement signature and delegation chain
                 if let Err(reason) = verify_linked_devices_announcement(&announcement) {
                     log::warn!(
                         "[gossip-rx] bad device announcement from {}: {reason}",
@@ -755,7 +847,6 @@ impl GossipService {
                     );
                     return;
                 }
-                // Skip stale announcements
                 let cached_version = storage
                     .get_peer_announcement_version(pk)
                     .await
@@ -786,7 +877,6 @@ impl GossipService {
                     );
                     return;
                 }
-                // Verify the rotation signature and embedded delegation
                 if let Err(reason) = verify_rotation(&rotation) {
                     log::warn!(
                         "[gossip-rx] bad key rotation from {}: {reason}",
@@ -794,7 +884,6 @@ impl GossipService {
                     );
                     return;
                 }
-                // Reject replay/downgrade: new key index must be higher than cached
                 if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk).await
                     && rotation.new_key_index <= cached_delegation.key_index
                 {
@@ -811,7 +900,6 @@ impl GossipService {
                     short_id(pk),
                     rotation.new_key_index
                 );
-                // Update cached delegation with the new signing key
                 let response = iroh_social_types::IdentityResponse {
                     master_pubkey: rotation.master_pubkey.clone(),
                     delegation: rotation.new_delegation.clone(),
@@ -824,39 +912,12 @@ impl GossipService {
                 if let Err(e) = storage.cache_peer_identity(&response).await {
                     log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
                 }
-                // Note: signing key rotation does NOT invalidate DM sessions.
-                // The DM key is derived independently from the master key and
-                // only changes when explicitly rotated via dm_key_index.
             }
-            Ok(GossipMessage::Heartbeat) => {
-                // No-op: heartbeats keep the underlying QUIC connections
-                // alive so they don't time out during idle periods.
-            }
+            Ok(GossipMessage::Heartbeat) => {}
             Err(e) => {
                 log::error!("[gossip-rx] failed to parse message: {e}");
             }
         }
-    }
-
-    /// Tear down own feed and all follow subscriptions so they can be
-    /// re-established with fresh connections (e.g. after sleep/wake).
-    pub async fn teardown_all(&self) {
-        let mut inner = self.inner.lock().await;
-        if let Some(handle) = inner.own_feed_handle.take() {
-            handle.abort();
-            inner.my_sender = None;
-            log::info!("[gossip] stopped own feed topic");
-        }
-        let keys: Vec<String> = inner.subscriptions.keys().cloned().collect();
-        for key in &keys {
-            if let Some((handle, _)) = inner.subscriptions.remove(key) {
-                handle.abort();
-            }
-        }
-        log::info!(
-            "[gossip] tore down own feed + {} follow subscriptions",
-            keys.len()
-        );
     }
 
     pub async fn unfollow_user(&self, pubkey: &str) {
@@ -869,140 +930,5 @@ impl GossipService {
 
     pub async fn get_subscription_count(&self) -> usize {
         self.inner.lock().await.subscriptions.len()
-    }
-
-    /// Trigger a full refresh of all gossip connections (sync, safe to call from sync context).
-    pub fn refresh_all(&self) {
-        let _ = self.reconnect_tx.send(ReconnectRequest::RefreshAll);
-    }
-
-    async fn handle_reconnect(&self, req: ReconnectRequest) {
-        match req {
-            ReconnectRequest::OwnFeed { attempt } => {
-                let delay = backoff_secs(attempt);
-                log::info!("[reconnect] own feed died, restarting in {delay}s (attempt {attempt})");
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                {
-                    let mut inner = self.inner.lock().await;
-                    inner.own_feed_handle = None;
-                    inner.my_sender = None;
-                }
-                if let Err(e) = self.start_own_feed().await {
-                    log::error!("[reconnect] own feed restart failed: {e}");
-                    let _ = self.reconnect_tx.send(ReconnectRequest::OwnFeed {
-                        attempt: attempt + 1,
-                    });
-                }
-            }
-            ReconnectRequest::RefreshAll => {
-                log::info!("[reconnect] refreshing all gossip connections");
-                self.teardown_all().await;
-
-                if let Err(e) = self.start_own_feed().await {
-                    log::error!("[reconnect] own feed restart failed: {e}");
-                }
-
-                let follows = self.storage.get_follows().await.unwrap_or_default();
-                for f in &follows {
-                    let node_ids = self
-                        .storage
-                        .get_peer_transport_node_ids(&f.pubkey)
-                        .await
-                        .unwrap_or_default();
-                    if node_ids.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = self.follow_user(f.pubkey.clone(), node_ids).await {
-                        log::error!("[reconnect] re-follow {} failed: {e}", short_id(&f.pubkey));
-                    }
-                }
-                log::info!("[reconnect] refreshed own feed + {} follows", follows.len());
-            }
-            ReconnectRequest::RefreshFollow { pubkey } => {
-                {
-                    let inner = self.inner.lock().await;
-                    if inner
-                        .subscriptions
-                        .get(&pubkey)
-                        .is_some_and(|(h, has_neighbor)| {
-                            !h.is_finished() && has_neighbor.load(Ordering::Relaxed)
-                        })
-                    {
-                        log::info!(
-                            "[reconnect] skipping refresh for {} (subscription alive with neighbors)",
-                            short_id(&pubkey)
-                        );
-                        return;
-                    }
-                    if let Some((handle, _)) = inner.subscriptions.get(&pubkey) {
-                        handle.abort();
-                    }
-                }
-                {
-                    let mut inner = self.inner.lock().await;
-                    inner.subscriptions.remove(&pubkey);
-                }
-                log::info!(
-                    "[reconnect] removed isolated/dead subscription for {}",
-                    short_id(&pubkey)
-                );
-                let node_ids = self
-                    .storage
-                    .get_peer_transport_node_ids(&pubkey)
-                    .await
-                    .unwrap_or_default();
-                if node_ids.is_empty() {
-                    log::warn!(
-                        "[reconnect] no transport NodeIds for {}, cannot refresh",
-                        short_id(&pubkey)
-                    );
-                } else if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
-                    log::error!(
-                        "[reconnect] refresh follow for {} failed: {e}",
-                        short_id(&pubkey)
-                    );
-                } else {
-                    log::info!(
-                        "[reconnect] refreshed follow subscription for {}",
-                        short_id(&pubkey)
-                    );
-                }
-            }
-            ReconnectRequest::Follow { pubkey, attempt } => {
-                let delay = backoff_secs(attempt);
-                log::info!(
-                    "[reconnect] {} died, restarting in {delay}s (attempt {attempt})",
-                    short_id(&pubkey)
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                {
-                    let mut inner = self.inner.lock().await;
-                    if let Some((handle, _)) = inner.subscriptions.remove(&pubkey) {
-                        handle.abort();
-                    }
-                }
-                let node_ids = self
-                    .storage
-                    .get_peer_transport_node_ids(&pubkey)
-                    .await
-                    .unwrap_or_default();
-                if node_ids.is_empty() {
-                    log::error!(
-                        "[reconnect] no cached transport NodeIds for {}, cannot restart",
-                        short_id(&pubkey)
-                    );
-                    let _ = self.reconnect_tx.send(ReconnectRequest::Follow {
-                        pubkey,
-                        attempt: attempt + 1,
-                    });
-                } else if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
-                    log::error!("[reconnect] {} restart failed: {e}", short_id(&pubkey));
-                    let _ = self.reconnect_tx.send(ReconnectRequest::Follow {
-                        pubkey,
-                        attempt: attempt + 1,
-                    });
-                }
-            }
-        }
     }
 }

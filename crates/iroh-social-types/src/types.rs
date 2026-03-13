@@ -52,15 +52,6 @@ pub struct MediaAttachment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LinkPreview {
-    pub url: String,
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub image: Option<String>,
-    pub site_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Post {
     pub id: String,
     pub author: String,
@@ -198,6 +189,159 @@ pub struct ModerationSyncEntry {
 pub struct RatchetSyncEntry {
     pub peer_pubkey: String,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostCounts {
+    pub likes: u32,
+    pub replies: u32,
+    pub reposts: u32,
+    pub liked_by_me: bool,
+    pub reposted_by_me: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: String,
+    pub kind: String,
+    pub actor: String,
+    pub target_post_id: Option<String>,
+    pub post_id: Option<String>,
+    pub timestamp: u64,
+    pub read: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowRequestEntry {
+    pub pubkey: String,
+    pub timestamp: u64,
+    pub status: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerEntry {
+    pub url: String,
+    pub name: String,
+    pub description: String,
+    pub node_id: String,
+    pub registered_at: Option<i64>,
+    pub visibility: String,
+    pub added_at: i64,
+    pub last_synced_at: Option<i64>,
+}
+
+// ── Frontend / Tauri IPC response types ───────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontendSyncResult {
+    pub posts: Vec<Post>,
+    pub remote_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatus {
+    pub local_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub node_id: String,
+    pub has_relay: bool,
+    pub relay_url: Option<String>,
+    pub follow_count: usize,
+    pub follower_count: usize,
+}
+
+// ── Federated server HTTP API types ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub node_id: String,
+    pub registered_users: i64,
+    pub total_posts: i64,
+    pub uptime_seconds: u64,
+    pub registration_open: bool,
+    #[serde(default)]
+    pub retention_days: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerFeedPost {
+    pub id: String,
+    pub author: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub media_json: Option<String>,
+    pub reply_to: Option<String>,
+    pub reply_to_author: Option<String>,
+    pub quote_of: Option<String>,
+    pub quote_of_author: Option<String>,
+    pub signature: String,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerFeedResponse {
+    pub posts: Vec<ServerFeedPost>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendingHashtag {
+    pub tag: String,
+    pub post_count: i64,
+    pub computed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrendingResponse {
+    pub hashtags: Vec<TrendingHashtag>,
+    pub computed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerUser {
+    pub pubkey: String,
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub avatar_hash: Option<String>,
+    pub visibility: String,
+    pub registered_at: i64,
+    pub post_count: i64,
+    pub latest_post_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserSearchResponse {
+    pub users: Vec<ServerUser>,
+    pub total: usize,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSearchPost {
+    pub id: String,
+    pub author: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub media_json: Option<String>,
+    pub reply_to: Option<String>,
+    pub reply_to_author: Option<String>,
+    pub quote_of: Option<String>,
+    pub quote_of_author: Option<String>,
+    pub signature: String,
+    pub indexed_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostSearchResponse {
+    pub posts: Vec<ServerSearchPost>,
+    pub total: i64,
+    pub query: String,
 }
 
 /// Compact summary of local state for device sync negotiation.

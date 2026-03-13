@@ -6,9 +6,8 @@
   import MediaGrid from "$lib/MediaGrid.svelte";
   import ReplyContextBlock from "$lib/ReplyContextBlock.svelte";
   import QuotedPostEmbed from "$lib/QuotedPostEmbed.svelte";
-  import LinkPreviewCard from "$lib/LinkPreviewCard.svelte";
   import { useDisplayName } from "$lib/name.svelte";
-  import type { Post, LinkPreview } from "$lib/types";
+  import type { Post } from "$lib/types";
   import { getCachedAvatarTicket, renderContent } from "$lib/utils";
 
   let {
@@ -60,18 +59,6 @@
     () => post.author,
     () => pubkey,
   );
-
-  // Fetch link previews on-demand for posts with URLs
-  let linkPreviews = $state<LinkPreview[]>([]);
-  $effect(() => {
-    const content = displayPost.content;
-    if (!content || !/https?:\/\//.test(content)) return;
-    invoke("fetch_link_previews", { content })
-      .then((result) => {
-        linkPreviews = result as LinkPreview[];
-      })
-      .catch((e) => console.error("[og] fetch_link_previews failed:", e));
-  });
 </script>
 
 <article class="post">
@@ -125,11 +112,6 @@
       </p>
     {/if}
     <MediaGrid media={quotedPost.media} {onlightbox} />
-    {#if linkPreviews.length}
-      {#each linkPreviews as preview (preview.url)}
-        <LinkPreviewCard {preview} />
-      {/each}
-    {/if}
   {:else}
     {#if post.content}
       <p class="post-content">{@html renderContent(post.content, pubkey)}</p>
@@ -137,11 +119,6 @@
     <MediaGrid media={post.media} {onlightbox} />
     {#if post.quote_of}
       <QuotedPostEmbed quoteOfId={post.quote_of} {pubkey} />
-    {/if}
-    {#if linkPreviews.length}
-      {#each linkPreviews as preview (preview.url)}
-        <LinkPreviewCard {preview} />
-      {/each}
     {/if}
   {/if}
 

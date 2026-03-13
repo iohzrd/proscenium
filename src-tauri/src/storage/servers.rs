@@ -1,18 +1,6 @@
 use crate::storage::Storage;
-use serde::{Deserialize, Serialize};
+use iroh_social_types::ServerEntry;
 use sqlx::Row;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerEntry {
-    pub url: String,
-    pub name: String,
-    pub description: String,
-    pub node_id: String,
-    pub registered_at: Option<i64>,
-    pub visibility: String,
-    pub added_at: i64,
-    pub last_synced_at: Option<i64>,
-}
 
 fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> ServerEntry {
     ServerEntry {

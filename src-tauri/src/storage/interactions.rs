@@ -1,7 +1,7 @@
-use iroh_social_types::{Interaction, InteractionKind};
+use iroh_social_types::{Interaction, InteractionKind, PostCounts};
 use sqlx::Row;
 
-use super::{PostCounts, Storage};
+use super::Storage;
 
 impl Storage {
     fn row_to_interaction(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Interaction> {
@@ -19,19 +19,6 @@ impl Storage {
             timestamp: row.get::<i64, _>(5) as u64,
             signature: row.get(6),
         })
-    }
-
-    pub async fn get_interaction_by_id(&self, id: &str) -> anyhow::Result<Option<Interaction>> {
-        let row = sqlx::query(
-            "SELECT id, author, kind, target_post_id, target_author, timestamp, signature FROM interactions WHERE id=?1",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        match row {
-            Some(row) => Ok(Some(Self::row_to_interaction(&row)?)),
-            None => Ok(None),
-        }
     }
 
     pub async fn save_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {

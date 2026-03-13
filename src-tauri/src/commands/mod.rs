@@ -24,4 +24,4 @@ pub use posts::*;
 pub use profile::*;
 pub use servers::*;
 pub use social::*;
-pub use sync::{get_sync_status, sync_posts};
+pub use sync::{get_sync_status, sync_all_peers, sync_posts};

@@ -205,27 +205,19 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_outbox_for_peer(
+    /// Returns all pending dm_outbox entries ordered oldest-first.
+    pub async fn get_all_outbox_messages(
         &self,
-        peer_pubkey: &str,
-    ) -> anyhow::Result<Vec<(String, String, String)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
         let rows = sqlx::query(
-            "SELECT id, envelope_json, message_id FROM dm_outbox WHERE peer_pubkey=?1 ORDER BY created_at ASC",
+            "SELECT id, peer_pubkey, envelope_json, message_id FROM dm_outbox ORDER BY created_at ASC",
         )
-        .bind(peer_pubkey)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
-            .iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2)))
+            .into_iter()
+            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
             .collect())
-    }
-
-    pub async fn get_all_outbox_peers(&self) -> anyhow::Result<Vec<String>> {
-        let rows = sqlx::query("SELECT DISTINCT peer_pubkey FROM dm_outbox")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     pub async fn remove_outbox_message(&self, id: &str) -> anyhow::Result<()> {

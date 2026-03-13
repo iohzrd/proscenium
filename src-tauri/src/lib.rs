@@ -3,10 +3,9 @@ mod constants;
 mod crypto;
 mod device_sync;
 mod dm;
-mod ext;
 mod framing;
 mod gossip;
-mod opengraph;
+mod ingest;
 mod peer;
 mod push;
 mod setup;
@@ -78,6 +77,7 @@ pub fn run() {
             mark_notifications_read,
             get_user_posts,
             sync_posts,
+            sync_all_peers,
             get_sync_status,
             like_post,
             unlike_post,
@@ -103,7 +103,6 @@ pub fn run() {
             get_dm_messages,
             mark_dm_read,
             delete_dm_message,
-            flush_dm_outbox,
             get_unread_dm_count,
             send_dm_signal,
             toggle_bookmark,
@@ -133,7 +132,6 @@ pub fn run() {
             server_search_posts,
             server_list_users,
             sync_profile_to_server,
-            fetch_link_previews,
             get_seed_phrase,
             is_seed_phrase_backed_up,
             mark_seed_phrase_backed_up,
@@ -147,29 +145,5 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app, event| {
-            use tauri::Manager;
-            if let tauri::RunEvent::Exit = event
-                && let Some(state) = app.try_state::<std::sync::Arc<crate::state::AppState>>()
-            {
-                log::info!("[shutdown] cancelling background tasks");
-                state.shutdown_token.cancel();
-
-                tauri::async_runtime::block_on(async {
-                    let task_manager = state.task_manager.lock().await.take();
-                    if let Some(tm) = task_manager {
-                        let timed_out = tm.shutdown(crate::constants::SHUTDOWN_TIMEOUT).await;
-                        if timed_out.is_empty() {
-                            log::info!("[shutdown] all background tasks exited cleanly");
-                        } else {
-                            log::warn!(
-                                "[shutdown] {} task(s) force-killed: {}",
-                                timed_out.len(),
-                                timed_out.join(", ")
-                            );
-                        }
-                    }
-                });
-            }
-        });
+        .run(|_app, _event| {});
 }

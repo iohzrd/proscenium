@@ -1,30 +1,39 @@
 use crate::constants::{DEVICE_SYNC_INITIAL_DELAY, DEVICE_SYNC_INTERVAL};
-use crate::storage::Storage;
-use iroh::Endpoint;
+use crate::state::AppState;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
-pub async fn device_sync_task(
-    endpoint: Endpoint,
-    storage: Arc<Storage>,
-    master_pubkey: String,
-    signing_secret_key_bytes: [u8; 32],
-    token: CancellationToken,
-) {
-    tokio::select! {
-        _ = token.cancelled() => return,
-        _ = tokio::time::sleep(DEVICE_SYNC_INITIAL_DELAY) => {}
-    }
+pub fn spawn(state: Arc<AppState>) {
+    let token = state.shutdown.child_token();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = token.cancelled() => {}
+            _ = run(state) => {}
+        }
+        log::info!("[device-sync] task stopped");
+    });
+}
+
+async fn run(state: Arc<AppState>) {
+    // Wait before first sync so the endpoint has time to connect to the relay.
+    tokio::time::sleep(DEVICE_SYNC_INITIAL_DELAY).await;
+
     loop {
+        // Read identity live so key rotation is immediately reflected.
+        let (master_pubkey, signing_secret_key_bytes) = {
+            let id = state.identity.read().await;
+            (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        };
+
         crate::device_sync::sync_all_devices(
-            &endpoint,
-            &storage,
+            &state.endpoint,
+            &state.storage,
             &master_pubkey,
             &signing_secret_key_bytes,
         )
         .await;
+
         tokio::select! {
-            _ = token.cancelled() => break,
+            _ = state.shutdown.cancelled() => break,
             _ = tokio::time::sleep(DEVICE_SYNC_INTERVAL) => {}
         }
     }

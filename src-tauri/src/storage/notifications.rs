@@ -1,7 +1,9 @@
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
-use super::{Notification, Storage};
+use iroh_social_types::Notification;
+
+use super::Storage;
 
 impl Storage {
     pub async fn insert_notification(

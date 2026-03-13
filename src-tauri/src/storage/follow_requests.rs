@@ -1,16 +1,7 @@
-use serde::{Deserialize, Serialize};
+use iroh_social_types::FollowRequestEntry;
 use sqlx::Row;
 
 use super::Storage;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowRequestEntry {
-    pub pubkey: String,
-    pub timestamp: u64,
-    pub status: String,
-    pub created_at: u64,
-    pub expires_at: u64,
-}
 
 impl Storage {
     pub async fn insert_follow_request(
@@ -100,15 +91,5 @@ impl Storage {
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
-    }
-
-    pub async fn prune_expired_follow_requests(&self) -> anyhow::Result<u64> {
-        let now = iroh_social_types::now_millis();
-        let result =
-            sqlx::query("DELETE FROM follow_requests WHERE status='pending' AND expires_at < ?1")
-                .bind(now as i64)
-                .execute(&self.pool)
-                .await?;
-        Ok(result.rows_affected())
     }
 }

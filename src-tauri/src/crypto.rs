@@ -1,9 +1,21 @@
 use chacha20poly1305::{ChaCha20Poly1305, Key, KeyInit, Nonce, aead::Aead};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
 use zeroize::Zeroize;
+
+// -- Key Derivation --
+
+/// Derive the ratchet state storage encryption key from a DM secret key.
+/// Used to encrypt ratchet sessions at rest.
+pub fn derive_ratchet_storage_key(dm_secret_key_bytes: &[u8; 32]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(None, dm_secret_key_bytes);
+    let mut key = [0u8; 32];
+    hk.expand(b"iroh-social-ratchet-storage-v1", &mut key)
+        .expect("HKDF expand valid length");
+    key
+}
 
 // -- Key Conversion --
 

@@ -1,6 +1,5 @@
-mod crypto;
 mod device_sync;
-pub(crate) mod follow_requests;
+mod follow_requests;
 mod interactions;
 mod linked_devices;
 mod messaging;
@@ -10,37 +9,17 @@ mod peer_delegations;
 mod posts;
 mod profiles;
 mod push;
-pub(crate) mod servers;
+mod ratchet;
+mod servers;
 mod social;
 
-use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PostCounts {
-    pub likes: u32,
-    pub replies: u32,
-    pub reposts: u32,
-    pub liked_by_me: bool,
-    pub reposted_by_me: bool,
-}
-
 pub struct FeedQuery {
     pub limit: usize,
     pub before: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Notification {
-    pub id: String,
-    pub kind: String,
-    pub actor: String,
-    pub target_post_id: Option<String>,
-    pub post_id: Option<String>,
-    pub timestamp: u64,
-    pub read: bool,
 }
 
 pub struct Storage {
