@@ -98,14 +98,14 @@ impl GossipService {
         (service, reconnect_rx)
     }
 
-    /// Spawn the background reconnect loop. Call once after construction.
-    pub fn spawn_reconnect_loop(
+    /// Build the reconnect loop future. The caller is responsible for spawning it.
+    pub fn reconnect_loop(
         &self,
         mut reconnect_rx: mpsc::UnboundedReceiver<ReconnectRequest>,
         shutdown: CancellationToken,
-    ) {
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let service = self.clone();
-        tokio::spawn(async move {
+        async move {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
@@ -118,7 +118,7 @@ impl GossipService {
                     }
                 }
             }
-        });
+        }
     }
 
     async fn my_visibility(&self) -> Visibility {

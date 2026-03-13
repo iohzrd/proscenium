@@ -4,8 +4,10 @@ use crate::opengraph::OgCache;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 /// Commands that can be sent to the sync task to trigger on-demand syncs.
@@ -87,6 +89,88 @@ impl Net {
     }
 }
 
+/// Tracks all background tasks by name for structured shutdown.
+pub struct TaskManager {
+    tasks: JoinSet<()>,
+    names: HashMap<Id, &'static str>,
+}
+
+impl TaskManager {
+    pub fn new() -> Self {
+        Self {
+            tasks: JoinSet::new(),
+            names: HashMap::new(),
+        }
+    }
+
+    /// Spawn a named background task and track it.
+    pub fn spawn(
+        &mut self,
+        name: &'static str,
+        fut: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let handle = self.tasks.spawn(fut);
+        self.names.insert(handle.id(), name);
+    }
+
+    /// Drain all tasks with a timeout. Returns names of tasks that were force-killed.
+    pub async fn shutdown(mut self, timeout: std::time::Duration) -> Vec<&'static str> {
+        let total = self.tasks.len();
+        let mut completed = 0;
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, self.tasks.join_next_with_id()).await {
+                Ok(Some(Ok((id, ())))) => {
+                    completed += 1;
+                    let name = self.names.get(&id).copied().unwrap_or("unknown");
+                    log::info!(
+                        "[shutdown] task '{}' completed ({}/{})",
+                        name,
+                        completed,
+                        total
+                    );
+                }
+                Ok(Some(Err(e))) => {
+                    completed += 1;
+                    let name = self.names.get(&e.id()).copied().unwrap_or("unknown");
+                    log::error!("[shutdown] task '{}' panicked: {}", name, e);
+                }
+                Ok(None) => {
+                    log::info!("[shutdown] all {} tasks completed cleanly", total);
+                    return Vec::new();
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Force-abort remaining tasks
+        let mut timed_out = Vec::new();
+        self.tasks.abort_all();
+        while let Some(result) = self.tasks.join_next_with_id().await {
+            match result {
+                Ok((id, ())) => {
+                    let name = self.names.get(&id).copied().unwrap_or("unknown");
+                    log::info!("[shutdown] task '{}' finished during abort", name);
+                }
+                Err(e) => {
+                    let name = self.names.get(&e.id()).copied().unwrap_or("unknown");
+                    if e.is_cancelled() {
+                        log::warn!("[shutdown] task '{}' force-killed after timeout", name);
+                        timed_out.push(name);
+                    }
+                }
+            }
+        }
+
+        timed_out
+    }
+}
+
 pub struct AppState {
     pub identity: Arc<Identity>,
     pub net: Net,
@@ -102,4 +186,6 @@ pub struct AppState {
     pub sync_tx: mpsc::Sender<SyncCommand>,
     /// Cancellation token for graceful shutdown of background tasks.
     pub shutdown_token: CancellationToken,
+    /// Tracked background tasks for structured shutdown.
+    pub task_manager: tokio::sync::Mutex<Option<TaskManager>>,
 }

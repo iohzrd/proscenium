@@ -1,7 +1,7 @@
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
-use crate::state::{AppState, Identity, Net};
+use crate::state::{AppState, Identity, Net, TaskManager};
 use crate::storage::Storage;
 use crate::tasks;
 use iroh::{Endpoint, SecretKey, protocol::Router};
@@ -139,19 +139,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         log::info!("[setup] addr (after 3s): {:?}", ep_clone.addr());
     });
 
-    #[cfg(target_os = "android")]
-    {
-        let ep_net = endpoint.clone();
-        tokio::spawn(async move {
-            ep_net.network_change().await;
-            log::info!("[android-net] initial network_change() sent");
-            loop {
-                tokio::time::sleep(ANDROID_NET_INTERVAL).await;
-                ep_net.network_change().await;
-            }
-        });
-    }
-
     let storage = Arc::new(
         Storage::open(&data_dir.join("social.db"))
             .await
@@ -262,56 +249,21 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     let shutdown_token = CancellationToken::new();
     let (sync_tx, sync_rx) = tokio::sync::mpsc::channel(16);
 
-    gossip_service.spawn_reconnect_loop(reconnect_rx, shutdown_token.child_token());
-
-    let task_endpoint = endpoint.clone();
-    let task_gossip = gossip_service.clone();
-    let task_dm = dm_handler.clone();
-
-    tokio::spawn(tasks::subscribe_and_sync_task(
-        task_gossip.clone(),
-        task_endpoint.clone(),
+    let mut task_manager = TaskManager::new();
+    tasks::spawn_all(
+        &mut task_manager,
+        endpoint.clone(),
+        gossip_service.clone(),
+        dm_handler.clone(),
         storage.clone(),
+        identity.clone(),
         handle.clone(),
-        identity.master_pubkey.clone(),
         follows,
+        reconnect_rx,
         sync_rx,
-        shutdown_token.child_token(),
-    ));
-
-    tokio::spawn(tasks::dm_outbox_flush_task(
-        task_dm,
-        task_endpoint.clone(),
-        storage.clone(),
         dm_outbox_notify,
-        shutdown_token.child_token(),
-    ));
-
-    tokio::spawn(tasks::push_outbox_flush_task(
-        task_endpoint.clone(),
-        storage.clone(),
-        identity.master_pubkey.clone(),
-        shutdown_token.child_token(),
-    ));
-
-    tokio::spawn(tasks::housekeeping_task(
-        storage.clone(),
-        shutdown_token.child_token(),
-    ));
-
-    tokio::spawn(tasks::device_sync_task(
-        task_endpoint.clone(),
-        storage.clone(),
-        identity.master_pubkey.clone(),
-        identity.signing_secret_key_bytes,
-        shutdown_token.child_token(),
-    ));
-
-    tokio::spawn(tasks::network_health_task(
-        task_endpoint,
-        task_gossip,
-        shutdown_token.child_token(),
-    ));
+        shutdown_token.clone(),
+    );
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -330,6 +282,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         pending_link,
         sync_tx,
         shutdown_token,
+        task_manager: tokio::sync::Mutex::new(Some(task_manager)),
     });
 
     handle.manage(state);

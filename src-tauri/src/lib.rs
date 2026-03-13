@@ -154,6 +154,22 @@ pub fn run() {
             {
                 log::info!("[shutdown] cancelling background tasks");
                 state.shutdown_token.cancel();
+
+                tauri::async_runtime::block_on(async {
+                    let task_manager = state.task_manager.lock().await.take();
+                    if let Some(tm) = task_manager {
+                        let timed_out = tm.shutdown(crate::constants::SHUTDOWN_TIMEOUT).await;
+                        if timed_out.is_empty() {
+                            log::info!("[shutdown] all background tasks exited cleanly");
+                        } else {
+                            log::warn!(
+                                "[shutdown] {} task(s) force-killed: {}",
+                                timed_out.len(),
+                                timed_out.join(", ")
+                            );
+                        }
+                    }
+                });
             }
         });
 }

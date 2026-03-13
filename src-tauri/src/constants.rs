@@ -36,6 +36,9 @@ pub const GOSSIP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 // Relay address logging delay
 pub const RELAY_LOG_DELAY: Duration = Duration::from_secs(3);
 
+// Graceful shutdown timeout before force-killing tasks
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 // Defaults
 pub const DEFAULT_FEED_LIMIT: usize = 20;
 pub const DEFAULT_NOTIFICATION_LIMIT: usize = 30;
