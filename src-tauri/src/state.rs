@@ -45,6 +45,8 @@ pub struct Identity {
     pub signing_key: SecretKey,
     /// Signing key derivation index (0 for initial, incremented on rotation).
     pub signing_key_index: u32,
+    /// DM key secret bytes (derived from master, used for Noise IK + Double Ratchet).
+    pub dm_secret_key_bytes: [u8; 32],
     /// DM public key string (hex-encoded X25519).
     pub dm_pubkey: String,
     /// DM key derivation index.
@@ -86,7 +88,7 @@ impl Net {
 }
 
 pub struct AppState {
-    pub identity: Identity,
+    pub identity: Arc<Identity>,
     pub net: Net,
     pub storage: Arc<Storage>,
     /// Local blob storage (add/get bytes). For fetching remote blobs use net.blobs.
