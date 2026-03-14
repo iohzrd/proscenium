@@ -1,3 +1,4 @@
+use crate::error::AppError;
 mod device_sync;
 mod follow_requests;
 mod interactions;
@@ -76,7 +77,7 @@ impl Storage {
         ),
     ];
 
-    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
         let opts = SqliteConnectOptions::from_str(&url)?
             .pragma("journal_mode", "WAL")
@@ -92,7 +93,7 @@ impl Storage {
         Ok(Self { pool })
     }
 
-    async fn run_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
+    async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,

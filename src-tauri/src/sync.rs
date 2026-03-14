@@ -1,4 +1,5 @@
 use crate::constants::{BATCH_SIZE, SYNC_TIMEOUT};
+use crate::error::AppError;
 use crate::framing::{read_frame, write_frame};
 use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
@@ -53,7 +54,7 @@ pub async fn handle_sync(
         }
     }
 
-    let map_err = |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
+    let map_err = |e: AppError| AcceptError::from_err(e);
 
     let server_post_count = storage
         .count_posts_by_author(&req.author)
@@ -241,7 +242,7 @@ pub async fn sync_from_peer(
     storage: &Storage,
     target: EndpointId,
     author: &str,
-) -> anyhow::Result<SyncResult> {
+) -> Result<SyncResult, AppError> {
     let addr = EndpointAddr::from(target);
     log::info!(
         "[sync-client] connecting to {} for sync...",
@@ -447,10 +448,13 @@ pub async fn sync_one_peer(
     my_id: &str,
     app_handle: &AppHandle,
     label: &str,
-) -> anyhow::Result<SyncOneResult> {
+) -> Result<SyncOneResult, AppError> {
     let node_ids = storage.get_peer_transport_node_ids(pubkey).await?;
     if node_ids.is_empty() {
-        anyhow::bail!("no cached transport NodeId for {}", short_id(pubkey));
+        return Err(AppError::Other(format!(
+            "no cached transport NodeId for {}",
+            short_id(pubkey)
+        )));
     }
 
     let mut last_err = String::new();
@@ -501,9 +505,9 @@ pub async fn sync_one_peer(
         }
     }
 
-    anyhow::bail!(
+    Err(AppError::Other(format!(
         "sync failed for {} (tried {} node(s)): {last_err}",
         short_id(pubkey),
         node_ids.len(),
-    )
+    )))
 }

@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use iroh_social_types::{
     DeviceSyncVector, FollowSyncEntry, ModerationSyncEntry, RatchetSessionExport, RatchetSyncEntry,
 };
@@ -9,7 +10,7 @@ impl Storage {
     pub async fn build_device_sync_vector(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<DeviceSyncVector> {
+    ) -> Result<DeviceSyncVector, AppError> {
         let post_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE author = ?1")
             .bind(master_pubkey)
             .fetch_one(&self.pool)
@@ -118,7 +119,7 @@ impl Storage {
         })
     }
 
-    pub async fn merge_follows_lww(&self, entries: &[FollowSyncEntry]) -> anyhow::Result<u32> {
+    pub async fn merge_follows_lww(&self, entries: &[FollowSyncEntry]) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for entry in entries {
             let local_changed: Option<i64> =
@@ -152,7 +153,7 @@ impl Storage {
         Ok(merged)
     }
 
-    pub async fn merge_mutes_lww(&self, entries: &[ModerationSyncEntry]) -> anyhow::Result<u32> {
+    pub async fn merge_mutes_lww(&self, entries: &[ModerationSyncEntry]) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for entry in entries {
             let local_changed: Option<i64> =
@@ -185,7 +186,7 @@ impl Storage {
         Ok(merged)
     }
 
-    pub async fn merge_blocks_lww(&self, entries: &[ModerationSyncEntry]) -> anyhow::Result<u32> {
+    pub async fn merge_blocks_lww(&self, entries: &[ModerationSyncEntry]) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for entry in entries {
             let local_changed: Option<i64> =
@@ -218,7 +219,7 @@ impl Storage {
         Ok(merged)
     }
 
-    pub async fn merge_bookmarks(&self, post_ids: &[String]) -> anyhow::Result<u32> {
+    pub async fn merge_bookmarks(&self, post_ids: &[String]) -> Result<u32, AppError> {
         let mut added = 0u32;
         let now = iroh_social_types::now_millis() as i64;
         for post_id in post_ids {
@@ -242,7 +243,7 @@ impl Storage {
     pub async fn merge_ratchet_sessions_lww(
         &self,
         sessions: &[RatchetSessionExport],
-    ) -> anyhow::Result<u32> {
+    ) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for session in sessions {
             let local_updated: Option<i64> = sqlx::query_scalar(

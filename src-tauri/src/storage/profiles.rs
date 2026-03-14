@@ -1,10 +1,11 @@
+use crate::error::AppError;
 use iroh_social_types::{Profile, Visibility};
 use sqlx::Row;
 
 use super::Storage;
 
 impl Storage {
-    pub async fn save_profile(&self, pubkey: &str, profile: &Profile) -> anyhow::Result<()> {
+    pub async fn save_profile(&self, pubkey: &str, profile: &Profile) -> Result<(), AppError> {
         sqlx::query(
             "INSERT INTO profiles (pubkey, display_name, bio, avatar_hash, avatar_ticket, visibility, signature)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -22,7 +23,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_profile(&self, pubkey: &str) -> anyhow::Result<Option<Profile>> {
+    pub async fn get_profile(&self, pubkey: &str) -> Result<Option<Profile>, AppError> {
         let row = sqlx::query(
             "SELECT display_name, bio, avatar_hash, avatar_ticket, visibility, signature FROM profiles WHERE pubkey=?1",
         )

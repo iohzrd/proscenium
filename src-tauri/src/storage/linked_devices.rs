@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use iroh_social_types::{
     DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, RatchetSessionExport,
     SigningKeyDelegation, now_millis,
@@ -14,7 +15,7 @@ impl Storage {
         is_primary: bool,
         is_self: bool,
         added_at: u64,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         sqlx::query(
             "INSERT INTO linked_devices (node_id, device_name, is_primary, is_self, added_at, last_seen_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -36,7 +37,7 @@ impl Storage {
     }
 
     #[allow(dead_code)]
-    pub async fn get_linked_devices(&self) -> anyhow::Result<Vec<DeviceEntry>> {
+    pub async fn get_linked_devices(&self) -> Result<Vec<DeviceEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT node_id, device_name, is_primary, added_at FROM linked_devices ORDER BY added_at ASC",
         )
@@ -58,7 +59,7 @@ impl Storage {
         &self,
         master_pubkey: &str,
         announcement: &LinkedDevicesAnnouncement,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let json = serde_json::to_string(announcement)?;
         let now = now_millis() as i64;
         sqlx::query(
@@ -97,7 +98,7 @@ impl Storage {
     pub async fn get_peer_announcement_version(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<Option<u64>> {
+    ) -> Result<Option<u64>, AppError> {
         let result: Option<i64> = sqlx::query_scalar(
             "SELECT version FROM peer_device_announcements WHERE master_pubkey = ?1",
         )
@@ -107,21 +108,21 @@ impl Storage {
         Ok(result.map(|v| v as u64))
     }
 
-    pub async fn next_device_index(&self) -> anyhow::Result<u32> {
+    pub async fn next_device_index(&self) -> Result<u32, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM linked_devices")
             .fetch_one(&self.pool)
             .await?;
         Ok(count as u32)
     }
 
-    pub async fn get_all_bookmark_ids(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn get_all_bookmark_ids(&self) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query("SELECT post_id FROM bookmarks ORDER BY created_at DESC")
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    pub async fn export_ratchet_sessions(&self) -> anyhow::Result<Vec<RatchetSessionExport>> {
+    pub async fn export_ratchet_sessions(&self) -> Result<Vec<RatchetSessionExport>, AppError> {
         let rows = sqlx::query(
             "SELECT peer_pubkey, state_json, COALESCE(updated_at, 0) FROM dm_ratchet_sessions",
         )
@@ -148,7 +149,7 @@ impl Storage {
         transport_secret_key_bytes: &[u8; 32],
         device_index: u32,
         master_secret_key_bytes: Option<&[u8; 32]>,
-    ) -> anyhow::Result<LinkBundleData> {
+    ) -> Result<LinkBundleData, AppError> {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
 
@@ -179,7 +180,7 @@ impl Storage {
         &self,
         master_pubkey: &str,
         bundle: &LinkBundleData,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         if let Some(ref profile) = bundle.profile {
             self.save_profile(master_pubkey, profile).await?;
         }
@@ -208,7 +209,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_other_device_node_ids(&self) -> anyhow::Result<Vec<String>> {
+    pub async fn get_other_device_node_ids(&self) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query(
             "SELECT node_id FROM linked_devices WHERE is_self = 0 ORDER BY added_at ASC",
         )

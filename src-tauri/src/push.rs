@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
@@ -13,14 +14,14 @@ pub async fn push_to_peer(
     endpoint: &Endpoint,
     target: EndpointId,
     msg: &PushMessage,
-) -> anyhow::Result<PushAck> {
+) -> Result<PushAck, AppError> {
     let addr = EndpointAddr::from(target);
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         endpoint.connect(addr, PEER_ALPN),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("push connect timeout"))??;
+    .map_err(|_| AppError::Other("push connect timeout".into()))??;
 
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -31,7 +32,7 @@ pub async fn push_to_peer(
     let ack_bytes =
         tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(65536))
             .await
-            .map_err(|_| anyhow::anyhow!("push ack timeout"))??;
+            .map_err(|_| AppError::Other("push ack timeout".into()))??;
     let ack: PushAck = serde_json::from_slice(&ack_bytes)?;
 
     conn.close(0u32.into(), b"done");

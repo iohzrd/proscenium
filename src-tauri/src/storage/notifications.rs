@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -13,7 +14,7 @@ impl Storage {
         target_post_id: Option<&str>,
         post_id: Option<&str>,
         timestamp: u64,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let mut hasher = Sha256::new();
         hasher.update(kind.as_bytes());
         hasher.update(actor.as_bytes());
@@ -39,7 +40,7 @@ impl Storage {
         &self,
         limit: usize,
         before: Option<u64>,
-    ) -> anyhow::Result<Vec<Notification>> {
+    ) -> Result<Vec<Notification>, AppError> {
         let hidden =
             "AND n.actor NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
         let rows = match before {
@@ -89,14 +90,14 @@ impl Storage {
         }
     }
 
-    pub async fn get_unread_notification_count(&self) -> anyhow::Result<u32> {
+    pub async fn get_unread_notification_count(&self) -> Result<u32, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE read=0")
             .fetch_one(&self.pool)
             .await?;
         Ok(count as u32)
     }
 
-    pub async fn mark_notifications_read(&self) -> anyhow::Result<()> {
+    pub async fn mark_notifications_read(&self) -> Result<(), AppError> {
         sqlx::query("UPDATE notifications SET read=1 WHERE read=0")
             .execute(&self.pool)
             .await?;

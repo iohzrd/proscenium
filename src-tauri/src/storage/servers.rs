@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use crate::storage::Storage;
 use iroh_social_types::ServerEntry;
 use sqlx::Row;
@@ -16,7 +17,7 @@ fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> ServerEntry {
 }
 
 impl Storage {
-    pub async fn add_server(&self, url: &str) -> anyhow::Result<()> {
+    pub async fn add_server(&self, url: &str) -> Result<(), AppError> {
         let now = iroh_social_types::now_millis() as i64;
         sqlx::query("INSERT OR IGNORE INTO servers (url, added_at) VALUES (?1, ?2)")
             .bind(url)
@@ -26,7 +27,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn remove_server(&self, url: &str) -> anyhow::Result<()> {
+    pub async fn remove_server(&self, url: &str) -> Result<(), AppError> {
         sqlx::query("DELETE FROM servers WHERE url = ?1")
             .bind(url)
             .execute(&self.pool)
@@ -34,7 +35,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
+    pub async fn get_servers(&self) -> Result<Vec<ServerEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers ORDER BY added_at DESC",
         )
@@ -43,7 +44,7 @@ impl Storage {
         Ok(rows.iter().map(row_to_server).collect())
     }
 
-    pub async fn get_server(&self, url: &str) -> anyhow::Result<Option<ServerEntry>> {
+    pub async fn get_server(&self, url: &str) -> Result<Option<ServerEntry>, AppError> {
         let row = sqlx::query(
             "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE url = ?1",
         )
@@ -59,7 +60,7 @@ impl Storage {
         name: &str,
         description: &str,
         node_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         sqlx::query("UPDATE servers SET name = ?2, description = ?3, node_id = ?4 WHERE url = ?1")
             .bind(url)
             .bind(name)
@@ -70,7 +71,11 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn mark_server_registered(&self, url: &str, visibility: &str) -> anyhow::Result<()> {
+    pub async fn mark_server_registered(
+        &self,
+        url: &str,
+        visibility: &str,
+    ) -> Result<(), AppError> {
         let now = iroh_social_types::now_millis() as i64;
         sqlx::query("UPDATE servers SET registered_at = ?2, visibility = ?3 WHERE url = ?1")
             .bind(url)
@@ -81,7 +86,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_registered_servers(&self) -> anyhow::Result<Vec<ServerEntry>> {
+    pub async fn get_registered_servers(&self) -> Result<Vec<ServerEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT url, name, description, node_id, registered_at, visibility, added_at, last_synced_at FROM servers WHERE registered_at IS NOT NULL ORDER BY added_at DESC",
         )
@@ -90,7 +95,7 @@ impl Storage {
         Ok(rows.iter().map(row_to_server).collect())
     }
 
-    pub async fn mark_server_unregistered(&self, url: &str) -> anyhow::Result<()> {
+    pub async fn mark_server_unregistered(&self, url: &str) -> Result<(), AppError> {
         sqlx::query("UPDATE servers SET registered_at = NULL WHERE url = ?1")
             .bind(url)
             .execute(&self.pool)

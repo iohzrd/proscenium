@@ -1,6 +1,7 @@
 #[cfg(target_os = "android")]
 use crate::constants::ANDROID_NET_INTERVAL;
 use crate::constants::{GOSSIP_HEARTBEAT_INTERVAL, HEALTH_TICK_INTERVAL, WAKE_THRESHOLD};
+use crate::error::AppError;
 use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
@@ -297,7 +298,7 @@ impl GossipService {
         old: Visibility,
         new: Visibility,
         profile: &Profile,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         if old == new {
             return Ok(());
         }
@@ -330,7 +331,7 @@ impl GossipService {
         }
     }
 
-    async fn start_own_feed_unconditional(&self) -> anyhow::Result<()> {
+    async fn start_own_feed_unconditional(&self) -> Result<(), AppError> {
         let mut inner = self.inner.lock().await;
         if inner
             .own_feed_handle
@@ -447,7 +448,7 @@ impl GossipService {
         Ok(())
     }
 
-    pub async fn start_own_feed(&self) -> anyhow::Result<()> {
+    pub async fn start_own_feed(&self) -> Result<(), AppError> {
         let visibility = self.my_visibility().await;
         if visibility != Visibility::Public {
             log::info!("[gossip] skipping own feed topic (visibility={visibility})");
@@ -458,7 +459,7 @@ impl GossipService {
 
     /// Serialize and broadcast a gossip message if we have an active sender.
     /// Returns `true` if the message was broadcast, `false` if no sender is active.
-    async fn broadcast_msg(&self, msg: &GossipMessage, label: &str) -> anyhow::Result<bool> {
+    async fn broadcast_msg(&self, msg: &GossipMessage, label: &str) -> Result<bool, AppError> {
         let sender = self.inner.lock().await.my_sender.clone();
         if let Some(sender) = sender {
             let payload = serde_json::to_vec(msg)?;
@@ -470,13 +471,13 @@ impl GossipService {
         }
     }
 
-    pub async fn broadcast_heartbeat(&self) -> anyhow::Result<()> {
+    pub async fn broadcast_heartbeat(&self) -> Result<(), AppError> {
         self.broadcast_msg(&GossipMessage::Heartbeat, "heartbeat")
             .await?;
         Ok(())
     }
 
-    pub async fn broadcast_profile(&self, profile: &Profile) -> anyhow::Result<()> {
+    pub async fn broadcast_profile(&self, profile: &Profile) -> Result<(), AppError> {
         let msg = GossipMessage::ProfileUpdate(profile.clone());
         if !self
             .broadcast_msg(&msg, &format!("profile: {}", profile.display_name))
@@ -494,7 +495,7 @@ impl GossipService {
         Ok(())
     }
 
-    pub async fn broadcast_post(&self, post: &Post) -> anyhow::Result<()> {
+    pub async fn broadcast_post(&self, post: &Post) -> Result<(), AppError> {
         let msg = GossipMessage::NewPost(post.clone());
         if !self
             .broadcast_msg(&msg, &format!("post {}", &post.id))
@@ -517,7 +518,7 @@ impl GossipService {
         id: &str,
         author: &str,
         signature: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let msg = GossipMessage::DeletePost {
             id: id.to_string(),
             author: author.to_string(),
@@ -529,7 +530,7 @@ impl GossipService {
         Ok(())
     }
 
-    pub async fn broadcast_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {
+    pub async fn broadcast_interaction(&self, interaction: &Interaction) -> Result<(), AppError> {
         let msg = GossipMessage::NewInteraction(interaction.clone());
         let label = format!(
             "{:?} on post {}",
@@ -553,7 +554,7 @@ impl GossipService {
         id: &str,
         author: &str,
         signature: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let msg = GossipMessage::DeleteInteraction {
             id: id.to_string(),
             author: author.to_string(),
@@ -571,7 +572,7 @@ impl GossipService {
     pub async fn broadcast_linked_devices(
         &self,
         announcement: &LinkedDevicesAnnouncement,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let msg = GossipMessage::LinkedDevices(announcement.clone());
         self.broadcast_msg(
             &msg,
@@ -584,7 +585,7 @@ impl GossipService {
     pub async fn broadcast_signing_key_rotation(
         &self,
         rotation: &SigningKeyRotation,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let msg = GossipMessage::SigningKeyRotation(rotation.clone());
         self.broadcast_msg(
             &msg,
@@ -601,7 +602,7 @@ impl GossipService {
         &self,
         pubkey: String,
         transport_node_ids: Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let mut inner = self.inner.lock().await;
 
         // Skip if already subscribed with a live task; clean up finished handles.
@@ -620,10 +621,10 @@ impl GossipService {
             .collect();
 
         if bootstrap.is_empty() {
-            anyhow::bail!(
+            return Err(AppError::Other(format!(
                 "no valid transport NodeIds for gossip bootstrap of {}",
                 short_id(&pubkey)
-            );
+            )));
         }
 
         log::info!(
@@ -706,217 +707,277 @@ impl GossipService {
         );
         match serde_json::from_slice(content) {
             Ok(GossipMessage::NewPost(post)) => {
-                if post.author != pk {
-                    log::info!(
-                        "[gossip-rx] ignored post from {} (expected {})",
-                        short_id(&post.author),
-                        short_id(pk)
-                    );
-                } else if storage.is_hidden(pk).await.unwrap_or(false) {
-                    log::info!(
-                        "[gossip-rx] skipping post from muted/blocked {}",
-                        short_id(pk)
-                    );
-                } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle)
-                    .await
-                {
-                    let _ = app_handle.emit("feed-updated", ());
-                }
+                Self::handle_new_post(storage, pk, my_id, app_handle, post).await;
             }
             Ok(GossipMessage::DeletePost {
                 id,
                 author,
                 signature,
             }) => {
-                if author == pk {
-                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-                        && let Err(reason) =
-                            verify_delete_post_signature(&id, &author, &signature, &signer)
-                    {
-                        log::warn!(
-                            "[gossip-rx] bad delete-post signature from {}: {reason}",
-                            short_id(pk)
-                        );
-                        return;
-                    }
-                    match storage.get_post_by_id(&id).await {
-                        Ok(Some(post)) if post.author == pk => {
-                            log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
-                            if let Err(e) = storage.delete_post(&id).await {
-                                log::error!("[gossip-rx] failed to delete post: {e}");
-                            }
-                            let _ = app_handle.emit("feed-updated", ());
-                        }
-                        Ok(Some(_)) => {
-                            log::error!("[gossip-rx] rejected delete for {id}: author mismatch");
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::error!("[gossip-rx] failed to look up post {id}: {e}");
-                        }
-                    }
-                }
+                Self::handle_delete_post(storage, pk, app_handle, &id, &author, &signature).await;
             }
             Ok(GossipMessage::ProfileUpdate(profile)) => {
-                if let Err(reason) = validate_profile(&profile) {
-                    log::error!(
-                        "[gossip-rx] rejected profile from {}: {reason}",
-                        short_id(pk)
-                    );
-                } else {
-                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-                        && let Err(reason) = verify_profile_signature(&profile, &signer)
-                    {
-                        log::warn!(
-                            "[gossip-rx] bad profile signature from {}: {reason}",
-                            short_id(pk)
-                        );
-                        return;
-                    }
-                    log::info!(
-                        "[gossip-rx] profile update from {}: {}",
-                        short_id(pk),
-                        profile.display_name
-                    );
-                    if let Err(e) = storage.save_profile(pk, &profile).await {
-                        log::error!("[gossip-rx] failed to store profile: {e}");
-                    }
-                    let _ = app_handle.emit("profile-updated", pk);
-                }
+                Self::handle_profile_update(storage, pk, app_handle, profile).await;
             }
             Ok(GossipMessage::NewInteraction(interaction)) => {
-                if interaction.author != pk {
-                    // Ignore interactions not from the expected author
-                } else if storage.is_hidden(pk).await.unwrap_or(false) {
-                    log::info!(
-                        "[gossip-rx] skipping interaction from muted/blocked {}",
-                        short_id(pk)
-                    );
-                } else {
-                    process_incoming_interaction(
-                        storage,
-                        &interaction,
-                        pk,
-                        "gossip-rx",
-                        my_id,
-                        app_handle,
-                    )
-                    .await;
-                    let _ = app_handle.emit("interaction-received", &interaction);
-                }
+                Self::handle_new_interaction(storage, pk, my_id, app_handle, interaction).await;
             }
             Ok(GossipMessage::DeleteInteraction {
                 id,
                 author,
                 signature,
             }) => {
-                if author == pk {
-                    if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-                        && let Err(reason) =
-                            verify_delete_interaction_signature(&id, &author, &signature, &signer)
-                    {
-                        log::warn!(
-                            "[gossip-rx] bad delete-interaction signature from {}: {reason}",
-                            short_id(pk)
-                        );
-                        return;
-                    }
-                    log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
-                    if let Err(e) = storage.delete_interaction(&id, &author).await {
-                        log::error!("[gossip-rx] failed to delete interaction: {e}");
-                    }
-                    let _ = app_handle.emit(
-                        "interaction-deleted",
-                        serde_json::json!({ "id": id, "author": author }),
-                    );
-                }
+                Self::handle_delete_interaction(storage, pk, app_handle, &id, &author, &signature)
+                    .await;
             }
             Ok(GossipMessage::LinkedDevices(announcement)) => {
-                if announcement.master_pubkey != pk {
-                    log::warn!(
-                        "[gossip-rx] ignoring device announcement from {} (expected {})",
-                        short_id(&announcement.master_pubkey),
-                        short_id(pk)
-                    );
-                    return;
-                }
-                if let Err(reason) = verify_linked_devices_announcement(&announcement) {
-                    log::warn!(
-                        "[gossip-rx] bad device announcement from {}: {reason}",
-                        short_id(pk)
-                    );
-                    return;
-                }
-                let cached_version = storage
-                    .get_peer_announcement_version(pk)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or(0);
-                if announcement.version <= cached_version {
-                    return;
-                }
-                log::info!(
-                    "[gossip-rx] device announcement from {} v{} ({} devices)",
-                    short_id(pk),
-                    announcement.version,
-                    announcement.devices.len()
-                );
-                if let Err(e) = storage
-                    .cache_peer_device_announcement(pk, &announcement)
-                    .await
-                {
-                    log::error!("[gossip-rx] failed to cache device announcement: {e}");
-                }
+                Self::handle_linked_devices(storage, pk, announcement).await;
             }
             Ok(GossipMessage::SigningKeyRotation(rotation)) => {
-                if rotation.master_pubkey != pk {
-                    log::warn!(
-                        "[gossip-rx] ignoring key rotation from {} (expected {})",
-                        short_id(&rotation.master_pubkey),
-                        short_id(pk)
-                    );
-                    return;
-                }
-                if let Err(reason) = verify_rotation(&rotation) {
-                    log::warn!(
-                        "[gossip-rx] bad key rotation from {}: {reason}",
-                        short_id(pk)
-                    );
-                    return;
-                }
-                if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk).await
-                    && rotation.new_key_index <= cached_delegation.key_index
-                {
-                    log::warn!(
-                        "[gossip-rx] stale key rotation from {} (index {} <= cached {})",
-                        short_id(pk),
-                        rotation.new_key_index,
-                        cached_delegation.key_index
-                    );
-                    return;
-                }
-                log::info!(
-                    "[gossip-rx] signing key rotation from {} to index {}",
-                    short_id(pk),
-                    rotation.new_key_index
-                );
-                let response = iroh_social_types::IdentityResponse {
-                    master_pubkey: rotation.master_pubkey.clone(),
-                    delegation: rotation.new_delegation.clone(),
-                    transport_node_ids: storage
-                        .get_peer_transport_node_ids(pk)
-                        .await
-                        .unwrap_or_default(),
-                    profile: None,
-                };
-                if let Err(e) = storage.cache_peer_identity(&response).await {
-                    log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
-                }
+                Self::handle_signing_key_rotation(storage, pk, rotation).await;
             }
             Ok(GossipMessage::Heartbeat) => {}
             Err(e) => {
                 log::error!("[gossip-rx] failed to parse message: {e}");
             }
+        }
+    }
+
+    async fn handle_new_post(
+        storage: &Storage,
+        pk: &str,
+        my_id: &str,
+        app_handle: &AppHandle,
+        post: Post,
+    ) {
+        if post.author != pk {
+            log::info!(
+                "[gossip-rx] ignored post from {} (expected {})",
+                short_id(&post.author),
+                short_id(pk)
+            );
+        } else if storage.is_hidden(pk).await.unwrap_or(false) {
+            log::info!(
+                "[gossip-rx] skipping post from muted/blocked {}",
+                short_id(pk)
+            );
+        } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle).await {
+            let _ = app_handle.emit("feed-updated", ());
+        }
+    }
+
+    async fn handle_delete_post(
+        storage: &Storage,
+        pk: &str,
+        app_handle: &AppHandle,
+        id: &str,
+        author: &str,
+        signature: &str,
+    ) {
+        if author != pk {
+            return;
+        }
+        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
+            && let Err(reason) = verify_delete_post_signature(id, author, signature, &signer)
+        {
+            log::warn!(
+                "[gossip-rx] bad delete-post signature from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        match storage.get_post_by_id(id).await {
+            Ok(Some(post)) if post.author == pk => {
+                log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
+                if let Err(e) = storage.delete_post(id).await {
+                    log::error!("[gossip-rx] failed to delete post: {e}");
+                }
+                let _ = app_handle.emit("feed-updated", ());
+            }
+            Ok(Some(_)) => {
+                log::error!("[gossip-rx] rejected delete for {id}: author mismatch");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::error!("[gossip-rx] failed to look up post {id}: {e}");
+            }
+        }
+    }
+
+    async fn handle_profile_update(
+        storage: &Storage,
+        pk: &str,
+        app_handle: &AppHandle,
+        profile: Profile,
+    ) {
+        if let Err(reason) = validate_profile(&profile) {
+            log::error!(
+                "[gossip-rx] rejected profile from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
+            && let Err(reason) = verify_profile_signature(&profile, &signer)
+        {
+            log::warn!(
+                "[gossip-rx] bad profile signature from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        log::info!(
+            "[gossip-rx] profile update from {}: {}",
+            short_id(pk),
+            profile.display_name
+        );
+        if let Err(e) = storage.save_profile(pk, &profile).await {
+            log::error!("[gossip-rx] failed to store profile: {e}");
+        }
+        let _ = app_handle.emit("profile-updated", pk);
+    }
+
+    async fn handle_new_interaction(
+        storage: &Storage,
+        pk: &str,
+        my_id: &str,
+        app_handle: &AppHandle,
+        interaction: Interaction,
+    ) {
+        if interaction.author != pk {
+            return;
+        }
+        if storage.is_hidden(pk).await.unwrap_or(false) {
+            log::info!(
+                "[gossip-rx] skipping interaction from muted/blocked {}",
+                short_id(pk)
+            );
+            return;
+        }
+        process_incoming_interaction(storage, &interaction, pk, "gossip-rx", my_id, app_handle)
+            .await;
+        let _ = app_handle.emit("interaction-received", &interaction);
+    }
+
+    async fn handle_delete_interaction(
+        storage: &Storage,
+        pk: &str,
+        app_handle: &AppHandle,
+        id: &str,
+        author: &str,
+        signature: &str,
+    ) {
+        if author != pk {
+            return;
+        }
+        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
+            && let Err(reason) = verify_delete_interaction_signature(id, author, signature, &signer)
+        {
+            log::warn!(
+                "[gossip-rx] bad delete-interaction signature from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
+        if let Err(e) = storage.delete_interaction(id, author).await {
+            log::error!("[gossip-rx] failed to delete interaction: {e}");
+        }
+        let _ = app_handle.emit(
+            "interaction-deleted",
+            serde_json::json!({ "id": id, "author": author }),
+        );
+    }
+
+    async fn handle_linked_devices(
+        storage: &Storage,
+        pk: &str,
+        announcement: LinkedDevicesAnnouncement,
+    ) {
+        if announcement.master_pubkey != pk {
+            log::warn!(
+                "[gossip-rx] ignoring device announcement from {} (expected {})",
+                short_id(&announcement.master_pubkey),
+                short_id(pk)
+            );
+            return;
+        }
+        if let Err(reason) = verify_linked_devices_announcement(&announcement) {
+            log::warn!(
+                "[gossip-rx] bad device announcement from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        let cached_version = storage
+            .get_peer_announcement_version(pk)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0);
+        if announcement.version <= cached_version {
+            return;
+        }
+        log::info!(
+            "[gossip-rx] device announcement from {} v{} ({} devices)",
+            short_id(pk),
+            announcement.version,
+            announcement.devices.len()
+        );
+        if let Err(e) = storage
+            .cache_peer_device_announcement(pk, &announcement)
+            .await
+        {
+            log::error!("[gossip-rx] failed to cache device announcement: {e}");
+        }
+    }
+
+    async fn handle_signing_key_rotation(
+        storage: &Storage,
+        pk: &str,
+        rotation: SigningKeyRotation,
+    ) {
+        if rotation.master_pubkey != pk {
+            log::warn!(
+                "[gossip-rx] ignoring key rotation from {} (expected {})",
+                short_id(&rotation.master_pubkey),
+                short_id(pk)
+            );
+            return;
+        }
+        if let Err(reason) = verify_rotation(&rotation) {
+            log::warn!(
+                "[gossip-rx] bad key rotation from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk).await
+            && rotation.new_key_index <= cached_delegation.key_index
+        {
+            log::warn!(
+                "[gossip-rx] stale key rotation from {} (index {} <= cached {})",
+                short_id(pk),
+                rotation.new_key_index,
+                cached_delegation.key_index
+            );
+            return;
+        }
+        log::info!(
+            "[gossip-rx] signing key rotation from {} to index {}",
+            short_id(pk),
+            rotation.new_key_index
+        );
+        let response = iroh_social_types::IdentityResponse {
+            master_pubkey: rotation.master_pubkey.clone(),
+            delegation: rotation.new_delegation.clone(),
+            transport_node_ids: storage
+                .get_peer_transport_node_ids(pk)
+                .await
+                .unwrap_or_default(),
+            profile: None,
+        };
+        if let Err(e) = storage.cache_peer_identity(&response).await {
+            log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
         }
     }
 

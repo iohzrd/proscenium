@@ -1,4 +1,5 @@
 use super::Storage;
+use crate::error::AppError;
 
 impl Storage {
     pub async fn save_ratchet_session(
@@ -6,7 +7,7 @@ impl Storage {
         peer_pubkey: &str,
         state_json: &str,
         updated_at: u64,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         sqlx::query(
             "INSERT INTO dm_ratchet_sessions (peer_pubkey, state_json, updated_at)
              VALUES (?1, ?2, ?3)
@@ -20,7 +21,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_ratchet_session(&self, peer_pubkey: &str) -> anyhow::Result<Option<String>> {
+    pub async fn get_ratchet_session(&self, peer_pubkey: &str) -> Result<Option<String>, AppError> {
         let result: Option<String> =
             sqlx::query_scalar("SELECT state_json FROM dm_ratchet_sessions WHERE peer_pubkey=?1")
                 .bind(peer_pubkey)

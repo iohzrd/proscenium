@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use crate::gossip::GossipService;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
@@ -59,9 +60,9 @@ impl PeerHandler {
         &self,
         transfer_master_key: bool,
         relay_url: Option<String>,
-    ) -> Result<LinkQrPayload, String> {
+    ) -> Result<LinkQrPayload, AppError> {
         let mut psk = [0u8; 32];
-        getrandom::fill(&mut psk).map_err(|e| format!("failed to generate PSK: {e}"))?;
+        getrandom::fill(&mut psk)?;
 
         let (master_secret_key_bytes, transport_node_id) = {
             let id = self.identity.read().await;
@@ -587,7 +588,7 @@ pub async fn send_follow_request(
     master_pubkey: &str,
     signing_secret_key_bytes: &[u8; 32],
     delegation: &SigningKeyDelegation,
-) -> anyhow::Result<FollowResponse> {
+) -> Result<FollowResponse, AppError> {
     let timestamp = now_millis();
     let secret_key = iroh::SecretKey::from_bytes(signing_secret_key_bytes);
     let signature = sign_follow_request(master_pubkey, timestamp, &secret_key);
@@ -626,7 +627,7 @@ pub async fn send_follow_request(
 pub async fn query_identity(
     endpoint: &Endpoint,
     target: EndpointId,
-) -> anyhow::Result<IdentityResponse> {
+) -> Result<IdentityResponse, AppError> {
     let addr = EndpointAddr::from(target);
     let conn = endpoint.connect(addr, PEER_ALPN).await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -642,9 +643,9 @@ pub async fn query_identity(
 
     match response {
         PeerResponse::Identity(identity) => Ok(identity),
-        other => anyhow::bail!(
+        other => Err(AppError::Other(format!(
             "unexpected response: expected Identity, got {:?}",
             std::mem::discriminant(&other)
-        ),
+        ))),
     }
 }

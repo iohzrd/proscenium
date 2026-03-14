@@ -1,10 +1,11 @@
+use crate::error::AppError;
 use iroh_social_types::{FollowEntry, FollowerEntry, Visibility, now_millis};
 use sqlx::Row;
 
 use super::Storage;
 
 impl Storage {
-    pub async fn get_visibility(&self, pubkey: &str) -> anyhow::Result<Visibility> {
+    pub async fn get_visibility(&self, pubkey: &str) -> Result<Visibility, AppError> {
         let result: Option<String> =
             sqlx::query_scalar("SELECT visibility FROM profiles WHERE pubkey=?1")
                 .bind(pubkey)
@@ -15,7 +16,7 @@ impl Storage {
             .unwrap_or(Visibility::Public))
     }
 
-    pub async fn is_follower(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn is_follower(&self, pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1")
             .bind(pubkey)
             .fetch_one(&self.pool)
@@ -23,7 +24,7 @@ impl Storage {
         Ok(exists)
     }
 
-    pub async fn follow(&self, entry: &FollowEntry) -> anyhow::Result<()> {
+    pub async fn follow(&self, entry: &FollowEntry) -> Result<(), AppError> {
         let now = now_millis() as i64;
         sqlx::query(
             "INSERT INTO follows (pubkey, alias, followed_at, state, last_changed_at) VALUES (?1, ?2, ?3, 'active', ?4)
@@ -42,7 +43,7 @@ impl Storage {
         &self,
         pubkey: &str,
         alias: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         sqlx::query("UPDATE follows SET alias=?2 WHERE pubkey=?1")
             .bind(pubkey)
             .bind(alias)
@@ -51,7 +52,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn unfollow(&self, pubkey: &str) -> anyhow::Result<()> {
+    pub async fn unfollow(&self, pubkey: &str) -> Result<(), AppError> {
         let now = now_millis() as i64;
         sqlx::query("UPDATE follows SET state='removed', last_changed_at=?2 WHERE pubkey=?1")
             .bind(pubkey)
@@ -61,7 +62,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_follows(&self) -> anyhow::Result<Vec<FollowEntry>> {
+    pub async fn get_follows(&self) -> Result<Vec<FollowEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT pubkey, alias, followed_at FROM follows WHERE state='active' ORDER BY followed_at DESC",
         )
@@ -78,7 +79,7 @@ impl Storage {
         Ok(follows)
     }
 
-    pub async fn upsert_follower(&self, pubkey: &str, now: u64) -> anyhow::Result<bool> {
+    pub async fn upsert_follower(&self, pubkey: &str, now: u64) -> Result<bool, AppError> {
         let existing: bool =
             sqlx::query_scalar("SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1")
                 .bind(pubkey)
@@ -96,7 +97,7 @@ impl Storage {
         Ok(!existing)
     }
 
-    pub async fn set_follower_offline(&self, pubkey: &str) -> anyhow::Result<()> {
+    pub async fn set_follower_offline(&self, pubkey: &str) -> Result<(), AppError> {
         sqlx::query("UPDATE followers SET is_online=0 WHERE pubkey=?1")
             .bind(pubkey)
             .execute(&self.pool)
@@ -104,7 +105,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_followers(&self) -> anyhow::Result<Vec<FollowerEntry>> {
+    pub async fn get_followers(&self) -> Result<Vec<FollowerEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT pubkey, first_seen, last_seen, is_online FROM followers ORDER BY last_seen DESC",
         )
@@ -122,7 +123,7 @@ impl Storage {
         Ok(followers)
     }
 
-    pub async fn is_following(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn is_following(&self, pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar(
             "SELECT COUNT(*) > 0 FROM follows WHERE pubkey=?1 AND state='active'",
         )
@@ -132,7 +133,7 @@ impl Storage {
         Ok(exists)
     }
 
-    pub async fn is_mutual(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn is_mutual(&self, pubkey: &str) -> Result<bool, AppError> {
         let is_follower: bool =
             sqlx::query_scalar("SELECT COUNT(*) > 0 FROM followers WHERE pubkey=?1")
                 .bind(pubkey)

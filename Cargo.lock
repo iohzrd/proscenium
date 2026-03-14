@@ -3333,7 +3333,6 @@ dependencies = [
 name = "iroh-tauri-app"
 version = "0.1.40"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "bip39",
  "bytes",
@@ -3364,10 +3363,10 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-os",
  "tauri-plugin-single-instance",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "urlencoding",
- "uuid",
  "x25519-dalek",
  "zeroize",
 ]

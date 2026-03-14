@@ -3,6 +3,7 @@ use crate::crypto::{
     RatchetHeader, RatchetState, noise_complete_initiator, noise_complete_responder,
     noise_initiate, noise_respond,
 };
+use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use base64::Engine as _;
@@ -108,7 +109,7 @@ impl DmHandler {
     async fn get_or_establish_session(
         &self,
         peer_master_pubkey: &str,
-    ) -> anyhow::Result<(RatchetState, String)> {
+    ) -> Result<(RatchetState, String), AppError> {
         log::info!(
             "[dm] get_or_establish_session: peer={}",
             short_id(peer_master_pubkey)
@@ -120,7 +121,10 @@ impl DmHandler {
             .get_peer_dm_pubkey(peer_master_pubkey)
             .await?
             .ok_or_else(|| {
-                anyhow::anyhow!("no DM pubkey cached for {}", short_id(peer_master_pubkey))
+                AppError::Other(format!(
+                    "no DM pubkey cached for {}",
+                    short_id(peer_master_pubkey)
+                ))
             })?;
 
         // Read all identity fields needed before any await points.
@@ -156,7 +160,10 @@ impl DmHandler {
             .get_peer_transport_node_ids(peer_master_pubkey)
             .await?;
         let transport_id_str = node_ids.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("no transport NodeId for {}", short_id(peer_master_pubkey))
+            AppError::Other(format!(
+                "no transport NodeId for {}",
+                short_id(peer_master_pubkey)
+            ))
         })?;
         let transport_id: EndpointId = transport_id_str.parse()?;
         let addr = EndpointAddr::from(transport_id);
@@ -166,8 +173,7 @@ impl DmHandler {
         log::info!("[dm] resolved peer DM X25519 key");
 
         // Noise IK handshake: initiator
-        let (initiator_hs, msg1) = noise_initiate(&my_x25519_private, &peer_x25519_public)
-            .map_err(|e| anyhow::anyhow!("noise init: {e}"))?;
+        let (initiator_hs, msg1) = noise_initiate(&my_x25519_private, &peer_x25519_public)?;
         log::info!("[dm] noise init message created ({} bytes)", msg1.len());
 
         log::info!(
@@ -180,19 +186,16 @@ impl DmHandler {
         )
         .await
         .map_err(|_| {
-            anyhow::anyhow!(
+            AppError::Other(format!(
                 "handshake connect timeout to {}",
                 short_id(peer_master_pubkey)
-            )
-        })
-        .and_then(|r| {
-            r.map_err(|e| {
-                log::error!(
-                    "[dm] QUIC connect failed to {}: {e}",
-                    short_id(peer_master_pubkey)
-                );
-                anyhow::anyhow!("{e}")
-            })
+            ))
+        })?
+        .inspect_err(|e| {
+            log::error!(
+                "[dm] QUIC connect failed to {}: {e}",
+                short_id(peer_master_pubkey)
+            );
         })?;
         log::info!("[dm] QUIC connected, opening bi-stream...");
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -218,12 +221,11 @@ impl DmHandler {
 
         let noise_response = match resp {
             DmHandshake::Response { noise_message } => noise_message,
-            _ => return Err(anyhow::anyhow!("unexpected handshake response")),
+            _ => return Err(AppError::Other("unexpected handshake response".into())),
         };
 
         // Complete handshake
-        let shared_secret = noise_complete_initiator(initiator_hs, &noise_response)
-            .map_err(|e| anyhow::anyhow!("noise complete: {e}"))?;
+        let shared_secret = noise_complete_initiator(initiator_hs, &noise_response)?;
         log::info!("[dm] noise handshake completed successfully");
 
         conn.close(0u32.into(), b"done");
@@ -245,16 +247,16 @@ impl DmHandler {
         Ok((ratchet, peer_dm_pubkey))
     }
 
-    /// Send a DM to a peer. Encrypts with Double Ratchet and sends over QUIC.
-    /// If the peer is offline, queues to outbox.
-    /// On successful delivery, marks the message as delivered and emits `dm-delivered`.
-    pub async fn send_dm(&self, peer_pubkey: &str, message: DirectMessage) -> anyhow::Result<()> {
-        let message_id = message.id.clone();
+    /// Encrypt a payload with Double Ratchet and save the updated ratchet state.
+    /// Returns the sealed envelope ready for transmission.
+    async fn encrypt_and_save(
+        &self,
+        peer_pubkey: &str,
+        payload: &DmPayload,
+    ) -> Result<EncryptedEnvelope, AppError> {
         let (mut ratchet, peer_dm_pubkey) = self.get_or_establish_session(peer_pubkey).await?;
 
-        // Encrypt the message
-        let payload = DmPayload::Message(message);
-        let plaintext = serde_json::to_vec(&payload)?;
+        let plaintext = serde_json::to_vec(payload)?;
         let (header, ciphertext) = ratchet.encrypt(&plaintext);
 
         let (dm_pubkey, ratchet_storage_key) = {
@@ -262,7 +264,6 @@ impl DmHandler {
             (id.dm_pubkey.clone(), id.ratchet_storage_key)
         };
 
-        // Encrypt and save updated ratchet state (keyed by DM pubkey)
         let ratchet_json = serde_json::to_string(&ratchet)?;
         let ratchet_sealed = seal_ratchet_state(&ratchet_storage_key, &ratchet_json)?;
         self.storage
@@ -283,7 +284,17 @@ impl DmHandler {
             envelope.ciphertext.len(),
         );
 
-        // Try to send
+        Ok(envelope)
+    }
+
+    /// Send a DM to a peer. Encrypts with Double Ratchet and sends over QUIC.
+    /// If the peer is offline, queues to outbox.
+    /// On successful delivery, marks the message as delivered and emits `dm-delivered`.
+    pub async fn send_dm(&self, peer_pubkey: &str, message: DirectMessage) -> Result<(), AppError> {
+        let message_id = message.id.clone();
+        let payload = DmPayload::Message(message);
+        let envelope = self.encrypt_and_save(peer_pubkey, &payload).await?;
+
         match self.try_send_envelope(peer_pubkey, &envelope).await {
             Ok(()) => {
                 log::info!("[dm] sent message to {}", short_id(peer_pubkey));
@@ -295,7 +306,7 @@ impl DmHandler {
                     short_id(peer_pubkey)
                 );
                 let envelope_json = serde_json::to_string(&envelope)?;
-                let id = uuid::Uuid::new_v4().to_string();
+                let id = crate::util::generate_id();
                 self.storage
                     .insert_outbox_message(
                         &id,
@@ -332,13 +343,16 @@ impl DmHandler {
         &self,
         peer_master_pubkey: &str,
         envelope: &EncryptedEnvelope,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let node_ids = self
             .storage
             .get_peer_transport_node_ids(peer_master_pubkey)
             .await?;
         let transport_id_str = node_ids.into_iter().next().ok_or_else(|| {
-            anyhow::anyhow!("no transport NodeId for {}", short_id(peer_master_pubkey))
+            AppError::Other(format!(
+                "no transport NodeId for {}",
+                short_id(peer_master_pubkey)
+            ))
         })?;
         let transport_id: EndpointId = transport_id_str.parse()?;
         let addr = EndpointAddr::from(transport_id);
@@ -348,7 +362,7 @@ impl DmHandler {
             self.endpoint.connect(addr, DM_ALPN),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("connection timeout"))??;
+        .map_err(|_| AppError::Other("connection timeout".into()))??;
 
         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -360,40 +374,17 @@ impl DmHandler {
         let ack_bytes =
             tokio::time::timeout(std::time::Duration::from_secs(5), recv.read_to_end(256))
                 .await
-                .map_err(|_| anyhow::anyhow!("ack timeout"))??;
-        serde_json::from_slice::<DmAck>(&ack_bytes)
-            .map_err(|e| anyhow::anyhow!("unexpected ack: {e}"))?;
+                .map_err(|_| AppError::Other("ack timeout".into()))??;
+        serde_json::from_slice::<DmAck>(&ack_bytes)?;
 
         conn.close(0u32.into(), b"done");
         Ok(())
     }
 
     /// Send a lightweight DM signal (typing, read receipt) without storing a message.
-    pub async fn send_signal(&self, peer_pubkey: &str, payload: DmPayload) -> anyhow::Result<()> {
-        let (mut ratchet, peer_dm_pubkey) = self.get_or_establish_session(peer_pubkey).await?;
-
-        let plaintext = serde_json::to_vec(&payload)?;
-        let (header, ciphertext) = ratchet.encrypt(&plaintext);
-
-        let (dm_pubkey, ratchet_storage_key) = {
-            let id = self.identity.read().await;
-            (id.dm_pubkey.clone(), id.ratchet_storage_key)
-        };
-
-        let ratchet_json = serde_json::to_string(&ratchet)?;
-        let ratchet_sealed = seal_ratchet_state(&ratchet_storage_key, &ratchet_json)?;
-        self.storage
-            .save_ratchet_session(&peer_dm_pubkey, &ratchet_sealed, now_millis())
-            .await?;
-
-        let envelope = EncryptedEnvelope {
-            sender: dm_pubkey,
-            ratchet_header: ratchet_header_to_wire(&header),
-            ciphertext,
-        };
-
+    pub async fn send_signal(&self, peer_pubkey: &str, payload: DmPayload) -> Result<(), AppError> {
+        let envelope = self.encrypt_and_save(peer_pubkey, &payload).await?;
         self.try_send_envelope(peer_pubkey, &envelope).await?;
-
         Ok(())
     }
 
@@ -403,7 +394,7 @@ impl DmHandler {
         &self,
         peer_dm_pubkey: &str,
         noise_message: Vec<u8>,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, AppError> {
         log::info!("[dm] handling handshake from {}", short_id(peer_dm_pubkey));
 
         let (my_x25519_private, my_x25519_public, ratchet_storage_key) = {
@@ -416,11 +407,9 @@ impl DmHandler {
         };
 
         // Noise IK responder
-        let (responder_hs, response_msg) = noise_respond(&my_x25519_private, &noise_message)
-            .map_err(|e| anyhow::anyhow!("noise respond: {e}"))?;
+        let (responder_hs, response_msg) = noise_respond(&my_x25519_private, &noise_message)?;
 
-        let (shared_secret, initiator_dm_pubkey) = noise_complete_responder(responder_hs)
-            .map_err(|e| anyhow::anyhow!("noise complete: {e}"))?;
+        let (shared_secret, initiator_dm_pubkey) = noise_complete_responder(responder_hs)?;
 
         // Verify the Noise IK-authenticated initiator DM key matches the claimed sender.
         // Noise IK encrypts the initiator's long-term key to us, so this is cryptographically
@@ -429,12 +418,14 @@ impl DmHandler {
         match initiator_dm_pubkey {
             Some(actual) if actual == claimed_key => {}
             Some(_) => {
-                anyhow::bail!(
-                    "DmHandshake::Init sender mismatch: claimed key does not match authenticated key"
-                );
+                return Err(AppError::Other(
+                    "DmHandshake::Init sender mismatch: claimed key does not match authenticated key".into(),
+                ));
             }
             None => {
-                anyhow::bail!("Noise IK handshake did not reveal initiator key");
+                return Err(AppError::Other(
+                    "Noise IK handshake did not reveal initiator key".into(),
+                ));
             }
         }
 
@@ -462,7 +453,7 @@ impl DmHandler {
         &self,
         peer_dm_pubkey: &str,
         envelope: EncryptedEnvelope,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         log::debug!(
             "[dm] received envelope: sender={} msg_n={} prev_chain={} dh={} ciphertext_len={}",
             short_id(&envelope.sender),
@@ -481,7 +472,9 @@ impl DmHandler {
             .storage
             .get_ratchet_session(peer_dm_pubkey)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("no session with {}", short_id(peer_dm_pubkey)))?;
+            .ok_or_else(|| {
+                AppError::Other(format!("no session with {}", short_id(peer_dm_pubkey)))
+            })?;
         let json = open_ratchet_state(&ratchet_storage_key, &stored)?;
         let mut ratchet: RatchetState = serde_json::from_str(&json)?;
 
@@ -489,9 +482,7 @@ impl DmHandler {
         let header = wire_to_ratchet_header(&envelope.ratchet_header)?;
 
         // Decrypt
-        let plaintext = ratchet
-            .decrypt(&header, &envelope.ciphertext)
-            .map_err(|e| anyhow::anyhow!("decrypt: {e}"))?;
+        let plaintext = ratchet.decrypt(&header, &envelope.ciphertext)?;
 
         // Serialize updated ratchet state (encrypted)
         let ratchet_json = serde_json::to_string(&ratchet)?;
@@ -509,7 +500,10 @@ impl DmHandler {
                     .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
                     .await
                     .ok_or_else(|| {
-                        anyhow::anyhow!("no master pubkey for DM key {}", short_id(peer_dm_pubkey))
+                        AppError::Other(format!(
+                            "no master pubkey for DM key {}",
+                            short_id(peer_dm_pubkey)
+                        ))
                     })?;
 
                 let conv_id = Storage::conversation_id(&my_master_pubkey, &peer_master_pubkey);
@@ -628,8 +622,7 @@ impl ProtocolHandler for DmHandler {
             .await
             .map_err(AcceptError::from_err)?;
 
-        let msg: DmMessage = serde_json::from_slice(&frame_bytes)
-            .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
+        let msg: DmMessage = serde_json::from_slice(&frame_bytes).map_err(AcceptError::from_err)?;
 
         match msg {
             DmMessage::Handshake(DmHandshake::Init {
@@ -639,7 +632,7 @@ impl ProtocolHandler for DmHandler {
                 let response = self
                     .handle_handshake(&sender, noise_message)
                     .await
-                    .map_err(|e| AcceptError::from_err(std::io::Error::other(e)))?;
+                    .map_err(AcceptError::from_err)?;
                 send.write_all(&response)
                     .await
                     .map_err(AcceptError::from_err)?;
@@ -674,45 +667,45 @@ impl ProtocolHandler for DmHandler {
 
 /// Encrypt a ratchet state JSON string with ChaCha20Poly1305.
 /// Returns base64(nonce || ciphertext).
-fn seal_ratchet_state(key: &[u8; 32], plaintext: &str) -> anyhow::Result<String> {
+fn seal_ratchet_state(key: &[u8; 32], plaintext: &str) -> Result<String, AppError> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
     getrandom::fill(&mut nonce_bytes).expect("getrandom failed");
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
-        .map_err(|_| anyhow::anyhow!("ratchet state encryption failed"))?;
+        .map_err(|_| AppError::Other("ratchet state encryption failed".into()))?;
     let mut blob = nonce_bytes.to_vec();
     blob.extend_from_slice(&ciphertext);
     Ok(base64::engine::general_purpose::STANDARD.encode(&blob))
 }
 
 /// Decrypt a ratchet state stored by `seal_ratchet_state`.
-fn open_ratchet_state(key: &[u8; 32], stored: &str) -> anyhow::Result<String> {
+fn open_ratchet_state(key: &[u8; 32], stored: &str) -> Result<String, AppError> {
     let blob = base64::engine::general_purpose::STANDARD
         .decode(stored)
-        .map_err(|_| anyhow::anyhow!("invalid base64 in ratchet state"))?;
+        .map_err(|_| AppError::Other("invalid base64 in ratchet state".into()))?;
     if blob.len() <= 12 {
-        return Err(anyhow::anyhow!("ratchet state too short"));
+        return Err(AppError::Other("ratchet state too short".into()));
     }
     let (nonce_bytes, ciphertext) = blob.split_at(12);
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from_slice(nonce_bytes);
     let plaintext_bytes = cipher
         .decrypt(nonce, ciphertext)
-        .map_err(|_| anyhow::anyhow!("ratchet state decryption failed"))?;
-    String::from_utf8(plaintext_bytes).map_err(|_| anyhow::anyhow!("ratchet state not valid UTF-8"))
+        .map_err(|_| AppError::Other("ratchet state decryption failed".into()))?;
+    String::from_utf8(plaintext_bytes)
+        .map_err(|_| AppError::Other("ratchet state not valid UTF-8".into()))
 }
 
 // -- Helper functions --
 
 /// Decode a hex-encoded DM pubkey (X25519) to 32 bytes.
-fn dm_pubkey_to_x25519(hex_pubkey: &str) -> anyhow::Result<[u8; 32]> {
-    let bytes =
-        hex::decode(hex_pubkey).map_err(|e| anyhow::anyhow!("invalid hex DM pubkey: {e}"))?;
+fn dm_pubkey_to_x25519(hex_pubkey: &str) -> Result<[u8; 32], AppError> {
+    let bytes = hex::decode(hex_pubkey)?;
     bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("DM pubkey wrong length"))
+        .map_err(|_| AppError::Other("DM pubkey wrong length".into()))
 }
 
 fn ratchet_header_to_wire(header: &RatchetHeader) -> RatchetHeaderWire {
@@ -723,11 +716,11 @@ fn ratchet_header_to_wire(header: &RatchetHeader) -> RatchetHeaderWire {
     }
 }
 
-fn wire_to_ratchet_header(wire: &RatchetHeaderWire) -> anyhow::Result<RatchetHeader> {
+fn wire_to_ratchet_header(wire: &RatchetHeaderWire) -> Result<RatchetHeader, AppError> {
     let bytes = hex::decode(&wire.dh_public)?;
     let dh_public: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid dh_public length"))?;
+        .map_err(|_| AppError::Other("invalid dh_public length".into()))?;
     Ok(RatchetHeader {
         dh_public,
         message_number: wire.message_number,

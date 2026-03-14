@@ -1,4 +1,5 @@
 use crate::constants::BATCH_SIZE;
+use crate::error::AppError;
 use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
 use iroh::protocol::AcceptError;
@@ -23,7 +24,7 @@ pub async fn handle_device_sync(
     peer_vector: DeviceSyncVector,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
-    let map_err = |e: anyhow::Error| AcceptError::from_err(std::io::Error::other(e.to_string()));
+    let map_err = |e: AppError| AcceptError::from_err(e);
 
     // Verify the initiator's challenge signature (proves they have the signing key)
     let signing_secret = SecretKey::from_bytes(signing_secret_key_bytes);
@@ -70,18 +71,18 @@ pub async fn handle_device_sync(
         &mut data_send,
     )
     .await
-    .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
+    .map_err(|e| AcceptError::from_err(e))?;
 
     // End-of-stream marker
     write_frame(&mut data_send, &[])
         .await
-        .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
+        .map_err(|e| AcceptError::from_err(e))?;
     data_send.finish().map_err(AcceptError::from_err)?;
 
     // Receive and import deltas from the initiator
     import_deltas(storage, master_pubkey, &mut data_recv)
         .await
-        .map_err(|e| AcceptError::from_err(std::io::Error::other(e.to_string())))?;
+        .map_err(|e| AcceptError::from_err(e))?;
 
     log::info!("[device-sync] completed sync with peer device");
     conn.closed().await;
@@ -95,13 +96,13 @@ pub async fn sync_with_device(
     target: EndpointId,
     master_pubkey: &str,
     signing_secret_key_bytes: &[u8; 32],
-) -> anyhow::Result<DeviceSyncStats> {
+) -> Result<DeviceSyncStats, AppError> {
     let signing_secret = SecretKey::from_bytes(signing_secret_key_bytes);
     let signing_pubkey = signing_secret.public();
 
     // Generate challenge
     let mut challenge = [0u8; 32];
-    getrandom::fill(&mut challenge).map_err(|e| anyhow::anyhow!("rng failed: {e}"))?;
+    getrandom::fill(&mut challenge)?;
     let challenge_sig = sign_device_sync_challenge(&challenge, &signing_secret);
 
     // Build our sync vector
@@ -130,14 +131,18 @@ pub async fn sync_with_device(
             challenge_response,
             vector,
         } => (challenge_response, vector),
-        _ => anyhow::bail!("unexpected response type for device sync"),
+        _ => {
+            return Err(AppError::Other(
+                "unexpected response type for device sync".into(),
+            ));
+        }
     };
 
     // Verify the responder's challenge response
     if let Err(reason) =
         verify_device_sync_challenge(&challenge, &challenge_response, &signing_pubkey)
     {
-        anyhow::bail!("peer failed challenge: {reason}");
+        return Err(AppError::Other(format!("peer failed challenge: {reason}")));
     }
 
     // Accept the data stream opened by the responder.
@@ -186,7 +191,7 @@ async fn send_deltas(
     our_vector: DeviceSyncVector,
     peer_vector: &DeviceSyncVector,
     data_send: &mut iroh::endpoint::SendStream,
-) -> anyhow::Result<()> {
+) -> Result<(), AppError> {
     // Posts: stream posts with timestamp > peer's newest
     let post_after_ts = if peer_vector.newest_post_ts > 0 || peer_vector.post_count == 0 {
         peer_vector.newest_post_ts
@@ -334,7 +339,7 @@ async fn import_deltas(
     storage: &Storage,
     master_pubkey: &str,
     data_recv: &mut iroh::endpoint::RecvStream,
-) -> anyhow::Result<DeviceSyncStats> {
+) -> Result<DeviceSyncStats, AppError> {
     let mut stats = DeviceSyncStats::default();
 
     loop {

@@ -1,10 +1,11 @@
+use crate::error::AppError;
 use iroh_social_types::{MediaAttachment, Post};
 use sqlx::Row;
 
 use super::{FeedQuery, Storage};
 
 impl Storage {
-    fn row_to_post(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Post> {
+    fn row_to_post(row: &sqlx::sqlite::SqliteRow) -> Result<Post, AppError> {
         let media_json: String = row.get(4);
         let media: Vec<MediaAttachment> = serde_json::from_str(&media_json)?;
         Ok(Post {
@@ -21,7 +22,7 @@ impl Storage {
         })
     }
 
-    pub async fn insert_post(&self, post: &Post) -> anyhow::Result<()> {
+    pub async fn insert_post(&self, post: &Post) -> Result<(), AppError> {
         let media_json = serde_json::to_string(&post.media)?;
         sqlx::query(
             "INSERT OR IGNORE INTO posts (id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature)
@@ -42,7 +43,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_post_by_id(&self, id: &str) -> anyhow::Result<Option<Post>> {
+    pub async fn get_post_by_id(&self, id: &str) -> Result<Option<Post>, AppError> {
         let row = sqlx::query(
             "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature FROM posts WHERE id=?1",
         )
@@ -55,7 +56,7 @@ impl Storage {
         }
     }
 
-    pub async fn get_feed(&self, q: &FeedQuery) -> anyhow::Result<Vec<Post>> {
+    pub async fn get_feed(&self, q: &FeedQuery) -> Result<Vec<Post>, AppError> {
         let hidden =
             "AND p.author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
         let rows = match q.before {
@@ -88,7 +89,7 @@ impl Storage {
         Ok(posts)
     }
 
-    pub async fn delete_post(&self, id: &str) -> anyhow::Result<bool> {
+    pub async fn delete_post(&self, id: &str) -> Result<bool, AppError> {
         sqlx::query("DELETE FROM notifications WHERE post_id=?1 OR target_post_id=?1")
             .bind(id)
             .execute(&self.pool)
@@ -100,7 +101,7 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn delete_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
+    pub async fn delete_posts_by_author(&self, author: &str) -> Result<u64, AppError> {
         sqlx::query(
             "DELETE FROM notifications WHERE post_id IN (SELECT id FROM posts WHERE author=?1) OR target_post_id IN (SELECT id FROM posts WHERE author=?1)",
         )
@@ -118,7 +119,7 @@ impl Storage {
         &self,
         author: &str,
         quote_of: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> Result<Option<String>, AppError> {
         let id: Option<String> =
             sqlx::query_scalar("SELECT id FROM posts WHERE author=?1 AND quote_of=?2")
                 .bind(author)
@@ -140,7 +141,7 @@ impl Storage {
         limit: usize,
         before: Option<u64>,
         media_filter: Option<&str>,
-    ) -> anyhow::Result<Vec<Post>> {
+    ) -> Result<Vec<Post>, AppError> {
         let filter_clause = match media_filter {
             Some("images") => " AND media_json LIKE '%image/%'",
             Some("videos") => " AND media_json LIKE '%video/%'",
@@ -184,7 +185,7 @@ impl Storage {
         Ok(posts)
     }
 
-    pub async fn get_post_ids_by_author(&self, author: &str) -> anyhow::Result<Vec<String>> {
+    pub async fn get_post_ids_by_author(&self, author: &str) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query("SELECT id FROM posts WHERE author=?1 ORDER BY timestamp ASC")
             .bind(author)
             .fetch_all(&self.pool)
@@ -192,7 +193,7 @@ impl Storage {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
-    pub async fn count_posts_by_author(&self, author: &str) -> anyhow::Result<u64> {
+    pub async fn count_posts_by_author(&self, author: &str) -> Result<u64, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE author=?1")
             .bind(author)
             .fetch_one(&self.pool)
@@ -200,7 +201,7 @@ impl Storage {
         Ok(count as u64)
     }
 
-    pub async fn newest_post_timestamp(&self, author: &str) -> anyhow::Result<u64> {
+    pub async fn newest_post_timestamp(&self, author: &str) -> Result<u64, AppError> {
         let ts: Option<i64> =
             sqlx::query_scalar("SELECT MAX(timestamp) FROM posts WHERE author=?1")
                 .bind(author)
@@ -209,7 +210,7 @@ impl Storage {
         Ok(ts.unwrap_or(0) as u64)
     }
 
-    pub async fn count_posts_after(&self, author: &str, after_ts: u64) -> anyhow::Result<u64> {
+    pub async fn count_posts_after(&self, author: &str, after_ts: u64) -> Result<u64, AppError> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE author=?1 AND timestamp > ?2")
                 .bind(author)
@@ -225,7 +226,7 @@ impl Storage {
         after_ts: u64,
         limit: usize,
         offset: usize,
-    ) -> anyhow::Result<Vec<Post>> {
+    ) -> Result<Vec<Post>, AppError> {
         let rows = sqlx::query(
             "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
              FROM posts WHERE author=?1 AND timestamp > ?2
@@ -250,7 +251,7 @@ impl Storage {
         known_ids: &[String],
         limit: usize,
         offset: usize,
-    ) -> anyhow::Result<Vec<Post>> {
+    ) -> Result<Vec<Post>, AppError> {
         if known_ids.is_empty() {
             let rows = sqlx::query(
                 "SELECT id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature
@@ -312,7 +313,7 @@ impl Storage {
         parent_post_id: &str,
         limit: usize,
         before: Option<u64>,
-    ) -> anyhow::Result<Vec<Post>> {
+    ) -> Result<Vec<Post>, AppError> {
         let hidden = "AND author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
         let rows = match before {
             Some(b) => {

@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use iroh_social_types::FollowRequestEntry;
 use sqlx::Row;
 
@@ -10,7 +11,7 @@ impl Storage {
         timestamp: u64,
         created_at: u64,
         expires_at: u64,
-    ) -> anyhow::Result<bool> {
+    ) -> Result<bool, AppError> {
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM follow_requests WHERE pubkey=?1")
                 .bind(pubkey)
@@ -35,7 +36,7 @@ impl Storage {
         Ok(true)
     }
 
-    pub async fn approve_follow_request(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn approve_follow_request(&self, pubkey: &str) -> Result<bool, AppError> {
         let result = sqlx::query(
             "UPDATE follow_requests SET status='approved' WHERE pubkey=?1 AND status='pending'",
         )
@@ -45,7 +46,7 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn deny_follow_request(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn deny_follow_request(&self, pubkey: &str) -> Result<bool, AppError> {
         let result = sqlx::query(
             "UPDATE follow_requests SET status='denied' WHERE pubkey=?1 AND status='pending'",
         )
@@ -55,7 +56,7 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_follow_requests(&self) -> anyhow::Result<Vec<FollowRequestEntry>> {
+    pub async fn get_follow_requests(&self) -> Result<Vec<FollowRequestEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT pubkey, timestamp, status, created_at, expires_at
              FROM follow_requests ORDER BY created_at DESC",
@@ -75,7 +76,7 @@ impl Storage {
         Ok(entries)
     }
 
-    pub async fn get_pending_follow_request_count(&self) -> anyhow::Result<u64> {
+    pub async fn get_pending_follow_request_count(&self) -> Result<u64, AppError> {
         let count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM follow_requests WHERE status='pending'")
                 .fetch_one(&self.pool)
@@ -83,7 +84,7 @@ impl Storage {
         Ok(count as u64)
     }
 
-    pub async fn is_approved_follower(&self, pubkey: &str) -> anyhow::Result<bool> {
+    pub async fn is_approved_follower(&self, pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar(
             "SELECT COUNT(*) > 0 FROM follow_requests WHERE pubkey=?1 AND status='approved'",
         )

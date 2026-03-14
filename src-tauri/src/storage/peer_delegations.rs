@@ -1,8 +1,9 @@
+use crate::error::AppError;
 use crate::storage::Storage;
 use iroh_social_types::{IdentityResponse, SigningKeyDelegation, now_millis};
 
 impl Storage {
-    pub async fn cache_peer_identity(&self, response: &IdentityResponse) -> anyhow::Result<()> {
+    pub async fn cache_peer_identity(&self, response: &IdentityResponse) -> Result<(), AppError> {
         let delegation_json = serde_json::to_string(&response.delegation)?;
         let transport_json = serde_json::to_string(&response.transport_node_ids)?;
         let now = now_millis() as i64;
@@ -31,7 +32,7 @@ impl Storage {
     pub async fn get_peer_delegation(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<Option<SigningKeyDelegation>> {
+    ) -> Result<Option<SigningKeyDelegation>, AppError> {
         let result: Option<String> = sqlx::query_scalar(
             "SELECT delegation_json FROM peer_delegations WHERE master_pubkey = ?1",
         )
@@ -47,7 +48,7 @@ impl Storage {
     pub async fn get_peer_transport_node_ids(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> Result<Vec<String>, AppError> {
         let result: Option<String> = sqlx::query_scalar(
             "SELECT transport_node_ids_json FROM peer_delegations WHERE master_pubkey = ?1",
         )
@@ -87,7 +88,7 @@ impl Storage {
     pub async fn get_peer_signing_pubkey(
         &self,
         master_pubkey: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> Result<Option<String>, AppError> {
         let result: Option<String> = sqlx::query_scalar(
             "SELECT signing_pubkey FROM peer_delegations WHERE master_pubkey = ?1",
         )
@@ -97,7 +98,10 @@ impl Storage {
         Ok(result)
     }
 
-    pub async fn get_peer_dm_pubkey(&self, master_pubkey: &str) -> anyhow::Result<Option<String>> {
+    pub async fn get_peer_dm_pubkey(
+        &self,
+        master_pubkey: &str,
+    ) -> Result<Option<String>, AppError> {
         let result: Option<String> =
             sqlx::query_scalar("SELECT dm_pubkey FROM peer_delegations WHERE master_pubkey = ?1")
                 .bind(master_pubkey)

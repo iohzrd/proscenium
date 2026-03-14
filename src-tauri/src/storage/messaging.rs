@@ -1,3 +1,4 @@
+use crate::error::AppError;
 use iroh_social_types::{ConversationMeta, MediaAttachment, StoredMessage};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -22,7 +23,7 @@ impl Storage {
         my_pubkey: &str,
         last_message_at: u64,
         preview: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let conv_id = Self::conversation_id(my_pubkey, peer_pubkey);
         sqlx::query(
             "INSERT INTO dm_conversations (conversation_id, peer_pubkey, last_message_at, last_message_preview, created_at)
@@ -38,7 +39,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_conversations(&self) -> anyhow::Result<Vec<ConversationMeta>> {
+    pub async fn get_conversations(&self) -> Result<Vec<ConversationMeta>, AppError> {
         let rows = sqlx::query(
             "SELECT peer_pubkey, last_message_at, last_message_preview, unread_count
              FROM dm_conversations ORDER BY last_message_at DESC",
@@ -61,7 +62,7 @@ impl Storage {
         &self,
         peer_pubkey: &str,
         my_pubkey: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let conv_id = Self::conversation_id(my_pubkey, peer_pubkey);
         sqlx::query("UPDATE dm_conversations SET unread_count = 0 WHERE conversation_id=?1")
             .bind(&conv_id)
@@ -74,7 +75,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn insert_dm_message(&self, msg: &StoredMessage) -> anyhow::Result<()> {
+    pub async fn insert_dm_message(&self, msg: &StoredMessage) -> Result<(), AppError> {
         let media_json = serde_json::to_string(&msg.media)?;
         sqlx::query(
             "INSERT OR IGNORE INTO dm_messages (id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to)
@@ -100,7 +101,7 @@ impl Storage {
         conversation_id: &str,
         limit: usize,
         before: Option<u64>,
-    ) -> anyhow::Result<Vec<StoredMessage>> {
+    ) -> Result<Vec<StoredMessage>, AppError> {
         let rows = match before {
             Some(b) => {
                 sqlx::query(
@@ -134,7 +135,7 @@ impl Storage {
         Ok(messages)
     }
 
-    fn row_to_stored_message(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<StoredMessage> {
+    fn row_to_stored_message(row: &sqlx::sqlite::SqliteRow) -> Result<StoredMessage, AppError> {
         let media_json: String = row.get(6);
         let media: Vec<MediaAttachment> = serde_json::from_str(&media_json)?;
         Ok(StoredMessage {
@@ -151,7 +152,7 @@ impl Storage {
         })
     }
 
-    pub async fn mark_dm_delivered(&self, message_id: &str) -> anyhow::Result<()> {
+    pub async fn mark_dm_delivered(&self, message_id: &str) -> Result<(), AppError> {
         sqlx::query("UPDATE dm_messages SET delivered = 1 WHERE id=?1")
             .bind(message_id)
             .execute(&self.pool)
@@ -159,7 +160,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn mark_dm_read_by_id(&self, message_id: &str) -> anyhow::Result<()> {
+    pub async fn mark_dm_read_by_id(&self, message_id: &str) -> Result<(), AppError> {
         sqlx::query("UPDATE dm_messages SET read = 1 WHERE id=?1")
             .bind(message_id)
             .execute(&self.pool)
@@ -167,7 +168,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn delete_dm_message(&self, message_id: &str) -> anyhow::Result<bool> {
+    pub async fn delete_dm_message(&self, message_id: &str) -> Result<bool, AppError> {
         let result = sqlx::query("DELETE FROM dm_messages WHERE id=?1")
             .bind(message_id)
             .execute(&self.pool)
@@ -175,7 +176,7 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    pub async fn get_total_unread_count(&self) -> anyhow::Result<u32> {
+    pub async fn get_total_unread_count(&self) -> Result<u32, AppError> {
         let count: i64 =
             sqlx::query_scalar("SELECT COALESCE(SUM(unread_count), 0) FROM dm_conversations")
                 .fetch_one(&self.pool)
@@ -190,7 +191,7 @@ impl Storage {
         envelope_json: &str,
         created_at: u64,
         message_id: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         sqlx::query(
             "INSERT INTO dm_outbox (id, peer_pubkey, envelope_json, created_at, message_id)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -208,7 +209,7 @@ impl Storage {
     /// Returns all pending dm_outbox entries ordered oldest-first.
     pub async fn get_all_outbox_messages(
         &self,
-    ) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    ) -> Result<Vec<(String, String, String, String)>, AppError> {
         let rows = sqlx::query(
             "SELECT id, peer_pubkey, envelope_json, message_id FROM dm_outbox ORDER BY created_at ASC",
         )
@@ -220,7 +221,7 @@ impl Storage {
             .collect())
     }
 
-    pub async fn remove_outbox_message(&self, id: &str) -> anyhow::Result<()> {
+    pub async fn remove_outbox_message(&self, id: &str) -> Result<(), AppError> {
         sqlx::query("DELETE FROM dm_outbox WHERE id=?1")
             .bind(id)
             .execute(&self.pool)
@@ -236,7 +237,7 @@ impl Storage {
         ratchet_updated_at: u64,
         message: &StoredMessage,
         preview: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), AppError> {
         let conv_id = &message.conversation_id;
         let media_json = serde_json::to_string(&message.media)?;
 

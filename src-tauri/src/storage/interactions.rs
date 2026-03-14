@@ -1,14 +1,19 @@
+use crate::error::AppError;
 use iroh_social_types::{Interaction, InteractionKind, PostCounts};
 use sqlx::Row;
 
 use super::Storage;
 
 impl Storage {
-    fn row_to_interaction(row: &sqlx::sqlite::SqliteRow) -> anyhow::Result<Interaction> {
+    fn row_to_interaction(row: &sqlx::sqlite::SqliteRow) -> Result<Interaction, AppError> {
         let kind_str: String = row.get(2);
         let kind = match kind_str.to_lowercase().as_str() {
             "like" => InteractionKind::Like,
-            other => anyhow::bail!("unknown interaction kind: {other}"),
+            other => {
+                return Err(AppError::Other(format!(
+                    "unknown interaction kind: {other}"
+                )));
+            }
         };
         Ok(Interaction {
             id: row.get(0),
@@ -21,7 +26,7 @@ impl Storage {
         })
     }
 
-    pub async fn save_interaction(&self, interaction: &Interaction) -> anyhow::Result<()> {
+    pub async fn save_interaction(&self, interaction: &Interaction) -> Result<(), AppError> {
         let kind_str = match interaction.kind {
             InteractionKind::Like => "Like",
         };
@@ -41,7 +46,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn delete_interaction(&self, id: &str, author: &str) -> anyhow::Result<bool> {
+    pub async fn delete_interaction(&self, id: &str, author: &str) -> Result<bool, AppError> {
         let result = sqlx::query("DELETE FROM interactions WHERE id=?1 AND author=?2")
             .bind(id)
             .bind(author)
@@ -55,7 +60,7 @@ impl Storage {
         author: &str,
         kind: &str,
         target_post_id: &str,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> Result<Option<String>, AppError> {
         let id: Option<String> = sqlx::query_scalar(
             "SELECT id FROM interactions WHERE author=?1 AND kind=?2 AND target_post_id=?3",
         )
@@ -78,7 +83,7 @@ impl Storage {
         &self,
         my_pubkey: &str,
         target_post_id: &str,
-    ) -> anyhow::Result<PostCounts> {
+    ) -> Result<PostCounts, AppError> {
         let row = sqlx::query(
             "SELECT
                 (SELECT COUNT(*) FROM interactions WHERE target_post_id=?1 AND kind='Like') AS likes,
@@ -100,7 +105,7 @@ impl Storage {
         })
     }
 
-    pub async fn count_interactions_by_author(&self, author: &str) -> anyhow::Result<u64> {
+    pub async fn count_interactions_by_author(&self, author: &str) -> Result<u64, AppError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM interactions WHERE author=?1")
             .bind(author)
             .fetch_one(&self.pool)
@@ -108,7 +113,7 @@ impl Storage {
         Ok(count as u64)
     }
 
-    pub async fn newest_interaction_timestamp(&self, author: &str) -> anyhow::Result<u64> {
+    pub async fn newest_interaction_timestamp(&self, author: &str) -> Result<u64, AppError> {
         let ts: Option<i64> =
             sqlx::query_scalar("SELECT MAX(timestamp) FROM interactions WHERE author=?1")
                 .bind(author)
@@ -121,7 +126,7 @@ impl Storage {
         &self,
         author: &str,
         after_ts: u64,
-    ) -> anyhow::Result<u64> {
+    ) -> Result<u64, AppError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM interactions WHERE author=?1 AND timestamp > ?2",
         )
@@ -138,7 +143,7 @@ impl Storage {
         after_ts: u64,
         limit: usize,
         offset: usize,
-    ) -> anyhow::Result<Vec<Interaction>> {
+    ) -> Result<Vec<Interaction>, AppError> {
         let rows = sqlx::query(
             "SELECT id, author, kind, target_post_id, target_author, timestamp, signature
              FROM interactions WHERE author=?1 AND timestamp > ?2
@@ -162,7 +167,7 @@ impl Storage {
         author: &str,
         limit: usize,
         offset: usize,
-    ) -> anyhow::Result<Vec<Interaction>> {
+    ) -> Result<Vec<Interaction>, AppError> {
         let rows = sqlx::query(
             "SELECT id, author, kind, target_post_id, target_author, timestamp, signature
              FROM interactions WHERE author=?1

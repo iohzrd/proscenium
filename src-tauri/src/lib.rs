@@ -3,6 +3,7 @@ mod constants;
 mod crypto;
 mod device_sync;
 mod dm;
+mod error;
 mod framing;
 mod gossip;
 mod ingest;
