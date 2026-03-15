@@ -1,4 +1,6 @@
 use crate::error::AppError;
+#[cfg(test)]
+mod tests;
 mod device_sync;
 mod follow_requests;
 mod interactions;
@@ -89,6 +91,19 @@ impl Storage {
             .connect_with(opts)
             .await?;
 
+        Self::run_migrations(&pool).await?;
+        Ok(Self { pool })
+    }
+
+    /// Create an in-memory storage instance for testing.
+    #[cfg(test)]
+    pub async fn open_in_memory() -> Result<Self, AppError> {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .pragma("foreign_keys", "ON");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
         Self::run_migrations(&pool).await?;
         Ok(Self { pool })
     }

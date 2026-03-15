@@ -114,3 +114,72 @@ impl serde::Serialize for AppError {
 
 /// Shorthand used by all command return types.
 pub type CmdResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_from_string() {
+        let err = AppError::from("something went wrong".to_string());
+        assert_eq!(err.to_string(), "something went wrong");
+    }
+
+    #[test]
+    fn error_from_str() {
+        let err = AppError::from("bad input");
+        assert_eq!(err.to_string(), "bad input");
+    }
+
+    #[test]
+    fn error_serializes_to_string() {
+        let err = AppError::Other("test error".into());
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, r#""test error""#);
+    }
+
+    #[test]
+    fn error_display_shows_inner() {
+        let err = AppError::HexDecode(hex::FromHexError::OddLength);
+        let display = err.to_string();
+        assert!(!display.is_empty());
+    }
+
+    #[test]
+    fn error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "not found");
+        let err = AppError::from(io_err);
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn error_from_serde_json() {
+        let bad_json = "not json at all {{{";
+        let result: Result<serde_json::Value, _> = serde_json::from_str(bad_json);
+        let err = AppError::from(result.unwrap_err());
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn error_from_base64() {
+        use base64::Engine;
+        let result = base64::engine::general_purpose::STANDARD.decode("!!!invalid!!!");
+        let err = AppError::from(result.unwrap_err());
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn error_from_hex_decode() {
+        let result = hex::decode("zzzz");
+        let err = AppError::from(result.unwrap_err());
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn error_from_utf8() {
+        let bad_bytes = vec![0xff, 0xfe];
+        let result = String::from_utf8(bad_bytes);
+        let err = AppError::from(result.unwrap_err());
+        assert!(!err.to_string().is_empty());
+    }
+}
