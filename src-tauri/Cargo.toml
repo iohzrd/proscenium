@@ -25,7 +25,7 @@ futures-lite = "2"
 getrandom = "0.4.1"
 hex = "0.4.3"
 hkdf = "0.12"
-iroh = "0.96"
+iroh = { version = "0.96", features = ["address-lookup-mdns", "address-lookup-pkarr-dht"] }
 iroh-blobs = { version = "0.98", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
 iroh-social-types = { path = "../crates/iroh-social-types" }

@@ -98,6 +98,8 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
             PEER_ALPN.to_vec(),
             DM_ALPN.to_vec(),
         ])
+        .address_lookup(iroh::address_lookup::MdnsAddressLookup::builder())
+        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder())
         .bind()
         .await
         .expect("failed to bind iroh endpoint");
