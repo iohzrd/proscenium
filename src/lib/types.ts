@@ -201,6 +201,14 @@ export interface LinkQrPayload {
   relay_url: string | null;
 }
 
+export type CallState = "ringing" | "incoming" | "active" | "ended" | "failed";
+
+export interface CallEvent {
+  call_id: string;
+  peer_pubkey: string;
+  state: CallState;
+}
+
 export interface StoredMessage {
   id: string;
   conversation_id: string;

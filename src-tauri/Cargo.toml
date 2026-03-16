@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 bip39 = { version = "2", features = ["zeroize"] }
 bytes = "1"
+cpal = "0.17"
 chacha20poly1305 = "0.10"
 curve25519-dalek = { version = "4", default-features = false }
 futures-lite = "2"
@@ -30,6 +31,7 @@ iroh-blobs = { version = "0.98", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
 iroh-social-types = { path = "../crates/iroh-social-types" }
 log = "0.4"
+opus = "0.3"
 reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 serde = { workspace = true }

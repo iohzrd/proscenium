@@ -1,3 +1,4 @@
+use crate::call::CallHandler;
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
@@ -61,6 +62,7 @@ pub struct AppState {
     pub(crate) http_client: reqwest::Client,
     pub(crate) gossip: GossipService,
     pub(crate) dm: DmHandler,
+    pub(crate) call: CallHandler,
     pub(crate) peer: PeerHandler,
     pub(crate) endpoint: Endpoint,
     pub(crate) blobs: BlobsProtocol,
@@ -82,6 +84,7 @@ impl AppState {
         http_client: reqwest::Client,
         gossip: GossipService,
         dm: DmHandler,
+        call: CallHandler,
         peer: PeerHandler,
         endpoint: Endpoint,
         blobs: BlobsProtocol,
@@ -97,6 +100,7 @@ impl AppState {
             http_client,
             gossip,
             dm,
+            call,
             peer,
             endpoint,
             blobs,

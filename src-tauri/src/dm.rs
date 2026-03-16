@@ -19,8 +19,15 @@ use iroh_social_types::{
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
+
+/// A call signal received via the DM ratchet channel.
+#[derive(Debug, Clone)]
+pub struct CallSignal {
+    pub peer_pubkey: String,
+    pub payload: DmPayload,
+}
 
 #[derive(Debug, Clone)]
 pub struct DmHandler {
@@ -29,6 +36,7 @@ pub struct DmHandler {
     endpoint: Endpoint,
     identity: SharedIdentity,
     outbox_notify: Arc<Notify>,
+    call_signal_tx: mpsc::UnboundedSender<CallSignal>,
 }
 
 impl DmHandler {
@@ -38,13 +46,21 @@ impl DmHandler {
         endpoint: Endpoint,
         identity: SharedIdentity,
     ) -> Self {
+        let (call_signal_tx, _rx) = mpsc::unbounded_channel();
         Self {
             storage,
             app_handle,
             endpoint,
             identity,
             outbox_notify: Arc::new(Notify::new()),
+            call_signal_tx,
         }
+    }
+
+    /// Take the call signal receiver. Must be called once during setup
+    /// to wire call signals into the CallHandler.
+    pub fn set_call_signal_tx(&mut self, tx: mpsc::UnboundedSender<CallSignal>) {
+        self.call_signal_tx = tx;
     }
 
     /// Spawn the outbox flush loop. Select on immediate notify (from send_dm on peer-offline)
@@ -583,6 +599,24 @@ impl DmHandler {
                         "typing-indicator",
                         serde_json::json!({ "peer": peer_master_pubkey }),
                     );
+                }
+            }
+            payload @ (DmPayload::CallOffer { .. }
+            | DmPayload::CallAnswer { .. }
+            | DmPayload::CallReject { .. }
+            | DmPayload::CallHangup { .. }) => {
+                self.storage
+                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, ratchet_ts)
+                    .await?;
+                if let Some(peer_master_pubkey) = self
+                    .storage
+                    .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
+                    .await
+                {
+                    let _ = self.call_signal_tx.send(CallSignal {
+                        peer_pubkey: peer_master_pubkey,
+                        payload,
+                    });
                 }
             }
         }

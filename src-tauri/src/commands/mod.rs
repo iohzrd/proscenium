@@ -1,4 +1,5 @@
 mod blobs;
+mod calls;
 mod devices;
 mod dm;
 mod follow_requests;
@@ -13,6 +14,7 @@ mod social;
 pub(crate) mod sync;
 
 pub use blobs::*;
+pub use calls::*;
 pub use devices::*;
 pub use dm::*;
 pub use follow_requests::*;

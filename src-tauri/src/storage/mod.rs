@@ -1,6 +1,4 @@
 use crate::error::AppError;
-#[cfg(test)]
-mod tests;
 mod device_sync;
 mod follow_requests;
 mod interactions;
@@ -15,6 +13,8 @@ mod push;
 mod ratchet;
 mod servers;
 mod social;
+#[cfg(test)]
+mod tests;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -98,8 +98,7 @@ impl Storage {
     /// Create an in-memory storage instance for testing.
     #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self, AppError> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
-            .pragma("foreign_keys", "ON");
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.pragma("foreign_keys", "ON");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)

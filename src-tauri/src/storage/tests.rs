@@ -20,7 +20,13 @@ fn make_post(id: &str, author: &str, ts: u64) -> Post {
     }
 }
 
-fn make_interaction(id: &str, author: &str, target_post: &str, target_author: &str, ts: u64) -> Interaction {
+fn make_interaction(
+    id: &str,
+    author: &str,
+    target_post: &str,
+    target_author: &str,
+    ts: u64,
+) -> Interaction {
     Interaction {
         id: id.to_string(),
         author: author.to_string(),
@@ -273,8 +279,12 @@ async fn post_feed_cursor_pagination() {
 async fn post_feed_excludes_muted_and_blocked() {
     let s = test_storage().await;
     s.insert_post(&make_post("p1", "good", 1000)).await.unwrap();
-    s.insert_post(&make_post("p2", "muted_user", 2000)).await.unwrap();
-    s.insert_post(&make_post("p3", "blocked_user", 3000)).await.unwrap();
+    s.insert_post(&make_post("p2", "muted_user", 2000))
+        .await
+        .unwrap();
+    s.insert_post(&make_post("p3", "blocked_user", 3000))
+        .await
+        .unwrap();
 
     s.mute_user("muted_user").await.unwrap();
     s.block_user("blocked_user").await.unwrap();
@@ -319,10 +329,7 @@ async fn post_delete_repost_by_target() {
     repost.quote_of_author = Some("b".to_string());
     s.insert_post(&repost).await.unwrap();
 
-    let deleted_id = s
-        .delete_repost_by_target("a", "target_post")
-        .await
-        .unwrap();
+    let deleted_id = s.delete_repost_by_target("a", "target_post").await.unwrap();
     assert_eq!(deleted_id, Some("rp1".to_string()));
     assert!(s.get_post_by_id("rp1").await.unwrap().is_none());
 }
@@ -719,9 +726,15 @@ async fn notification_excludes_muted_and_blocked() {
 async fn notification_cursor_pagination() {
     let s = test_storage().await;
     for i in 1..=5 {
-        s.insert_notification("like", &format!("actor_{i}"), Some(&format!("p{i}")), None, i * 1000)
-            .await
-            .unwrap();
+        s.insert_notification(
+            "like",
+            &format!("actor_{i}"),
+            Some(&format!("p{i}")),
+            None,
+            i * 1000,
+        )
+        .await
+        .unwrap();
     }
 
     let page1 = s.get_notifications(2, None).await.unwrap();
@@ -943,10 +956,7 @@ async fn peer_delegation_cache_and_retrieve() {
     assert_eq!(dm, "dm_pk");
 
     // Transport node IDs
-    let ids = s
-        .get_peer_transport_node_ids("master_pk")
-        .await
-        .unwrap();
+    let ids = s.get_peer_transport_node_ids("master_pk").await.unwrap();
     assert_eq!(ids, vec!["transport_1", "transport_2"]);
 
     // Delegation round-trip
@@ -990,8 +1000,16 @@ async fn peer_delegation_reverse_lookups() {
     assert_eq!(master, "master_pk");
 
     // Non-existent lookups
-    assert!(s.get_master_pubkey_for_dm_pubkey("nonexistent").await.is_none());
-    assert!(s.get_master_pubkey_for_transport("nonexistent").await.is_none());
+    assert!(
+        s.get_master_pubkey_for_dm_pubkey("nonexistent")
+            .await
+            .is_none()
+    );
+    assert!(
+        s.get_master_pubkey_for_transport("nonexistent")
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1000,7 +1018,12 @@ async fn peer_delegation_empty_returns() {
     assert!(s.get_peer_delegation("nope").await.unwrap().is_none());
     assert!(s.get_peer_signing_pubkey("nope").await.unwrap().is_none());
     assert!(s.get_peer_dm_pubkey("nope").await.unwrap().is_none());
-    assert!(s.get_peer_transport_node_ids("nope").await.unwrap().is_empty());
+    assert!(
+        s.get_peer_transport_node_ids("nope")
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 // ── Ratchet Sessions ─────────────────────────────────────────────────────────

@@ -255,6 +255,15 @@
     togglingBlock = false;
   }
 
+  async function startCall() {
+    try {
+      await invoke("start_call", { peerPubkey: pubkey });
+    } catch (e) {
+      toast.show("Failed to start call");
+      console.error("Failed to start call:", e);
+    }
+  }
+
   function handleGlobalKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       if (del.pendingId) del.cancel();
@@ -404,6 +413,9 @@
             : "Follow"}{/if}
       </button>
       <a href="/messages/{pubkey}" class="message-btn">Message</a>
+      <button class="call-btn" onclick={startCall} disabled={isBlocked}>
+        Call
+      </button>
     </div>
     <div class="moderation-row">
       <button
@@ -598,6 +610,27 @@
 
   .message-btn:hover {
     background: var(--bg-elevated-hover);
+  }
+
+  .call-btn {
+    background: var(--color-success);
+    color: white;
+    border: none;
+    border-radius: var(--radius-md);
+    padding: 0.5rem 1rem;
+    font-size: var(--text-base);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition-normal);
+  }
+
+  .call-btn:hover:not(:disabled) {
+    background: #16a34a;
+  }
+
+  .call-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .follow-toggle:hover:not(:disabled) {

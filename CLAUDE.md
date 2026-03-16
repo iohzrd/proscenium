@@ -4,12 +4,13 @@
 
 - **DON'T BOTHER WITH BACKWARD COMPATIBILITY.**
 - Always thoroughly study all existing code relevant to your current task before offering changes.
-- **NEVER USE EMOJIS** in code, documentation, commits, anywhere.
+- **NEVER USE EMOJIS** in code or commits.
 - Always use latest dependency versions possible.
 - Always run code formatters before committing (`cargo fmt` for backend, `npm run check` and `npx prettier --plugin prettier-plugin-svelte --write "src/**/*.{ts,svelte}" 2>&1` for frontend).
 - Always run `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings` before committing and fix any warnings.
 - Always omit Claude signature when writing commit messages.
 - Always follow Rust idioms and best practices.
+- Always follow the idioms and best practices of the project dependencies (e.g Tokio, Tauri, etc).
 
 ## Task Continuity (anti-compaction-drift)
 

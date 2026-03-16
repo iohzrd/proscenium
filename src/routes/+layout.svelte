@@ -12,10 +12,17 @@
   } from "@tauri-apps/plugin-notification";
   import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
   import { goto } from "$app/navigation";
-  import type { NodeStatus, Post, StoredMessage } from "$lib/types";
+  import type {
+    NodeStatus,
+    Post,
+    StoredMessage,
+    CallEvent,
+    CallState,
+  } from "$lib/types";
   import Sidebar from "$lib/Sidebar.svelte";
   import BottomNav from "$lib/BottomNav.svelte";
   import MobileHeader from "$lib/MobileHeader.svelte";
+  import CallOverlay from "$lib/CallOverlay.svelte";
 
   const ZOOM_KEY = "app-zoom-level";
   const ZOOM_STEP = 0.2;
@@ -29,6 +36,9 @@
   let unreadNotificationCount = $state(0);
   let nodeId = $state("");
   let pubkey = $state("");
+  let activeCallId = $state<string | null>(null);
+  let activeCallPeer = $state("");
+  let activeCallState = $state<CallState | null>(null);
 
   async function applyZoom(level: number) {
     zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
@@ -181,6 +191,27 @@
           pollUnreadNotifications();
         }),
       );
+      unlisteners.push(
+        listen<CallEvent>("call-state", (event) => {
+          const { call_id, peer_pubkey, state } = event.payload;
+          if (state === "ended" || state === "failed") {
+            // Show briefly then dismiss
+            activeCallId = call_id;
+            activeCallPeer = peer_pubkey;
+            activeCallState = state;
+            setTimeout(() => {
+              if (activeCallId === call_id) {
+                activeCallId = null;
+                activeCallState = null;
+              }
+            }, 2000);
+          } else {
+            activeCallId = call_id;
+            activeCallPeer = peer_pubkey;
+            activeCallState = state;
+          }
+        }),
+      );
     }
 
     setupNotifications();
@@ -241,6 +272,15 @@
     currentPath={page.url.pathname}
   />
 </div>
+
+{#if activeCallId && activeCallState}
+  <CallOverlay
+    callId={activeCallId}
+    peerPubkey={activeCallPeer}
+    callState={activeCallState}
+    selfId={pubkey}
+  />
+{/if}
 
 <style>
   .app-shell {

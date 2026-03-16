@@ -1,3 +1,4 @@
+use crate::call::CallHandler;
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
@@ -7,8 +8,9 @@ use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
-    DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_dm_key, derive_signing_key,
-    derive_transport_key, now_millis, sign_delegation, sign_linked_devices_announcement,
+    CALL_ALPN, DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_dm_key,
+    derive_signing_key, derive_transport_key, now_millis, sign_delegation,
+    sign_linked_devices_announcement,
 };
 use std::sync::Arc;
 use tauri::Manager;
@@ -97,6 +99,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
             iroh_gossip::ALPN.to_vec(),
             PEER_ALPN.to_vec(),
             DM_ALPN.to_vec(),
+            CALL_ALPN.to_vec(),
         ])
         .address_lookup(iroh::address_lookup::MdnsAddressLookup::builder())
         .address_lookup(iroh::address_lookup::DhtAddressLookup::builder())
@@ -166,11 +169,23 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         handle.clone(),
     );
 
-    let dm_handler = DmHandler::new(
+    let (call_signal_tx, call_signal_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::dm::CallSignal>();
+
+    let mut dm_handler = DmHandler::new(
         storage.clone(),
         handle.clone(),
         endpoint.clone(),
         identity.clone(),
+    );
+    dm_handler.set_call_signal_tx(call_signal_tx);
+
+    let call_handler = CallHandler::new(
+        storage.clone(),
+        identity.clone(),
+        endpoint.clone(),
+        dm_handler.clone(),
+        handle.clone(),
     );
 
     let peer_handler = PeerHandler::new(
@@ -185,6 +200,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         .accept(iroh_gossip::ALPN, gossip)
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
+        .accept(CALL_ALPN, call_handler.clone())
         .spawn();
     log::info!("[setup] router spawned");
 
@@ -257,6 +273,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         http_client,
         gossip_service,
         dm_handler,
+        call_handler,
         peer_handler,
         endpoint,
         blobs,
@@ -268,6 +285,29 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     state.gossip.start_background(shutdown.child_token()).await;
     state.dm.start_background(shutdown.child_token());
     crate::tasks::spawn_all(state.clone(), sync_rx);
+
+    // Route call signals from DM ratchet to CallHandler
+    {
+        let call = state.call.clone();
+        let mut rx = call_signal_rx;
+        tokio::spawn(async move {
+            while let Some(signal) = rx.recv().await {
+                match signal.payload {
+                    iroh_social_types::DmPayload::CallOffer { call_id, .. } => {
+                        call.on_call_offer(&call_id, &signal.peer_pubkey).await;
+                    }
+                    iroh_social_types::DmPayload::CallAnswer { call_id } => {
+                        call.on_call_answered(&call_id, &signal.peer_pubkey).await;
+                    }
+                    iroh_social_types::DmPayload::CallReject { call_id }
+                    | iroh_social_types::DmPayload::CallHangup { call_id } => {
+                        call.on_call_ended(&call_id).await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
 
     handle.manage(state);
     log::info!("[setup] app state ready");

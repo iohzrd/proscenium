@@ -1,3 +1,4 @@
+mod call;
 mod commands;
 mod constants;
 mod crypto;
@@ -143,6 +144,11 @@ pub fn run() {
             link_with_device,
             get_linked_devices,
             force_device_sync,
+            start_call,
+            accept_call,
+            reject_call,
+            hangup_call,
+            toggle_mute_call,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
