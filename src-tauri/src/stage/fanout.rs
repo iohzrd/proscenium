@@ -98,14 +98,6 @@ impl Fanout {
         token
     }
 
-    /// Subscribe an in-process consumer (no QUIC stream needed).
-    ///
-    /// Used by the host to hear the mixed output locally without a network
-    /// round-trip.
-    pub fn subscribe_local(&self) -> broadcast::Receiver<AudioFrame> {
-        self.tx.subscribe()
-    }
-
     /// Number of currently active subscriber tasks. Useful for load metrics.
     #[allow(dead_code)]
     pub fn subscriber_count(&self) -> usize {

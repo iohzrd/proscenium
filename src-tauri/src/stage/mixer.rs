@@ -28,6 +28,20 @@ pub enum MixerCommand {
     GetLevels {
         reply: oneshot::Sender<HashMap<String, f32>>,
     },
+    /// Mark a speaker as the local host and provide a direct PCM channel for
+    /// mix-minus playback. The host receives all other speakers except themselves.
+    SetHostSpeaker {
+        pubkey: String,
+        pcm_tx: mpsc::Sender<Vec<f32>>,
+    },
+    /// Register a per-speaker return channel for personalized mix-minus Opus output.
+    /// The mixer encodes mix-minus-self and sends raw Opus packets to this channel.
+    AddReturnChannel {
+        pubkey: String,
+        opus_tx: mpsc::Sender<Vec<u8>>,
+    },
+    /// Remove a speaker's return channel (speaker left or was demoted).
+    RemoveReturnChannel(String),
     Shutdown,
 }
 
@@ -70,6 +84,35 @@ impl MixerHandle {
             return HashMap::new();
         }
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn set_host_speaker(
+        &self,
+        pubkey: String,
+        pcm_tx: mpsc::Sender<Vec<f32>>,
+    ) -> Result<(), AppError> {
+        self.cmd_tx
+            .send(MixerCommand::SetHostSpeaker { pubkey, pcm_tx })
+            .await
+            .map_err(|_| AppError::Other("mixer actor closed".into()))
+    }
+
+    pub async fn add_return_channel(
+        &self,
+        pubkey: String,
+        opus_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<(), AppError> {
+        self.cmd_tx
+            .send(MixerCommand::AddReturnChannel { pubkey, opus_tx })
+            .await
+            .map_err(|_| AppError::Other("mixer actor closed".into()))
+    }
+
+    pub async fn remove_return_channel(&self, pubkey: String) -> Result<(), AppError> {
+        self.cmd_tx
+            .send(MixerCommand::RemoveReturnChannel(pubkey))
+            .await
+            .map_err(|_| AppError::Other("mixer actor closed".into()))
     }
 }
 
@@ -117,6 +160,10 @@ async fn run_mixer(
     let mut buffers: HashMap<String, (Vec<f32>, f32)> = HashMap::new();
     // Separate vec for the PCM receivers so we can drain them each tick
     let mut speaker_channels: Vec<(String, mpsc::Receiver<Vec<f32>>)> = Vec::new();
+    // Host speaker pubkey + direct PCM channel for mix-minus local playback
+    let mut host_speaker: Option<(String, mpsc::Sender<Vec<f32>>)> = None;
+    // Per-remote-speaker return channels: pubkey -> (opus sender, per-speaker encoder)
+    let mut return_channels: HashMap<String, (mpsc::Sender<Vec<u8>>, OpusEncoder)> = HashMap::new();
 
     let mut seq: u32 = 0;
     let mut timestamp: u32 = 0;
@@ -148,6 +195,25 @@ async fn run_mixer(
                             .map(|(pk, (_, rms))| (pk.clone(), *rms))
                             .collect();
                         let _ = reply.send(levels);
+                    }
+                    Some(MixerCommand::SetHostSpeaker { pubkey, pcm_tx }) => {
+                        host_speaker = Some((pubkey, pcm_tx));
+                    }
+                    Some(MixerCommand::AddReturnChannel { pubkey, opus_tx }) => {
+                        match OpusEncoder::new() {
+                            Ok(enc) => {
+                                return_channels.insert(pubkey, (opus_tx, enc));
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "[mixer] failed to create return encoder for {}: {e}",
+                                    short_id(&pubkey)
+                                );
+                            }
+                        }
+                    }
+                    Some(MixerCommand::RemoveReturnChannel(pubkey)) => {
+                        return_channels.remove(&pubkey);
                     }
                     Some(MixerCommand::Shutdown) | None => break,
                 }
@@ -187,26 +253,70 @@ async fn run_mixer(
                     speaker_channels.retain(|(pk, _)| pk != &pubkey);
                 }
 
-                // Mix: sum one frame worth of samples from all speakers, clamp
-                let mut mix = vec![0.0f32; FRAME_SIZE];
-                for (_, (buf, rms)) in buffers.iter_mut() {
+                // Collect per-speaker contributions (FRAME_SIZE samples each) and
+                // compute the unclamped total sum for mix-minus arithmetic.
+                let mut contributions: HashMap<String, Vec<f32>> = HashMap::new();
+                let mut total = vec![0.0f32; FRAME_SIZE];
+                for (pubkey, (buf, rms)) in buffers.iter_mut() {
                     let available = buf.len().min(FRAME_SIZE);
                     let sum_sq: f32 = buf[..available].iter().map(|s| s * s).sum();
                     *rms = (sum_sq / available.max(1) as f32).sqrt();
 
+                    let mut contrib = vec![0.0f32; FRAME_SIZE];
                     for (i, s) in buf.drain(..available).enumerate() {
-                        mix[i] = (mix[i] + s).clamp(-1.0, 1.0);
+                        contrib[i] = s;
+                        total[i] += s;
                     }
+                    contributions.insert(pubkey.clone(), contrib);
                 }
 
-                // Encode, authenticate, and distribute
-                let packets = encoder.push_samples(&mix);
-                for packet in packets {
-                    let (tag, wire_payload) = auth.process(&packet);
+                // Full mix (clamped) → encode once → fanout (all listeners and relays).
+                let full_mix: Vec<f32> = total.iter().map(|s| s.clamp(-1.0, 1.0)).collect();
+                let packets = encoder.push_samples(&full_mix);
+                for packet in &packets {
+                    let (tag, wire_payload) = auth.process(packet);
                     fanout.send_frame(seq, timestamp, tag, wire_payload);
                     seq = seq.wrapping_add(1);
                     timestamp = timestamp.wrapping_add(SAMPLES_PER_FRAME as u32);
                     frame_count = frame_count.wrapping_add(1);
+                }
+
+                // Mix-minus for host local playback: PCM of all speakers except the host.
+                if let Some((ref host_pk, ref pcm_tx)) = host_speaker {
+                    let host_contrib = contributions
+                        .get(host_pk.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE]);
+                    let minus_host: Vec<f32> = total
+                        .iter()
+                        .zip(host_contrib.iter())
+                        .map(|(t, c)| (t - c).clamp(-1.0, 1.0))
+                        .collect();
+                    // Non-blocking: drop frame if consumer is slow rather than stall the mix tick.
+                    let _ = pcm_tx.try_send(minus_host);
+                }
+
+                // Mix-minus per remote speaker: encode and forward on each return channel.
+                let mut dead_returns: Vec<String> = Vec::new();
+                for (pubkey, (opus_tx, ret_encoder)) in return_channels.iter_mut() {
+                    let contrib = contributions
+                        .get(pubkey.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE]);
+                    let minus_self: Vec<f32> = total
+                        .iter()
+                        .zip(contrib.iter())
+                        .map(|(t, c)| (t - c).clamp(-1.0, 1.0))
+                        .collect();
+                    for packet in ret_encoder.push_samples(&minus_self) {
+                        if opus_tx.try_send(packet).is_err() {
+                            dead_returns.push(pubkey.clone());
+                            break;
+                        }
+                    }
+                }
+                for pk in dead_returns {
+                    return_channels.remove(&pk);
                 }
             }
         }

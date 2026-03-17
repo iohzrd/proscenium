@@ -531,18 +531,20 @@ impl StageActor {
         // Start the host audio mixer (owns encoder, auth state, per-speaker PCM buffers)
         let (mixer_handle, fanout) = spawn_mixer(signing_key.clone(), cancel.child_token())?;
 
-        // Host subscribes to own fanout for local playback (to hear remote speakers).
-        // Frames come from the in-process broadcast channel — no QUIC round-trip.
-        let local_rx = fanout.subscribe_local();
-        let host_pb_cancel = cancel.child_token();
-        tokio::spawn(async move {
-            run_host_playback(local_rx, host_pb_cancel).await;
-        });
-
-        // Add host's own microphone as a speaker input so the host's voice is included in the mix
+        // Add host's own microphone as a speaker input so the host's voice is included in the mix.
+        // Also wire a direct PCM channel for mix-minus local playback (host hears others only).
         let (cap_tx, cap_rx) = mpsc::channel::<Vec<f32>>(32);
+        let (host_pcm_tx, host_pcm_rx) = mpsc::channel::<Vec<f32>>(32);
         match mixer_handle.add_speaker(my_pubkey.clone(), cap_rx).await {
             Ok(()) => {
+                // Register mix-minus channel: host only hears speakers other than themselves.
+                let _ = mixer_handle
+                    .set_host_speaker(my_pubkey.clone(), host_pcm_tx)
+                    .await;
+                let host_pb_cancel = cancel.child_token();
+                tokio::spawn(async move {
+                    run_host_playback(host_pcm_rx, host_pb_cancel).await;
+                });
                 let mic_cancel = cancel.child_token();
                 tokio::spawn(async move {
                     let _capture = match AudioCapture::start(cap_tx) {
@@ -1141,9 +1143,14 @@ impl StageActor {
                     if let Some(p) = stage.participants.get_mut(pubkey.as_str()) {
                         p.role = StageRole::Speaker;
                     }
-                    // If promoted ourselves, start the speaker audio pipeline
+                    // If promoted ourselves, start the speaker audio pipeline.
                     if pubkey == &stage.my_pubkey {
                         stage.my_role = StageRole::Speaker;
+                        // Cancel the listener pipeline — the speaker pipeline provides its own
+                        // mix-minus playback via the return stream, eliminating echo.
+                        if let Some(old_cancel) = stage.listener_pipeline_cancel.take() {
+                            old_cancel.cancel();
+                        }
                         let endpoint = self.endpoint.clone();
                         // listener_upstream_id is the host's transport NodeId (set at join).
                         // For a speaker who joined as a listener this is always populated.
@@ -1658,16 +1665,25 @@ async fn handle_incoming_connection(
             match type_buf[0] {
                 CONN_TYPE_SPEAKER => {
                     log::info!("[stage-host] speaker connected: {}", short_id(&remote));
-                    // Add a per-speaker PCM channel to the mixer
                     if let Some(mixer) = mixer_handle {
                         let (pcm_tx, pcm_rx) = mpsc::channel::<Vec<f32>>(32);
-                        if mixer.add_speaker(remote.clone(), pcm_rx).await.is_ok() {
+                        let (opus_tx, opus_rx) = mpsc::channel::<Vec<u8>>(32);
+                        let added = mixer.add_speaker(remote.clone(), pcm_rx).await.is_ok()
+                            && mixer
+                                .add_return_channel(remote.clone(), opus_tx)
+                                .await
+                                .is_ok();
+                        if added {
+                            // Return stream: host sends personalized mix-minus Opus back to speaker.
+                            let return_cancel = cancel.child_token();
+                            tokio::spawn(run_return_writer(opus_rx, send, return_cancel));
                             tokio::spawn(speaker_recv_loop(recv, remote, pcm_tx, cancel));
+                        } else {
+                            let _ = send.finish();
                         }
+                    } else {
+                        let _ = send.finish();
                     }
-                    // send stream: host sends their mic audio to the speaker (Phase 4)
-                    // For now, just finish it so the speaker knows we accepted
-                    let _ = send.finish();
                 }
                 CONN_TYPE_LISTENER => {
                     log::info!("[stage-host] listener connected: {}", short_id(&remote));
@@ -1784,18 +1800,11 @@ async fn start_relay_pipeline(
     relay::spawn_relay(recv, cancel)
 }
 
-/// Decode the mixed audio stream from an in-process fanout subscription and play it locally.
+/// Receive mix-minus PCM from the mixer and play it locally (host only).
 ///
-/// Used by the host to hear remote speakers. There is no QUIC round-trip — the frames
-/// come directly from the broadcast channel. Hosts should use headphones until AEC is
-/// implemented; the mix includes the host's own voice.
-async fn run_host_playback(
-    mut rx: tokio::sync::broadcast::Receiver<fanout::AudioFrame>,
-    cancel: CancellationToken,
-) {
-    use crate::audio::transport::TAG_CHECKPOINT;
-    use auth::CHECKPOINT_EXTRA;
-
+/// The mixer sends only the contributions of other speakers — the host's own
+/// voice is excluded, eliminating echo without a round-trip through the network.
+async fn run_host_playback(mut rx: mpsc::Receiver<Vec<f32>>, cancel: CancellationToken) {
     let (mut prod, _playback) = match AudioPlayback::start() {
         Ok(p) => p,
         Err(e) => {
@@ -1804,39 +1813,14 @@ async fn run_host_playback(
         }
     };
 
-    let mut decoder = match OpusDecoder::new() {
-        Ok(d) => d,
-        Err(e) => {
-            log::error!("[stage-host] failed to create decoder for playback: {e}");
-            return;
-        }
-    };
-
     let mut frames: u32 = 0;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            result = rx.recv() => {
-                match result {
-                    Ok(frame) => {
-                        let opus = if frame.tag == TAG_CHECKPOINT {
-                            if frame.payload.len() < CHECKPOINT_EXTRA {
-                                continue;
-                            }
-                            &frame.payload[CHECKPOINT_EXTRA..]
-                        } else {
-                            &frame.payload
-                        };
-                        if let Ok(samples) = decoder.decode(opus) {
-                            prod.push(&samples);
-                            frames += 1;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        log::debug!("[stage-host] playback lagged {n} frames");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
+            pcm = rx.recv() => {
+                let Some(samples) = pcm else { break };
+                prod.push(&samples);
+                frames += 1;
             }
         }
     }
@@ -2117,6 +2101,78 @@ async fn run_listener_once(
     log::info!("[stage-listener] playback stopped ({frames} frames decoded)");
 }
 
+/// Write mix-minus Opus packets from the mixer to a speaker's QUIC return send stream.
+///
+/// The mixer encodes a personalized "mix minus self" stream for each remote speaker
+/// and forwards raw Opus packets here. This task adds framing and writes to the stream.
+async fn run_return_writer(
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut send: iroh::endpoint::SendStream,
+    cancel: CancellationToken,
+) {
+    let mut seq: u32 = 0;
+    let mut timestamp: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            packet = rx.recv() => {
+                let Some(opus) = packet else { break };
+                if write_audio_frame(&mut send, seq, timestamp, TAG_NORMAL, &opus)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                seq = seq.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(SAMPLES_PER_FRAME as u32);
+            }
+        }
+    }
+    let _ = send.finish();
+}
+
+/// Receive a host's personalized mix-minus Opus stream on the speaker's return recv stream
+/// and play it back locally.
+///
+/// The host sends a stream of framed Opus packets containing the mix of all other speakers
+/// (i.e. everyone except this speaker), eliminating echo for the promoted speaker.
+async fn speaker_return_playback(mut recv: iroh::endpoint::RecvStream, cancel: CancellationToken) {
+    let (mut prod, _playback) = match AudioPlayback::start() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[stage-speaker] failed to start return playback: {e}");
+            return;
+        }
+    };
+
+    let mut decoder = match OpusDecoder::new() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("[stage-speaker] failed to create return decoder: {e}");
+            return;
+        }
+    };
+
+    let mut frames: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = read_audio_frame(&mut recv) => {
+                match result {
+                    Ok(Some((_, _, _, payload))) => {
+                        if let Ok(samples) = decoder.decode(&payload) {
+                            prod.push(&samples);
+                            frames += 1;
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    }
+    log::info!("[stage-speaker] return playback stopped ({frames} frames)");
+}
+
 /// Connect to the host as a speaker and start the capture → encode → send pipeline.
 /// Also handles receiving the host's audio back (phase 4: individual mesh streams).
 async fn start_speaker_pipeline(
@@ -2143,7 +2199,7 @@ async fn start_speaker_pipeline(
         }
     };
 
-    let (mut send, _recv) = match conn.open_bi().await {
+    let (mut send, recv) = match conn.open_bi().await {
         Ok(pair) => pair,
         Err(e) => {
             log::error!("[stage-speaker] failed to open bi-stream: {e}");
@@ -2157,6 +2213,11 @@ async fn start_speaker_pipeline(
     }
 
     log::info!("[stage-speaker] connected to host, starting capture");
+
+    // Play back the host's personalized mix-minus stream on the return recv stream.
+    // This replaces the listener pipeline and carries only other speakers' voices.
+    let pb_cancel = cancel.child_token();
+    tokio::spawn(speaker_return_playback(recv, pb_cancel));
 
     // Capture → encode → send
     let (cap_tx, mut cap_rx) = mpsc::channel::<Vec<f32>>(32);
