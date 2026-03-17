@@ -337,6 +337,13 @@
     margin-bottom: 0.75rem;
   }
 
+  /* Right sidebar handles live stages on wide screens. */
+  @media (min-width: 1150px) {
+    .live-stages {
+      display: none;
+    }
+  }
+
   .identity-card {
     display: flex;
     flex-direction: column;

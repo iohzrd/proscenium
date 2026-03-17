@@ -18,8 +18,10 @@
     StoredMessage,
     CallEvent,
     CallState,
+    StageAnnouncement,
   } from "$lib/types";
   import Sidebar from "$lib/Sidebar.svelte";
+  import RightSidebar from "$lib/RightSidebar.svelte";
   import BottomNav from "$lib/BottomNav.svelte";
   import MobileHeader from "$lib/MobileHeader.svelte";
   import CallOverlay from "$lib/CallOverlay.svelte";
@@ -39,6 +41,7 @@
   let activeCallId = $state<string | null>(null);
   let activeCallPeer = $state("");
   let activeCallState = $state<CallState | null>(null);
+  let liveStages = $state<Map<string, StageAnnouncement>>(new Map());
 
   async function applyZoom(level: number) {
     zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
@@ -216,6 +219,21 @@
 
     setupNotifications();
 
+    // Stage announcements (drive the right sidebar live-stages panel)
+    unlisteners.push(
+      listen<StageAnnouncement>("stage-announced", (event) => {
+        const ann = event.payload;
+        liveStages = new Map(liveStages).set(ann.stage_id, ann);
+      }),
+    );
+    unlisteners.push(
+      listen<string>("stage-ended-remote", (event) => {
+        const next = new Map(liveStages);
+        next.delete(event.payload);
+        liveStages = next;
+      }),
+    );
+
     // Deep link handling
     unlisteners.push(
       onOpenUrl((urls) => {
@@ -264,6 +282,8 @@
       {@render children()}
     </main>
   </div>
+
+  <RightSidebar {liveStages} />
 
   <BottomNav
     {pubkey}
@@ -342,6 +362,12 @@
 
     main {
       padding-bottom: var(--space-lg);
+    }
+  }
+
+  @media (min-width: 1150px) {
+    .app-shell {
+      padding-right: var(--right-sidebar-width);
     }
   }
 </style>
