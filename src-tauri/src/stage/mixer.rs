@@ -1,6 +1,6 @@
 use super::auth::HostAuthState;
 use super::fanout::Fanout;
-use crate::audio::{FRAME_SIZE, OpusEncoder, SAMPLES_PER_FRAME};
+use crate::audio::{FRAME_SIZE, OpusEncoder, SAMPLES_PER_FRAME, TAG_NORMAL};
 
 /// Per-speaker sample buffer cap: 5 frames (~100ms). Excess oldest samples
 /// are dropped to prevent a rogue or slow speaker from causing unbounded growth.
@@ -34,14 +34,6 @@ pub enum MixerCommand {
         pubkey: String,
         pcm_tx: mpsc::Sender<Vec<f32>>,
     },
-    /// Register a per-speaker return channel for personalized mix-minus Opus output.
-    /// The mixer encodes mix-minus-self and sends raw Opus packets to this channel.
-    AddReturnChannel {
-        pubkey: String,
-        opus_tx: mpsc::Sender<Vec<u8>>,
-    },
-    /// Remove a speaker's return channel (speaker left or was demoted).
-    RemoveReturnChannel(String),
     Shutdown,
 }
 
@@ -96,24 +88,6 @@ impl MixerHandle {
             .await
             .map_err(|_| AppError::Other("mixer actor closed".into()))
     }
-
-    pub async fn add_return_channel(
-        &self,
-        pubkey: String,
-        opus_tx: mpsc::Sender<Vec<u8>>,
-    ) -> Result<(), AppError> {
-        self.cmd_tx
-            .send(MixerCommand::AddReturnChannel { pubkey, opus_tx })
-            .await
-            .map_err(|_| AppError::Other("mixer actor closed".into()))
-    }
-
-    pub async fn remove_return_channel(&self, pubkey: String) -> Result<(), AppError> {
-        self.cmd_tx
-            .send(MixerCommand::RemoveReturnChannel(pubkey))
-            .await
-            .map_err(|_| AppError::Other("mixer actor closed".into()))
-    }
 }
 
 // ---- Actor --------------------------------------------------------------
@@ -122,34 +96,53 @@ impl MixerHandle {
 ///
 /// Returns `(MixerHandle, Arc<Fanout>)`:
 /// - `MixerHandle`: add/remove speakers, query RMS levels
-/// - `Arc<Fanout>`: add QUIC-stream subscribers (from StageHandler::accept)
+/// - `Arc<Fanout>`: the listener mix fanout — add QUIC-stream subscribers for listeners/relays
 ///
-/// The actor owns the encoder, auth state, and all per-speaker buffers exclusively.
-/// Speaker recv tasks deliver decoded PCM via per-speaker `mpsc::Sender<Vec<f32>>`.
+/// `host_sfu_fanout`: the host's own voice SFU fanout — the mixer encodes the host's
+/// contribution separately and sends to this fanout each tick so connected speakers
+/// can receive the host's voice via uni-streams.
+///
+/// The actor owns the encoders, auth state, and all per-speaker buffers exclusively.
 pub fn spawn_mixer(
     signing_key: SecretKey,
+    host_sfu_fanout: Arc<Fanout>,
     cancel: CancellationToken,
 ) -> Result<(MixerHandle, Arc<Fanout>), AppError> {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let fanout = Arc::new(Fanout::new());
-    let actor_fanout = fanout.clone();
+    let listener_fanout = Arc::new(Fanout::new());
+    let actor_fanout = listener_fanout.clone();
 
-    tokio::spawn(run_mixer(cmd_rx, actor_fanout, signing_key, cancel));
+    tokio::spawn(run_mixer(
+        cmd_rx,
+        actor_fanout,
+        host_sfu_fanout,
+        signing_key,
+        cancel,
+    ));
 
-    Ok((MixerHandle { cmd_tx }, fanout))
+    Ok((MixerHandle { cmd_tx }, listener_fanout))
 }
 
 /// The mixer actor loop. Runs until `cancel` fires or all senders are dropped.
 async fn run_mixer(
     mut cmd_rx: mpsc::Receiver<MixerCommand>,
-    fanout: Arc<Fanout>,
+    listener_fanout: Arc<Fanout>,
+    host_sfu_fanout: Arc<Fanout>,
     signing_key: SecretKey,
     cancel: CancellationToken,
 ) {
-    let mut encoder = match OpusEncoder::new() {
+    let mut listener_encoder = match OpusEncoder::new() {
         Ok(e) => e,
         Err(e) => {
-            log::error!("[mixer] failed to create Opus encoder: {e}");
+            log::error!("[mixer] failed to create listener Opus encoder: {e}");
+            return;
+        }
+    };
+
+    let mut host_sfu_encoder = match OpusEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("[mixer] failed to create host SFU encoder: {e}");
             return;
         }
     };
@@ -162,11 +155,11 @@ async fn run_mixer(
     let mut speaker_channels: Vec<(String, mpsc::Receiver<Vec<f32>>)> = Vec::new();
     // Host speaker pubkey + direct PCM channel for mix-minus local playback
     let mut host_speaker: Option<(String, mpsc::Sender<Vec<f32>>)> = None;
-    // Per-remote-speaker return channels: pubkey -> (opus sender, per-speaker encoder)
-    let mut return_channels: HashMap<String, (mpsc::Sender<Vec<u8>>, OpusEncoder)> = HashMap::new();
 
-    let mut seq: u32 = 0;
-    let mut timestamp: u32 = 0;
+    let mut listener_seq: u32 = 0;
+    let mut listener_ts: u32 = 0;
+    let mut host_sfu_seq: u32 = 0;
+    let mut host_sfu_ts: u32 = 0;
     let mut frame_count: u32 = 0;
 
     // Mix tick: one Opus frame = 20ms
@@ -199,29 +192,12 @@ async fn run_mixer(
                     Some(MixerCommand::SetHostSpeaker { pubkey, pcm_tx }) => {
                         host_speaker = Some((pubkey, pcm_tx));
                     }
-                    Some(MixerCommand::AddReturnChannel { pubkey, opus_tx }) => {
-                        match OpusEncoder::new() {
-                            Ok(enc) => {
-                                return_channels.insert(pubkey, (opus_tx, enc));
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "[mixer] failed to create return encoder for {}: {e}",
-                                    short_id(&pubkey)
-                                );
-                            }
-                        }
-                    }
-                    Some(MixerCommand::RemoveReturnChannel(pubkey)) => {
-                        return_channels.remove(&pubkey);
-                    }
                     Some(MixerCommand::Shutdown) | None => break,
                 }
             }
 
             _ = mix_interval.tick() => {
                 // Drain all available PCM from each speaker's channel into their buffer.
-                // Collect disconnected channels for removal after the loop.
                 let mut dead: Vec<String> = Vec::new();
                 for (pubkey, rx) in &mut speaker_channels {
                     loop {
@@ -270,37 +246,18 @@ async fn run_mixer(
                     contributions.insert(pubkey.clone(), contrib);
                 }
 
-                // Full mix (clamped) → encode once → fanout (all listeners and relays).
+                // Full mix (clamped) → encode once → listener fanout.
                 let full_mix: Vec<f32> = total.iter().map(|s| s.clamp(-1.0, 1.0)).collect();
-                let packets = encoder.push_samples(&full_mix);
+                let packets = listener_encoder.push_samples(&full_mix);
                 for packet in &packets {
                     let (tag, wire_payload) = auth.process(packet);
-                    fanout.send_frame(seq, timestamp, tag, wire_payload);
-                    seq = seq.wrapping_add(1);
-                    timestamp = timestamp.wrapping_add(SAMPLES_PER_FRAME as u32);
+                    listener_fanout.send_frame(listener_seq, listener_ts, tag, wire_payload);
+                    listener_seq = listener_seq.wrapping_add(1);
+                    listener_ts = listener_ts.wrapping_add(SAMPLES_PER_FRAME as u32);
                     frame_count = frame_count.wrapping_add(1);
                 }
 
                 // Mix-minus for host local playback: PCM of all speakers except the host.
-                if let Some((ref host_pk, ref pcm_tx)) = host_speaker {
-                    let host_contrib = contributions
-                        .get(host_pk.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE]);
-                    let minus_host: Vec<f32> = total
-                        .iter()
-                        .zip(host_contrib.iter())
-                        .map(|(t, c)| (t - c).clamp(-1.0, 1.0))
-                        .collect();
-                    // Non-blocking: drop frame if consumer is slow rather than stall the mix tick.
-                    let _ = pcm_tx.try_send(minus_host);
-                }
-
-                // Per-speaker return stream: host-voice-only.
-                //
-                // Each promoted speaker receives the host's mic contribution as their
-                // return stream. All other speaker voices reach them via direct mesh
-                // connections, eliminating double-playback artifacts.
                 let host_contrib = if let Some((ref host_pk, _)) = host_speaker {
                     contributions
                         .get(host_pk.as_str())
@@ -309,22 +266,26 @@ async fn run_mixer(
                 } else {
                     vec![0.0; FRAME_SIZE]
                 };
+
+                if let Some((_, ref pcm_tx)) = host_speaker {
+                    let minus_host: Vec<f32> = total
+                        .iter()
+                        .zip(host_contrib.iter())
+                        .map(|(t, c)| (t - c).clamp(-1.0, 1.0))
+                        .collect();
+                    let _ = pcm_tx.try_send(minus_host);
+                }
+
+                // Host SFU stream: encode host's own contribution and send to
+                // all connected speakers via the host_sfu_fanout.
                 let host_only: Vec<f32> = host_contrib
                     .iter()
                     .map(|s| s.clamp(-1.0, 1.0))
                     .collect();
-
-                let mut dead_returns: Vec<String> = Vec::new();
-                for (pubkey, (opus_tx, ret_encoder)) in return_channels.iter_mut() {
-                    for packet in ret_encoder.push_samples(&host_only) {
-                        if opus_tx.try_send(packet).is_err() {
-                            dead_returns.push(pubkey.clone());
-                            break;
-                        }
-                    }
-                }
-                for pk in dead_returns {
-                    return_channels.remove(&pk);
+                for packet in host_sfu_encoder.push_samples(&host_only) {
+                    host_sfu_fanout.send_frame(host_sfu_seq, host_sfu_ts, TAG_NORMAL, packet);
+                    host_sfu_seq = host_sfu_seq.wrapping_add(1);
+                    host_sfu_ts = host_sfu_ts.wrapping_add(SAMPLES_PER_FRAME as u32);
                 }
             }
         }

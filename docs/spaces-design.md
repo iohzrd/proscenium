@@ -58,30 +58,21 @@ pattern as `DmHandler`, `PeerHandler`, and `CallHandler`.
 
 | Role | Publishes audio | Receives audio | Mixes + forwards | Controls room |
 |------|:-:|:-:|:-:|:-:|
-| **Host** | Yes | Yes | Yes (primary mixer) | Yes (full control) |
-| **Co-host** | Yes | Yes | Yes (backup mixer) | Partial (mute, promote, demote) |
+| **Host** | Yes | Yes | Yes (primary mixer + SFU) | Yes (full control) |
+| **Co-host** | Yes | Yes | No | Partial (mute, promote, demote) |
 | **Speaker** | Yes | Yes | No | No (can self-mute, leave) |
 | **Relay** | No | Yes | Forwards only | No (can leave, reverts to listener) |
 | **Listener** | No | Yes | No | No (can raise hand, volunteer as relay, leave) |
 
 The **host** is the user who creates the Stage. There is exactly one host.
-The host is always a speaker (participates in the speaker mesh) and runs
-the primary mixer. The host has full control: promote, demote, mute,
-assign relays, assign co-hosts, end the Stage. If the host leaves, the
-Stage ends (unless a co-host is present -- see below).
+The host runs the primary mixer and the SFU hub. The host has full control:
+promote, demote, mute, assign relays, assign co-hosts, end the Stage. If
+the host leaves, the Stage ends.
 
-A **co-host** is a speaker that the host has delegated mixer-relay
-responsibilities to. Co-hosts receive all individual speaker streams via
-the mesh (like any speaker), but additionally run their own mixer and
-serve a mixed stream to assigned listeners via a `Fanout`. This provides:
-- **Redundancy**: if the host's connection degrades, listeners on co-host
-  sources are unaffected
-- **Load distribution**: fan-out is spread across host + co-hosts
-- **Failover**: if the host drops, a co-host can keep the Stage alive
-  (future: automatic host transfer to a co-host)
-
-Co-hosts also have partial room control (mute speakers, promote/demote
-listeners) so they can moderate if the host is busy or unreachable.
+A **co-host** is a participant with partial room control. Co-hosts receive
+speaker audio via the host SFU (like any other speaker). They can mute
+speakers, promote/demote listeners, kick and ban — but they do not run an
+independent mixer. Co-hosts are useful for moderation in large rooms.
 
 A **relay** is a listener that has volunteered (or been asked) to forward
 audio streams to other listeners. Relays receive Opus frames from speakers
@@ -107,61 +98,64 @@ post, DM, or QR code).
 
 ## 4. Architecture
 
-### 4.1 Topology: Host-Mixed Single Stream
+### 4.1 Topology: Host-SFU + Mixed Single Stream
 
-The Stage uses a **split topology**: speakers exchange individual audio
-streams in a small mesh for conversation quality, while the host mixes
-all speaker audio into a **single Opus stream** that listeners and relays
-subscribe to.
+The Stage uses a **split topology**: speakers each hold one QUIC
+connection to the host, which acts as an SFU for speaker-to-speaker
+audio and a mixer for the listener stream.
 
 ```
-Speaker mesh (small, S*(S-1) connections):
+SFU model (each speaker has exactly 1 connection to host):
 
-  [Speaker A] <--individual streams--> [Co-host B]
-       \                                   /
-        \                                 /
-         +-----> [Host] <---------------+
-                   |                    |
-            primary mixer         co-host mixer
-              Fanout                Fanout
-               |                    |
-         +-----+-----+       +-----+-----+
-         |     |     |       |     |     |
-       [R1]  [L1]  [L2]   [L5]  [L6]  [L7]
-       /|\
-    [L3][L4]
+  [Speaker A] ---QUIC---> [Host]
+  [Speaker B] ---QUIC---> [Host]
 
-Host and co-hosts each independently mix all speaker streams and serve
-their own mixed stream. Listeners are assigned to one source by the
-topology manager. If the host drops, co-host sources keep working.
+  Host SfuHub:
+    Fanout[A] ---uni-stream---> conn B (Speaker B hears Speaker A)
+    Fanout[A] ---uni-stream---> conn C (Speaker C hears Speaker A)
+    Fanout[B] ---uni-stream---> conn A (Speaker A hears Speaker B)
+    Fanout[host] ---uni-stream---> conn A (Speaker A hears Host)
+    Fanout[host] ---uni-stream---> conn B (Speaker B hears Host)
+
+  Host mixer:
+    decode all speaker streams -> mix PCM -> encode -> listener Fanout
+                                                              |
+                                                   +----+----+----+
+                                                   |    |    |    |
+                                                 [R1] [L1] [L2] [server relay]
+                                                 /|\
+                                              [L3][L4]
 ```
 
 **Two audio paths:**
 
-1. **Speaker mesh** -- each speaker connects to every other speaker on
-   STAGE_ALPN and exchanges individual audio streams (bidirectional, or
-   one uni stream per direction). Speakers hear each other's audio
-   individually and can adjust relative volumes. This is a small mesh
-   (e.g., 8 speakers = 56 connections, trivial).
+1. **Speaker SFU** -- each speaker opens one QUIC connection to the host.
+   The host's `SfuHub` maintains a per-speaker `Fanout` and forwards each
+   speaker's raw Opus frames to all other speakers via uni-streams opened
+   on their connection. Speakers never connect to each other directly.
+   Host voice is encoded separately by the mixer and distributed to all
+   speakers via a dedicated `host_sfu_fanout`.
 
-2. **Mixed stream** -- the host receives all speaker audio, decodes each
-   stream, mixes the PCM samples together, re-encodes as a single Opus
-   stream, and serves it through a `Fanout`. Listeners, relays, server
-   relays, and web clients all subscribe to this one mixed stream.
+2. **Mixed stream** -- the host decodes all speaker streams, mixes the
+   PCM samples, re-encodes as a single Opus stream, and serves it through
+   a `Fanout`. Listeners, relays, server relays, and web clients all
+   subscribe to this one mixed stream.
 
 **Benefits:**
 - Listeners open **1 connection** instead of S (one per speaker)
 - Listeners need **1 decoder** instead of S, no client-side mixing
 - Relays maintain **1 fanout** instead of S
 - Web clients open **1 WebSocket** instead of S
+- Speakers open **1 connection** (to host) instead of S-1 (to every peer)
 - Topology management is drastically simpler (one stream to distribute)
 - Bandwidth per listener: 32 kbps (fixed, regardless of speaker count)
+- No mesh signaling needed; no peer NodeId exchange on promotion
 
 **Tradeoff:**
-- The host does extra work: decode S-1 speaker streams + mix + re-encode
+- The host does extra work: SFU forward + decode S streams + mix + re-encode
 - For ~8 speakers at 48kHz mono Opus, this is negligible CPU
-- The host is a single point of failure for the mix (if the host
-  disconnects, the mixed stream stops and the Stage ends anyway)
+- The host is a single point of failure (if the host disconnects, the
+  Stage ends)
 
 **The relay tree distributes the single mixed stream:**
 
@@ -209,10 +203,9 @@ Each source has its own **capacity** -- the max subscribers it can serve:
 
 When a new listener joins, the host decides where to place them:
 1. If a server relay has capacity, assign there (best bandwidth/uptime).
-2. Else if a co-host has capacity, assign there (independent mixer, high quality).
-3. Else if the host has capacity, assign directly to host.
-4. Else if a volunteer relay has capacity, assign there.
-5. If nothing has capacity, ask a willing listener to become a relay.
+2. Else if the host has capacity, assign directly to host.
+3. Else if a volunteer relay has capacity, assign there.
+4. If nothing has capacity, ask a willing listener to become a relay.
 
 ### 4.2 Control Plane (Gossip)
 
@@ -232,7 +225,7 @@ pub enum StageControl {
         title: String,
         host_pubkey: String,
         version: u64,                     // monotonic counter, prevents split-brain
-        co_hosts: Vec<String>,            // pubkeys of co-hosts (also speakers + mixers)
+        co_hosts: Vec<String>,            // pubkeys of co-hosts (also speakers, with moderation rights)
         speakers: Vec<String>,            // pubkeys of speakers (not including co-hosts)
         relays: Vec<String>,              // pubkeys of active relays
         banned: Vec<String>,              // pubkeys banned from this Stage
@@ -287,7 +280,7 @@ pub enum StageControl {
     },
 
     /// Host designates a speaker as co-host (signed by host).
-    /// The co-host should start running a mixer and serving listeners.
+    /// The co-host gains partial moderation rights (mute, promote, demote, kick, ban).
     AssignCoHost {
         pubkey: String,
         signature: String,
@@ -402,29 +395,34 @@ from the latest `RoomState`.
 
 ### 4.3 Media Plane (STAGE_ALPN)
 
-Audio transport uses plain QUIC **unidirectional streams** on `STAGE_ALPN`.
+Audio transport uses plain QUIC streams on `STAGE_ALPN`.
 This follows the same ProtocolHandler pattern as the rest of the codebase.
 
 There are two distinct audio paths:
 
-**Path 1: Speaker mesh (individual streams)**
+**Path 1: Speaker SFU (individual streams via host)**
 
-Speakers exchange audio directly with each other for conversation quality.
-Each speaker pair opens a connection with one uni stream per direction:
+Each speaker holds exactly one QUIC connection to the host. The host's
+`SfuHub` forwards speaker audio to all other speakers:
 
-1. Speaker A connects to Speaker B: `endpoint.connect(b_addr, STAGE_ALPN)`
-2. Speaker B accepts, opens a uni stream back to A
-3. Both sides send their individual Opus-encoded audio
-4. Each speaker decodes other speakers' streams individually
-
-This is a small mesh (S speakers = S*(S-1) uni streams). For 8 speakers,
-that's 56 streams -- trivial.
+1. Speaker connects to host: `endpoint.connect(host_node_id, STAGE_ALPN)`
+2. Speaker opens a bi-stream, sends `CONN_TYPE_SPEAKER` byte + mic Opus on
+   the send side
+3. Host `SfuHub` atomically registers the connection; for each existing speaker,
+   opens a new uni-stream on that speaker's connection subscribed to the new
+   speaker's `Fanout`, and opens a new uni-stream on the new speaker's
+   connection subscribed to each existing speaker's `Fanout`
+4. Host opens a uni-stream on the new speaker's connection subscribed to
+   `host_sfu_fanout` (so the speaker hears the host's voice)
+5. Speaker accepts N uni-streams from the host (one per other active speaker
+   + one for host voice), decoding each into the `SpeakerMixer`
+6. Speakers never connect to each other directly
 
 **Path 2: Host-mixed stream (listeners and relays)**
 
 The host produces a single mixed stream for all non-speaker participants:
 
-1. Host receives individual streams from all speakers (part of the mesh)
+1. Host receives individual streams from all speakers (via SFU QUIC connections)
 2. Host decodes each speaker's Opus stream to PCM (f32 samples)
 3. Host mixes all decoded samples (additive mixing + clipping)
 4. Host re-encodes the mix as a single Opus stream
@@ -595,42 +593,73 @@ Reuses existing infrastructure from `call/`. Five distinct pipelines:
 
 **Pipeline 1: Speaker capture + send (all speakers including host):**
 ```
-Microphone -> AudioCapture (cpal) -> AEC capture -> OpusEncoder -> speaker mesh uni streams
+Microphone -> AudioCapture (cpal) -> AEC capture -> OpusEncoder -> QUIC bi-stream send side to host
 ```
-Each speaker encodes their own audio and sends it to every other speaker
-via the speaker mesh. Same as the current 1:1 call send loop, but to
-S-1 peers instead of 1. AEC processes the capture before encoding.
+Each speaker encodes their own audio and sends it on the single QUIC
+connection to the host. Same as the current 1:1 call send loop. AEC
+processes the capture before encoding. On reconnect, a fresh `AudioCapture`
+and AEC thread are created for the new attempt; the `SpeakerMixer` persists
+across reconnects and accepts a new `far_end_tx` per attempt.
 
-**Pipeline 2: Speaker receive + local mix + playback (non-host speakers):**
+**Pipeline 2: Speaker receive + mix + playback (non-host speakers):**
 ```
-Mesh stream from Speaker A -> OpusDecoder A -> \
-Mesh stream from Speaker B -> OpusDecoder B ->  } local mix (sum + clamp)
-Mesh stream from Host      -> OpusDecoder H -> /        |
-                                                  AEC render (reference)
-                                                        |
-                                                  playback_buf -> AudioPlayback (cpal)
+SFU uni-stream (Speaker A) -> OpusDecoder A -> mpsc::Sender -> \
+SFU uni-stream (Speaker B) -> OpusDecoder B -> mpsc::Sender ->  } SpeakerMixer (20ms tick)
+SFU uni-stream (Host voice) -> OpusDecoder H -> mpsc::Sender -> /       |
+                                                                   sum + clamp
+                                                                         |
+                                                                   far_end_tx (AEC reference)
+                                                                         |
+                                                                   AudioPlayback (cpal)
 ```
-Non-host speakers receive individual streams from every other speaker
-(including the host) via the mesh. They decode each stream, mix locally
-(additive: sum f32 samples, clamp to -1.0..1.0), feed the mix to AEC
-as the render reference, and play back. This gives speakers per-peer
-audio (they could adjust individual volumes in the future).
+Non-host speakers accept N uni-streams from the host (one per other active
+speaker + one for host voice). Each `speaker_stream_recv` task decodes
+frames and sends PCM to the `SpeakerMixer` actor via a per-stream channel.
+The `SpeakerMixer` runs at 20ms intervals: sums all per-stream buffers
+sample-wise (clamp to -1.0..1.0), drives `AudioPlayback`, and tees each
+mixed chunk to `far_end_tx` for the AEC far-end reference.
 
-**Pipeline 3: Host mixing + broadcast (host and co-hosts):**
+**SpeakerMixer actor:**
+```rust
+enum SpeakerMixerCmd {
+    /// Register a new SFU stream's PCM channel.
+    AddStream { id: u32, rx: mpsc::Receiver<Vec<f32>> },
+    /// Deregister a stream that has ended.
+    RemoveStream(u32),
+    /// Wire (or rewire) the AEC far-end channel — called once per reconnect attempt.
+    SetFarEndTx(mpsc::Sender<Vec<f32>>),
+}
 ```
-Speaker A recv stream -> OpusDecoder A -> \
-Speaker B recv stream -> OpusDecoder B ->  } mix (sum + clamp) -> OpusEncoder -> Fanout
-Speaker C recv stream -> OpusDecoder C -> /        |                               |
-                                             AEC render               broadcast channel (50 frames)
-                                                   |                     /    |    \
-                                             playback_buf          [sub task] [sub task] [sub task]
-                                                   |                stream A   stream B   stream C
-                                          AudioPlayback (cpal)     (listener) (relay R1) (server relay)
+The actor persists for the speaker's entire promotion period. It survives
+reconnects: each `run_speaker_once` attempt calls `set_far_end_tx` with a
+fresh `far_end_tx` before starting capture.
+
+**Pipeline 3: Host mixing + broadcast (host only):**
 ```
-The host (and co-hosts) decode all incoming speaker streams, mix the PCM
-samples, and do two things with the mix: (1) re-encode as a single Opus
-stream and feed into the `Fanout` for listeners/relays, and (2) feed to
-their own AEC render + playback buffer so they hear the other speakers.
+Speaker A recv stream -> OpusDecoder A -> mpsc::Sender -> \
+Speaker B recv stream -> OpusDecoder B -> mpsc::Sender ->  } HostMixer (20ms tick)
+Speaker C recv stream -> OpusDecoder C -> mpsc::Sender -> /        |
+                                                            mix (sum + clamp)
+                                                              /             \
+                                          listener Fanout (encoded)   host_sfu_fanout (encoded separately)
+                                                    |                           |
+                                          broadcast (50 frames)         broadcast (50 frames)
+                                           / | \                          / | \
+                                       [sub][sub][sub]               [sub][sub][sub]
+                                       (listeners, relays)      (Speaker A, B, C via uni-streams)
+                                              |
+                                         mix-minus PCM (total - host_contrib)
+                                              |
+                                          AEC render
+                                              |
+                                         AudioPlayback (cpal)
+```
+The host mixer decodes all speaker streams, sums PCM, and each 20ms tick:
+(1) encodes the full mix → listener `Fanout` for listeners/relays;
+(2) encodes the host's own contribution → `host_sfu_fanout` for connected speakers;
+(3) computes mix-minus (full mix minus host contribution) → host's AEC
+render reference and local playback. The host hears all other speakers but
+not their own voice echoed back.
 
 **Pipeline 4: Listener playback (listeners, also relays for their own audio):**
 ```
@@ -702,13 +731,10 @@ in parallel from the same upstream.
   threshold (e.g., level > 0.01) are included. This is how listeners
   know who is currently talking.
 
-> **Implementation note (Tokio actor pattern):** `HostMixer` in `mixer.rs` should be
-> implemented as a Tokio actor. The mixer owns mutable per-speaker decoder state and
-> drives a 20ms encode loop via `tokio::time::interval`. Multiple concurrent speaker
-> recv tasks need to deliver decoded PCM to the mixer simultaneously. Sharing the mixer
-> under `Arc<Mutex<>>` would cause recv tasks to block each other on every decoded frame
-> (50 times per second per speaker) and would couple the 20ms mix interval to lock
-> availability — a recipe for audio glitches. Instead, each speaker recv task sends
+> **Implementation note (Tokio actor pattern):** `HostMixer` in `mixer.rs` is a
+> Tokio actor. The mixer owns mutable per-speaker decoder state and drives a 20ms
+> encode loop via `tokio::time::interval`. Multiple concurrent speaker recv tasks need
+> to deliver decoded PCM to the mixer simultaneously. Each speaker recv task sends
 > decoded PCM over a per-speaker `mpsc::Sender<Vec<f32>>` to the mixer actor. Commands:
 >
 > ```rust
@@ -717,14 +743,19 @@ in parallel from the same upstream.
 >     AddSpeaker { pubkey: String, pcm_rx: mpsc::Receiver<Vec<f32>> },
 >     /// Speaker left or was demoted — remove their input from the mix.
 >     RemoveSpeaker(String),
->     Shutdown,
+>     /// Query current per-speaker RMS levels (for SpeakerActivity gossip).
+>     GetLevels { reply: oneshot::Sender<HashMap<String, f32>> },
+>     /// Register the host as a speaker for mix-minus local playback.
+>     SetHostSpeaker { pubkey: String, pcm_tx: mpsc::Sender<Vec<f32>> },
 > }
 > ```
 >
-> The actor loop selects over the `tokio::time::interval` tick (mix + encode + fanout
-> send) and the `MixerCommand` receiver, with no mutex anywhere on the hot path.
-> An `mpsc::Sender<MixerCommand>` handle is held by the `StageActor` and passed to
-> speaker recv tasks when they are created.
+> The `spawn_mixer` function takes `host_sfu_fanout: Arc<Fanout>` and encodes the
+> host's contribution separately each tick, sending it to `host_sfu_fanout` so
+> all connected speakers receive the host's voice via uni-streams. Mix-minus
+> (total − host contribution) goes to the host's local playback via `SetHostSpeaker`.
+> The actor loop selects over the 20ms tick and the command receiver, with no mutex
+> on the hot path.
 
 ### 4.7 Connection Management
 
@@ -733,22 +764,41 @@ in parallel from the same upstream.
 When a node connects on `STAGE_ALPN`, the handler's `accept` fires. The
 handler checks the current node's role to determine behavior:
 
-- **If host**: check if remote is a speaker (add to speaker mesh) or a
-  listener/relay (add to mixed stream `Fanout`)
-- **If speaker**: check if remote is another speaker (exchange individual
-  streams) -- speakers don't serve listeners directly
+- **If host**: read `CONN_TYPE` byte — if `CONN_TYPE_SPEAKER`, wire into
+  `SfuHub` + `HostMixer`; if `CONN_TYPE_LISTENER`, add to mixed stream `Fanout`
 - **If relay**: add the connection to the relay's mixed stream `Fanout`
-- **If listener**: reject (listeners don't accept audio connections)
+- **If speaker or listener**: reject (they do not accept audio connections)
 
-The handler identifies the remote peer via `conn.remote_id()` and resolves
-to a pubkey. It rejects connections from banned pubkeys and checks that
-the peer is a known participant (seen in gossip) before accepting.
+The handler identifies the remote peer via `conn.remote_id()`. It rejects
+connections from banned transport NodeIds (`banned_node_ids` HashSet) and
+checks that the peer is a known participant before accepting.
 
-**Speaker mesh connections:**
+**Speaker SFU connections (host side):**
 
-When a speaker joins, they connect to every other speaker (including the
-host) on STAGE_ALPN. Each pair exchanges individual audio via uni streams.
-The host uses these individual streams as input for the mixer.
+When a speaker connects, the host:
+1. Adds them to the mixer (`pcm_rx` → mixer PCM buffer)
+2. Creates `sfu_fanout = Arc::new(Fanout::new())`
+3. Locks `sfu_hub`, snapshots existing fanouts+connections, inserts new entry
+4. For each existing speaker: opens a uni-stream on their connection
+   subscribed to the new speaker's fanout, and opens a uni-stream on the
+   new connection subscribed to their fanout
+5. Opens a uni-stream on the new connection subscribed to `host_sfu_fanout`
+6. Spawns `speaker_recv_sfu_loop` which reads Opus from the speaker's QUIC
+   recv stream, forwards raw bytes via `sfu_fanout.send_frame()`, decodes
+   PCM into `pcm_tx` for the mixer, and on exit removes from `SfuHub`
+
+**Speaker SFU connections (speaker side):**
+
+The speaker runs `start_speaker_pipeline` which wraps `run_speaker_once`
+in an exponential backoff reconnect loop (2s → 30s cap). Each attempt:
+1. Creates a fresh `(far_end_tx, far_end_rx)` pair
+2. Calls `speaker_mixer.set_far_end_tx(far_end_tx)` to wire AEC reference
+3. Spawns an AEC std thread + `AudioCapture` feeding the AEC capture path
+4. Connects to `host_node_id` on STAGE_ALPN
+5. Sends `CONN_TYPE_SPEAKER` on the bi-stream send side
+6. Spawns `speaker_mic_send` to encode mic PCM and write to the send stream
+7. Loops `conn.accept_uni()`: each accepted uni-stream spawns
+   `speaker_stream_recv` which decodes Opus and sends PCM to `SpeakerMixer`
 
 **Listener connections:**
 
@@ -785,12 +835,12 @@ distribute (not S), the topology is simpler:
 
 on_participant_join(pubkey, endpoint_id):
     if is_speaker(pubkey):
-        // Speakers join the mesh, connect to host directly
-        // No topology assignment needed
+        // Speakers connect to host directly via SFU
+        // No topology assignment needed for the mixed stream
         return
 
     // Listener: assign to a mixed stream source
-    // Priority: server relays > co-hosts > host > volunteer relays
+    // Priority: server relays > host > volunteer relays
     source = sources.iter()
         .find(|s| s.downstream_count < s.capacity)
 
@@ -813,8 +863,9 @@ on_relay_disconnect(relay_pubkey):
     broadcast updated RoomState
 
 on_speaker_added(speaker_pubkey):
-    // New speaker joins the mesh and sends audio to host
-    // Host automatically includes them in the mix
+    // New speaker connects to host via SFU QUIC connection
+    // Host SfuHub wires their Fanout to all existing speaker connections
+    // Host mixer adds the new speaker's PCM channel
     // No topology change needed for listeners/relays
     // (they already receive the mixed stream)
 ```
@@ -1101,67 +1152,67 @@ into 20ms for Opus encoding.
 
 | Role | What they hear (reference) | AEC removes |
 |------|---------------------------|-------------|
-| Host | Local mix of all speakers (own mixer output) | Echo of the mix from host's mic |
-| Co-host | Local mix of all speakers (own mixer output) | Echo of the mix from co-host's mic |
-| Speaker | Local mix of individual mesh streams | Echo of the local mix from speaker's mic |
+| Host | Mix-minus (all speakers except host) via `run_host_playback` | Echo of the mix from host's mic |
+| Co-host | SFU streams from all other speakers via `SpeakerMixer` | Echo of SpeakerMixer output from co-host's mic |
+| Speaker | SFU streams from all other speakers via `SpeakerMixer` | Echo of SpeakerMixer output from speaker's mic |
 | Listener | Single mixed stream (playback only) | N/A -- not capturing audio |
 
 This works naturally: whatever goes to the speakers is the reference
-signal. No special handling per role -- just feed playback audio to
-`process_render_frame()` and mic audio to `process_capture_frame()`.
+signal. For speakers, the `SpeakerMixer` tees each mixed chunk to
+`far_end_tx` before pushing to `AudioPlayback`. For the host, the
+mix-minus PCM is teed to `far_end_tx` from the host playback loop.
 
 **Integration into shared `audio/` module:**
 
 ```rust
-// audio/aec.rs (new file in shared audio module)
-use sonora_aec3::{Aec3, Aec3Config};  // or aec3_rs::VoipAec3
+// audio/aec.rs — uses aec3-rs (VoipAec3 builder API)
+use aec3::voip::VoipAec3;
 
 pub struct EchoCanceller {
-    processor: Aec3,
-    /// Buffer to accumulate samples into 10ms chunks.
+    inner: VoipAec3,
     render_buf: Vec<f32>,
     capture_buf: Vec<f32>,
 }
 
 impl EchoCanceller {
-    pub fn new(sample_rate: u32) -> Self {
-        let config = Aec3Config::default();
-        Self {
-            processor: Aec3::new(sample_rate, config),
-            render_buf: Vec::with_capacity(480),
-            capture_buf: Vec::with_capacity(480),
-        }
+    pub fn new() -> Result<Self, ...> {
+        let inner = VoipAec3::builder(48_000, 1, 1).build()?;
+        Ok(Self { inner, render_buf: Vec::new(), capture_buf: Vec::new() })
     }
 
-    /// Feed playback audio as reference. Call from playback path.
-    pub fn process_render(&mut self, samples: &[f32]) {
+    /// Feed playback (far-end reference) samples. Call before process_capture.
+    pub fn render(&mut self, samples: &[f32]) {
         self.render_buf.extend_from_slice(samples);
         while self.render_buf.len() >= 480 {
-            let chunk: Vec<f32> = self.render_buf.drain(..480).collect();
-            self.processor.handle_render_frame(&chunk);
+            let frame: Vec<f32> = self.render_buf.drain(..480).collect();
+            let _ = self.inner.handle_render_frame(&frame);
         }
     }
 
-    /// Process captured mic audio, removing echo. Call from capture path.
+    /// Process mic samples, returning echo-cancelled samples.
     pub fn process_capture(&mut self, samples: &[f32]) -> Vec<f32> {
         self.capture_buf.extend_from_slice(samples);
-        let mut output = Vec::new();
+        let mut out = Vec::new();
         while self.capture_buf.len() >= 480 {
-            let chunk: Vec<f32> = self.capture_buf.drain(..480).collect();
-            let mut out = vec![0.0f32; 480];
-            self.processor.process_capture_frame(&chunk, false, &mut out);
-            output.extend_from_slice(&out);
+            let frame: Vec<f32> = self.capture_buf.drain(..480).collect();
+            let mut cleaned = vec![0.0f32; 480];
+            match self.inner.process_capture_frame(&frame, false, &mut cleaned) {
+                Ok(_) => out.extend_from_slice(&cleaned),
+                Err(_) => out.extend_from_slice(&frame),
+            }
         }
-        output
+        out
     }
 }
 ```
 
-The `EchoCanceller` is shared between capture and playback paths via
-`Arc<Mutex<EchoCanceller>>`. In the capture callback, mic samples are
-processed through `process_capture()` before being sent to the encoder.
-In the playback callback (or recv loop), decoded samples are fed through
-`process_render()` before being written to the output device.
+The `EchoCanceller` is owned exclusively by a dedicated std thread (not
+shared). The capture path (AEC std thread) owns the `EchoCanceller` and
+receives raw mic samples from `AudioCapture` via an mpsc channel. The
+playback path feeds decoded samples to the AEC via a second mpsc channel
+(`far_end_tx`). The AEC thread calls `render()` with far-end samples, then
+`process_capture()` with mic samples, and forwards cleaned samples to the
+Opus encoder via a third mpsc channel. No mutex on the hot path.
 
 **User setting:**
 
@@ -1220,20 +1271,20 @@ hitting the host simultaneously, each listener adds **random jitter of
 topology manager will distribute them across available sources as they
 arrive.
 
-#### Scenario 2: Speaker loses connection to mesh peer
+#### Scenario 2: Speaker loses connection to host
 
-**Cause**: Same as above, but a speaker-to-speaker or speaker-to-host
-connection drops.
+**Cause**: Speaker's QUIC connection to the host drops (network blip,
+mobile switch, host restart).
 
-**Policy**: Per-peer reconnect.
-1. Each mesh connection is independent -- losing one doesn't affect others
-2. Retry the dropped peer: 200ms / 500ms / 1s / 2s / 4s (5 attempts)
-3. **If the lost peer is the host**: escalate -- this means the host
-   can't mix this speaker's audio. Try 10 attempts over 15s.
-4. Host's mixer **fades the disconnected speaker to silence over 100ms**
-   (avoids audible pop/click from hard cut)
-5. When the speaker reconnects, the host fades them back in
-6. Frontend: speaker grid shows the peer as "reconnecting" (dimmed avatar)
+**Policy**: Exponential backoff reconnect.
+1. `run_speaker_once` returns when the connection drops
+2. `start_speaker_pipeline` waits backoff (initial 2s, doubles to 30s cap)
+3. Each retry creates a fresh AEC + capture, calls `set_far_end_tx` on the
+   persistent `SpeakerMixer`, reconnects to `host_node_id`
+4. Host's mixer removes the disconnected speaker immediately
+5. When the speaker reconnects, the host's `SfuHub` opens fresh uni-streams
+   to all other speakers and the speaker begins receiving audio again
+6. Frontend: speaker grid shows the speaker as "reconnecting" (dimmed avatar)
 
 #### Scenario 3: Relay loses upstream (from host or co-host)
 
@@ -1262,19 +1313,19 @@ connection drops.
    15s). After **45s without a heartbeat**, enter "host unreachable" state.
 2. **Co-host present**: Co-host detects missing heartbeats and begins
    broadcasting `RoomState` with incremented version and a
-   `host_status: "unreachable"` flag. Topology continues to function.
-   Listeners on the host's direct fanout lose audio and reconnect to
-   co-host sources via updated topology. Speaker mesh connections to
-   the host drop -- co-hosts still have direct mesh connections to
-   other speakers, so their mix continues (minus the host's own audio).
+   `host_status: "unreachable"` flag. Note: in the SFU model, co-hosts
+   do not run an independent mixer. When the host drops, the mixed stream
+   and SFU both stop. The Stage is effectively paused until the host
+   returns. Topology continues to be broadcast by the co-host so
+   participants stay informed.
 3. **No co-host**: After 60s without host heartbeat, all participants
    show "Host disconnected." Stage is considered ended. Participants
    linger for an additional 60s grace period in case the host returns.
 4. **Host returns**: Host resumes broadcasting `RoomState` with a new
    (higher) version. Co-host sees the host's `RoomState` and stops its
-   own broadcasts. Speakers reconnect to the host mesh. Host rebuilds
-   mixer state from incoming speaker streams. Topology is reasserted
-   by the host.
+   own broadcasts. Speakers' `start_speaker_pipeline` reconnect loops
+   reconnect to the host. Host rebuilds mixer and SFU state from
+   incoming speaker connections. Topology is reasserted by the host.
 
 #### Scenario 5: Mobile network change (wifi <-> cellular)
 
@@ -1318,8 +1369,8 @@ appropriate UI for each.
 | Scenario | Detection | First retry | Fallback | Grace period |
 |---|---|---|---|---|
 | Listener loses source | 500ms no-frame | 200ms (parallel with RoomState check) | Alt source from topology, then host direct | 15s before "Disconnected" |
-| Speaker loses mesh peer | 500ms no-frame | 200ms | Keep trying 15s, mixer fades to silence | 15s (30s if lost peer is host) |
-| Relay loses upstream | 500ms no-frame | 200ms | Try co-host, downstream auto-recovers | 10s before degraded flag |
+| Speaker loses host connection | connection drop | 2s (exponential backoff to 30s) | Keep retrying indefinitely until cancel | N/A — SpeakerMixer persists |
+| Relay loses upstream | 500ms no-frame | 200ms | Try co-host if available, downstream auto-recovers | 10s before degraded flag |
 | Host drops | 45s no heartbeat | Co-host takes over | Stage ends after 60s if no co-host | 120s total grace |
 | Network change | OS notification | Immediate liveness check | Standard per-role reconnect | N/A |
 | Gossip lost, audio ok | 45s no RoomState | Reconnect gossip to bootstrap | Warning banner | N/A |
@@ -1358,8 +1409,10 @@ src-tauri/src/stage/                  (new)
                        non-blocking and lock-free; owned exclusively by whichever
                        actor drives it (HostMixer or RelayActor)
     mixer.rs        -- HostMixer (Tokio actor): owns all OpusDecoders, the encode
-                       OpusEncoder, Fanout, HostAuthState, RMS accumulators;
-                       MixerCommand enum (AddSpeaker, RemoveSpeaker, Shutdown);
+                       OpusEncoder, listener Fanout, host_sfu_fanout, HostAuthState,
+                       RMS accumulators;
+                       MixerCommand enum (AddSpeaker, RemoveSpeaker, GetLevels,
+                       SetHostSpeaker);
                        MixerHandle (mpsc::Sender<MixerCommand>) held by StageActor
     relay.rs        -- RelayActor (Tokio actor): owns Fanout, upstream
                        CancellationToken, subscriber token list;
@@ -1410,11 +1463,20 @@ Internal to src-tauri/src/stage/ (not shared):
     AudioFrame              -- seq + timestamp + payload
 
     -- mixer.rs (Tokio actor)
-    MixerActor              -- actor task; owns all OpusDecoders, OpusEncoder,
-                               Fanout, HostAuthState, RMS state
+    MixerActor              -- actor task; owns all OpusDecoders, listener OpusEncoder,
+                               host_sfu OpusEncoder, listener Fanout, host_sfu_fanout,
+                               HostAuthState, RMS state
     MixerHandle             -- mpsc::Sender<MixerCommand>; held by StageActor
-    MixerCommand            -- AddSpeaker { pubkey, pcm_rx }, RemoveSpeaker, Shutdown
+    MixerCommand            -- AddSpeaker { pubkey, pcm_rx }, RemoveSpeaker,
+                               GetLevels { reply }, SetHostSpeaker { pubkey, pcm_tx }
     HostAuthState           -- hash chain + signing state (owned by MixerActor)
+
+    -- mod.rs (SpeakerMixer actor — speaker-side only)
+    SpeakerMixerCmd         -- AddStream { id, rx }, RemoveStream(u32), SetFarEndTx(Sender)
+    SpeakerMixerHandle      -- mpsc::Sender<SpeakerMixerCmd>; held by ActiveStage
+    SfuHub                  -- host-only; fanouts: HashMap<String, Arc<Fanout>>;
+                               connections: HashMap<String, Connection>;
+                               wrapped in Arc<tokio::sync::Mutex<SfuHub>>
 
     -- relay.rs (Tokio actor)
     RelayActor              -- actor task; owns Fanout, upstream token, subscriber tokens
@@ -1516,36 +1578,34 @@ struct ActiveStage {
     title: String,
     my_role: StageRole,
     host_pubkey: String,
+    /// Stable transport NodeId of the host. Speakers always dial this directly,
+    /// even after a relay assignment overwrites `listener_upstream_id`.
+    host_node_id: String,
 
     // Participants
-    co_hosts: HashSet<String>,                     // pubkeys of co-hosts
-    speakers: HashMap<String, SpeakerState>,
-    relays: HashMap<String, RelayInfo>,
-    listeners: HashMap<String, ListenerState>,
+    participants: HashMap<String, Participant>,    // all known participants
     raised_hands: Vec<(String, u64)>,
-    banned: HashSet<String>,                       // cannot rejoin this Stage
+    banned: HashSet<String>,                       // pubkeys banned from this Stage
+    banned_node_ids: HashSet<String>,              // transport NodeIds for ban enforcement at connection time
 
-    // Audio: own capture (speakers, co-hosts, and host)
-    capture: Option<AudioCapture>,
-    encoder: Option<OpusEncoder>,
+    // Audio: host mixer (host only)
+    // Decodes all speaker streams, mixes, re-encodes as single listener stream
+    // and encodes host contribution to host_sfu_fanout for speakers.
+    mixer: Option<MixerHandle>,
+    listener_fanout: Option<Arc<Fanout>>,          // serves mixed stream to listeners/relays
+    host_sfu_fanout: Option<Arc<Fanout>>,          // serves host voice to connected speakers
+    sfu_hub: Option<Arc<tokio::sync::Mutex<SfuHub>>>,  // host-only; per-speaker fanouts + connections
 
-    // Audio: mixer (host and co-hosts only)
-    // Decodes all speaker streams, mixes, re-encodes as single stream
-    mixer: Option<HostMixer>,
-    mixed_fanout: Option<Fanout>,          // serves mixed stream to listeners/relays
-
-    // Audio: speaker mesh (speakers only, not host-specific)
-    // Individual streams to/from other speakers
-    speaker_streams: HashMap<String, CancellationToken>,
+    // Audio: speaker (when my_role == Speaker or Host)
+    speaker_mixer: Option<SpeakerMixerHandle>,     // non-host speakers only; persists across reconnects
 
     // Audio: relay mode (relay only)
     relay_state: Option<RelayState>,
 
+    // Audio: listener upstream
+    listener_upstream_id: Option<String>,          // NodeId we currently recv mixed stream from
+
     // Audio: playback
-    // Host/Co-host: hears local mix of all speakers (Pipeline 3)
-    // Speaker: hears local mix of individual mesh streams (Pipeline 2)
-    // Listener: hears single mixed stream from host/relay (Pipeline 4)
-    playback_buf: Arc<Mutex<Vec<f32>>>,
     playback: Option<AudioPlayback>,
     recv_tasks: HashMap<String, CancellationToken>,
 
@@ -1555,6 +1615,16 @@ struct ActiveStage {
     // Lifecycle
     cancel: CancellationToken,
     muted: Arc<AtomicBool>,
+}
+
+struct Participant {
+    pubkey: String,
+    role: StageRole,
+    node_id: Option<String>,                       // transport NodeId (from Presence heartbeats)
+    last_seen_ms: u64,                             // for presence expiry (45s)
+    hand_raised: bool,
+    self_muted: bool,
+    host_muted: bool,
 }
 
 struct SpeakerState {
@@ -1691,13 +1761,18 @@ Only one active Stage at a time. A user cannot be in a Stage and a
 1. Host sends `PromoteSpeaker` via gossip (signed)
 2. Promoted participant verifies host signature
 3. Disconnects from mixed stream source (was a listener)
-4. Starts audio capture + encoder
-5. Connects to every other speaker (including host) on STAGE_ALPN for
-   individual audio exchange (speaker mesh)
-6. Host's mixer automatically picks up the new speaker's stream
-7. Listeners seamlessly hear the new speaker in the mix without
-   reconnecting
-8. Broadcasts `Join { role: Speaker }` via gossip (with endpoint_id)
+4. Spawns `SpeakerMixer` actor (persists for the duration of the speaker role)
+5. Calls `start_speaker_pipeline(endpoint, host_node_id, speaker_mixer, cancel)`:
+   - Connects to `host_node_id` on STAGE_ALPN (one connection)
+   - Sends `CONN_TYPE_SPEAKER` on bi-stream send side
+   - Spawns `speaker_mic_send` to encode mic PCM + write to send stream
+   - Loops `conn.accept_uni()`: each uni-stream spawns `speaker_stream_recv`
+     which decodes Opus and sends PCM to `SpeakerMixer`
+   - On disconnect, exponential backoff reconnect
+6. Host's `SfuHub` wires up the new speaker's fanout to all existing speaker
+   connections and vice versa; host's mixer adds the new speaker
+7. Listeners seamlessly hear the new speaker in the mix without reconnecting
+8. Broadcasts `Presence { role: Speaker }` via gossip
 
 **Assign as Relay:**
 1. Host sends `AssignRelay` via gossip (signed)
@@ -1716,10 +1791,12 @@ Only one active Stage at a time. A user cannot be in a Stage and a
 
 **Demote to Listener:**
 1. Host sends `DemoteSpeaker` via gossip (signed)
-2. Demoted participant stops capture + encoder
-3. Disconnects from speaker mesh
+2. Demoted participant cancels `speaker_pipeline` cancel token (stops capture,
+   AEC, and the QUIC connection to the host)
+3. Drops `SpeakerMixer` handle (actor shuts down)
 4. Reconnects to mixed stream source (host or relay, per topology)
-5. Host's mixer automatically drops the demoted speaker's input
+5. Host's mixer automatically drops the demoted speaker's input;
+   `SfuHub` removes the speaker's fanout and connection
 6. Listeners seamlessly stop hearing them in the mix
 
 **Revoke Relay:**
@@ -1730,7 +1807,8 @@ Only one active Stage at a time. A user cannot be in a Stage and a
 
 **Leave Stage:**
 1. Broadcast `Leave` via gossip
-2. If speaker: stop capture/encoder, disconnect from speaker mesh
+2. If speaker: cancel `speaker_pipeline` cancel token (stops capture,
+   AEC, mic send, and the QUIC connection to the host); drop `SpeakerMixer`
 3. If relay: stop forwarding, drop fanout
 4. Cancel recv tasks, stop playback
 5. Unsubscribe from gossip topic
@@ -1742,33 +1820,35 @@ Only one active Stage at a time. A user cannot be in a Stage and a
 
 ## 7. Scaling Analysis
 
-### Speaker mesh (always present)
+### Speaker SFU (host upload to speakers)
 
-With S speakers, the mesh has S*(S-1) uni streams. This is always small:
+With S speakers, the host forwards S raw Opus streams to each of the S-1
+other speakers. Each stream is 32 kbps:
 
-| Speakers | Mesh connections | Total mesh bandwidth |
+| Speakers | Host SFU upload | Per-speaker download |
 |:---:|:---:|:---:|
-| 3 | 6 | 192 kbps total |
-| 5 | 20 | 640 kbps total |
-| 8 | 56 | 1.8 Mbps total |
+| 3 | 192 kbps | 64 kbps (2 streams) |
+| 5 | 640 kbps | 128 kbps (4 streams) |
+| 8 | 1.8 Mbps | 224 kbps (7 streams) |
 
-Per-speaker upload in the mesh: (S-1) * 32 kbps. For 8 speakers, that's
-224 kbps each. Trivial.
+Each speaker also uploads one stream to the host: 32 kbps upload, fixed
+regardless of speaker count. Trivial.
 
 ### Mixed stream: Direct from host (no relays)
 
 The host serves the single mixed stream to all listeners directly:
-- Host upload: L * 32 kbps (plus mesh upload to S-1 speakers)
+- Host upload: L * 32 kbps (plus SFU upload to S speakers)
 - Listener download: 32 kbps (fixed, regardless of speaker count)
 
-| Scenario | Host upload (mix) | Host upload (mesh) | Host total |
+| Scenario | Host upload (mix) | Host upload (SFU) | Host total |
 |----------|:---:|:---:|:---:|
-| 3 speakers, 20 listeners | 640 kbps | 64 kbps | 704 kbps |
-| 5 speakers, 50 listeners | 1.6 Mbps | 128 kbps | 1.7 Mbps |
-| 8 speakers, 100 listeners | 3.2 Mbps | 224 kbps | 3.4 Mbps |
+| 3 speakers, 20 listeners | 640 kbps | 192 kbps | 832 kbps |
+| 5 speakers, 50 listeners | 1.6 Mbps | 640 kbps | 2.2 Mbps |
+| 8 speakers, 100 listeners | 3.2 Mbps | 1.8 Mbps | 5.0 Mbps |
 
 Works well up to ~50 listeners. The bottleneck is the host's upload for
-the mixed stream.
+the mixed stream (same as before). The SFU overhead is proportional to
+S^2 but bounded by the small speaker count.
 
 ### Mixed stream: With relay tree
 
@@ -1834,75 +1914,60 @@ join. The frontend renders a `StageCard` in the feed with a "Join" button.
 
 ## 9. Implementation Plan
 
-### Phase 1: Extract shared audio module and types
+### Phase 1: Extract shared audio module and types [COMPLETE]
 1. Extract `call/audio.rs` -> `audio/capture.rs` + `audio/playback.rs`
-   Modify `AudioCapture::start()` and `AudioPlayback::start()` to accept
-   an optional device name (for user settings). Update `call/mod.rs` to
-   import from `audio::` instead of `self::audio`.
 2. Extract `call/codec.rs` -> `audio/codec.rs`
-   (`OpusEncoder`, `OpusDecoder`, constants). No changes needed.
 3. Extract `call/transport.rs` -> `audio/transport.rs`
    Extend frame format with auth tag byte (0x00 normal, 0x01 checkpoint).
-   Keep backward compat for 1:1 calls (tag byte 0x00 always).
-4. Add `audio/aec.rs`: `EchoCanceller` wrapping `sonora-aec3` (with
-   `aec3-rs` as fallback). Integrate into capture/playback paths.
-   Gated by `echo_cancellation` user setting.
-5. Verify `call/` still works with the new imports + AEC. Run tests.
-6. Add `StageRole`, `StageControl`, `StageTicket`, `StageState`,
-   `StageEvent`, `StageParticipant`, `AudioAssignment` to
-   `iroh-social-types/src/stage.rs`
-7. Add `STAGE_ALPN` constant
-8. Add `StageAnnouncement` / `StageEnded` variants to `GossipMessage`
-9. Create `src-tauri/src/stage/mod.rs` with `StageHandler` struct
+4. Add `audio/aec.rs`: `EchoCanceller` wrapping `aec3-rs` (`VoipAec3`).
+5. Add `StageRole`, `StageControl`, `StageTicket`, `StageState`,
+   `StageEvent`, `StageParticipant` to `iroh-social-types/src/stage.rs`
+6. Add `STAGE_ALPN`, `stage_control_topic()`, `sign_stage_control()`,
+   `verify_stage_control()` to types crate
+7. Add `StageAnnouncement` / `StageEnded` variants to `GossipMessage`
+8. Create `src-tauri/src/stage/mod.rs` with `StageHandler` struct
    and `ProtocolHandler` impl
 
-### Phase 2: Control plane
-10. Implement `stage/control.rs`: gossip subscribe/broadcast for
-    `StageControl` messages
-11. Implement host command signing and verification
-12. Implement presence tracking with heartbeat (15s interval, 45s expiry)
-13. Wire StageHandler into `setup.rs` (register ALPN, construct handler)
+### Phase 2: Control plane [COMPLETE]
+9. Implement `stage/control.rs`: gossip subscribe/broadcast for
+   `StageControl` messages, presence tracking, signing/verification,
+   heartbeat (15s interval), presence expiry sweep (45s)
+10. Wire StageHandler into `setup.rs`
 
-### Phase 3: Audio transport (direct from host, no relays)
-14. Implement `stage/fanout.rs`: broadcast-channel based fan-out
-15. Implement `stage/mixer.rs`: HostMixer that decodes N speaker
-    streams (using `audio::codec`), mixes PCM samples, re-encodes as
-    single Opus stream, feeds Fanout
-16. Wire speaker mesh: speakers connect to each other + host on
-    STAGE_ALPN, exchange individual audio via uni streams
-    (using `audio::capture`, `audio::codec`, `audio::transport`)
-17. Wire non-host speaker local mix: decode individual mesh streams,
-    sum + clamp, feed to AEC render + playback (Pipeline 2)
-18. Wire host mixer: decode speaker inputs -> compute per-speaker RMS
-    levels -> mix -> encode -> fanout
-19. Broadcast `SpeakerActivity` via gossip every ~200ms from mixer
-20. Wire listener recv: single uni stream -> `audio::codec::OpusDecoder`
-    -> `audio::playback` -> speaker output
-21. Implement create_stage, join_stage, leave_stage, end_stage
-22. Implement promote/demote speaker flow (mesh join/leave + mixer
-    input add/remove + speaker local mix start/stop)
-23. Implement raise_hand / lower_hand, toggle_self_mute, mute_speaker
-24. Add Tauri commands in `commands/stage.rs`
-25. Add frontend events emission (including `stage-speaker-activity`)
+### Phase 3: Audio transport — Host-SFU model [COMPLETE]
+11. Implement `stage/fanout.rs`: broadcast-channel based fan-out
+12. Implement `stage/mixer.rs`: HostMixer decodes N speaker streams,
+    mixes PCM, encodes listener stream → listener Fanout, encodes host
+    contribution → host_sfu_fanout, mix-minus → host AEC/playback
+13. Implement `SfuHub` + SFU wiring in `mod.rs`: per-speaker Fanout,
+    per-connection uni-stream subscribers, atomic snapshot-and-insert
+14. Implement `SpeakerMixer` actor in `mod.rs`: 20ms tick, per-stream
+    PCM buffers, sum+clamp, drive AudioPlayback, tee to AEC far-end
+15. Implement `start_speaker_pipeline` + `run_speaker_once` with
+    exponential backoff reconnect (2s → 30s)
+16. Wire host mixer: decode speaker inputs → mix → listener Fanout +
+    host_sfu_fanout; compute per-speaker RMS levels
+17. Wire listener recv: single uni stream → OpusDecoder → AudioPlayback
+18. Implement create_stage, join_stage, leave_stage, end_stage
+19. Implement promote/demote speaker flow (SFU join/leave + mixer
+    add/remove + SpeakerMixer start/stop)
+20. Implement co-host moderation, ban enforcement (banned_node_ids),
+    presence sweep (SweepPresence command)
+21. Add Tauri commands in `commands/stage.rs`
+22. Add frontend events emission
 
-### Phase 4: Stream authentication
-26. Implement `HostAuthState`: chain hash + periodic signing in the
-    host's mixer encode loop (auth tag byte already added in Phase 1
-    transport refactor)
-27. Implement `ListenerAuthState`: chain verification in recv loop
-    using host's public key
-28. Handle tamper detection: warn frontend, offer source switch
+### Phase 4: Stream authentication [COMPLETE]
+23. `HostAuthState`: chain hash + periodic signing in mixer encode loop
+24. `ListenerAuthState`: chain verification in recv loop
+25. Tamper detection: warn frontend, offer source switch
 
-### Phase 5: Relay tree
-29. Implement `stage/relay.rs`: RelayState with single fanout for
-    mixed stream, upstream connection, downstream subscriber management
-30. Implement `stage/topology.rs`: host-side TopologyManager with
-    per-source capacity, assignment algorithm, rebalancing
-31. Add `AssignRelay` / `RevokeRelay` control messages
-32. Add topology map to `RoomState` broadcasts
-33. Implement client-side topology following: parse AudioAssignment,
-    connect to assigned source, reconnect on changes
-34. Add `volunteer_relay` / `assign_relay` / `revoke_relay` commands
+### Phase 5: Relay tree [COMPLETE]
+26. `stage/relay.rs`: RelayState with single fanout, upstream connection,
+    downstream subscriber management
+27. `stage/topology.rs`: TopologyManager with per-source capacity,
+    assignment algorithm, rebalancing
+28. `AssignRelay` / `RevokeRelay` control messages, topology map in
+    `RoomState`, client-side topology following, relay commands
 
 ### Phase 6: Frontend
 35. Add TypeScript types for Stage in `types.ts`
@@ -1925,8 +1990,9 @@ join. The frontend renders a `StageCard` in the feed with a "Join" button.
 ### Phase 7: Reconnection and polish
 40. Implement stream liveness detection (500ms no-frame timeout)
 41. Implement per-role reconnection logic (section 4.11): listener
-    parallel retry + fallback, speaker mesh reconnect with fade,
-    relay upstream failover, thundering herd jitter
+    parallel retry + fallback, speaker SFU reconnect (backoff already
+    implemented in start_speaker_pipeline), relay upstream failover,
+    thundering herd jitter
 42. Implement co-host takeover on host disconnect (RoomState versioning,
     45s heartbeat timeout, automatic topology reassignment)
 43. Implement gossip/audio independent health tracking and UI states
@@ -2268,11 +2334,10 @@ audio devices from cpal at runtime (new command: `list_audio_devices()`).
    fully ephemeral.
 
 4. **Host transfer?** If the host wants to leave without ending the Stage,
-   transfer host role to a co-host. Co-hosts already run mixers and have
-   partial control, so promotion to full host is natural. Design the
-   control messages to allow a `TransferHost` variant later. For MVP,
-   if a co-host exists when the host drops, the Stage could continue
-   with the co-host serving all listeners (automatic failover).
+   transfer host role to a co-host. The new host would need to start the
+   SFU and mixer, and all speakers would reconnect to the new host's
+   NodeId. Design the control messages to allow a `TransferHost` variant
+   later. For MVP, if the host drops the Stage ends (see scenario 4).
 
 5. **Capacity auto-tuning?** Each source's capacity is currently manual
    (host sets `host_relay_capacity`, volunteers set `volunteer_relay_capacity`,

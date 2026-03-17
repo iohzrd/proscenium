@@ -73,13 +73,7 @@ pub enum StageControl {
     /// Participant lowers their hand.
     LowerHand { stage_id: String, pubkey: String },
     /// Host promotes a listener to speaker.
-    PromoteSpeaker {
-        stage_id: String,
-        pubkey: String,
-        /// Transport NodeId of the promoted speaker. Included by the host so
-        /// existing speakers can open direct mesh connections immediately.
-        speaker_node_id: Option<String>,
-    },
+    PromoteSpeaker { stage_id: String, pubkey: String },
     /// Host demotes a speaker to listener.
     DemoteSpeaker { stage_id: String, pubkey: String },
     /// Host mutes a speaker on the mix (speaker can still hear themselves locally).

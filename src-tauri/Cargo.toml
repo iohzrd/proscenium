@@ -19,6 +19,7 @@ tauri-build = { version = "2", features = [] }
 base64 = "0.22"
 bip39 = { version = "2", features = ["zeroize"] }
 bytes = "1"
+aec3 = "0.1.7"
 cpal = "0.17"
 chacha20poly1305 = "0.10"
 curve25519-dalek = { version = "4", default-features = false }

@@ -1,17 +1,64 @@
-/// Echo cancellation stub for Phase 1 (passthrough, no-op).
-/// Phase 2 will replace this with a real AEC3 implementation (sonora-aec3 or aec3-rs).
-#[allow(dead_code)]
-pub struct EchoCanceller;
+use aec3::voip::{VoipAec3, VoipAec3Error};
 
-#[allow(dead_code)]
+/// Number of samples per 10 ms frame at 48 kHz (mono).
+const FRAME_SAMPLES: usize = 480;
+
+/// Acoustic echo canceller wrapping `aec3::VoipAec3`.
+///
+/// Operates at 48 kHz mono. Buffers arbitrary-size input chunks and processes
+/// them in 480-sample (10 ms) increments internally.
+///
+/// Usage:
+/// 1. Before processing each mic chunk, call `render()` with any pending
+///    playback samples to keep the far-end reference up to date.
+/// 2. Call `process_capture()` with the raw mic samples; returns cleaned samples.
+pub struct EchoCanceller {
+    inner: VoipAec3,
+    render_buf: Vec<f32>,
+    capture_buf: Vec<f32>,
+}
+
 impl EchoCanceller {
-    pub fn new(_sample_rate: u32, _channels: u16) -> Self {
-        Self
+    pub fn new() -> Result<Self, VoipAec3Error> {
+        let inner = VoipAec3::builder(48_000, 1, 1).build()?;
+        Ok(Self {
+            inner,
+            render_buf: Vec::new(),
+            capture_buf: Vec::new(),
+        })
     }
 
-    /// Process microphone samples against the far-end reference.
-    /// Returns the input unchanged (no-op stub).
-    pub fn process(&mut self, mic_samples: &[f32], _far_end: &[f32]) -> Vec<f32> {
-        mic_samples.to_vec()
+    /// Feed playback (far-end reference) samples into the AEC render path.
+    /// Call this before `process_capture` for the same time slice.
+    pub fn render(&mut self, samples: &[f32]) {
+        self.render_buf.extend_from_slice(samples);
+        while self.render_buf.len() >= FRAME_SAMPLES {
+            let frame: Vec<f32> = self.render_buf.drain(..FRAME_SAMPLES).collect();
+            if let Err(e) = self.inner.handle_render_frame(&frame) {
+                log::warn!("[aec] render frame error: {e}");
+            }
+        }
+    }
+
+    /// Process mic samples through AEC. Returns echo-cancelled samples.
+    /// Drain all pending render samples first by calling `render()` before this.
+    pub fn process_capture(&mut self, samples: &[f32]) -> Vec<f32> {
+        self.capture_buf.extend_from_slice(samples);
+        let mut out = Vec::with_capacity(samples.len());
+        while self.capture_buf.len() >= FRAME_SAMPLES {
+            let frame: Vec<f32> = self.capture_buf.drain(..FRAME_SAMPLES).collect();
+            let mut cleaned = vec![0.0f32; FRAME_SAMPLES];
+            match self
+                .inner
+                .process_capture_frame(&frame, false, &mut cleaned)
+            {
+                Ok(_) => out.extend_from_slice(&cleaned),
+                Err(e) => {
+                    log::warn!("[aec] capture frame error: {e}");
+                    out.extend_from_slice(&frame);
+                }
+            }
+        }
+        out
     }
 }
