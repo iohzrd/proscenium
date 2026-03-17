@@ -437,17 +437,19 @@
               onclick={() => navigator.clipboard.writeText(stage!.ticket!)}
               title="Copy invite ticket"
             >
-              <Icon name="copy" size={14} />
+              <Icon name="link" size={13} />
               Invite
             </button>
           {/if}
         </div>
         <div class="room-meta">
-          {stage.participants.length} participant{stage.participants.length !==
-          1
-            ? "s"
-            : ""}
-          &middot;
+          <span class="participant-count"
+            >{stage.participants.length} participant{stage.participants
+              .length !== 1
+              ? "s"
+              : ""}</span
+          >
+          <span class="meta-sep">&middot;</span>
           <span class="my-role-badge role-{stage.my_role.toLowerCase()}"
             >{stage.my_role}</span
           >
@@ -455,10 +457,10 @@
       </div>
 
       <div class="room-body">
-        <!-- Speaker grid -->
+        <!-- Main: speakers + listeners -->
         <div class="room-main">
           <section class="speaker-section">
-            <h2 class="section-label">On Stage ({speakers.length})</h2>
+            <p class="section-label">On Stage ({speakers.length})</p>
             <div class="speaker-grid">
               {#each speakers as p (p.pubkey)}
                 <button
@@ -469,18 +471,20 @@
                     (selectedParticipant =
                       selectedParticipant === p.pubkey ? null : p.pubkey)}
                 >
-                  <Avatar pubkey={p.pubkey} name={displayName(p)} size={56} />
+                  <div class="avatar-wrap">
+                    <Avatar pubkey={p.pubkey} name={displayName(p)} size={72} />
+                    {#if p.self_muted || p.host_muted}
+                      <span class="mute-badge"
+                        ><Icon name="mic-off" size={11} /></span
+                      >
+                    {/if}
+                    {#if p.role === "Host"}
+                      <span class="role-pip host">H</span>
+                    {:else if p.role === "CoHost"}
+                      <span class="role-pip cohost">C</span>
+                    {/if}
+                  </div>
                   <span class="speaker-name">{displayName(p)}</span>
-                  {#if p.self_muted || p.host_muted}
-                    <span class="mute-badge"
-                      ><Icon name="mic-off" size={12} /></span
-                    >
-                  {/if}
-                  {#if p.role === "Host"}
-                    <span class="role-pip host">H</span>
-                  {:else if p.role === "CoHost"}
-                    <span class="role-pip cohost">C</span>
-                  {/if}
                 </button>
               {/each}
             </div>
@@ -488,15 +492,17 @@
 
           {#if raisedHands.length > 0}
             <section class="hands-section">
-              <h2 class="section-label">Raised Hands ({raisedHands.length})</h2>
+              <p class="section-label">
+                Raised Hands ({raisedHands.length})
+              </p>
               <div class="hands-list">
                 {#each raisedHands as p (p.pubkey)}
                   <div class="hand-item">
-                    <Avatar pubkey={p.pubkey} name={displayName(p)} size={32} />
+                    <Avatar pubkey={p.pubkey} name={displayName(p)} size={28} />
                     <span class="hand-name">{displayName(p)}</span>
                     {#if isCoHost}
                       <button
-                        class="btn-sm btn-promote"
+                        class="btn-promote"
                         onclick={() => promoteSpeaker(p.pubkey)}
                       >
                         Promote
@@ -510,7 +516,7 @@
 
           {#if listeners.length > 0}
             <section class="listeners-section">
-              <h2 class="section-label">Listeners ({listeners.length})</h2>
+              <p class="section-label">Listeners ({listeners.length})</p>
               <div class="listeners-list">
                 {#each listeners as p (p.pubkey)}
                   <button
@@ -519,11 +525,11 @@
                       (selectedParticipant =
                         selectedParticipant === p.pubkey ? null : p.pubkey)}
                   >
-                    <Avatar pubkey={p.pubkey} name={displayName(p)} size={28} />
+                    <Avatar pubkey={p.pubkey} name={displayName(p)} size={24} />
                     <span class="listener-name">{displayName(p)}</span>
                     {#if p.hand_raised}
                       <span class="hand-icon"
-                        ><Icon name="hand" size={14} /></span
+                        ><Icon name="hand" size={12} /></span
                       >
                     {/if}
                   </button>
@@ -575,7 +581,7 @@
               onclick={toggleMute}
               title={selfMuted ? "Unmute" : "Mute"}
             >
-              <Icon name={selfMuted ? "mic-off" : "mic"} size={20} />
+              <Icon name={selfMuted ? "mic-off" : "mic"} size={18} />
               <span>{selfMuted ? "Unmute" : "Mute"}</span>
             </button>
           {:else}
@@ -585,7 +591,7 @@
               onclick={toggleHand}
               title={handRaised ? "Lower hand" : "Raise hand"}
             >
-              <Icon name="hand" size={20} />
+              <Icon name="hand" size={18} />
               <span>{handRaised ? "Lower Hand" : "Raise Hand"}</span>
             </button>
           {/if}
@@ -602,12 +608,12 @@
         <div class="controls-right">
           {#if isHost}
             <button class="ctrl-btn ctrl-danger" onclick={endStage}>
-              <Icon name="log-out" size={20} />
+              <Icon name="log-out" size={18} />
               <span>End Stage</span>
             </button>
           {:else}
             <button class="ctrl-btn ctrl-danger" onclick={leaveStage}>
-              <Icon name="log-out" size={20} />
+              <Icon name="log-out" size={18} />
               <span>Leave</span>
             </button>
           {/if}
@@ -845,13 +851,13 @@
   .stage-room {
     display: flex;
     flex-direction: column;
-    height: calc(100vh - var(--bottom-nav-height, 60px) - 3rem);
+    height: calc(100vh - 3rem);
     min-height: 0;
     position: relative;
   }
 
   .room-header {
-    padding: 0.75rem 0;
+    padding: 0.75rem 0 1rem;
     border-bottom: 1px solid var(--border);
     margin-bottom: 1rem;
     flex-shrink: 0;
@@ -860,27 +866,30 @@
   .room-title-row {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.6rem;
   }
 
   .btn-invite {
     display: flex;
     align-items: center;
     gap: 0.3rem;
-    padding: 0.3rem 0.65rem;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
+    padding: 0.3rem 0.7rem;
+    background: transparent;
+    border: 1px solid var(--accent-medium);
+    border-radius: var(--radius-full);
+    color: var(--accent-medium);
     font-size: var(--text-xs);
     font-weight: 600;
     cursor: pointer;
-    transition: background var(--transition-fast);
-    margin-left: 0.5rem;
+    transition:
+      background var(--transition-fast),
+      color var(--transition-fast);
+    margin-left: 0.25rem;
   }
 
   .btn-invite:hover {
-    background: var(--bg-elevated-hover);
+    background: var(--accent-light-hover-bg);
+    color: var(--accent-light);
   }
 
   .live-dot {
@@ -898,7 +907,7 @@
       opacity: 1;
     }
     50% {
-      opacity: 0.4;
+      opacity: 0.3;
     }
   }
 
@@ -912,19 +921,28 @@
   .room-meta {
     font-size: var(--text-sm);
     color: var(--text-muted);
-    margin-top: 0.25rem;
+    margin-top: 0.35rem;
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.4rem;
+  }
+
+  .participant-count {
+    color: var(--text-muted);
+  }
+
+  .meta-sep {
+    color: var(--border-hover);
   }
 
   .my-role-badge {
     font-size: var(--text-xs);
-    font-weight: 600;
-    padding: 0.15rem 0.5rem;
+    font-weight: 700;
+    padding: 0.15rem 0.55rem;
     border-radius: var(--radius-full);
     background: var(--bg-elevated);
     color: var(--text-secondary);
+    letter-spacing: 0.02em;
   }
 
   .my-role-badge.role-host,
@@ -951,22 +969,25 @@
     overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: 1.5rem;
+    padding-right: 0.25rem;
   }
 
   .section-label {
-    font-size: var(--text-sm);
-    font-weight: 600;
+    font-size: var(--text-xs);
+    font-weight: 700;
     color: var(--text-muted);
     text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin: 0 0 0.5rem 0;
+    letter-spacing: 0.08em;
+    margin: 0 0 0.75rem;
   }
+
+  /* Speaker grid */
 
   .speaker-grid {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.75rem;
+    gap: 1rem;
   }
 
   .speaker-card {
@@ -974,16 +995,17 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.4rem;
-    padding: 1rem 0.75rem 0.75rem;
+    gap: 0.55rem;
+    padding: 1.25rem 1rem 1rem;
     background: var(--bg-surface);
-    border: 2px solid var(--border);
-    border-radius: var(--radius-xl);
+    border: 2px solid transparent;
+    border-radius: var(--radius-2xl);
     cursor: pointer;
+    width: 120px;
     transition:
       border-color var(--transition-fast),
-      background var(--transition-fast);
-    min-width: 90px;
+      background var(--transition-fast),
+      box-shadow var(--transition-fast);
   }
 
   .speaker-card:hover {
@@ -992,49 +1014,58 @@
   }
 
   .speaker-card.self {
-    border-color: var(--accent);
+    border-color: var(--accent-medium);
+    box-shadow: 0 0 0 3px var(--accent-light-faint);
   }
 
   .speaker-card.muted {
-    opacity: 0.65;
+    opacity: 0.6;
+  }
+
+  .avatar-wrap {
+    position: relative;
+    display: inline-flex;
   }
 
   .speaker-name {
     font-size: var(--text-xs);
     font-weight: 600;
     color: var(--text-secondary);
-    max-width: 80px;
+    max-width: 96px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: center;
   }
 
   .mute-badge {
     position: absolute;
-    bottom: 6px;
-    right: 6px;
+    bottom: -2px;
+    right: -2px;
     background: var(--color-error);
     color: white;
     border-radius: 50%;
-    width: 18px;
-    height: 18px;
+    width: 20px;
+    height: 20px;
     display: flex;
     align-items: center;
     justify-content: center;
+    border: 2px solid var(--bg-surface);
   }
 
   .role-pip {
     position: absolute;
-    top: 4px;
-    right: 4px;
+    top: -3px;
+    right: -3px;
     font-size: 9px;
-    font-weight: 700;
-    width: 16px;
-    height: 16px;
+    font-weight: 800;
+    width: 17px;
+    height: 17px;
     border-radius: 50%;
     display: flex;
     align-items: center;
     justify-content: center;
+    border: 2px solid var(--bg-deep);
   }
 
   .role-pip.host {
@@ -1047,25 +1078,25 @@
     color: #1a1a2e;
   }
 
-  /* Hands section */
+  /* Raised hands */
 
   .hands-section {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
     padding: 0.75rem 1rem;
+    background: var(--bg-surface);
+    border: 1px solid var(--color-warning-border);
+    border-radius: var(--radius-xl);
   }
 
   .hands-list {
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
+    gap: 0.5rem;
   }
 
   .hand-item {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: 0.6rem;
   }
 
   .hand-name {
@@ -1074,17 +1105,14 @@
     color: var(--text-secondary);
   }
 
-  .btn-sm {
+  .btn-promote {
     font-size: var(--text-xs);
-    font-weight: 600;
-    padding: 0.25rem 0.6rem;
+    font-weight: 700;
+    padding: 0.25rem 0.65rem;
     border: none;
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     cursor: pointer;
     transition: background var(--transition-fast);
-  }
-
-  .btn-promote {
     background: var(--color-success);
     color: white;
   }
@@ -1096,10 +1124,7 @@
   /* Listeners section */
 
   .listeners-section {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    padding: 0.75rem 1rem;
+    padding: 0;
   }
 
   .listeners-list {
@@ -1111,9 +1136,9 @@
   .listener-item {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
-    padding: 0.25rem 0.5rem;
-    background: var(--bg-elevated);
+    gap: 0.35rem;
+    padding: 0.2rem 0.55rem 0.2rem 0.3rem;
+    background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-full);
     cursor: pointer;
@@ -1121,7 +1146,7 @@
   }
 
   .listener-item:hover {
-    background: var(--bg-elevated-hover);
+    background: var(--bg-elevated);
   }
 
   .listener-name {
@@ -1131,44 +1156,47 @@
 
   .hand-icon {
     color: var(--color-warning, #f59e0b);
+    display: flex;
+    align-items: center;
   }
 
   /* Chat */
 
   .room-sidebar {
-    width: 260px;
+    width: 280px;
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
     background: var(--bg-surface);
     border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
+    border-radius: var(--radius-2xl);
     overflow: hidden;
   }
 
   .chat-messages {
     flex: 1;
     overflow-y: auto;
-    padding: 0.75rem;
+    padding: 0.85rem 0.85rem 0.5rem;
     display: flex;
     flex-direction: column;
-    gap: 0.4rem;
+    gap: 0.5rem;
   }
 
   .chat-empty {
     color: var(--text-muted);
     font-size: var(--text-xs);
     text-align: center;
-    padding: 1rem;
+    padding: 1.5rem 1rem;
   }
 
   .chat-msg {
     font-size: var(--text-sm);
     word-break: break-word;
+    line-height: 1.4;
   }
 
   .chat-author {
-    font-weight: 600;
+    font-weight: 700;
     color: var(--accent-medium);
     margin-right: 0.3rem;
   }
@@ -1180,7 +1208,7 @@
   .chat-input-row {
     display: flex;
     gap: 0.4rem;
-    padding: 0.5rem;
+    padding: 0.6rem;
     border-top: 1px solid var(--border);
   }
 
@@ -1188,10 +1216,10 @@
     flex: 1;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
-    border-radius: var(--radius-md);
+    border-radius: var(--radius-full);
     color: var(--text-primary);
     font-size: var(--text-sm);
-    padding: 0.4rem 0.6rem;
+    padding: 0.4rem 0.75rem;
   }
 
   .chat-input:focus {
@@ -1203,21 +1231,22 @@
     background: var(--accent);
     color: var(--text-on-accent);
     border: none;
-    border-radius: var(--radius-md);
-    padding: 0.4rem 0.75rem;
+    border-radius: var(--radius-full);
+    padding: 0.4rem 0.9rem;
     font-size: var(--text-sm);
     font-weight: 600;
     cursor: pointer;
     transition: background var(--transition-fast);
+    flex-shrink: 0;
   }
 
   .btn-send:disabled {
-    opacity: 0.4;
+    opacity: 0.35;
     cursor: default;
   }
 
   .btn-send:hover:not(:disabled) {
-    background: var(--accent-dark);
+    background: var(--accent-hover);
   }
 
   /* Controls bar */
@@ -1226,9 +1255,9 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 0.75rem 0;
+    padding: 0.85rem 0 0;
     border-top: 1px solid var(--border);
-    margin-top: 0.5rem;
+    margin-top: 0.75rem;
     flex-shrink: 0;
     gap: 1rem;
   }
@@ -1240,36 +1269,36 @@
 
   .reactions-bar {
     display: flex;
-    gap: 0.25rem;
-    flex-wrap: wrap;
+    gap: 0.3rem;
     justify-content: center;
   }
 
   .reaction-btn {
-    background: var(--bg-elevated);
+    background: var(--bg-surface);
     border: 1px solid var(--border);
     border-radius: var(--radius-full);
-    padding: 0.3rem 0.5rem;
+    padding: 0.35rem 0.55rem;
     font-size: 1.1rem;
     cursor: pointer;
     transition:
       background var(--transition-fast),
       transform var(--transition-fast);
+    line-height: 1;
   }
 
   .reaction-btn:hover {
-    background: var(--bg-elevated-hover);
-    transform: scale(1.15);
+    background: var(--bg-elevated);
+    transform: scale(1.2);
   }
 
   .ctrl-btn {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    padding: 0.5rem 1rem;
+    padding: 0.5rem 1.1rem;
     background: var(--bg-elevated);
     border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-full);
     color: var(--text-primary);
     font-size: var(--text-sm);
     font-weight: 600;
@@ -1277,6 +1306,7 @@
     transition:
       background var(--transition-fast),
       border-color var(--transition-fast);
+    white-space: nowrap;
   }
 
   .ctrl-btn:hover {
@@ -1284,25 +1314,25 @@
   }
 
   .ctrl-btn.ctrl-muted {
-    background: var(--color-warning, #f59e0b);
-    color: #1a1a2e;
-    border-color: transparent;
+    background: var(--color-warning-bg);
+    color: var(--color-warning);
+    border-color: var(--color-warning-border);
   }
 
   .ctrl-btn.ctrl-active {
-    background: var(--accent);
-    color: var(--text-on-accent);
-    border-color: transparent;
+    background: var(--accent-light-hover-bg);
+    color: var(--accent-light);
+    border-color: var(--accent-light-faint);
   }
 
   .ctrl-btn.ctrl-danger {
-    background: var(--color-error);
-    color: white;
-    border-color: transparent;
+    background: var(--color-error-bg-subtle);
+    color: var(--color-error-light);
+    border-color: var(--color-error-light-border);
   }
 
   .ctrl-btn.ctrl-danger:hover {
-    background: var(--color-error-dark, #b91c1c);
+    background: var(--color-error-bg-hover);
   }
 
   /* Popover */
@@ -1409,6 +1439,10 @@
       display: none;
     }
 
+    .stage-room {
+      height: calc(100vh - var(--bottom-nav-height) - 2rem);
+    }
+
     .stage-cards {
       flex-direction: column;
     }
@@ -1416,6 +1450,19 @@
     .stage-divider {
       align-self: stretch;
       text-align: center;
+    }
+
+    .speaker-card {
+      width: 100px;
+    }
+
+    .reactions-bar {
+      gap: 0.2rem;
+    }
+
+    .reaction-btn {
+      padding: 0.3rem 0.4rem;
+      font-size: 1rem;
     }
   }
 </style>
