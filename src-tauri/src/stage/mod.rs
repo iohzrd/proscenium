@@ -323,6 +323,8 @@ struct ActiveStage {
     topology: Option<TopologyManager>,
     /// Set when this node is acting as a relay: handle to the relay actor.
     relay_handle: Option<relay::RelayHandle>,
+    /// Invite ticket (host only; `None` for joiners).
+    ticket: Option<StageTicket>,
     /// Transport NodeId we're currently receiving audio from (host or an upstream relay).
     listener_upstream_id: Option<String>,
     /// Cancellation token for the current listener audio pipeline.
@@ -486,9 +488,12 @@ impl StageActor {
         let signing_key = id.signing_key.clone();
         drop(id);
 
+        // host_pubkey in the ticket must be the *signing* key's public key —
+        // that is the key that signs audio stream checkpoints. master_pubkey
+        // is a different key and would cause InvalidSignature on every checkpoint.
         let ticket = StageTicket {
             stage_id: stage_id.clone(),
-            host_pubkey: my_pubkey.clone(),
+            host_pubkey: signing_key.public().to_string(),
             host_node_id: node_id.clone(),
             title: title.clone(),
         };
@@ -578,6 +583,7 @@ impl StageActor {
             fanout: Some(fanout),
             topology: Some(topology),
             relay_handle: None,
+            ticket: Some(ticket.clone()),
             listener_upstream_id: None,
             listener_pipeline_cancel: None,
         });
@@ -671,6 +677,7 @@ impl StageActor {
             fanout: None,
             topology: None,
             relay_handle: None,
+            ticket: None,
             listener_upstream_id: Some(ticket.host_node_id.clone()),
             listener_pipeline_cancel: Some(listener_cancel.clone()),
         });
@@ -1390,6 +1397,7 @@ impl StageActor {
             my_role: s.my_role,
             participants,
             started_at: s.started_at,
+            ticket: s.ticket.as_ref().map(|t| t.to_string()),
         })
     }
 

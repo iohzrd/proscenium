@@ -424,6 +424,16 @@
         <div class="room-title-row">
           <span class="live-dot"></span>
           <h1 class="room-title">{stage.title}</h1>
+          {#if isHost && stage.ticket}
+            <button
+              class="btn-invite"
+              onclick={() => navigator.clipboard.writeText(stage!.ticket!)}
+              title="Copy invite ticket"
+            >
+              <Icon name="copy" size={14} />
+              Invite
+            </button>
+          {/if}
         </div>
         <div class="room-meta">
           {stage.participants.length} participant{stage.participants.length !==
@@ -844,6 +854,26 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+  }
+
+  .btn-invite {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    padding: 0.3rem 0.65rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    cursor: pointer;
+    transition: background var(--transition-fast);
+    margin-left: 0.5rem;
+  }
+
+  .btn-invite:hover {
+    background: var(--bg-elevated-hover);
   }
 
   .live-dot {

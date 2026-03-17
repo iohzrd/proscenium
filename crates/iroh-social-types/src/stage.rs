@@ -164,6 +164,8 @@ pub fn verify_stage_control(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageTicket {
     pub stage_id: String,
+    /// Host's *signing* key public key (not master pubkey). Used by listeners
+    /// to verify audio stream checkpoint signatures produced by the mixer.
     pub host_pubkey: String,
     /// Transport NodeId of the host (for direct QUIC connection).
     pub host_node_id: String,
@@ -209,6 +211,8 @@ pub struct StageState {
     pub my_role: StageRole,
     pub participants: Vec<StageParticipant>,
     pub started_at: u64,
+    /// Invite ticket string. Only populated for the host; `None` for joiners.
+    pub ticket: Option<String>,
 }
 
 /// Events emitted to the Tauri frontend on the "stage-event" channel.

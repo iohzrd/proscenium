@@ -223,6 +223,7 @@ export interface StageState {
   my_role: StageRole;
   participants: StageParticipant[];
   started_at: number;
+  ticket: string | null;
 }
 
 export type StageEvent =
