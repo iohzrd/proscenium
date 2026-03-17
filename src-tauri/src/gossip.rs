@@ -14,8 +14,8 @@ use iroh_gossip::{
 };
 use iroh_social_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, PushMessage,
-    SigningKeyRotation, Visibility, now_millis, short_id, user_feed_topic, validate_profile,
-    verify_delete_interaction_signature, verify_delete_post_signature,
+    SigningKeyRotation, StageTicket, Visibility, now_millis, short_id, user_feed_topic,
+    validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
     verify_linked_devices_announcement, verify_profile_signature, verify_rotation,
 };
 use std::collections::HashMap;
@@ -73,6 +73,12 @@ impl GossipService {
                 reconnect_rx: Some(reconnect_rx),
             })),
         }
+    }
+
+    /// Return a clone of the underlying iroh-gossip handle for direct topic subscriptions
+    /// (e.g., Stage control plane topics that are separate from user feed topics).
+    pub fn gossip_handle(&self) -> Gossip {
+        self.gossip.clone()
     }
 
     /// Subscribe to all current follows, then spawn the reconnect loop and
@@ -595,6 +601,33 @@ impl GossipService {
         Ok(())
     }
 
+    /// Announce a new Stage room on the host's own user-feed gossip topic so followers discover it.
+    pub async fn broadcast_stage_announcement(
+        &self,
+        stage_id: String,
+        title: String,
+        ticket: StageTicket,
+        host_pubkey: String,
+        started_at: u64,
+    ) -> Result<(), AppError> {
+        let msg = GossipMessage::StageAnnouncement {
+            stage_id,
+            title,
+            ticket,
+            host_pubkey,
+            started_at,
+        };
+        self.broadcast_msg(&msg, "stage announcement").await?;
+        Ok(())
+    }
+
+    /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic.
+    pub async fn broadcast_stage_ended(&self, stage_id: String) -> Result<(), AppError> {
+        let msg = GossipMessage::StageEnded { stage_id };
+        self.broadcast_msg(&msg, "stage ended").await?;
+        Ok(())
+    }
+
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
@@ -737,6 +770,33 @@ impl GossipService {
                 Self::handle_signing_key_rotation(storage, pk, rotation).await;
             }
             Ok(GossipMessage::Heartbeat) => {}
+            Ok(GossipMessage::StageAnnouncement {
+                stage_id,
+                title,
+                ticket,
+                host_pubkey,
+                started_at,
+            }) => {
+                log::info!(
+                    "[gossip-rx] stage announcement: {} ({})",
+                    title,
+                    short_id(&stage_id)
+                );
+                let _ = app_handle.emit(
+                    "stage-announced",
+                    serde_json::json!({
+                        "stage_id": stage_id,
+                        "title": title,
+                        "ticket": ticket.to_string(),
+                        "host_pubkey": host_pubkey,
+                        "started_at": started_at,
+                    }),
+                );
+            }
+            Ok(GossipMessage::StageEnded { stage_id }) => {
+                log::info!("[gossip-rx] stage ended: {}", short_id(&stage_id));
+                let _ = app_handle.emit("stage-ended-remote", &stage_id);
+            }
             Err(e) => {
                 log::error!("[gossip-rx] failed to parse message: {e}");
             }

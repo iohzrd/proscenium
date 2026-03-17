@@ -47,6 +47,18 @@ pub enum GossipMessage {
     /// Lightweight keep-alive so followers know the connection is still
     /// active even when the publisher isn't posting.
     Heartbeat,
+    /// Host announces a new live audio Stage room on their feed topic.
+    StageAnnouncement {
+        stage_id: String,
+        title: String,
+        ticket: crate::stage::StageTicket,
+        host_pubkey: String,
+        started_at: u64,
+    },
+    /// Host signals the Stage room has ended.
+    StageEnded {
+        stage_id: String,
+    },
 }
 
 /// Response to an IdentityRequest. Contains everything a peer needs

@@ -1,3 +1,4 @@
+mod audio;
 mod call;
 mod commands;
 mod constants;
@@ -11,6 +12,7 @@ mod ingest;
 mod peer;
 mod push;
 mod setup;
+mod stage;
 mod state;
 mod storage;
 mod sync;
@@ -149,6 +151,19 @@ pub fn run() {
             reject_call,
             hangup_call,
             toggle_mute_call,
+            create_stage,
+            join_stage,
+            leave_stage,
+            end_stage,
+            get_stage_state,
+            stage_promote_speaker,
+            stage_demote_speaker,
+            stage_toggle_mute,
+            stage_raise_hand,
+            stage_lower_hand,
+            stage_send_reaction,
+            stage_send_chat,
+            stage_volunteer_relay,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

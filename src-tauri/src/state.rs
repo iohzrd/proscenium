@@ -2,6 +2,7 @@ use crate::call::CallHandler;
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
+use crate::stage::StageHandler;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
@@ -64,6 +65,7 @@ pub struct AppState {
     pub(crate) dm: DmHandler,
     pub(crate) call: CallHandler,
     pub(crate) peer: PeerHandler,
+    pub(crate) stage: StageHandler,
     pub(crate) endpoint: Endpoint,
     pub(crate) blobs: BlobsProtocol,
     /// Send on-demand sync commands to the peer sync task.
@@ -86,6 +88,7 @@ impl AppState {
         dm: DmHandler,
         call: CallHandler,
         peer: PeerHandler,
+        stage: StageHandler,
         endpoint: Endpoint,
         blobs: BlobsProtocol,
         router: Router,
@@ -102,6 +105,7 @@ impl AppState {
             dm,
             call,
             peer,
+            stage,
             endpoint,
             blobs,
             sync_tx,

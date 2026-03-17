@@ -2,14 +2,15 @@ use crate::call::CallHandler;
 use crate::dm::DmHandler;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
+use crate::stage::StageHandler;
 use crate::state::{AppState, Identity, SharedIdentity, SyncCommand};
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use iroh_social_types::{
-    CALL_ALPN, DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, derive_dm_key,
-    derive_signing_key, derive_transport_key, now_millis, sign_delegation,
+    CALL_ALPN, DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, STAGE_ALPN,
+    derive_dm_key, derive_signing_key, derive_transport_key, now_millis, sign_delegation,
     sign_linked_devices_announcement,
 };
 use std::sync::Arc;
@@ -100,6 +101,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
             PEER_ALPN.to_vec(),
             DM_ALPN.to_vec(),
             CALL_ALPN.to_vec(),
+            STAGE_ALPN.to_vec(),
         ])
         .address_lookup(iroh::address_lookup::MdnsAddressLookup::builder())
         .address_lookup(iroh::address_lookup::DhtAddressLookup::builder())
@@ -195,12 +197,22 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         handle.clone(),
     );
 
+    let stage_handler = StageHandler::new(
+        endpoint.clone(),
+        gossip_service.gossip_handle(),
+        identity.clone(),
+        storage.clone(),
+        gossip_service.clone(),
+        handle.clone(),
+    );
+
     let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
         .accept(iroh_gossip::ALPN, gossip)
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
         .accept(CALL_ALPN, call_handler.clone())
+        .accept(STAGE_ALPN, stage_handler.clone())
         .spawn();
     log::info!("[setup] router spawned");
 
@@ -275,6 +287,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         dm_handler,
         call_handler,
         peer_handler,
+        stage_handler,
         endpoint,
         blobs,
         router,

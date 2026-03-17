@@ -11,6 +11,7 @@ mod posts;
 mod profile;
 mod servers;
 mod social;
+mod stage;
 pub(crate) mod sync;
 
 pub use blobs::*;
@@ -26,4 +27,5 @@ pub use posts::*;
 pub use profile::*;
 pub use servers::*;
 pub use social::*;
+pub use stage::*;
 pub use sync::{get_sync_status, sync_all_peers, sync_posts};

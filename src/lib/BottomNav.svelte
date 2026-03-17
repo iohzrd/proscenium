@@ -73,6 +73,10 @@
     <Icon name="compass" size={22} />
     <span class="tab-label">Discover</span>
   </a>
+  <a href="/stage" class:active={currentPath === "/stage"} onclick={closeMore}>
+    <Icon name="radio" size={22} />
+    <span class="tab-label">Stage</span>
+  </a>
   <button
     class="tab-btn"
     class:active={moreActive}

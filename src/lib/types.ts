@@ -203,6 +203,47 @@ export interface LinkQrPayload {
 
 export type CallState = "ringing" | "incoming" | "active" | "ended" | "failed";
 
+export type StageRole = "Host" | "CoHost" | "Speaker" | "Listener";
+
+export interface StageParticipant {
+  pubkey: string;
+  role: StageRole;
+  display_name: string | null;
+  avatar_hash: string | null;
+  hand_raised: boolean;
+  self_muted: boolean;
+  host_muted: boolean;
+}
+
+export interface StageState {
+  stage_id: string;
+  title: string;
+  host_pubkey: string;
+  my_pubkey: string;
+  my_role: StageRole;
+  participants: StageParticipant[];
+  started_at: number;
+}
+
+export type StageEvent =
+  | ({ type: "state_snapshot" } & StageState)
+  | { type: "participant_joined"; pubkey: string; role: StageRole }
+  | { type: "participant_left"; pubkey: string }
+  | { type: "role_changed"; pubkey: string; role: StageRole }
+  | {
+      type: "mute_changed";
+      pubkey: string;
+      self_muted: boolean;
+      host_muted: boolean;
+    }
+  | { type: "hand_raised"; pubkey: string }
+  | { type: "hand_lowered"; pubkey: string }
+  | { type: "reaction"; pubkey: string; emoji: string }
+  | { type: "chat"; pubkey: string; text: string }
+  | { type: "ended"; stage_id: string }
+  | { type: "kicked" }
+  | { type: "auth_failed"; source: string; reason: string };
+
 export interface CallEvent {
   call_id: string;
   peer_pubkey: string;

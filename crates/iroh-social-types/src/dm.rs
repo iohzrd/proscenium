@@ -53,8 +53,12 @@ pub struct RatchetHeaderWire {
 pub enum DmPayload {
     Message(DirectMessage),
     Typing,
-    Read { message_id: String },
-    Delivered { message_id: String },
+    Read {
+        message_id: String,
+    },
+    Delivered {
+        message_id: String,
+    },
     /// Offer to start a call. Sent by the caller.
     CallOffer {
         call_id: String,
@@ -62,11 +66,17 @@ pub enum DmPayload {
         video: bool,
     },
     /// Accept an incoming call. Sent by the callee.
-    CallAnswer { call_id: String },
+    CallAnswer {
+        call_id: String,
+    },
     /// Reject or cancel an incoming call.
-    CallReject { call_id: String },
+    CallReject {
+        call_id: String,
+    },
     /// End an active call.
-    CallHangup { call_id: String },
+    CallHangup {
+        call_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

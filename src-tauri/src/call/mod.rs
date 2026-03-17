@@ -1,7 +1,7 @@
-pub mod audio;
-pub mod codec;
-pub mod transport;
-
+use crate::audio::{
+    AudioCapture, AudioPlayback, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME, TAG_NORMAL,
+    read_audio_frame, write_audio_frame,
+};
 use crate::dm::DmHandler;
 use crate::error::AppError;
 use crate::state::SharedIdentity;
@@ -14,8 +14,6 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-
-use self::codec::{FRAME_SIZE, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME};
 
 /// Active call state tracked by the handler.
 struct ActiveCall {
@@ -418,7 +416,7 @@ impl CallHandler {
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
 
-        let _capture = match audio::AudioCapture::start(tx) {
+        let _capture = match AudioCapture::start(tx) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("[call] failed to start audio capture: {e}");
@@ -450,8 +448,8 @@ impl CallHandler {
                     };
                     let packets = encoder.push_samples(&samples);
                     for packet in packets {
-                        if let Err(e) = transport::write_audio_frame(
-                            &mut send, seq, timestamp, &packet,
+                        if let Err(e) = write_audio_frame(
+                            &mut send, seq, timestamp, TAG_NORMAL, &packet,
                         ).await {
                             log::error!("[call] send error: {e}");
                             return;
@@ -477,11 +475,7 @@ impl CallHandler {
             }
         };
 
-        // Shared playback buffer
-        let playback_buf: Arc<std::sync::Mutex<Vec<f32>>> =
-            Arc::new(std::sync::Mutex::new(Vec::with_capacity(FRAME_SIZE * 4)));
-
-        let _playback = match audio::AudioPlayback::start(playback_buf.clone()) {
+        let (mut prod, _playback) = match AudioPlayback::start() {
             Ok(p) => p,
             Err(e) => {
                 log::error!("[call] failed to start audio playback: {e}");
@@ -494,18 +488,14 @@ impl CallHandler {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
-                result = transport::read_audio_frame(&mut recv) => {
+                result = read_audio_frame(&mut recv) => {
                     match result {
-                        Ok(Some((_seq, _ts, payload))) => {
+                        Ok(Some((_seq, _ts, _tag, payload))) => {
                             match decoder.decode(&payload) {
                                 Ok(samples) => {
-                                    let mut buf = playback_buf.lock().unwrap();
-                                    buf.extend_from_slice(&samples);
-                                    // Cap buffer at ~200ms to prevent unbounded growth
-                                    let max_samples = FRAME_SIZE * 10;
-                                    let current_len = buf.len();
-                                    if current_len > max_samples {
-                                        buf.drain(..current_len - max_samples);
+                                    let pushed = prod.push(&samples);
+                                    if pushed < samples.len() {
+                                        log::debug!("[call] ring buffer full, dropped {} samples", samples.len() - pushed);
                                     }
                                 }
                                 Err(e) => {

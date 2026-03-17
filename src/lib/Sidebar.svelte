@@ -44,6 +44,10 @@
       <Icon name="compass" />
       <span class="nav-label">Discover</span>
     </a>
+    <a href="/stage" class:active={currentPath === "/stage"}>
+      <Icon name="radio" />
+      <span class="nav-label">Stage</span>
+    </a>
     <a href="/follows" class:active={currentPath === "/follows"}>
       <Icon name="users" />
       <span class="nav-label">Follows</span>

@@ -566,6 +566,29 @@ struct RelayState {
 }
 ```
 
+> **Implementation note (Tokio actor pattern):** `RelayState` in `relay.rs` should be
+> implemented as a Tokio actor. Two concurrent callers need to mutate `RelayState` at
+> runtime: the upstream forward loop (calls `fanout.send_frame` on every received frame)
+> and `StageHandler::accept` (calls `fanout.add_subscriber` whenever a downstream
+> listener connects). Wrapping `RelayState` in `Arc<Mutex<>>` would require holding the
+> lock across async `add_subscriber` operations and would couple the hot forward loop to
+> lock contention. Instead, the actor owns `RelayState` exclusively and processes
+> `RelayCommand` messages from an `mpsc::Receiver`. An `mpsc::Sender<RelayCommand>`
+> (cheap to clone) is held by both callers. Commands:
+>
+> ```rust
+> enum RelayCommand {
+>     /// New downstream listener connected — add their send stream to the fanout.
+>     AddDownstream(SendStream),
+>     /// Upstream frame received — forward to all downstream subscribers.
+>     Frame { seq: u32, ts: u32, payload: Vec<u8> },
+>     Shutdown,
+> }
+> ```
+>
+> The actor loop handles both the upstream recv future and incoming commands via
+> `tokio::select!`, keeping all `RelayState` mutations sequential with no mutex.
+
 ### 4.6 Audio Pipeline
 
 Reuses existing infrastructure from `call/`. Five distinct pipelines:
@@ -611,9 +634,44 @@ their own AEC render + playback buffer so they hear the other speakers.
 
 **Pipeline 4: Listener playback (listeners, also relays for their own audio):**
 ```
-Single mixed stream (from host or relay) -> OpusDecoder -> playback_buf -> AudioPlayback (cpal)
+Single mixed stream (from host or relay)
+  -> read_audio_frame()
+  -> seq gap check  ->  decode_loss() x N  (PLC for lost frames)
+  -> OpusDecoder
+  -> ringbuf::HeapRb<f32> producer  (lock-free SPSC, 10-frame / ~200ms capacity)
+       [wait for 3-frame / ~60ms pre-fill before starting cpal]
+  -> ringbuf::HeapRb<f32> consumer  (lives in cpal callback, lock-free pop_slice)
+  -> AudioPlayback (cpal)
 ```
-Listeners receive one stream, decode it, play it. No mixing needed.
+Listeners receive one stream, decode it, and push PCM into a lock-free ring buffer.
+The cpal output callback reads from the consumer end with `pop_slice`; on underrun it
+zero-fills (silence) without blocking.
+
+**Jitter buffer rationale:**
+- The cpal callback fires on a real-time OS audio thread; it must never take a mutex or
+  allocate. `Arc<Mutex<Vec<f32>>>` is incorrect here.
+- `ringbuf::HeapRb<f32>` (`ringbuf = "0.4"`) is a lock-free SPSC ring buffer: the tokio
+  decode task is the sole producer, the cpal callback is the sole consumer. `push_slice` /
+  `pop_slice` are the core operations; no allocation or lock on either side.
+- **Capacity: 10 frames (9600 samples, ~200ms)** — hard ceiling. If the buffer is full the
+  push is partially dropped; this is preferable to growing unbounded lag.
+- **Adaptive pre-fill depth** (governs when playback starts / restarts after reconnect):
+  - Min: 3 frames (60ms) — adequate for low-latency WAN
+  - Init: 4 frames (80ms) — conservative starting point
+  - Max: 10 frames (200ms) — ceiling for degraded WAN / relay hops
+  - The cpal callback increments an `Arc<AtomicUsize>` underrun counter (Relaxed ordering,
+    purely advisory). The decode task drains the counter once per decoded frame:
+    - Underrun detected → `target += 1` (capped at max), reset drift timer
+    - Every ~250 frames (~5 s) with no underruns → `target -= 1` (floored at min)
+  - Depth converges toward the minimum that avoids underruns on the current network path.
+    WAN connections with relay hops naturally settle at a higher depth than direct LAN.
+- **Packet loss concealment (PLC):** sequence numbers are tracked across frames. On a gap
+  (`seq != last_seq + 1`), `OpusDecoder::decode_loss()` (passes `&[]` to
+  `opus::Decoder::decode_float`) is called once per missing frame and the comfort noise is
+  pushed into the ring before the next real frame. This avoids abrupt silence pops on
+  isolated packet loss (rare on QUIC, but possible across relay hops).
+- The same ring buffer pattern is used for 1:1 calls (`call/mod.rs`) without the pre-fill
+  gate or adaptive logic (lower latency is more important for interactive calls).
 
 **Pipeline 5: Relay forwarding (relays only):**
 ```
@@ -643,6 +701,30 @@ in parallel from the same upstream.
   with the current per-speaker RMS levels. Only speakers above a silence
   threshold (e.g., level > 0.01) are included. This is how listeners
   know who is currently talking.
+
+> **Implementation note (Tokio actor pattern):** `HostMixer` in `mixer.rs` should be
+> implemented as a Tokio actor. The mixer owns mutable per-speaker decoder state and
+> drives a 20ms encode loop via `tokio::time::interval`. Multiple concurrent speaker
+> recv tasks need to deliver decoded PCM to the mixer simultaneously. Sharing the mixer
+> under `Arc<Mutex<>>` would cause recv tasks to block each other on every decoded frame
+> (50 times per second per speaker) and would couple the 20ms mix interval to lock
+> availability — a recipe for audio glitches. Instead, each speaker recv task sends
+> decoded PCM over a per-speaker `mpsc::Sender<Vec<f32>>` to the mixer actor. Commands:
+>
+> ```rust
+> enum MixerCommand {
+>     /// New speaker joined — register their PCM channel with the mixer.
+>     AddSpeaker { pubkey: String, pcm_rx: mpsc::Receiver<Vec<f32>> },
+>     /// Speaker left or was demoted — remove their input from the mix.
+>     RemoveSpeaker(String),
+>     Shutdown,
+> }
+> ```
+>
+> The actor loop selects over the `tokio::time::interval` tick (mix + encode + fanout
+> send) and the `MixerCommand` receiver, with no mutex anywhere on the hot path.
+> An `mpsc::Sender<MixerCommand>` handle is held by the `StageActor` and passed to
+> speaker recv tasks when they are created.
 
 ### 4.7 Connection Management
 
@@ -749,6 +831,35 @@ reconnecting.
 
 The host broadcasts the updated topology in the periodic `RoomState`
 (every 15s) and immediately on changes.
+
+> **Implementation note (Tokio actor pattern):** `TopologyManager` in `topology.rs`
+> should be implemented as a Tokio actor. Topology events arrive from two concurrent
+> sources — the gossip control loop (participant `Join`/`Leave` messages) and the
+> `StageActor` (relay volunteering, relay disconnection detected by the media plane).
+> Wrapping `TopologyManager` in `Arc<Mutex<>>` and calling mutation methods from both
+> contexts would require holding the lock during gossip broadcasts (async), risking
+> starvation. Instead, the actor owns the source list and all listener assignments
+> exclusively. Commands:
+>
+> ```rust
+> enum TopologyCommand {
+>     ParticipantJoined {
+>         pubkey: String,
+>         endpoint_id: String,
+>         willing_relay: bool,
+>         relay_capacity: Option<u32>,
+>     },
+>     ParticipantLeft(String),
+>     RelayDisconnected(String),
+>     RelayVolunteered { pubkey: String, capacity: u32 },
+>     /// Query: caller supplies a oneshot to receive the current topology map.
+>     GetTopology(oneshot::Sender<HashMap<String, AudioAssignment>>),
+> }
+> ```
+>
+> The host's gossip heartbeat loop calls `GetTopology` (non-blocking `oneshot`) to
+> build the `RoomState` broadcast. All assignment mutations are sequential inside the
+> actor, so rebalancing decisions are never interleaved with concurrent joins/leaves.
 
 ### 4.9 Stream Authentication (Hash Chain)
 
@@ -1233,20 +1344,32 @@ src-tauri/src/call/                   (existing, updated imports only)
                        instead of local submodules
 
 src-tauri/src/stage/                  (new)
-    mod.rs          -- StageHandler: ProtocolHandler impl, create/join/leave,
-                       state management, audio session orchestration
-    control.rs      -- Gossip-based control plane: StageControl message
-                       processing, host command signing/verification,
-                       presence tracking with heartbeat
-    fanout.rs       -- Fanout: broadcast-channel based fan-out, used by
-                       host (mixed stream) and relays (forwarding)
-    mixer.rs        -- HostMixer: decodes N speaker streams (audio::codec),
-                       mixes PCM, re-encodes as single Opus stream, feeds
-                       Fanout
-    relay.rs        -- RelayState: upstream connection to host/relay,
-                       downstream fanout to listeners
-    topology.rs     -- Host-side topology manager: assigns listeners to
-                       host/relays, rebalances on changes
+    mod.rs          -- StageHandler (ProtocolHandler impl, holds StageActorHandle),
+                       StageActor (Tokio actor, owns ActiveStage exclusively),
+                       StageActorHandle (cheap-to-clone mpsc::Sender<StageCommand>),
+                       StageCommand (enum covering all lifecycle, media, control,
+                       and query messages)
+    control.rs      -- Gossip-based control plane: subscribes to Stage TopicId,
+                       deserializes StageControl messages, forwards them to
+                       StageActorHandle as StageCommand::GossipEvent; also
+                       drives the host heartbeat loop (sends StageCommand::Tick)
+    fanout.rs       -- Fanout: thin wrapper over broadcast::Sender<Arc<AudioFrame>>;
+                       NOT an actor -- send_frame() and subscribe() are both
+                       non-blocking and lock-free; owned exclusively by whichever
+                       actor drives it (HostMixer or RelayActor)
+    mixer.rs        -- HostMixer (Tokio actor): owns all OpusDecoders, the encode
+                       OpusEncoder, Fanout, HostAuthState, RMS accumulators;
+                       MixerCommand enum (AddSpeaker, RemoveSpeaker, Shutdown);
+                       MixerHandle (mpsc::Sender<MixerCommand>) held by StageActor
+    relay.rs        -- RelayActor (Tokio actor): owns Fanout, upstream
+                       CancellationToken, subscriber token list;
+                       RelayCommand enum (AddDownstream, Frame, Shutdown);
+                       RelayHandle (mpsc::Sender<RelayCommand>) held by StageActor
+    topology.rs     -- TopologyActor (Tokio actor): owns source list and all
+                       listener assignments; TopologyCommand enum
+                       (ParticipantJoined, ParticipantLeft, RelayDisconnected,
+                       RelayVolunteered, GetTopology);
+                       TopologyHandle (mpsc::Sender<TopologyCommand>) held by StageActor
 ```
 
 ### 5.2 Types (shared crate)
@@ -1266,15 +1389,45 @@ crates/iroh-social-types/src/stage.rs
     AuthResult              -- Ok | Verified | TamperDetected | InvalidSignature
 
 Internal to src-tauri/src/stage/ (not shared):
-    Fanout                  -- broadcast-channel fan-out (fanout.rs)
-    AudioFrame              -- seq + timestamp + payload (fanout.rs)
-    HostMixer               -- decode N streams, mix, re-encode (mixer.rs)
-    HostAuthState           -- hash chain + signing for mixed stream (mixer.rs)
-    ListenerAuthState       -- hash chain verification (mod.rs)
-    RelayState              -- upstream conn + downstream fanout (relay.rs)
-    TopologyManager         -- source list, assignments, rebalancing (topology.rs)
-    Source                  -- endpoint_id + kind + capacity + count (topology.rs)
-    SourceKind              -- Host | CoHost | ServerRelay | VolunteerRelay (topology.rs)
+    -- mod.rs (StageActor owns ActiveStage; all other actors are sub-actors)
+    StageActor              -- Tokio actor task; owns Option<ActiveStage>
+    StageActorHandle        -- mpsc::Sender<StageCommand>; Clone; held by
+                               StageHandler, Tauri command handlers, control loop
+    StageCommand            -- enum: CreateStage, JoinStage, LeaveStage, EndStage,
+                               IncomingConnection, GossipEvent, PromoteSpeaker,
+                               DemoteSpeaker, AssignCoHost, RevokeCoHost,
+                               AssignRelay, RevokeRelay, MuteSpeaker, Kick, Ban,
+                               RaiseHand, LowerHand, ToggleSelfMute, SendReaction,
+                               SendChat, GetState (oneshot reply)
+    ActiveStage             -- plain struct, exclusively owned by StageActor;
+                               holds sub-actor handles (MixerHandle, RelayHandle,
+                               TopologyHandle) rather than the actors themselves
+    ListenerAuthState       -- hash chain verification (owned by recv task in mod.rs)
+
+    -- fanout.rs
+    Fanout                  -- thin broadcast::Sender<Arc<AudioFrame>> wrapper;
+                               NOT an actor; lock-free; owned by MixerActor or RelayActor
+    AudioFrame              -- seq + timestamp + payload
+
+    -- mixer.rs (Tokio actor)
+    MixerActor              -- actor task; owns all OpusDecoders, OpusEncoder,
+                               Fanout, HostAuthState, RMS state
+    MixerHandle             -- mpsc::Sender<MixerCommand>; held by StageActor
+    MixerCommand            -- AddSpeaker { pubkey, pcm_rx }, RemoveSpeaker, Shutdown
+    HostAuthState           -- hash chain + signing state (owned by MixerActor)
+
+    -- relay.rs (Tokio actor)
+    RelayActor              -- actor task; owns Fanout, upstream token, subscriber tokens
+    RelayHandle             -- mpsc::Sender<RelayCommand>; held by StageActor
+    RelayCommand            -- AddDownstream(SendStream), Frame { seq, ts, payload }, Shutdown
+
+    -- topology.rs (Tokio actor)
+    TopologyActor           -- actor task; owns source list and all assignments
+    TopologyHandle          -- mpsc::Sender<TopologyCommand>; held by StageActor
+    TopologyCommand         -- ParticipantJoined, ParticipantLeft, RelayDisconnected,
+                               RelayVolunteered, GetTopology (oneshot reply)
+    Source                  -- endpoint_id + kind + capacity + downstream_count
+    SourceKind              -- Host | CoHost | ServerRelay | VolunteerRelay
 ```
 
 ### 5.3 Commands
@@ -1428,8 +1581,77 @@ struct RelayInfo {
 }
 ```
 
-Like `CallHandler`, only one active Stage at a time (mutex over `Option`).
-A user cannot be in a Stage and a 1:1 call simultaneously.
+Only one active Stage at a time. A user cannot be in a Stage and a
+1:1 call simultaneously.
+
+> **Implementation note (Tokio actor pattern):** Unlike `CallHandler`, which uses
+> `Arc<Mutex<Option<ActiveCall>>>` safely because `ActiveCall` is tiny (call_id,
+> peer pubkey, cancel token, one AtomicBool) and no lock is ever held across an await
+> point, `ActiveStage` is far too complex for that approach.
+>
+> `StageHandler` should hold a `StageActorHandle` (an `mpsc::Sender<StageCommand>`)
+> rather than `Arc<Mutex<Option<ActiveStage>>>`. A `StageActor` task owns
+> `Option<ActiveStage>` exclusively and processes all mutations sequentially:
+>
+> ```rust
+> /// Cheap to clone — just a channel sender.
+> #[derive(Clone)]
+> pub struct StageActorHandle {
+>     cmd_tx: mpsc::Sender<StageCommand>,
+> }
+>
+> enum StageCommand {
+>     // Lifecycle
+>     CreateStage { title: String, relay_servers: Vec<String>, reply: oneshot::Sender<Result<StageTicket, AppError>> },
+>     JoinStage    { ticket: StageTicket, reply: oneshot::Sender<Result<StageState, AppError>> },
+>     LeaveStage,
+>     EndStage,
+>
+>     // Media plane (from ProtocolHandler::accept)
+>     IncomingConnection(Connection),
+>
+>     // Control plane (from gossip loop in control.rs)
+>     GossipEvent(StageControl),
+>
+>     // Host commands (from Tauri command handlers)
+>     PromoteSpeaker(String),
+>     DemoteSpeaker(String),
+>     AssignCoHost(String),
+>     RevokeCoHost(String),
+>     AssignRelay(String),
+>     RevokeRelay(String),
+>     MuteSpeaker(String),
+>     Kick(String),
+>     Ban(String),
+>     RaiseHand,
+>     LowerHand,
+>     ToggleSelfMute { reply: oneshot::Sender<bool> },
+>     SendReaction(String),
+>     SendChat(String),
+>
+>     // Query
+>     GetState(oneshot::Sender<Option<StageState>>),
+> }
+> ```
+>
+> **Why this is necessary here (and not for `CallHandler`):**
+>
+> 1. `ProtocolHandler::accept` is called concurrently for every incoming QUIC
+>    connection (multiple speakers and listeners may connect simultaneously). Each
+>    `accept` call needs to read the current role list and mutate the participant
+>    map. With a mutex, these calls would serialize on every connection attempt.
+>    With the actor, each `accept` simply sends `IncomingConnection(conn)` and
+>    returns — the actor serializes them naturally.
+>
+> 2. Multi-step commands like `PromoteSpeaker` involve async work (connect to
+>    the new speaker on `STAGE_ALPN`, send a `MixerCommand::AddSpeaker`, broadcast
+>    gossip). A mutex cannot be held across those awaits. The actor performs
+>    them in sequence without holding any lock.
+>
+> 3. The mixer actor and topology actor (see §4.6 and §4.8 notes) are owned by
+>    the `StageActor`. Handles to them (`mpsc::Sender<MixerCommand>`,
+>    `mpsc::Sender<TopologyCommand>`) live inside `ActiveStage`. There is no
+>    shared mutable state: the `StageActor` drives everything via message passing.
 
 ### 6.2 Lifecycle
 

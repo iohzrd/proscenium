@@ -6,7 +6,7 @@ pub const SAMPLE_RATE: u32 = 48_000;
 pub const FRAME_DURATION_MS: u32 = 20;
 /// Samples per channel per frame: 48000 * 20 / 1000 = 960.
 pub const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
-/// We operate in mono for voice calls.
+/// We operate in mono for voice.
 pub const CHANNELS: Channels = Channels::Mono;
 /// Total samples per frame (mono = same as SAMPLES_PER_FRAME).
 pub const FRAME_SIZE: usize = SAMPLES_PER_FRAME;
@@ -30,8 +30,17 @@ impl OpusEncoder {
 
     /// Push samples into the encoder buffer. Returns encoded Opus packets
     /// for each complete frame accumulated.
+    ///
+    /// The buffer is capped at 10 frames (~200ms). If the caller stalls,
+    /// the oldest samples are dropped to prevent unbounded memory growth.
     pub fn push_samples(&mut self, samples: &[f32]) -> Vec<Vec<u8>> {
+        const MAX_BUFFER: usize = FRAME_SIZE * 10;
         self.buffer.extend_from_slice(samples);
+        if self.buffer.len() > MAX_BUFFER {
+            let excess = self.buffer.len() - MAX_BUFFER;
+            log::warn!("[opus-enc] buffer overflow, dropping {excess} oldest samples");
+            self.buffer.drain(..excess);
+        }
         let mut packets = Vec::new();
         while self.buffer.len() >= FRAME_SIZE {
             let frame: Vec<f32> = self.buffer.drain(..FRAME_SIZE).collect();
@@ -58,7 +67,7 @@ impl OpusDecoder {
         Ok(Self { decoder })
     }
 
-    /// Decode an Opus packet into f32 samples. Returns the decoded samples.
+    /// Decode an Opus packet into f32 samples.
     pub fn decode(&mut self, packet: &[u8]) -> Result<Vec<f32>, opus::Error> {
         let mut output = vec![0.0f32; FRAME_SIZE];
         let decoded = self.decoder.decode_float(packet, &mut output, false)?;
@@ -67,7 +76,7 @@ impl OpusDecoder {
     }
 
     /// Generate comfort noise / silence for a lost packet (PLC).
-    #[allow(dead_code)] // available for future jitter buffer use
+    #[allow(dead_code)]
     pub fn decode_loss(&mut self) -> Result<Vec<f32>, opus::Error> {
         let mut output = vec![0.0f32; FRAME_SIZE];
         let decoded = self.decoder.decode_float(&[], &mut output, false)?;
@@ -85,7 +94,6 @@ mod tests {
         let mut enc = OpusEncoder::new().unwrap();
         let mut dec = OpusDecoder::new().unwrap();
 
-        // Generate a 960-sample sine wave (one frame)
         let samples: Vec<f32> = (0..FRAME_SIZE)
             .map(|i| (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / SAMPLE_RATE as f32).sin())
             .collect();
@@ -95,7 +103,6 @@ mod tests {
 
         let decoded = dec.decode(&packets[0]).unwrap();
         assert_eq!(decoded.len(), FRAME_SIZE);
-        // Lossy codec, so just check non-silence
         let energy: f32 = decoded.iter().map(|s| s * s).sum();
         assert!(energy > 0.01);
     }
@@ -104,12 +111,10 @@ mod tests {
     fn encode_accumulates_partial_frames() {
         let mut enc = OpusEncoder::new().unwrap();
 
-        // Push half a frame
         let half: Vec<f32> = vec![0.0; FRAME_SIZE / 2];
         let packets = enc.push_samples(&half);
         assert!(packets.is_empty());
 
-        // Push the other half
         let packets = enc.push_samples(&half);
         assert_eq!(packets.len(), 1);
     }
