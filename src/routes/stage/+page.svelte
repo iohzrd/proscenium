@@ -322,6 +322,13 @@
   onMount(() => {
     const unlisteners: Promise<UnlistenFn>[] = [];
 
+    // Prefill join ticket from ?ticket= URL param (e.g. navigated from a StageCard)
+    const params = new URLSearchParams(window.location.search);
+    const ticketParam = params.get("ticket");
+    if (ticketParam) {
+      joinTicket = ticketParam;
+    }
+
     // Restore existing stage state on mount
     invoke<StageState | null>("get_stage_state")
       .then((s) => {

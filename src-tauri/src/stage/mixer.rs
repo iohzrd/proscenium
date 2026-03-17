@@ -296,19 +296,27 @@ async fn run_mixer(
                     let _ = pcm_tx.try_send(minus_host);
                 }
 
-                // Mix-minus per remote speaker: encode and forward on each return channel.
+                // Per-speaker return stream: host-voice-only.
+                //
+                // Each promoted speaker receives the host's mic contribution as their
+                // return stream. All other speaker voices reach them via direct mesh
+                // connections, eliminating double-playback artifacts.
+                let host_contrib = if let Some((ref host_pk, _)) = host_speaker {
+                    contributions
+                        .get(host_pk.as_str())
+                        .cloned()
+                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE])
+                } else {
+                    vec![0.0; FRAME_SIZE]
+                };
+                let host_only: Vec<f32> = host_contrib
+                    .iter()
+                    .map(|s| s.clamp(-1.0, 1.0))
+                    .collect();
+
                 let mut dead_returns: Vec<String> = Vec::new();
                 for (pubkey, (opus_tx, ret_encoder)) in return_channels.iter_mut() {
-                    let contrib = contributions
-                        .get(pubkey.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE]);
-                    let minus_self: Vec<f32> = total
-                        .iter()
-                        .zip(contrib.iter())
-                        .map(|(t, c)| (t - c).clamp(-1.0, 1.0))
-                        .collect();
-                    for packet in ret_encoder.push_samples(&minus_self) {
+                    for packet in ret_encoder.push_samples(&host_only) {
                         if opus_tx.try_send(packet).is_err() {
                             dead_returns.push(pubkey.clone());
                             break;

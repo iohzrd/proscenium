@@ -44,6 +44,7 @@ impl ControlPlane {
         my_pubkey: String,
         my_role: StageRole,
         signing_key: SecretKey,
+        node_id: Option<String>,
         // Deliver parsed incoming control messages back to the StageActor.
         ctrl_tx: mpsc::Sender<SignedStageControl>,
         cancel: CancellationToken,
@@ -66,12 +67,14 @@ impl ControlPlane {
         let hb_pubkey = my_pubkey.clone();
         let hb_role = my_role;
         let hb_key = signing_key.clone();
+        let hb_node_id = node_id.clone();
         tokio::spawn(async move {
             heartbeat_loop(
                 hb_sender,
                 hb_stage_id,
                 hb_pubkey,
                 hb_role,
+                hb_node_id,
                 hb_key,
                 hb_cancel,
             )
@@ -86,6 +89,7 @@ impl ControlPlane {
                 pubkey: my_pubkey,
                 role: my_role,
                 timestamp: now_millis(),
+                node_id,
             },
             &signing_pubkey,
             &signing_key,
@@ -187,6 +191,7 @@ async fn heartbeat_loop(
     stage_id: String,
     pubkey: String,
     role: StageRole,
+    node_id: Option<String>,
     signing_key: SecretKey,
     cancel: CancellationToken,
 ) {
@@ -207,6 +212,7 @@ async fn heartbeat_loop(
                         pubkey: pubkey.clone(),
                         role,
                         timestamp: ts,
+                        node_id: node_id.clone(),
                     },
                     &signing_pubkey,
                     &signing_key,

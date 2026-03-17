@@ -245,6 +245,14 @@ export type StageEvent =
   | { type: "kicked" }
   | { type: "auth_failed"; source: string; reason: string };
 
+export interface StageAnnouncement {
+  stage_id: string;
+  title: string;
+  ticket: string;
+  host_pubkey: string;
+  started_at: number;
+}
+
 export interface CallEvent {
   call_id: string;
   peer_pubkey: string;

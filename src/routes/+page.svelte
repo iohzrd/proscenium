@@ -4,11 +4,12 @@
   import { onMount } from "svelte";
   import Lightbox from "$lib/Lightbox.svelte";
   import PostFeed from "$lib/PostFeed.svelte";
+  import StageCard from "$lib/StageCard.svelte";
   import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import PostComposer from "$lib/PostComposer.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import { hapticImpact } from "$lib/haptics";
-  import type { Post } from "$lib/types";
+  import type { Post, StageAnnouncement } from "$lib/types";
   import { shortId, seedOwnProfile, evictDisplayName } from "$lib/utils";
   import {
     useToast,
@@ -23,6 +24,7 @@
 
   let syncing = $state(false);
   let posts = $state<Post[]>([]);
+  let liveStages = $state<Map<string, StageAnnouncement>>(new Map());
   let showScrollTop = $state(false);
   let sentinel = $state<HTMLDivElement>(null!);
   let syncFailures = $state<string[]>([]);
@@ -177,6 +179,16 @@
         evictDisplayName(pubkey);
         loadFeed();
       },
+      "stage-announced": (payload) => {
+        const ann = payload as StageAnnouncement;
+        liveStages = new Map(liveStages).set(ann.stage_id, ann);
+      },
+      "stage-ended-remote": (payload) => {
+        const stageId = payload as string;
+        const next = new Map(liveStages);
+        next.delete(stageId);
+        liveStages = next;
+      },
     });
     window.addEventListener("scroll", handleScroll);
     window.addEventListener("keydown", handleGlobalKey);
@@ -247,6 +259,14 @@
 
     <hr class="divider" />
 
+    {#if liveStages.size > 0}
+      <div class="live-stages">
+        {#each [...liveStages.values()] as ann (ann.stage_id)}
+          <StageCard announcement={ann} />
+        {/each}
+      </div>
+    {/if}
+
     <PostFeed
       {posts}
       pubkey={node.pubkey}
@@ -311,6 +331,10 @@
     border: none;
     border-top: 1px solid var(--border);
     margin: 0.25rem 0 1rem;
+  }
+
+  .live-stages {
+    margin-bottom: 0.75rem;
   }
 
   .identity-card {

@@ -34,6 +34,10 @@ use topology::TopologyManager;
 /// Connection type byte: sent as first byte of the bi-stream by the initiating side.
 const CONN_TYPE_SPEAKER: u8 = 0x01;
 const CONN_TYPE_LISTENER: u8 = 0x02;
+/// Direct speaker-to-speaker mesh connection. The initiating speaker sends mic
+/// audio on the send stream; the accepting speaker decodes and plays it back.
+/// No return data flows on the recv side.
+const CONN_TYPE_SPEAKER_MESH: u8 = 0x03;
 
 // ---- Participant tracking -----------------------------------------------
 
@@ -45,6 +49,9 @@ struct Participant {
     self_muted: bool,
     host_muted: bool,
     last_seen_ms: u64,
+    /// Transport NodeId of this participant, populated from Presence heartbeats.
+    /// Required for direct speaker mesh connections.
+    node_id: Option<String>,
 }
 
 // ---- Command enum -------------------------------------------------------
@@ -330,6 +337,12 @@ struct ActiveStage {
     /// Cancellation token for the current listener audio pipeline.
     /// Cancelled on relay reassignment to restart the pipeline pointing at the new upstream.
     listener_pipeline_cancel: Option<CancellationToken>,
+    /// Speaker-role only: PCM sink for the local mesh playback mixer.
+    /// Each decoded mesh peer stream sends Vec<f32> frames here.
+    mesh_pcm_tx: Option<mpsc::Sender<Vec<f32>>>,
+    /// Speaker-role only: broadcast sender for mic capture fan-out.
+    /// Cloned for each mesh peer send task so all connections share one AudioCapture.
+    mic_broadcast_tx: Option<tokio::sync::broadcast::Sender<Vec<f32>>>,
 }
 
 // ---- StageActor ---------------------------------------------------------
@@ -399,6 +412,7 @@ impl StageActor {
                     let fanout = active.fanout.clone();
                     let mixer_handle = active.mixer_handle.clone();
                     let relay_handle = active.relay_handle.clone();
+                    let mesh_pcm_tx = active.mesh_pcm_tx.clone();
                     let conn_cancel = active.cancel.child_token();
                     tokio::spawn(async move {
                         handle_incoming_connection(
@@ -407,6 +421,7 @@ impl StageActor {
                             fanout,
                             mixer_handle,
                             relay_handle,
+                            mesh_pcm_tx,
                             conn_cancel,
                         )
                         .await;
@@ -508,6 +523,7 @@ impl StageActor {
             my_pubkey.clone(),
             StageRole::Host,
             signing_key.clone(),
+            Some(node_id.clone()),
             ctrl_tx,
             cancel.child_token(),
         )
@@ -573,6 +589,7 @@ impl StageActor {
                 self_muted: false,
                 host_muted: false,
                 last_seen_ms: now,
+                node_id: Some(node_id.clone()),
             },
         );
 
@@ -596,6 +613,8 @@ impl StageActor {
             ticket: Some(ticket.clone()),
             listener_upstream_id: None,
             listener_pipeline_cancel: None,
+            mesh_pcm_tx: None,
+            mic_broadcast_tx: None,
         });
 
         // Forward incoming control messages to the actor via the command channel
@@ -648,6 +667,7 @@ impl StageActor {
         let stage_id = ticket.stage_id.clone();
         let id = self.identity.read().await;
         let my_pubkey = id.master_pubkey.clone();
+        let my_node_id = id.transport_node_id.clone();
         let signing_key = id.signing_key.clone();
         drop(id);
 
@@ -664,6 +684,7 @@ impl StageActor {
             my_pubkey.clone(),
             StageRole::Listener,
             signing_key,
+            Some(my_node_id),
             ctrl_tx,
             cancel.child_token(),
         )
@@ -690,6 +711,8 @@ impl StageActor {
             ticket: None,
             listener_upstream_id: Some(ticket.host_node_id.clone()),
             listener_pipeline_cancel: Some(listener_cancel.clone()),
+            mesh_pcm_tx: None,
+            mic_broadcast_tx: None,
         });
 
         // Forward incoming control messages to the actor
@@ -941,15 +964,26 @@ impl StageActor {
     async fn promote_speaker(&mut self, pubkey: String) -> Result<(), AppError> {
         self.require_host_active(&pubkey, "promote")?;
 
+        // Look up the speaker's transport NodeId from their Presence heartbeat so
+        // existing speakers can open direct mesh connections.
+        let speaker_node_id = self
+            .active
+            .as_ref()
+            .and_then(|s| s.participants.get(&pubkey))
+            .and_then(|p| p.node_id.clone());
+
         if let Some(p) = self.active.as_mut().unwrap().participants.get_mut(&pubkey) {
             p.role = StageRole::Speaker;
         }
 
-        self.broadcast_control(|sid, pk, sk| {
+        let pubkey_for_bcast = pubkey.clone();
+        let node_id_clone = speaker_node_id.clone();
+        self.broadcast_control(move |sid, pk, sk| {
             sign_stage_control(
                 StageControl::PromoteSpeaker {
                     stage_id: sid.to_string(),
-                    pubkey: pubkey.clone(),
+                    pubkey: pubkey_for_bcast.clone(),
+                    speaker_node_id: node_id_clone.clone(),
                 },
                 pk,
                 sk,
@@ -1076,6 +1110,7 @@ impl StageActor {
                 pubkey,
                 role,
                 timestamp,
+                node_id,
                 ..
             } => {
                 let now = now_millis();
@@ -1090,9 +1125,13 @@ impl StageActor {
                             self_muted: false,
                             host_muted: false,
                             last_seen_ms: *timestamp,
+                            node_id: node_id.clone(),
                         });
                 entry.last_seen_ms = now;
                 entry.role = *role;
+                if node_id.is_some() {
+                    entry.node_id = node_id.clone();
+                }
                 // Emit join if this is the first time we see them
                 // (Phase 3: track whether we've seen them before)
                 let _ = self.app_handle.emit(
@@ -1138,31 +1177,124 @@ impl StageActor {
                     },
                 );
             }
-            StageControl::PromoteSpeaker { pubkey, .. } => {
+            StageControl::PromoteSpeaker {
+                pubkey,
+                speaker_node_id,
+                ..
+            } => {
                 if signed.sender_pubkey == stage.host_pubkey {
+                    // Record the speaker's NodeId if provided.
+                    if let Some(nid) = speaker_node_id
+                        && let Some(p) = stage.participants.get_mut(pubkey.as_str())
+                    {
+                        p.node_id = Some(nid.clone());
+                    }
                     if let Some(p) = stage.participants.get_mut(pubkey.as_str()) {
                         p.role = StageRole::Speaker;
                     }
-                    // If promoted ourselves, start the speaker audio pipeline.
+
                     if pubkey == &stage.my_pubkey {
+                        // Self-promotion: set up the full speaker mesh pipeline.
                         stage.my_role = StageRole::Speaker;
-                        // Cancel the listener pipeline — the speaker pipeline provides its own
-                        // mix-minus playback via the return stream, eliminating echo.
+
+                        // Cancel the existing listener pipeline.
                         if let Some(old_cancel) = stage.listener_pipeline_cancel.take() {
                             old_cancel.cancel();
                         }
+
+                        // Mic broadcast fan-out: one AudioCapture shared across host
+                        // connection + all mesh peer connections.
+                        let (mic_bcast_tx, _) = tokio::sync::broadcast::channel::<Vec<f32>>(32);
+                        stage.mic_broadcast_tx = Some(mic_bcast_tx.clone());
+
+                        // Mesh playback mixer: all decoded peer streams funnel here.
+                        let (mesh_pcm_tx, mesh_pcm_rx) = mpsc::channel::<Vec<f32>>(64);
+                        stage.mesh_pcm_tx = Some(mesh_pcm_tx);
+                        let pb_cancel = stage.cancel.child_token();
+                        tokio::spawn(mesh_playback(mesh_pcm_rx, pb_cancel));
+
+                        // Start the AudioCapture and fan its output to the broadcast channel.
+                        let (cap_tx, cap_rx) = mpsc::channel::<Vec<f32>>(32);
+                        let fwd_tx = mic_bcast_tx.clone();
+                        let cap_cancel = stage.cancel.child_token();
+                        tokio::spawn(async move {
+                            let _capture = match AudioCapture::start(cap_tx) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    log::error!("[stage-speaker] mic capture failed: {e}");
+                                    return;
+                                }
+                            };
+                            let mut cap_rx = cap_rx;
+                            loop {
+                                tokio::select! {
+                                    _ = cap_cancel.cancelled() => break,
+                                    samples = cap_rx.recv() => {
+                                        let Some(s) = samples else { break };
+                                        let _ = fwd_tx.send(s);
+                                    }
+                                }
+                            }
+                        });
+
+                        // Connect to host for mic submission + host-voice return stream.
                         let endpoint = self.endpoint.clone();
-                        // listener_upstream_id is the host's transport NodeId (set at join).
-                        // For a speaker who joined as a listener this is always populated.
                         let host_node_id = stage
                             .listener_upstream_id
                             .clone()
                             .unwrap_or_else(|| stage.host_pubkey.clone());
-                        let speaker_cancel = stage.cancel.child_token();
+                        let host_mic_rx = mic_bcast_tx.subscribe();
+                        let mesh_tx_for_host = stage.mesh_pcm_tx.as_ref().unwrap().clone();
+                        let spk_cancel = stage.cancel.child_token();
                         tokio::spawn(async move {
-                            start_speaker_pipeline(endpoint, host_node_id, speaker_cancel).await;
+                            start_speaker_pipeline(
+                                endpoint,
+                                host_node_id,
+                                host_mic_rx,
+                                mesh_tx_for_host,
+                                spk_cancel,
+                            )
+                            .await;
                         });
+
+                        // Connect to all existing peer speakers for direct mesh audio.
+                        let my_pubkey = stage.my_pubkey.clone();
+                        for (pk, participant) in &stage.participants {
+                            if pk == &my_pubkey {
+                                continue;
+                            }
+                            if participant.role != StageRole::Speaker
+                                && participant.role != StageRole::CoHost
+                            {
+                                continue;
+                            }
+                            if let Some(ref peer_node_id) = participant.node_id {
+                                let ep = self.endpoint.clone();
+                                let nid = peer_node_id.clone();
+                                let mic_rx = mic_bcast_tx.subscribe();
+                                let mesh_cancel = stage.cancel.child_token();
+                                tokio::spawn(async move {
+                                    start_mesh_send(ep, nid, mic_rx, mesh_cancel).await;
+                                });
+                            }
+                        }
+                    } else if stage.my_role == StageRole::Speaker
+                        || stage.my_role == StageRole::CoHost
+                    {
+                        // Another speaker was promoted: open a direct mesh send to them.
+                        if let (Some(peer_node_id), Some(mic_tx)) =
+                            (speaker_node_id, &stage.mic_broadcast_tx)
+                        {
+                            let ep = self.endpoint.clone();
+                            let nid = peer_node_id.clone();
+                            let mic_rx = mic_tx.subscribe();
+                            let mesh_cancel = stage.cancel.child_token();
+                            tokio::spawn(async move {
+                                start_mesh_send(ep, nid, mic_rx, mesh_cancel).await;
+                            });
+                        }
                     }
+
                     let _ = self.app_handle.emit(
                         "stage-event",
                         StageEvent::RoleChanged {
@@ -1559,6 +1691,7 @@ async fn handle_incoming_connection(
     fanout: Option<Arc<Fanout>>,
     mixer_handle: Option<MixerHandle>,
     relay_handle: Option<relay::RelayHandle>,
+    mesh_pcm_tx: Option<mpsc::Sender<Vec<f32>>>,
     cancel: CancellationToken,
 ) {
     let remote = conn.remote_id().to_string();
@@ -1623,7 +1756,7 @@ async fn handle_incoming_connection(
     }
 
     match my_role {
-        StageRole::Host | StageRole::CoHost => {
+        StageRole::Host => {
             // Accept the bi-stream opened by the remote
             let (mut send, mut recv) =
                 match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
@@ -1701,8 +1834,58 @@ async fn handle_incoming_connection(
                 }
             }
         }
+        StageRole::Speaker | StageRole::CoHost => {
+            // Speakers accept direct mesh connections from peer speakers.
+            let (mut send, mut recv) =
+                match tokio::time::timeout(std::time::Duration::from_secs(5), conn.accept_bi())
+                    .await
+                {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        log::warn!(
+                            "[stage-mesh] failed to accept bi-stream from {}: {e}",
+                            short_id(&remote)
+                        );
+                        return;
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            "[stage-mesh] timeout accepting bi-stream from {}",
+                            short_id(&remote)
+                        );
+                        return;
+                    }
+                };
+
+            let mut type_buf = [0u8; 1];
+            if tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                recv.read_exact(&mut type_buf),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+
+            match type_buf[0] {
+                CONN_TYPE_SPEAKER_MESH => {
+                    log::info!("[stage-mesh] peer speaker connected: {}", short_id(&remote));
+                    let _ = send.finish(); // no return data on this stream
+                    if let Some(pcm_tx) = mesh_pcm_tx {
+                        tokio::spawn(mesh_recv_loop(recv, remote, pcm_tx, cancel));
+                    }
+                }
+                unknown => {
+                    log::warn!(
+                        "[stage-mesh] unexpected conn type {unknown:#x} from {}",
+                        short_id(&remote)
+                    );
+                    conn.close(0u32.into(), b"expected CONN_TYPE_SPEAKER_MESH");
+                }
+            }
+        }
         _ => {
-            // Listeners and speakers don't accept audio connections
             log::debug!(
                 "[stage] rejecting incoming from {} (role {:?})",
                 short_id(&remote),
@@ -2131,20 +2314,178 @@ async fn run_return_writer(
     let _ = send.finish();
 }
 
-/// Receive a host's personalized mix-minus Opus stream on the speaker's return recv stream
-/// and play it back locally.
+/// Push PCM frames from the mesh playback channel into a single AudioPlayback.
 ///
-/// The host sends a stream of framed Opus packets containing the mix of all other speakers
-/// (i.e. everyone except this speaker), eliminating echo for the promoted speaker.
-async fn speaker_return_playback(mut recv: iroh::endpoint::RecvStream, cancel: CancellationToken) {
+/// All mesh peer decoder tasks (return stream + direct peer streams) funnel
+/// their decoded samples here. The ring buffer handles concurrent pushes from
+/// multiple tasks naturally; the single cpal callback reads them out.
+async fn mesh_playback(mut rx: mpsc::Receiver<Vec<f32>>, cancel: CancellationToken) {
     let (mut prod, _playback) = match AudioPlayback::start() {
         Ok(p) => p,
         Err(e) => {
-            log::error!("[stage-speaker] failed to start return playback: {e}");
+            log::error!("[stage-mesh] failed to start playback: {e}");
             return;
         }
     };
 
+    let mut frames: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            pcm = rx.recv() => {
+                let Some(samples) = pcm else { break };
+                prod.push(&samples);
+                frames += 1;
+            }
+        }
+    }
+    log::info!("[stage-mesh] playback stopped ({frames} frames)");
+}
+
+/// Connect to a peer speaker and send our mic audio directly (mesh stream).
+///
+/// Uses `CONN_TYPE_SPEAKER_MESH` to identify as a peer-to-peer connection.
+/// The peer accepts it and decodes our mic for local playback.
+async fn start_mesh_send(
+    endpoint: Endpoint,
+    peer_node_id: String,
+    mut mic_rx: tokio::sync::broadcast::Receiver<Vec<f32>>,
+    cancel: CancellationToken,
+) {
+    let peer_id: EndpointId = match peer_node_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("[stage-mesh] invalid peer node id: {e}");
+            return;
+        }
+    };
+
+    let conn = match endpoint
+        .connect(EndpointAddr::from(peer_id), STAGE_ALPN)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "[stage-mesh] failed to connect to peer {}: {e}",
+                short_id(&peer_node_id)
+            );
+            return;
+        }
+    };
+
+    let (mut send, _recv) = match conn.open_bi().await {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::warn!(
+                "[stage-mesh] failed to open bi-stream to peer {}: {e}",
+                short_id(&peer_node_id)
+            );
+            return;
+        }
+    };
+
+    if send.write_all(&[CONN_TYPE_SPEAKER_MESH]).await.is_err() {
+        return;
+    }
+
+    log::info!("[stage-mesh] connected to peer {}", short_id(&peer_node_id));
+
+    let mut encoder = match OpusEncoder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            log::error!("[stage-mesh] failed to create encoder: {e}");
+            return;
+        }
+    };
+
+    let mut seq: u32 = 0;
+    let mut timestamp: u32 = 0;
+    let mut frames: u32 = 0;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = mic_rx.recv() => {
+                let samples = match result {
+                    Ok(s) => s,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                for packet in encoder.push_samples(&samples) {
+                    if write_audio_frame(&mut send, seq, timestamp, TAG_NORMAL, &packet)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    seq = seq.wrapping_add(1);
+                    timestamp = timestamp.wrapping_add(SAMPLES_PER_FRAME as u32);
+                    frames += 1;
+                }
+            }
+        }
+    }
+
+    let _ = send.finish();
+    log::info!(
+        "[stage-mesh] mesh send to {} stopped ({frames} frames)",
+        short_id(&peer_node_id)
+    );
+}
+
+/// Receive a peer speaker's mic audio from a mesh stream, decode, and push to the
+/// local mesh playback channel.
+async fn mesh_recv_loop(
+    mut recv: iroh::endpoint::RecvStream,
+    peer: String,
+    pcm_tx: mpsc::Sender<Vec<f32>>,
+    cancel: CancellationToken,
+) {
+    let mut decoder = match OpusDecoder::new() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!(
+                "[stage-mesh] failed to create decoder for {}: {e}",
+                short_id(&peer)
+            );
+            return;
+        }
+    };
+
+    let mut frames: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = read_audio_frame(&mut recv) => {
+                match result {
+                    Ok(Some((_, _, _, payload))) => {
+                        if let Ok(samples) = decoder.decode(&payload) {
+                            let _ = pcm_tx.send(samples).await;
+                            frames += 1;
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+    }
+    log::info!(
+        "[stage-mesh] recv from {} stopped ({frames} frames)",
+        short_id(&peer)
+    );
+}
+
+/// Receive the host's voice Opus stream on the return recv stream and forward
+/// decoded PCM into the shared mesh playback channel.
+///
+/// The return stream carries only the host's own voice. All other speaker voices
+/// arrive via direct mesh connections (start_mesh_send / mesh_recv_loop).
+async fn speaker_return_playback(
+    mut recv: iroh::endpoint::RecvStream,
+    pcm_tx: mpsc::Sender<Vec<f32>>,
+    cancel: CancellationToken,
+) {
     let mut decoder = match OpusDecoder::new() {
         Ok(d) => d,
         Err(e) => {
@@ -2161,7 +2502,7 @@ async fn speaker_return_playback(mut recv: iroh::endpoint::RecvStream, cancel: C
                 match result {
                     Ok(Some((_, _, _, payload))) => {
                         if let Ok(samples) = decoder.decode(&payload) {
-                            prod.push(&samples);
+                            let _ = pcm_tx.send(samples).await;
                             frames += 1;
                         }
                     }
@@ -2170,14 +2511,19 @@ async fn speaker_return_playback(mut recv: iroh::endpoint::RecvStream, cancel: C
             }
         }
     }
-    log::info!("[stage-speaker] return playback stopped ({frames} frames)");
+    log::info!("[stage-speaker] return stream stopped ({frames} frames)");
 }
 
-/// Connect to the host as a speaker and start the capture → encode → send pipeline.
-/// Also handles receiving the host's audio back (phase 4: individual mesh streams).
+/// Connect to the host as a speaker.
+///
+/// Sends mic audio (from the shared broadcast receiver) to the host for mixing.
+/// Receives the host's own voice on the return stream and pushes decoded PCM into
+/// the mesh playback channel alongside direct peer streams.
 async fn start_speaker_pipeline(
     endpoint: Endpoint,
     host_node_id: String,
+    mut mic_rx: tokio::sync::broadcast::Receiver<Vec<f32>>,
+    mesh_pcm_tx: mpsc::Sender<Vec<f32>>,
     cancel: CancellationToken,
 ) {
     let host_id: EndpointId = match host_node_id.parse() {
@@ -2214,21 +2560,11 @@ async fn start_speaker_pipeline(
 
     log::info!("[stage-speaker] connected to host, starting capture");
 
-    // Play back the host's personalized mix-minus stream on the return recv stream.
-    // This replaces the listener pipeline and carries only other speakers' voices.
+    // Route the host's return stream (host-voice-only) into the mesh playback channel.
     let pb_cancel = cancel.child_token();
-    tokio::spawn(speaker_return_playback(recv, pb_cancel));
+    tokio::spawn(speaker_return_playback(recv, mesh_pcm_tx, pb_cancel));
 
-    // Capture → encode → send
-    let (cap_tx, mut cap_rx) = mpsc::channel::<Vec<f32>>(32);
-    let _capture = match AudioCapture::start(cap_tx) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("[stage-speaker] failed to start capture: {e}");
-            return;
-        }
-    };
-
+    // Encode mic samples from the shared broadcast channel and send to host.
     let mut encoder = match OpusEncoder::new() {
         Ok(e) => e,
         Err(e) => {
@@ -2244,8 +2580,12 @@ async fn start_speaker_pipeline(
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            samples = cap_rx.recv() => {
-                let Some(samples) = samples else { break };
+            result = mic_rx.recv() => {
+                let samples = match result {
+                    Ok(s) => s,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 for packet in encoder.push_samples(&samples) {
                     if write_audio_frame(&mut send, seq, timestamp, TAG_NORMAL, &packet)
                         .await
