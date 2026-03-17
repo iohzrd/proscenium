@@ -1136,18 +1136,16 @@ impl StageActor {
                     // If promoted ourselves, start the speaker audio pipeline
                     if pubkey == &stage.my_pubkey {
                         stage.my_role = StageRole::Speaker;
-                        // Connect to host on STAGE_ALPN and start sending capture audio
                         let endpoint = self.endpoint.clone();
-                        let host_node_id = stage.host_pubkey.clone();
-                        // We need the host's transport NodeId, not their master pubkey.
-                        // The ticket stored the host_node_id; look it up from participants
-                        // via the transport_node_id field we track (Phase 4: use proper lookup).
-                        // For now, resolve via storage.
+                        // listener_upstream_id is the host's transport NodeId (set at join).
+                        // For a speaker who joined as a listener this is always populated.
+                        let host_node_id = stage
+                            .listener_upstream_id
+                            .clone()
+                            .unwrap_or_else(|| stage.host_pubkey.clone());
                         let speaker_cancel = stage.cancel.child_token();
-                        let storage = self.storage.clone();
                         tokio::spawn(async move {
-                            start_speaker_pipeline(endpoint, storage, host_node_id, speaker_cancel)
-                                .await;
+                            start_speaker_pipeline(endpoint, host_node_id, speaker_cancel).await;
                         });
                     }
                     let _ = self.app_handle.emit(
@@ -2056,23 +2054,13 @@ async fn run_listener_once(
 /// Also handles receiving the host's audio back (phase 4: individual mesh streams).
 async fn start_speaker_pipeline(
     endpoint: Endpoint,
-    storage: Arc<Storage>,
-    host_pubkey: String,
+    host_node_id: String,
     cancel: CancellationToken,
 ) {
-    // Resolve host's transport NodeId from storage
-    let node_ids = storage
-        .get_peer_transport_node_ids(&host_pubkey)
-        .await
-        .unwrap_or_default();
-
-    let host_id: EndpointId = match node_ids.iter().find_map(|id| id.parse().ok()) {
-        Some(id) => id,
-        None => {
-            log::error!(
-                "[stage-speaker] no transport NodeId for host {}",
-                short_id(&host_pubkey)
-            );
+    let host_id: EndpointId = match host_node_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("[stage-speaker] invalid host node id: {e}");
             return;
         }
     };
