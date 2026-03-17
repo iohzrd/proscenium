@@ -25,7 +25,10 @@ use iroh_social_types::{
 };
 use mixer::{MixerHandle, spawn_mixer};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -445,7 +448,10 @@ struct ActiveStage {
     host_pubkey: String,
     my_pubkey: String,
     my_role: StageRole,
-    self_muted: bool,
+    /// Whether this node has muted its own microphone. Shared with the audio
+    /// capture thread so mute takes effect immediately without round-tripping
+    /// through the actor.
+    self_muted: Arc<AtomicBool>,
     started_at: u64,
     /// Live participant list, keyed by master pubkey.
     participants: HashMap<String, Participant>,
@@ -700,6 +706,7 @@ impl StageActor {
         let (aec_out_tx, aec_out_rx) = mpsc::channel::<Vec<f32>>(32);
         let (far_end_tx, mut far_end_rx) = mpsc::channel::<Vec<f32>>(20);
         let (host_pcm_tx, host_pcm_rx) = mpsc::channel::<Vec<f32>>(32);
+        let host_muted_flag = Arc::new(AtomicBool::new(false));
         match mixer_handle
             .add_speaker(my_pubkey.clone(), aec_out_rx)
             .await
@@ -715,6 +722,7 @@ impl StageActor {
                 });
                 // AEC bridge: dedicated std thread owns VoipAec3 (which is !Send).
                 // Uses tokio's blocking_recv/try_recv so no async runtime needed.
+                let muted_flag = host_muted_flag.clone();
                 std::thread::spawn(move || {
                     let mut aec = match EchoCanceller::new() {
                         Ok(a) => a,
@@ -728,7 +736,15 @@ impl StageActor {
                             aec.render(&r);
                         }
                         let cleaned = aec.process_capture(&s);
-                        if !cleaned.is_empty() && aec_out_tx.blocking_send(cleaned).is_err() {
+                        if cleaned.is_empty() {
+                            continue;
+                        }
+                        let out = if muted_flag.load(Ordering::Relaxed) {
+                            vec![0.0f32; cleaned.len()]
+                        } else {
+                            cleaned
+                        };
+                        if aec_out_tx.blocking_send(out).is_err() {
                             break;
                         }
                     }
@@ -773,7 +789,7 @@ impl StageActor {
             host_pubkey: my_pubkey.clone(),
             my_pubkey: my_pubkey.clone(),
             my_role: StageRole::Host,
-            self_muted: false,
+            self_muted: host_muted_flag,
             started_at: now,
             participants,
             control_plane,
@@ -908,7 +924,7 @@ impl StageActor {
             host_pubkey: ticket.host_pubkey.clone(),
             my_pubkey: my_pubkey.clone(),
             my_role: StageRole::Listener,
-            self_muted: false,
+            self_muted: Arc::new(AtomicBool::new(false)),
             started_at: now,
             participants: HashMap::new(),
             control_plane,
@@ -1102,8 +1118,7 @@ impl StageActor {
             .as_mut()
             .ok_or_else(|| AppError::Other("not in a stage".into()))?;
 
-        stage.self_muted = !stage.self_muted;
-        let muted = stage.self_muted;
+        let muted = !stage.self_muted.fetch_xor(true, Ordering::Relaxed);
         let my_pubkey = stage.my_pubkey.clone();
 
         self.broadcast_control(|sid, pk, sk| {
@@ -1482,12 +1497,14 @@ impl StageActor {
                         // Uses stage.host_node_id — never listener_upstream_id (which may be a relay).
                         let endpoint = self.endpoint.clone();
                         let host_node_id = stage.host_node_id.clone();
+                        let muted = stage.self_muted.clone();
                         let spk_cancel = stage.cancel.child_token();
                         tokio::spawn(async move {
                             start_speaker_pipeline(
                                 endpoint,
                                 host_node_id,
                                 speaker_mixer,
+                                muted,
                                 spk_cancel,
                             )
                             .await;
@@ -2631,6 +2648,7 @@ async fn start_speaker_pipeline(
     endpoint: Endpoint,
     host_node_id: String,
     speaker_mixer: SpeakerMixerHandle,
+    muted: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) {
     const BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(2);
@@ -2646,7 +2664,14 @@ async fn start_speaker_pipeline(
     };
 
     loop {
-        run_speaker_once(&endpoint, host_id, &speaker_mixer, cancel.child_token()).await;
+        run_speaker_once(
+            &endpoint,
+            host_id,
+            &speaker_mixer,
+            muted.clone(),
+            cancel.child_token(),
+        )
+        .await;
 
         if cancel.is_cancelled() {
             break;
@@ -2672,6 +2697,7 @@ async fn run_speaker_once(
     endpoint: &Endpoint,
     host_id: EndpointId,
     speaker_mixer: &SpeakerMixerHandle,
+    muted: Arc<AtomicBool>,
     session_cancel: CancellationToken,
 ) {
     // Fresh AEC far-end channel for this session.
@@ -2701,7 +2727,15 @@ async fn run_speaker_once(
                 aec.render(&r);
             }
             let cleaned = aec.process_capture(&s);
-            if !cleaned.is_empty() && fwd_tx.blocking_send(cleaned).is_err() {
+            if cleaned.is_empty() {
+                continue;
+            }
+            let out = if muted.load(Ordering::Relaxed) {
+                vec![0.0f32; cleaned.len()]
+            } else {
+                cleaned
+            };
+            if fwd_tx.blocking_send(out).is_err() {
                 break;
             }
         }
