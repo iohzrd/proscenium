@@ -531,6 +531,14 @@ impl StageActor {
         // Start the host audio mixer (owns encoder, auth state, per-speaker PCM buffers)
         let (mixer_handle, fanout) = spawn_mixer(signing_key.clone(), cancel.child_token())?;
 
+        // Host subscribes to own fanout for local playback (to hear remote speakers).
+        // Frames come from the in-process broadcast channel — no QUIC round-trip.
+        let local_rx = fanout.subscribe_local();
+        let host_pb_cancel = cancel.child_token();
+        tokio::spawn(async move {
+            run_host_playback(local_rx, host_pb_cancel).await;
+        });
+
         // Add host's own microphone as a speaker input so the host's voice is included in the mix
         let (cap_tx, cap_rx) = mpsc::channel::<Vec<f32>>(32);
         match mixer_handle.add_speaker(my_pubkey.clone(), cap_rx).await {
@@ -1774,6 +1782,65 @@ async fn start_relay_pipeline(
     );
 
     relay::spawn_relay(recv, cancel)
+}
+
+/// Decode the mixed audio stream from an in-process fanout subscription and play it locally.
+///
+/// Used by the host to hear remote speakers. There is no QUIC round-trip — the frames
+/// come directly from the broadcast channel. Hosts should use headphones until AEC is
+/// implemented; the mix includes the host's own voice.
+async fn run_host_playback(
+    mut rx: tokio::sync::broadcast::Receiver<fanout::AudioFrame>,
+    cancel: CancellationToken,
+) {
+    use crate::audio::transport::TAG_CHECKPOINT;
+    use auth::CHECKPOINT_EXTRA;
+
+    let (mut prod, _playback) = match AudioPlayback::start() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("[stage-host] failed to start playback: {e}");
+            return;
+        }
+    };
+
+    let mut decoder = match OpusDecoder::new() {
+        Ok(d) => d,
+        Err(e) => {
+            log::error!("[stage-host] failed to create decoder for playback: {e}");
+            return;
+        }
+    };
+
+    let mut frames: u32 = 0;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = rx.recv() => {
+                match result {
+                    Ok(frame) => {
+                        let opus = if frame.tag == TAG_CHECKPOINT {
+                            if frame.payload.len() < CHECKPOINT_EXTRA {
+                                continue;
+                            }
+                            &frame.payload[CHECKPOINT_EXTRA..]
+                        } else {
+                            &frame.payload
+                        };
+                        if let Ok(samples) = decoder.decode(opus) {
+                            prod.push(&samples);
+                            frames += 1;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::debug!("[stage-host] playback lagged {n} frames");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    log::info!("[stage-host] host playback stopped ({frames} frames)");
 }
 
 /// Connect to an upstream node (host or relay), receive the mixed stream, verify auth,
