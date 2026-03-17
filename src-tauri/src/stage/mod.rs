@@ -631,25 +631,37 @@ impl StageActor {
             }
         });
 
-        // Announce the stage on our user feed so followers can discover and join
+        // Announce the stage on our user feed so followers can discover and join.
+        // Re-broadcast every 30 s so followers who connect after the initial
+        // announcement still see it within a short window.
         {
             let gs = self.gossip_service.clone();
             let ann_stage_id = stage_id.clone();
             let ann_title = self.active.as_ref().unwrap().title.clone();
             let ann_ticket = ticket.clone();
             let ann_pubkey = my_pubkey.clone();
+            let ann_cancel = cancel.child_token();
             tokio::spawn(async move {
-                if let Err(e) = gs
-                    .broadcast_stage_announcement(
-                        ann_stage_id,
-                        ann_title,
-                        ann_ticket,
-                        ann_pubkey,
-                        now,
-                    )
-                    .await
-                {
-                    log::warn!("[stage] failed to broadcast stage announcement: {e}");
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ann_cancel.cancelled() => break,
+                        _ = interval.tick() => {
+                            if let Err(e) = gs
+                                .broadcast_stage_announcement(
+                                    ann_stage_id.clone(),
+                                    ann_title.clone(),
+                                    ann_ticket.clone(),
+                                    ann_pubkey.clone(),
+                                    now,
+                                )
+                                .await
+                            {
+                                log::warn!("[stage] failed to broadcast stage announcement: {e}");
+                            }
+                        }
+                    }
                 }
             });
         }
