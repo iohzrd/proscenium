@@ -102,32 +102,48 @@ impl ListenerAuthState {
         tag_byte: u8,
         checkpoint: Option<([u8; 32], [u8; 64])>,
     ) -> AuthResult {
-        // Once tampered, every frame is rejected until the caller reconnects.
+        // Once compromised, every frame is rejected until the caller reconnects.
         if self.compromised {
             return AuthResult::TamperDetected;
         }
 
-        // Late joiner: play unverified until first checkpoint adopts the chain.
-        if !self.verified && checkpoint.is_none() {
-            return AuthResult::Unverified;
+        if !self.verified {
+            // Late joiner: we don't have the prior chain state, so we cannot
+            // verify the hash chain until we receive and signature-verify a
+            // checkpoint. Normal frames before the first checkpoint are played
+            // unverified. On the first checkpoint we trust the signature alone
+            // (not the chain hash, which we can't reconstruct) and adopt
+            // `wire_hash` as the new chain baseline going forward.
+            let Some((wire_hash, wire_sig)) = checkpoint else {
+                return AuthResult::Unverified;
+            };
+            let sig = Signature::from_bytes(&wire_sig);
+            return match self.host_pubkey.verify(&wire_hash, &sig) {
+                Ok(()) => {
+                    self.chain_hash = wire_hash;
+                    self.verified = true;
+                    AuthResult::Verified
+                }
+                Err(_) => {
+                    self.compromised = true;
+                    AuthResult::InvalidSignature
+                }
+            };
         }
 
-        // Extend local chain identically to host.
+        // Verified path: extend local chain identically to the host.
         let mut hasher = Sha256::new();
         hasher.update(self.chain_hash);
         hasher.update(opus);
         self.chain_hash = hasher.finalize().into();
 
         if tag_byte == crate::audio::TAG_NORMAL {
-            return if self.verified {
-                AuthResult::Ok
-            } else {
-                AuthResult::Unverified
-            };
+            return AuthResult::Ok;
         }
 
+        // Checkpoint: verify chain hash matches and signature is valid.
         let Some((wire_hash, wire_sig)) = checkpoint else {
-            return AuthResult::Unverified;
+            return AuthResult::Ok;
         };
 
         if self.chain_hash != wire_hash {
@@ -137,14 +153,7 @@ impl ListenerAuthState {
 
         let sig = Signature::from_bytes(&wire_sig);
         match self.host_pubkey.verify(&wire_hash, &sig) {
-            Ok(()) => {
-                if !self.verified {
-                    // Late joiner: adopt this checkpoint as the baseline.
-                    self.chain_hash = wire_hash;
-                    self.verified = true;
-                }
-                AuthResult::Verified
-            }
+            Ok(()) => AuthResult::Verified,
             Err(_) => {
                 self.compromised = true;
                 AuthResult::InvalidSignature
