@@ -120,7 +120,7 @@
   }
 </script>
 
-<h2>Settings</h2>
+<h2>Preferences</h2>
 
 <section class="settings-section">
   <h3>Identity</h3>
@@ -193,7 +193,7 @@
   <p class="section-desc">
     Link multiple devices to share your identity, follows, and messages.
   </p>
-  <a href="/settings/devices" class="server-manage-link">Manage devices</a>
+  <a href="/preferences/devices" class="server-manage-link">Manage devices</a>
 </section>
 
 <section class="settings-section">

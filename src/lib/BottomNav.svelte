@@ -15,7 +15,7 @@
 
   let moreActive = $derived(
     currentPath === "/follows" ||
-      currentPath === "/settings" ||
+      currentPath === "/preferences" ||
       (!!pubkey && currentPath === `/profile/${pubkey}`),
   );
 
@@ -108,12 +108,12 @@
         <span>Follows</span>
       </a>
       <a
-        href="/settings"
-        class:active={currentPath === "/settings"}
+        href="/preferences"
+        class:active={currentPath === "/preferences"}
         onclick={closeMore}
       >
         <Icon name="settings" size={18} />
-        <span>Settings</span>
+        <span>Preferences</span>
       </a>
     </div>
   {/if}

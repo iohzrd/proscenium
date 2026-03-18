@@ -61,9 +61,9 @@
         <span class="nav-label">Profile</span>
       </a>
     {/if}
-    <a href="/settings" class:active={currentPath === "/settings"}>
+    <a href="/preferences" class:active={currentPath === "/preferences"}>
       <Icon name="settings" />
-      <span class="nav-label">Settings</span>
+      <span class="nav-label">Preferences</span>
     </a>
   </nav>
   <div class="sidebar-footer">
