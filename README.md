@@ -19,8 +19,9 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 Each node has a three-tier key hierarchy:
 
 - **Master key** (Ed25519) -- The permanent, unforgeable identity. Stored in `master_key.key`. Your master public key is what others follow. The master key signs delegations and key rotations but never signs content directly. On first launch, a 24-word BIP39 recovery phrase is generated for backup.
-- **Signing key** (Ed25519) -- Derived from the master key via HKDF-SHA256. Shared across all linked devices. Signs posts, interactions, profiles, and server registrations. Also derives the X25519 key used for DM encryption. Rotatable by the master key if a device is compromised.
 - **Transport key** (Ed25519) -- Derived from the master key via HKDF with a device-specific index. Unique per device. Used as iroh's QUIC endpoint identity (NodeId) for networking. Never used for signing content.
+- **Signing key** (Ed25519) -- Derived from the master key via HKDF-SHA256. Shared across all linked devices. Signs posts, interactions, profiles, and server registrations. Rotatable by the master key if a device is compromised.
+- **DM key** (X25519) -- Independently derived from the master key via HKDF with its own index. Used for Noise IK handshakes and Double Ratchet encryption. Rotatable independently of the signing key.
 
 The master key signs a `SigningKeyDelegation` binding the signing key to the identity. Peers cache this delegation and verify content signatures against the signing key. This separation means a compromised device's signing key can be rotated without losing the permanent identity.
 
