@@ -59,6 +59,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           OPUS_STATIC: ${{ matrix.platform == 'windows-latest' && '1' || '' }}
+          CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Iroh Social ${{ github.ref_name }}'
