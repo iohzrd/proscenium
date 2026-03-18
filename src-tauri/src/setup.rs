@@ -90,10 +90,27 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         now_millis(),
     );
 
+    // Open the database early so we can read preferences before binding the endpoint.
+    let storage = Arc::new(
+        Storage::open(&data_dir.join("social.db"))
+            .await
+            .expect("failed to open database"),
+    );
+    log::info!("[setup] database opened");
+
+    // Load discovery preferences.
+    let mdns_enabled = crate::preferences::get_mdns_discovery(&storage).await;
+    let dht_enabled = crate::preferences::get_dht_discovery(&storage).await;
+    log::info!(
+        "[setup] mDNS discovery: {}, DHT discovery: {}",
+        if mdns_enabled { "enabled" } else { "disabled" },
+        if dht_enabled { "enabled" } else { "disabled" },
+    );
+
     // Bind the transport endpoint (needed for transport_node_id before building Identity).
     let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, 0);
     log::info!("[setup] binding iroh endpoint...");
-    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
+    let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(SecretKey::from_bytes(&transport_key_bytes))
         .alpns(vec![
             iroh_blobs::ALPN.to_vec(),
@@ -102,12 +119,16 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
             DM_ALPN.to_vec(),
             CALL_ALPN.to_vec(),
             STAGE_ALPN.to_vec(),
-        ])
-        .address_lookup(iroh::address_lookup::MdnsAddressLookup::builder())
-        .address_lookup(iroh::address_lookup::DhtAddressLookup::builder())
-        .bind()
-        .await
-        .expect("failed to bind iroh endpoint");
+        ]);
+
+    if mdns_enabled {
+        builder = builder.address_lookup(iroh::address_lookup::MdnsAddressLookup::builder());
+    }
+    if dht_enabled {
+        builder = builder.address_lookup(iroh::address_lookup::DhtAddressLookup::builder());
+    }
+
+    let endpoint = builder.bind().await.expect("failed to bind iroh endpoint");
 
     // Derive the ratchet storage key (used by DmHandler, stored in Identity so it
     // can be updated atomically when the DM key is rotated).
@@ -142,13 +163,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         &identity_data.transport_node_id
     );
     log::info!("[setup] addr (immediate): {:?}", endpoint.addr());
-
-    let storage = Arc::new(
-        Storage::open(&data_dir.join("social.db"))
-            .await
-            .expect("failed to open database"),
-    );
-    log::info!("[setup] database opened");
 
     let blobs_dir = data_dir.join("blobs");
     let blob_store = FsStore::load(&blobs_dir)

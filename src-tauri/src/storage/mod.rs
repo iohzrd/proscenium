@@ -8,6 +8,7 @@ mod moderation;
 mod notifications;
 mod peer_delegations;
 mod posts;
+mod preferences;
 mod profiles;
 mod push;
 mod ratchet;
@@ -76,6 +77,10 @@ impl Storage {
         (
             "010_push_outbox",
             include_str!("../../migrations/010_push_outbox.sql"),
+        ),
+        (
+            "011_preferences",
+            include_str!("../../migrations/011_preferences.sql"),
         ),
     ];
 

@@ -6,6 +6,10 @@ Successor to [follow](https://github.com/iohzrd/follow) and [identia](https://gi
 
 Every user runs their own node. Posts, profiles, and follows are stored locally. Peers exchange data directly -- no central server, no accounts, no passwords. Optional discovery servers provide search, trending, and user directories without compromising the P2P foundation.
 
+## Iroh
+
+[Iroh](https://iroh.computer/) is a networking library that gives every node a persistent identity (an Ed25519 keypair) and connects peers directly over QUIC, punching through NATs with the help of relay servers. Peers discover each other via DNS, mDNS on local networks, and the Mainline DHT. Iroh provides two higher-level primitives on top of raw QUIC connections: **iroh-gossip** for real-time pub/sub broadcast, and **iroh-blobs** for content-addressed data transfer. Proscenium uses all of these -- gossip for live feed updates, blobs for media, and direct QUIC connections for DMs, calls, and stage audio.
+
 ## How It Works
 
 ### Identity and Key Architecture

@@ -14,6 +14,10 @@
   let rotating = $state(false);
   let rotateStatus = $state("");
   let showRotateConfirm = $state(false);
+  let mdnsDiscovery = $state(false);
+  let dhtDiscovery = $state(false);
+  let mdnsLoading = $state(false);
+  let dhtLoading = $state(false);
 
   async function loadServers() {
     try {
@@ -81,7 +85,39 @@
       // Node not ready
     }
     await loadServers();
+    try {
+      [mdnsDiscovery, dhtDiscovery] = await Promise.all([
+        invoke<boolean>("get_mdns_discovery"),
+        invoke<boolean>("get_dht_discovery"),
+      ]);
+    } catch {
+      // preferences not available yet
+    }
   });
+
+  async function toggleMdns() {
+    mdnsLoading = true;
+    try {
+      const next = !mdnsDiscovery;
+      await invoke("set_mdns_discovery", { enabled: next });
+      mdnsDiscovery = next;
+    } catch (e) {
+      console.error("Failed to toggle mDNS:", e);
+    }
+    mdnsLoading = false;
+  }
+
+  async function toggleDht() {
+    dhtLoading = true;
+    try {
+      const next = !dhtDiscovery;
+      await invoke("set_dht_discovery", { enabled: next });
+      dhtDiscovery = next;
+    } catch (e) {
+      console.error("Failed to toggle DHT:", e);
+    }
+    dhtLoading = false;
+  }
 </script>
 
 <h2>Settings</h2>
@@ -158,6 +194,48 @@
     Link multiple devices to share your identity, follows, and messages.
   </p>
   <a href="/settings/devices" class="server-manage-link">Manage devices</a>
+</section>
+
+<section class="settings-section">
+  <h3>Privacy</h3>
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <span class="toggle-label">Local network discovery (mDNS)</span>
+      <p class="toggle-desc">
+        Announce on your local network so nearby peers can discover and connect
+        directly. Only exposes your IP to devices on the same LAN.
+      </p>
+    </div>
+    <button
+      class="toggle-switch"
+      class:active={mdnsDiscovery}
+      onclick={toggleMdns}
+      disabled={mdnsLoading}
+      aria-label="Toggle mDNS discovery"
+    >
+      <span class="toggle-knob"></span>
+    </button>
+  </div>
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <span class="toggle-label">Global discovery (DHT)</span>
+      <p class="toggle-desc">
+        Publish your IP address to the Mainline DHT so any peer who knows your
+        public key can connect directly without a relay. Exposes your IP
+        globally.
+      </p>
+    </div>
+    <button
+      class="toggle-switch"
+      class:active={dhtDiscovery}
+      onclick={toggleDht}
+      disabled={dhtLoading}
+      aria-label="Toggle DHT discovery"
+    >
+      <span class="toggle-knob"></span>
+    </button>
+  </div>
+  <p class="setting-hint">Changes take effect on next restart.</p>
 </section>
 
 <section class="settings-section">
@@ -412,6 +490,67 @@
     font-size: var(--text-sm);
     margin: 0 0 0.5rem;
     line-height: 1.5;
+  }
+
+  .toggle-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+
+  .toggle-info {
+    flex: 1;
+  }
+
+  .toggle-label {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+  }
+
+  .toggle-desc {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    margin: 0.25rem 0 0;
+    line-height: 1.4;
+  }
+
+  .toggle-switch {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    border-radius: 12px;
+    border: none;
+    background: var(--bg-elevated);
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 0;
+    transition: background 0.2s;
+    margin-top: 0.1rem;
+  }
+
+  .toggle-switch.active {
+    background: var(--accent);
+  }
+
+  .toggle-switch:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .toggle-knob {
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--text-primary);
+    transition: transform 0.2s;
+  }
+
+  .toggle-switch.active .toggle-knob {
+    transform: translateX(20px);
   }
 
   .rotate-btn {

@@ -10,6 +10,7 @@ mod framing;
 mod gossip;
 mod ingest;
 mod peer;
+mod preferences;
 mod push;
 mod setup;
 mod stage;
@@ -164,6 +165,10 @@ pub fn run() {
             stage_send_reaction,
             stage_send_chat,
             stage_volunteer_relay,
+            get_mdns_discovery,
+            set_mdns_discovery,
+            get_dht_discovery,
+            set_dht_discovery,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
