@@ -204,8 +204,8 @@
     <Icon name="compass" size={48} />
     <h2>No servers added</h2>
     <p>
-      Add a discovery server in <a href="/preferences">Preferences</a> to discover users
-      and content.
+      Add a discovery server in <a href="/preferences">Preferences</a> to discover
+      users and content.
     </p>
   </div>
 {:else}
