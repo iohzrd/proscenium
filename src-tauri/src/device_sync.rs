@@ -4,7 +4,7 @@ use crate::framing::{read_frame, write_frame};
 use crate::storage::Storage;
 use iroh::protocol::AcceptError;
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, endpoint::Connection};
-use iroh_social_types::{
+use proscenium_types::{
     DeviceSyncFrame, DeviceSyncVector, PEER_ALPN, PeerRequest, PeerResponse, short_id,
     sign_device_sync_challenge, verify_device_sync_challenge,
 };

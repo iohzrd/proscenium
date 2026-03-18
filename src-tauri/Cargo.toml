@@ -1,5 +1,5 @@
 [package]
-name = "iroh-tauri-app"
+name = "proscenium"
 version.workspace = true
 description = "A Tauri App"
 authors = ["you"]
@@ -9,7 +9,7 @@ edition.workspace = true
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "iroh_tauri_app_lib"
+name = "proscenium_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -27,10 +27,10 @@ futures-lite = "2"
 getrandom = "0.4.1"
 hex = "0.4.3"
 hkdf = "0.12"
-iroh = { version = "0.96", features = ["address-lookup-mdns", "address-lookup-pkarr-dht"] }
-iroh-blobs = { version = "0.98", features = ["fs-store"] }
+iroh = { version = "0.97.0", features = ["address-lookup-mdns", "address-lookup-pkarr-dht"] }
+iroh-blobs = { version = "0.99.0", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
-iroh-social-types = { path = "../crates/iroh-social-types" }
+proscenium-types = { path = "../crates/proscenium-types" }
 log = "0.4"
 opus = "0.3"
 ringbuf = "0.4"

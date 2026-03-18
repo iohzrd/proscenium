@@ -1,6 +1,6 @@
 use crate::storage::Storage;
 use iroh::PublicKey;
-use iroh_social_types::{
+use proscenium_types::{
     Interaction, Post, parse_mentions, short_id, validate_interaction, validate_post,
     verify_interaction_signature, verify_post_signature,
 };

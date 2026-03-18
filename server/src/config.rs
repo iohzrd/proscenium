@@ -57,7 +57,7 @@ pub struct TrendingConfig {
 }
 
 fn default_name() -> String {
-    "Iroh Social Server".to_string()
+    "Proscenium Gateway".to_string()
 }
 fn default_listen() -> String {
     "0.0.0.0:3000".to_string()

@@ -21,7 +21,7 @@
   function parseFromUrl(url: string): ScannedResult | null {
     try {
       const parsed = new URL(url);
-      if (parsed.protocol !== "iroh-social:") return null;
+      if (parsed.protocol !== "proscenium:") return null;
       const host = parsed.hostname;
       if (host !== "user" && host !== "profile") return null;
       const pubkey = parsed.pathname.slice(1);

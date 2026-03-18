@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::storage::Storage;
-use iroh_social_types::ServerEntry;
+use proscenium_types::ServerEntry;
 use sqlx::Row;
 
 fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> ServerEntry {
@@ -18,7 +18,7 @@ fn row_to_server(row: &sqlx::sqlite::SqliteRow) -> ServerEntry {
 
 impl Storage {
     pub async fn add_server(&self, url: &str) -> Result<(), AppError> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         sqlx::query("INSERT OR IGNORE INTO servers (url, added_at) VALUES (?1, ?2)")
             .bind(url)
             .bind(now)
@@ -76,7 +76,7 @@ impl Storage {
         url: &str,
         visibility: &str,
     ) -> Result<(), AppError> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         sqlx::query("UPDATE servers SET registered_at = ?2, visibility = ?3 WHERE url = ?1")
             .bind(url)
             .bind(now)

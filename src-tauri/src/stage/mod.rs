@@ -19,11 +19,11 @@ use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::Gossip;
-use iroh_social_types::{
+use mixer::{MixerHandle, spawn_mixer};
+use proscenium_types::{
     STAGE_ALPN, SignedStageControl, StageControl, StageEvent, StageRole, StageState, StageTicket,
     now_millis, short_id, sign_stage_control,
 };
-use mixer::{MixerHandle, spawn_mixer};
 use std::collections::HashMap;
 use std::sync::{
     Arc,
@@ -1768,7 +1768,7 @@ impl StageActor {
         let participants = s
             .participants
             .values()
-            .map(|p| iroh_social_types::StageParticipant {
+            .map(|p| proscenium_types::StageParticipant {
                 pubkey: p.pubkey.clone(),
                 role: p.role,
                 display_name: None,

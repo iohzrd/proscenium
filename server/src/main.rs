@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Parser)]
-#[command(name = "iroh-social-server", about = "Iroh Social discovery server")]
+#[command(name = "proscenium-server", about = "Proscenium discovery server")]
 struct Cli {
     /// Config file path
     #[arg(short, long, default_value = "config.toml")]
@@ -85,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(interval).await;
                 let cutoff_ms =
-                    iroh_social_types::now_millis() - (retention_days * 24 * 60 * 60 * 1000);
+                    proscenium_types::now_millis() - (retention_days * 24 * 60 * 60 * 1000);
                 match prune_storage.prune_old_posts(cutoff_ms as i64).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!("pruned {n} posts older than {retention_days} days"),

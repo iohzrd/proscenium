@@ -13,8 +13,8 @@
 
   let deepLinkUrl = $derived(
     transportNodeId
-      ? `iroh-social://profile/${pubkey}?transport=${transportNodeId}`
-      : `iroh-social://profile/${pubkey}`,
+      ? `proscenium://profile/${pubkey}?transport=${transportNodeId}`
+      : `proscenium://profile/${pubkey}`,
   );
 
   async function copyLink() {

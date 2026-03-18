@@ -77,13 +77,13 @@ pub struct IdentityResponse {
 
 pub fn user_feed_topic(pubkey: &str) -> TopicId {
     let mut hasher = Sha256::new();
-    hasher.update(b"iroh-social-feed-v1:");
+    hasher.update(b"proscenium-feed-v1:");
     hasher.update(pubkey.as_bytes());
     TopicId::from_bytes(hasher.finalize().into())
 }
 
 /// Single ALPN for all peer-to-peer protocol messages (sync, push, follow requests).
-pub const PEER_ALPN: &[u8] = b"iroh-social/peer/1";
+pub const PEER_ALPN: &[u8] = b"proscenium/peer/1";
 
 pub const MAX_PUSH_POSTS: usize = 50;
 pub const MAX_PUSH_INTERACTIONS: usize = 200;
@@ -231,7 +231,7 @@ pub enum DeviceSyncFrame {
 
 /// Canonical bytes for signing a device sync challenge.
 fn device_sync_challenge_signing_bytes(challenge: &[u8]) -> Vec<u8> {
-    let mut bytes = b"iroh-social-device-sync-v1:".to_vec();
+    let mut bytes = b"proscenium-device-sync-v1:".to_vec();
     bytes.extend_from_slice(challenge);
     bytes
 }

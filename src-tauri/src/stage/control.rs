@@ -7,7 +7,7 @@ use iroh_gossip::{
     Gossip,
     api::{Event, GossipReceiver, GossipSender},
 };
-use iroh_social_types::{
+use proscenium_types::{
     SignedStageControl, StageControl, StageRole, now_millis, short_id, sign_stage_control,
     stage_control_topic, verify_stage_control,
 };

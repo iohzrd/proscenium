@@ -15,7 +15,7 @@ pub fn page(title: &str, server_name: &str, content: Markup) -> Markup {
                     nav {
                         a.logo href="/" { (server_name) }
                         div.nav-links {
-                            a href="/" { "Feed" }
+                            a href="/" { "Arc" }
                             a href="/trending" { "Trending" }
                             a href="/users" { "Users" }
                         }
@@ -25,11 +25,11 @@ pub fn page(title: &str, server_name: &str, content: Markup) -> Markup {
                 footer {
                     div.app-cta {
                         p { "Join the conversation" }
-                        a.btn href="https://github.com/iohzrd/iroh-social/releases" target="_blank" rel="noopener" {
+                        a.btn href="https://github.com/iohzrd/proscenium/releases" target="_blank" rel="noopener" {
                             "Get the App"
                         }
                     }
-                    p.footer-note { "Powered by Iroh Social -- a peer-to-peer social network" }
+                    p.footer-note { "Powered by Proscenium -- a peer-to-peer social network" }
                 }
             }
         }

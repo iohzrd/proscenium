@@ -13,7 +13,7 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
-use iroh_social_types::{
+use proscenium_types::{
     DM_ALPN, DirectMessage, DmAck, DmHandshake, DmMessage, DmPayload, EncryptedEnvelope,
     RatchetHeaderWire, StoredMessage, now_millis, short_id,
 };

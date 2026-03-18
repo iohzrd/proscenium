@@ -1,4 +1,4 @@
-# Iroh Social (working title)
+# Proscenium
 
 A decentralized peer-to-peer social network built with [Iroh](https://iroh.computer/), [Tauri 2](https://tauri.app/), and [SvelteKit 5](https://svelte.dev/).
 
@@ -20,12 +20,14 @@ The master key signs a `SigningKeyDelegation` binding the signing key to the ide
 
 ### Protocols
 
-**Four protocol layers handle all communication:**
+**Six protocol layers handle all communication:**
 
 - **Gossip** -- Real-time pub/sub. When you post, it broadcasts instantly to anyone following you. Each user has a topic derived from their master public key.
 - **Sync** -- Historical pull. When you follow someone, their existing posts are fetched via a custom QUIC protocol with a three-tier streaming protocol (timestamp catch-up, ID diff, or up-to-date). On startup, all followed users are synced in parallel with bounded concurrency.
 - **Blobs** -- Content-addressed media storage. Images, videos, and files are stored locally and transferred peer-to-peer using iroh-blobs.
 - **DM** -- End-to-end encrypted direct messaging. A Noise IK handshake over QUIC establishes a shared secret between peers, which seeds a Double Ratchet providing per-message forward secrecy with ChaCha20-Poly1305 encryption. Messages are sent directly peer-to-peer with no intermediary, and queued locally for retry when the recipient is offline.
+- **Call** -- Peer-to-peer 1:1 voice calls over a dedicated QUIC protocol (`proscenium/call/1`). Audio is captured via cpal, encoded with Opus at 48kHz mono in 20ms frames, and streamed over bidirectional QUIC streams with length-prefixed framing. Call signaling (ring, accept, reject, end) is encrypted via the DM ratchet session.
+- **Stage** -- Multi-participant live audio rooms over a dedicated QUIC protocol (`proscenium/stage/1`). A host creates a room and speakers stream audio to the host via QUIC unidirectional streams. The host decodes all speaker streams, mixes them, re-encodes as a single Opus stream, and fans it out to listeners. Speakers receive individual forwarded streams from the host in an SFU model (no mesh). Volunteer relays extend capacity by forwarding the mixed stream to additional listeners. Stream authentication uses SHA256 hash chains with Ed25519 checkpoint signatures.
 
 When following a new user, an `IdentityRequest` is sent to their transport NodeId. The response contains their master pubkey, user key delegation, and profile. This is cached locally so subsequent connections can resolve the master pubkey to reachable transport NodeIds.
 
@@ -55,10 +57,18 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Connection status indicator (relay + peer count)
 - Confirmation dialogs for destructive actions
 - Dark theme UI
+- 1:1 voice calls with Opus audio over QUIC
+- Stage live audio rooms (host, speakers, listeners) with SFU forwarding
+- Stage hand-raising, host muting, co-host delegation, and chat
+- Live stages sidebar showing active rooms from followed users
+- Echo cancellation (AEC) for stage audio
+- Volunteer relay support for scaling stage listener capacity
+- Stream authentication with hash-chain + Ed25519 checkpoint signatures
+- mDNS and Mainline DHT peer discovery
 - Discovery server integration (find users, search posts, trending hashtags)
 - Server management in settings (add/remove servers, register with visibility levels)
 
-**Backend state model:** Only the `FeedManager` (which manages gossip subscriptions) is behind a mutex. All other state -- the Iroh endpoint, blob store, database -- is accessed lock-free, so blob fetches and feed queries never block each other.
+**Backend state model:** Services (`GossipService`, `DmHandler`, `CallHandler`, `StageHandler`, `PeerHandler`) are self-managing actors behind `Arc` with internal command channels. The Iroh endpoint, blob store, and database are accessed lock-free. A `TaskManager` tracks all background tasks for structured shutdown.
 
 ## Prerequisites
 
@@ -110,13 +120,13 @@ npm run tauri android dev
 To view logs:
 
 ```bash
-adb logcat -s iroh-tauri-app
+adb logcat -s proscenium
 ```
 
 Use a broader filter if needed (the tag may vary):
 
 ```bash
-adb logcat | grep -i iroh
+adb logcat | grep -i proscenium
 ```
 
 ### Building
@@ -132,7 +142,7 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 - The app uses `tauri-plugin-log` which routes to Android logcat automatically
 - Network change detection does not work natively on Android with iroh -- the app polls `endpoint.network_change()` every 30 seconds to keep connectivity alive
 - QR code scanning uses `tauri-plugin-barcode-scanner` which requires the CAMERA permission (declared in the manifest)
-- Deep links use the `iroh-social://` scheme
+- Deep links use the `proscenium://` scheme
 
 ## Discovery Server
 
@@ -144,10 +154,10 @@ The server is an overlay -- the P2P layer remains the foundation. Users who neve
 
 ```bash
 cargo build --release --manifest-path server/Cargo.toml
-./server/target/release/iroh-social-server
+./server/target/release/proscenium-server
 ```
 
-The server listens on port 3000 by default. Configuration is via environment variables (`IROH_SOCIAL_PORT`, `IROH_SOCIAL_DB_PATH`).
+The server listens on port 3000 by default. Configuration is via environment variables (`PROSCENIUM_PORT`, `PROSCENIUM_DB_PATH`).
 
 ### Deploying
 
@@ -183,7 +193,7 @@ See [todos/community-server.md](todos/community-server.md) for the full design d
 
 ## Direct Messaging
 
-End-to-end encrypted direct messaging over a custom QUIC protocol (`iroh-social/dm/1`). E2E encryption uses X25519 key exchange derived from each user's existing ed25519 identity, with a Noise IK handshake for session establishment and a Double Ratchet for per-message forward secrecy. Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
+End-to-end encrypted direct messaging over a custom QUIC protocol (`proscenium/dm/1`). E2E encryption uses X25519 key exchange derived from each user's existing ed25519 identity, with a Noise IK handshake for session establishment and a Double Ratchet for per-message forward secrecy. Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
 
 - Noise IK + Double Ratchet (Signal Protocol pattern) with ChaCha20-Poly1305
 - Typing indicators (debounced, sent over encrypted channel)
@@ -196,20 +206,37 @@ End-to-end encrypted direct messaging over a custom QUIC protocol (`iroh-social/
 
 See [todos/direct-messaging.md](todos/direct-messaging.md) for the original design document.
 
-## Voice/Video Calls (Planned)
+## Voice Calls
 
-Peer-to-peer voice and video calls, with call signaling encrypted via the DM ratchet session.
+Peer-to-peer 1:1 voice calls over a dedicated QUIC protocol (`proscenium/call/1`). Call signaling (ring, accept, reject, end) is encrypted via the DM ratchet session.
 
-- Voice calls with Opus audio codec over multiplexed QUIC streams
-- Video calls with VP9 codec and adaptive bitrate
+- Opus audio codec at 48kHz mono, 20ms frames (960 samples)
+- Bidirectional QUIC streams with length-prefixed framing
+- Mute/unmute with real-time UI feedback
+- Call state machine: Idle, Ringing, InCall
 
 See [todos/voice-video-calling.md](todos/voice-video-calling.md) for the design document.
 
+## Stage (Live Audio Rooms)
+
+Multi-participant live audio rooms built on a dedicated QUIC protocol (`proscenium/stage/1`). Rooms support roles (Host, Co-host, Speaker, Listener) with a host-centric SFU audio architecture.
+
+- **Control plane**: iroh-gossip on a per-room TopicId, with Ed25519-signed control messages
+- **Audio plane**: Speakers stream Opus audio to the host via QUIC unidirectional streams. The host mixes all speaker streams into one Opus stream and fans it out to listeners.
+- **SFU model**: Speakers receive individual forwarded streams from the host (no peer-to-peer mesh), enabling efficient bandwidth usage
+- **Relay hierarchy**: Volunteer relays connect to the host (or upstream relay), receive the mixed stream, and fan it out to additional listeners. A TopologyManager assigns listeners to the host or a relay based on capacity.
+- **Stream authentication**: SHA256 hash chain with Ed25519 signature checkpoints every 50 frames (~1 second), ensuring listeners can verify the audio source
+- **Echo cancellation**: AEC applied to stage audio to prevent feedback loops
+- **Stage announcements**: Broadcast on the host's gossip topic so followers see active rooms in the live stages sidebar
+- Hand-raising, host muting, speaker promotion/demotion, co-host delegation, kick/ban, in-room chat
+
+See [docs/spaces-design.md](docs/spaces-design.md) for the full design document.
+
 ## Linked Devices (In Progress)
 
-Link multiple devices (phone, desktop, tablet) to a single identity. The three-tier key hierarchy (master / user / transport) is implemented: a master key is the permanent identity, a derived user key handles signing and DM encryption across all devices, and per-device transport keys provide unique iroh NodeIds. The master key enables secure user key rotation if a device is compromised without losing the identity.
+Link multiple devices (phone, desktop, tablet) to a single identity. The three-tier key hierarchy (master / signing / transport) is implemented: a master key is the permanent identity, a derived signing key handles content signing and DM encryption across all devices, and per-device transport keys provide unique iroh NodeIds. The master key enables secure signing key rotation if a device is compromised without losing the identity.
 
-Phase 1 (key hierarchy, identity resolution, delegation) is complete. Remaining phases cover device pairing, multi-device sync, key rotation, and revocation.
+Key hierarchy, identity resolution, delegation, device pairing, and cross-device data sync are implemented. Remaining work covers key rotation and revocation.
 
 See [todos/linked-devices.md](todos/linked-devices.md) for the full design document.
 

@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::FollowRequestEntry;
+use proscenium_types::FollowRequestEntry;
 use sqlx::Row;
 
 use super::Storage;

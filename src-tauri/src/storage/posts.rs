@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{MediaAttachment, Post};
+use proscenium_types::{MediaAttachment, Post};
 use sqlx::Row;
 
 use super::{FeedQuery, Storage};

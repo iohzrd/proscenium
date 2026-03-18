@@ -2,7 +2,7 @@ use crate::constants::DEFAULT_DM_LIMIT;
 use crate::error::CmdResult;
 use crate::state::AppState;
 use crate::storage::Storage;
-use iroh_social_types::{
+use proscenium_types::{
     ConversationMeta, DirectMessage, DmPayload, MediaAttachment, StoredMessage, now_millis,
     short_id,
 };

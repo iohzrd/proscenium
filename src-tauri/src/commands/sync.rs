@@ -1,6 +1,6 @@
 use crate::error::CmdResult;
 use crate::state::{AppState, SyncCommand};
-use iroh_social_types::{FrontendSyncResult, SyncStatus};
+use proscenium_types::{FrontendSyncResult, SyncStatus};
 use std::sync::Arc;
 use tauri::State;
 

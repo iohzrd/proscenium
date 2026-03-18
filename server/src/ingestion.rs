@@ -5,7 +5,7 @@ use futures_lite::StreamExt;
 use iroh::PublicKey;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_gossip::Gossip;
-use iroh_social_types::{
+use proscenium_types::{
     GossipMessage, Interaction, PEER_ALPN, PeerRequest, Post, SyncRequest, short_id,
     user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
@@ -327,9 +327,8 @@ impl IngestionManager {
                 .bind(topic_owner)
                 .fetch_optional(&storage.pool)
                 .await
-                    && let Ok(cached) = serde_json::from_str::<
-                        iroh_social_types::SigningKeyDelegation,
-                    >(&cached_json)
+                    && let Ok(cached) =
+                        serde_json::from_str::<proscenium_types::SigningKeyDelegation>(&cached_json)
                     && rotation.new_key_index <= cached.key_index
                 {
                     tracing::warn!(
@@ -373,6 +372,9 @@ impl IngestionManager {
             }
             Ok(GossipMessage::Heartbeat) => {
                 // Keep-alive ping from publisher, nothing to store.
+            }
+            Ok(GossipMessage::StageAnnouncement { .. }) | Ok(GossipMessage::StageEnded { .. }) => {
+                // Stage events are ephemeral; the server does not index them.
             }
             Err(e) => {
                 tracing::warn!("[ingestion] failed to parse gossip message: {e}");
@@ -532,7 +534,7 @@ impl IngestionManager {
         send.finish()?;
 
         let summary_bytes = recv.read_to_end(65_536).await?;
-        let summary: iroh_social_types::SyncSummary = serde_json::from_slice(&summary_bytes)?;
+        let summary: proscenium_types::SyncSummary = serde_json::from_slice(&summary_bytes)?;
 
         if let Some(profile) = &summary.profile
             && validate_profile(profile).is_ok()
@@ -540,7 +542,7 @@ impl IngestionManager {
             let _ = storage.update_profile(pubkey, profile).await;
         }
 
-        if summary.mode == iroh_social_types::SyncMode::UpToDate {
+        if summary.mode == proscenium_types::SyncMode::UpToDate {
             storage.update_sync_state(pubkey, None, None).await?;
             return Ok((0, 0));
         }
@@ -569,8 +571,8 @@ impl IngestionManager {
                 break;
             }
 
-            match serde_json::from_slice::<iroh_social_types::SyncFrame>(&buf) {
-                Ok(iroh_social_types::SyncFrame::Posts(posts)) => {
+            match serde_json::from_slice::<proscenium_types::SyncFrame>(&buf) {
+                Ok(proscenium_types::SyncFrame::Posts(posts)) => {
                     for post in &posts {
                         Self::ingest_post(storage, post).await;
                         post_count += 1;
@@ -580,7 +582,7 @@ impl IngestionManager {
                         }
                     }
                 }
-                Ok(iroh_social_types::SyncFrame::Interactions(interactions)) => {
+                Ok(proscenium_types::SyncFrame::Interactions(interactions)) => {
                     for interaction in &interactions {
                         Self::ingest_interaction(storage, interaction).await;
                         interaction_count += 1;
@@ -590,7 +592,7 @@ impl IngestionManager {
                         }
                     }
                 }
-                Ok(iroh_social_types::SyncFrame::DeviceAnnouncements(announcements)) => {
+                Ok(proscenium_types::SyncFrame::DeviceAnnouncements(announcements)) => {
                     for announcement in &announcements {
                         if announcement.master_pubkey != pubkey {
                             continue;

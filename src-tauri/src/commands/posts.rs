@@ -4,7 +4,7 @@ use crate::state::AppState;
 use crate::storage::FeedQuery;
 use crate::util::generate_id;
 use iroh::SecretKey;
-use iroh_social_types::{
+use proscenium_types::{
     MediaAttachment, Post, now_millis, sign_delete_post, sign_post, validate_post,
 };
 use std::sync::Arc;

@@ -2,7 +2,7 @@ use crate::error::{AppError, CmdResult};
 use crate::state::AppState;
 use iroh::Endpoint;
 use iroh_blobs::{BlobsProtocol, HashAndFormat, store::fs::FsStore, ticket::BlobTicket};
-use iroh_social_types::MAX_BLOB_SIZE;
+use proscenium_types::MAX_BLOB_SIZE;
 use std::sync::Arc;
 use tauri::State;
 

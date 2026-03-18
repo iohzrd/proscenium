@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "iroh-tauri-app",
+  "productName": "Proscenium",
   "version": "0.1.40",
-  "identifier": "com.iroh-tauri-app.app",
+  "identifier": "com.proscenium.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "iroh-tauri-app",
+        "title": "Proscenium",
         "width": 800,
         "height": 600,
         "zoomHotkeysEnabled": false
@@ -36,11 +36,11 @@
   "plugins": {
     "deep-link": {
       "desktop": {
-        "schemes": ["iroh-social"]
+        "schemes": ["proscenium"]
       },
       "mobile": [
         {
-          "scheme": ["iroh-social"]
+          "scheme": ["proscenium"]
         }
       ]
     }

@@ -2,7 +2,7 @@ use crate::error::AppError;
 use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
-use iroh_social_types::{
+use proscenium_types::{
     MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,
     Visibility, short_id, validate_profile, verify_profile_signature,
 };

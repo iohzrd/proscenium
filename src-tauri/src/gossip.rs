@@ -12,7 +12,7 @@ use iroh_gossip::{
     Gossip,
     api::{Event, GossipSender},
 };
-use iroh_social_types::{
+use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, PushMessage,
     SigningKeyRotation, StageTicket, Visibility, now_millis, short_id, user_feed_topic,
     validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
@@ -1027,7 +1027,7 @@ impl GossipService {
             short_id(pk),
             rotation.new_key_index
         );
-        let response = iroh_social_types::IdentityResponse {
+        let response = proscenium_types::IdentityResponse {
             master_pubkey: rotation.master_pubkey.clone(),
             delegation: rotation.new_delegation.clone(),
             transport_node_ids: storage

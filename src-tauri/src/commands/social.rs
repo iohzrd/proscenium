@@ -1,6 +1,6 @@
 use crate::error::CmdResult;
 use crate::state::{AppState, SyncCommand};
-use iroh_social_types::{FollowEntry, FollowerEntry, now_millis, short_id};
+use proscenium_types::{FollowEntry, FollowerEntry, now_millis, short_id};
 use std::sync::Arc;
 use tauri::State;
 
@@ -99,7 +99,7 @@ pub async fn get_peer_node_ids(
 async fn resolve_peer_identity(
     state: &AppState,
     node_id: &str,
-) -> CmdResult<iroh_social_types::IdentityResponse> {
+) -> CmdResult<proscenium_types::IdentityResponse> {
     let target: iroh::EndpointId = node_id.parse()?;
     match crate::peer::query_identity(&state.endpoint, target).await {
         Ok(identity) => {

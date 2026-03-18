@@ -1,6 +1,6 @@
 # Ideas - Everything We Could Build
 
-A brain dump of every possible feature, improvement, and direction for Iroh Social.
+A brain dump of every possible feature, improvement, and direction for Proscenium.
 
 ---
 

@@ -1,7 +1,7 @@
 use crate::constants::DEFAULT_NOTIFICATION_LIMIT;
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh_social_types::Notification;
+use proscenium_types::Notification;
 use std::sync::Arc;
 use tauri::State;
 

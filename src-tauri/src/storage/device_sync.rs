@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{
+use proscenium_types::{
     DeviceSyncVector, FollowSyncEntry, ModerationSyncEntry, RatchetSessionExport, RatchetSyncEntry,
 };
 use sqlx::Row;
@@ -221,7 +221,7 @@ impl Storage {
 
     pub async fn merge_bookmarks(&self, post_ids: &[String]) -> Result<u32, AppError> {
         let mut added = 0u32;
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         for post_id in post_ids {
             let exists: bool =
                 sqlx::query_scalar("SELECT COUNT(*) > 0 FROM bookmarks WHERE post_id = ?1")

@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{Interaction, InteractionKind, PostCounts};
+use proscenium_types::{Interaction, InteractionKind, PostCounts};
 use sqlx::Row;
 
 use super::Storage;

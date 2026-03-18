@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{FollowEntry, FollowerEntry, Visibility, now_millis};
+use proscenium_types::{FollowEntry, FollowerEntry, Visibility, now_millis};
 use sqlx::Row;
 
 use super::Storage;

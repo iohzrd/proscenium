@@ -1,18 +1,18 @@
 [package]
-name = "iroh-social-types"
+name = "proscenium-types"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 hex = "0.4"
 hkdf = "0.12"
-iroh = "0.96"
+iroh = "0.97.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 iroh-gossip = { workspace = true }
 
 [dev-dependencies]
-getrandom = "0.3"
+getrandom = "0.4.2"
 hex = "0.4"
 x25519-dalek = { version = "2", features = ["static_secrets"] }

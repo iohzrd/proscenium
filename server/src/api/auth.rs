@@ -3,7 +3,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{delete, post, put};
 use axum::{Json, Router};
-use iroh_social_types::{
+use proscenium_types::{
     RegistrationRequest, Visibility, now_millis, verify_registration_signature,
 };
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,7 @@ struct ProfileUpdateRequest {
     bio: Option<String>,
     avatar_hash: Option<String>,
     signature: String,
-    delegation: iroh_social_types::SigningKeyDelegation,
+    delegation: proscenium_types::SigningKeyDelegation,
 }
 
 fn validate_registration(
@@ -154,7 +154,7 @@ async fn register(
     {
         tracing::error!(
             "[auth] failed to subscribe to {}: {e}",
-            iroh_social_types::short_id(&req.master_pubkey)
+            proscenium_types::short_id(&req.master_pubkey)
         );
     }
 
@@ -250,7 +250,7 @@ async fn update_profile(
         )
     })?;
 
-    let profile = iroh_social_types::Profile {
+    let profile = proscenium_types::Profile {
         display_name: req.display_name.unwrap_or_default(),
         bio: req.bio.unwrap_or_default(),
         avatar_hash: req.avatar_hash,

@@ -1,8 +1,8 @@
 use crate::types::MediaAttachment;
 use serde::{Deserialize, Serialize};
 
-pub const DM_ALPN: &[u8] = b"iroh-social/dm/1";
-pub const CALL_ALPN: &[u8] = b"iroh-social/call/1";
+pub const DM_ALPN: &[u8] = b"proscenium/dm/1";
+pub const CALL_ALPN: &[u8] = b"proscenium/call/1";
 
 // -- Wire types (sent over QUIC) --
 

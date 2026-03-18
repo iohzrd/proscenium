@@ -48,7 +48,7 @@ pub struct Identity {
     /// Transport NodeId string (iroh's own key, for QUIC networking).
     pub transport_node_id: String,
     /// The current signing key delegation (signed by master key).
-    pub delegation: iroh_social_types::SigningKeyDelegation,
+    pub delegation: proscenium_types::SigningKeyDelegation,
 }
 
 /// Shared, mutable identity — the canonical source for all key material.

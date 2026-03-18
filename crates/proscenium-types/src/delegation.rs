@@ -9,7 +9,7 @@ use sha2::Sha256;
 pub fn derive_signing_key(master_secret: &[u8; 32], index: u32) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(&index.to_be_bytes()), master_secret);
     let mut signing_secret = [0u8; 32];
-    hk.expand(b"iroh-social/signing-key", &mut signing_secret)
+    hk.expand(b"proscenium/signing-key", &mut signing_secret)
         .expect("32 bytes is a valid length for HKDF-SHA256");
     signing_secret
 }
@@ -20,7 +20,7 @@ pub fn derive_signing_key(master_secret: &[u8; 32], index: u32) -> [u8; 32] {
 pub fn derive_transport_key(master_secret: &[u8; 32], device_index: u32) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(&device_index.to_be_bytes()), master_secret);
     let mut transport_secret = [0u8; 32];
-    hk.expand(b"iroh-social/transport-key", &mut transport_secret)
+    hk.expand(b"proscenium/transport-key", &mut transport_secret)
         .expect("32 bytes is a valid length for HKDF-SHA256");
     transport_secret
 }
@@ -31,7 +31,7 @@ pub fn derive_transport_key(master_secret: &[u8; 32], device_index: u32) -> [u8;
 pub fn derive_dm_key(master_secret: &[u8; 32], index: u32) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(Some(&index.to_be_bytes()), master_secret);
     let mut dm_secret = [0u8; 32];
-    hk.expand(b"iroh-social/dm-key", &mut dm_secret)
+    hk.expand(b"proscenium/dm-key", &mut dm_secret)
         .expect("32 bytes is a valid length for HKDF-SHA256");
     dm_secret
 }

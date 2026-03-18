@@ -2,7 +2,7 @@ use crate::error::CmdResult;
 use crate::state::AppState;
 use crate::util::generate_id;
 use iroh::SecretKey;
-use iroh_social_types::{
+use proscenium_types::{
     Interaction, InteractionKind, PostCounts, now_millis, sign_delete_interaction, sign_interaction,
 };
 use std::sync::Arc;

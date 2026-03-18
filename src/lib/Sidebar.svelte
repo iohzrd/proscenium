@@ -20,11 +20,11 @@
 </script>
 
 <aside class="sidebar">
-  <div class="sidebar-brand">iroh social</div>
+  <div class="sidebar-brand">proscenium</div>
   <nav class="sidebar-nav">
     <a href="/" class:active={currentPath === "/"}>
       <Icon name="home" />
-      <span class="nav-label">Feed</span>
+      <span class="nav-label">Arc</span>
     </a>
     <a href="/activity" class:active={currentPath === "/activity"}>
       <Icon name="bell" />

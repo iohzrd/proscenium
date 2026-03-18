@@ -7,7 +7,7 @@ use iroh::{
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
-use iroh_social_types::{
+use proscenium_types::{
     FollowRequest, FollowResponse, IdentityResponse, LinkQrPayload, PEER_ALPN, PeerRequest,
     PeerResponse, SigningKeyDelegation, Visibility, derive_transport_key, now_millis, short_id,
     sign_follow_request, verify_follow_request,
@@ -134,7 +134,7 @@ impl PeerHandler {
         conn: &Connection,
     ) -> Result<(), AcceptError> {
         // Verify the delegation (master key signed the signing key binding)
-        if let Err(reason) = iroh_social_types::verify_delegation(&req.delegation) {
+        if let Err(reason) = proscenium_types::verify_delegation(&req.delegation) {
             log::warn!(
                 "[follow-req] invalid delegation from {}: {reason}",
                 short_id(remote_str)
@@ -441,7 +441,7 @@ impl PeerHandler {
         // Build and broadcast updated announcement with all devices
         if let Ok(all_devices) = self.storage.get_linked_devices().await {
             let signing_sk = iroh::SecretKey::from_bytes(&signing_secret_key_bytes);
-            let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
+            let mut announcement = proscenium_types::LinkedDevicesAnnouncement {
                 master_pubkey: master_pubkey.clone(),
                 delegation: delegation.clone(),
                 devices: all_devices,
@@ -449,7 +449,7 @@ impl PeerHandler {
                 timestamp: now,
                 signature: String::new(),
             };
-            iroh_social_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
+            proscenium_types::sign_linked_devices_announcement(&mut announcement, &signing_sk);
 
             if let Err(e) = self.gossip.broadcast_linked_devices(&announcement).await {
                 log::error!("[link] failed to broadcast device announcement: {e}");

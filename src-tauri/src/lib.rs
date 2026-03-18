@@ -30,7 +30,7 @@ pub fn run() {
         use tauri::Emitter;
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             for arg in &argv {
-                if arg.starts_with("iroh-social://") {
+                if arg.starts_with("proscenium://") {
                     let _ = app.emit("deep-link-received", vec![arg.clone()]);
                     break;
                 }

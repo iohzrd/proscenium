@@ -1,7 +1,7 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
 use iroh::SecretKey;
-use iroh_social_types::{
+use proscenium_types::{
     SigningKeyDelegation, derive_signing_key, now_millis, sign_delegation, sign_rotation,
 };
 use std::sync::Arc;
@@ -93,7 +93,7 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
         .unwrap_or(None)
         .unwrap_or(devices.len() as u64);
     let version = current_version + 1;
-    let mut announcement = iroh_social_types::LinkedDevicesAnnouncement {
+    let mut announcement = proscenium_types::LinkedDevicesAnnouncement {
         master_pubkey: master_pubkey.clone(),
         delegation: new_delegation.clone(),
         devices,
@@ -101,7 +101,7 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
         timestamp: now,
         signature: String::new(),
     };
-    iroh_social_types::sign_linked_devices_announcement(&mut announcement, &new_signing_sk);
+    proscenium_types::sign_linked_devices_announcement(&mut announcement, &new_signing_sk);
     if let Err(e) = state
         .storage
         .cache_peer_device_announcement(&master_pubkey, &announcement)
@@ -122,7 +122,7 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
         now,
     );
     for server in &servers {
-        let payload = iroh_social_types::RegistrationPayload {
+        let payload = proscenium_types::RegistrationPayload {
             master_pubkey: master_pubkey.clone(),
             transport_node_id: transport_node_id.clone(),
             server_url: server.url.clone(),
@@ -130,11 +130,11 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
             visibility: server
                 .visibility
                 .parse()
-                .unwrap_or(iroh_social_types::Visibility::Public),
+                .unwrap_or(proscenium_types::Visibility::Public),
             action: None,
         };
-        let signature = iroh_social_types::sign_registration(&payload, &new_signing_sk);
-        let request = iroh_social_types::RegistrationRequest {
+        let signature = proscenium_types::sign_registration(&payload, &new_signing_sk);
+        let request = proscenium_types::RegistrationRequest {
             master_pubkey: master_pubkey.clone(),
             transport_node_id: transport_node_id.clone(),
             server_url: server.url.clone(),
@@ -142,7 +142,7 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
             visibility: server
                 .visibility
                 .parse()
-                .unwrap_or(iroh_social_types::Visibility::Public),
+                .unwrap_or(proscenium_types::Visibility::Public),
             action: None,
             signature,
             delegation: new_delegation_for_reg.clone(),

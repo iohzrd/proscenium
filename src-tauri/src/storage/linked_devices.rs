@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{
+use proscenium_types::{
     DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, RatchetSessionExport,
     SigningKeyDelegation, now_millis,
 };

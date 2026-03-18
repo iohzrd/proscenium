@@ -26,7 +26,7 @@ fn extract_hashtags(content: &str) -> Vec<String> {
 }
 
 pub async fn compute_trending(storage: &Storage, window_hours: u64) -> anyhow::Result<()> {
-    let now = iroh_social_types::now_millis() as i64;
+    let now = proscenium_types::now_millis() as i64;
     let window_ms = (window_hours * 60 * 60 * 1000) as i64;
     let cutoff = now - window_ms;
 

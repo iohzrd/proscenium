@@ -1,5 +1,5 @@
 use super::*;
-use iroh_social_types::*;
+use proscenium_types::*;
 
 async fn test_storage() -> Storage {
     Storage::open_in_memory().await.expect("open in-memory db")

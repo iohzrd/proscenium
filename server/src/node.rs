@@ -1,6 +1,6 @@
 use iroh::{Endpoint, SecretKey};
 use iroh_gossip::Gossip;
-use iroh_social_types::PEER_ALPN;
+use proscenium_types::PEER_ALPN;
 use std::path::Path;
 
 pub struct Node {
@@ -26,7 +26,7 @@ impl Node {
     pub async fn start(data_dir: &Path) -> anyhow::Result<Self> {
         let secret_key = load_or_create_key(&data_dir.join("server.key"));
 
-        let endpoint = Endpoint::builder()
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
             .alpns(vec![iroh_gossip::ALPN.to_vec(), PEER_ALPN.to_vec()])
             .bind()

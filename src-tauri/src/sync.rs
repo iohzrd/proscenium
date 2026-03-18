@@ -4,7 +4,7 @@ use crate::framing::{read_frame, write_frame};
 use crate::ingest::{process_incoming_interaction, process_incoming_post};
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
-use iroh_social_types::{
+use proscenium_types::{
     Interaction, PEER_ALPN, PeerRequest, Post, Profile, SyncFrame, SyncMode, SyncRequest,
     SyncSummary, Visibility, short_id,
 };
@@ -349,7 +349,7 @@ pub async fn sync_from_peer(
                             if announcement.master_pubkey != author {
                                 continue;
                             }
-                            if iroh_social_types::verify_linked_devices_announcement(&announcement)
+                            if proscenium_types::verify_linked_devices_announcement(&announcement)
                                 .is_err()
                             {
                                 continue;

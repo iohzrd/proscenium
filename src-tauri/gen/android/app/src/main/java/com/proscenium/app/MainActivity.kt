@@ -1,4 +1,4 @@
-package com.iroh_tauri_app.app
+package com.proscenium.app
 
 import android.os.Bundle
 import androidx.activity.enableEdgeToEdge

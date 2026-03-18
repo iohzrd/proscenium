@@ -7,12 +7,12 @@ use std::fmt;
 use std::str::FromStr;
 
 /// QUIC ALPN for the Stage audio transport protocol.
-pub const STAGE_ALPN: &[u8] = b"iroh-social/stage/1";
+pub const STAGE_ALPN: &[u8] = b"proscenium/stage/1";
 
 /// Derive the iroh-gossip TopicId for a Stage room's control plane.
 pub fn stage_control_topic(stage_id: &str) -> TopicId {
     let mut hasher = Sha256::new();
-    hasher.update(b"iroh-social-stage-v1:");
+    hasher.update(b"proscenium-stage-v1:");
     hasher.update(stage_id.as_bytes());
     TopicId::from_bytes(hasher.finalize().into())
 }

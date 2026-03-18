@@ -12,7 +12,7 @@ use zeroize::Zeroize;
 pub fn derive_ratchet_storage_key(dm_secret_key_bytes: &[u8; 32]) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, dm_secret_key_bytes);
     let mut key = [0u8; 32];
-    hk.expand(b"iroh-social-ratchet-storage-v1", &mut key)
+    hk.expand(b"proscenium-ratchet-storage-v1", &mut key)
         .expect("HKDF expand valid length");
     key
 }
@@ -240,9 +240,9 @@ pub fn noise_transport_decrypt(
 const MAX_SKIP: u32 = 100;
 
 /// HKDF info strings for KDF chain derivation.
-const KDF_RK_INFO: &[u8] = b"iroh-social-dm-rk";
-const KDF_CK_INFO_KEY: &[u8] = b"iroh-social-dm-ck-msg";
-const KDF_CK_INFO_CHAIN: &[u8] = b"iroh-social-dm-ck-chain";
+const KDF_RK_INFO: &[u8] = b"proscenium-dm-rk";
+const KDF_CK_INFO_KEY: &[u8] = b"proscenium-dm-ck-msg";
+const KDF_CK_INFO_CHAIN: &[u8] = b"proscenium-dm-ck-chain";
 
 #[derive(Debug, Clone)]
 pub enum CryptoError {

@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use iroh_social_types::{ConversationMeta, MediaAttachment, StoredMessage};
+use proscenium_types::{ConversationMeta, MediaAttachment, StoredMessage};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -10,7 +10,7 @@ impl Storage {
         let mut keys = [pubkey_a, pubkey_b];
         keys.sort();
         let mut hasher = Sha256::new();
-        hasher.update(b"iroh-social-dm-v1:");
+        hasher.update(b"proscenium-dm-v1:");
         hasher.update(keys[0].as_bytes());
         hasher.update(b":");
         hasher.update(keys[1].as_bytes());

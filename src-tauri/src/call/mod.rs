@@ -9,7 +9,7 @@ use crate::storage::Storage;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr, EndpointId};
-use iroh_social_types::{CALL_ALPN, CallEvent, CallState, DmPayload, short_id};
+use proscenium_types::{CALL_ALPN, CallEvent, CallState, DmPayload, short_id};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;

@@ -121,7 +121,7 @@ async fn feed_page(
     };
 
     Ok(Html(
-        layout::page("Feed", server_name, content).into_string(),
+        layout::page("Arc", server_name, content).into_string(),
     ))
 }
 

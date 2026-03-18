@@ -8,7 +8,7 @@ use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
-use iroh_social_types::{
+use proscenium_types::{
     CALL_ALPN, DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, STAGE_ALPN,
     derive_dm_key, derive_signing_key, derive_transport_key, now_millis, sign_delegation,
     sign_linked_devices_announcement,
@@ -93,7 +93,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     // Bind the transport endpoint (needed for transport_node_id before building Identity).
     let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, 0);
     log::info!("[setup] binding iroh endpoint...");
-    let endpoint = Endpoint::builder()
+    let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(SecretKey::from_bytes(&transport_key_bytes))
         .alpns(vec![
             iroh_blobs::ALPN.to_vec(),
@@ -270,7 +270,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("iroh-social/1.0")
+        .user_agent("proscenium/1.0")
         .build()
         .expect("failed to build HTTP client");
 
@@ -306,14 +306,14 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         tokio::spawn(async move {
             while let Some(signal) = rx.recv().await {
                 match signal.payload {
-                    iroh_social_types::DmPayload::CallOffer { call_id, .. } => {
+                    proscenium_types::DmPayload::CallOffer { call_id, .. } => {
                         call.on_call_offer(&call_id, &signal.peer_pubkey).await;
                     }
-                    iroh_social_types::DmPayload::CallAnswer { call_id } => {
+                    proscenium_types::DmPayload::CallAnswer { call_id } => {
                         call.on_call_answered(&call_id, &signal.peer_pubkey).await;
                     }
-                    iroh_social_types::DmPayload::CallReject { call_id }
-                    | iroh_social_types::DmPayload::CallHangup { call_id } => {
+                    proscenium_types::DmPayload::CallReject { call_id }
+                    | proscenium_types::DmPayload::CallHangup { call_id } => {
                         call.on_call_ended(&call_id).await;
                     }
                     _ => {}

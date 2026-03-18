@@ -4,7 +4,7 @@ use crate::crypto::{
 };
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh_social_types::{
+use proscenium_types::{
     DeviceEntry, LinkBundleData, LinkQrPayload, PEER_ALPN, PeerRequest, PeerResponse,
     derive_transport_key,
 };

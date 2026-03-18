@@ -2,7 +2,7 @@ use crate::error::AppError;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
-use iroh_social_types::Notification;
+use proscenium_types::Notification;
 
 use super::Storage;
 

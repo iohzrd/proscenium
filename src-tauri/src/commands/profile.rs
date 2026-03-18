@@ -1,7 +1,7 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
 use iroh::SecretKey;
-use iroh_social_types::{NodeStatus, Profile, Visibility, sign_profile, validate_profile};
+use proscenium_types::{NodeStatus, Profile, Visibility, sign_profile, validate_profile};
 use std::sync::Arc;
 use tauri::State;
 

@@ -1,6 +1,6 @@
 {
-  "name": "iroh-tauri-app",
-  "version": "0.1.40",
+  "name": "proscenium",
+  "version": "0.2.0",
   "description": "",
   "type": "module",
   "scripts": {

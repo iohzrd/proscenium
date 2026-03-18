@@ -1,4 +1,4 @@
-use iroh_social_types::{Interaction, Post, Profile, Visibility};
+use proscenium_types::{Interaction, Post, Profile, Visibility};
 use serde::Serialize;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -111,7 +111,7 @@ impl Storage {
         transport_node_id: Option<&str>,
         delegation_json: Option<&str>,
     ) -> anyhow::Result<()> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         let (display_name, bio, avatar_hash) = match profile {
             Some(p) => (
                 Some(p.display_name.as_str()),
@@ -149,7 +149,7 @@ impl Storage {
         if let (Some(delegation_json), Some(transport_node_id)) =
             (delegation_json, transport_node_id)
             && let Ok(delegation) =
-                serde_json::from_str::<iroh_social_types::SigningKeyDelegation>(delegation_json)
+                serde_json::from_str::<proscenium_types::SigningKeyDelegation>(delegation_json)
         {
             let _ = self
                 .cache_peer_delegation(
@@ -204,7 +204,7 @@ impl Storage {
     }
 
     pub async fn update_profile(&self, pubkey: &str, profile: &Profile) -> anyhow::Result<bool> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         let vis = profile.visibility.to_string();
         let result = sqlx::query(
             "UPDATE registrations SET display_name = ?2, bio = ?3, avatar_hash = ?4, visibility = ?5, last_seen = ?6
@@ -273,7 +273,7 @@ impl Storage {
     // --- Posts ---
 
     pub async fn insert_post(&self, post: &Post) -> anyhow::Result<bool> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         let media_json = if post.media.is_empty() {
             None
         } else {
@@ -456,7 +456,7 @@ impl Storage {
     // --- Interactions ---
 
     pub async fn insert_interaction(&self, interaction: &Interaction) -> anyhow::Result<bool> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         let kind = format!("{:?}", interaction.kind);
 
         let result = sqlx::query(
@@ -727,7 +727,7 @@ impl Storage {
         last_post_ts: Option<i64>,
         last_interaction_ts: Option<i64>,
     ) -> anyhow::Result<()> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         sqlx::query(
             "INSERT INTO sync_state (pubkey, last_synced_at, last_post_timestamp, last_interaction_timestamp)
              VALUES (?1, ?2, ?3, ?4)
@@ -776,7 +776,7 @@ impl Storage {
         delegation_json: &str,
         transport_node_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         sqlx::query(
             "INSERT INTO peer_delegations (master_pubkey, signing_pubkey, delegation_json, transport_node_id, cached_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -817,7 +817,7 @@ impl Storage {
         version: i64,
         transport_node_ids: &[String],
     ) -> anyhow::Result<()> {
-        let now = iroh_social_types::now_millis() as i64;
+        let now = proscenium_types::now_millis() as i64;
         let transport_json = serde_json::to_string(transport_node_ids)?;
 
         sqlx::query(

@@ -1,6 +1,6 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh_social_types::{FollowRequestEntry, FollowResponse, now_millis, short_id};
+use proscenium_types::{FollowRequestEntry, FollowResponse, now_millis, short_id};
 use std::sync::Arc;
 use tauri::State;
 

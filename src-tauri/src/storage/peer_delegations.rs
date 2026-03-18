@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::storage::Storage;
-use iroh_social_types::{IdentityResponse, SigningKeyDelegation, now_millis};
+use proscenium_types::{IdentityResponse, SigningKeyDelegation, now_millis};
 
 impl Storage {
     pub async fn cache_peer_identity(&self, response: &IdentityResponse) -> Result<(), AppError> {

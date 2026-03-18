@@ -9,7 +9,7 @@
 </script>
 
 <header class="mobile-header">
-  <span class="app-name">iroh social</span>
+  <span class="app-name">proscenium</span>
   {#if status}
     <span
       class="status-dot"

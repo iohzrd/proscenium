@@ -1,6 +1,6 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh_social_types::StageState;
+use proscenium_types::StageState;
 use std::sync::Arc;
 use tauri::State;
 

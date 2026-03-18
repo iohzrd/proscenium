@@ -7,7 +7,7 @@ use crate::audio::{FRAME_SIZE, OpusEncoder, SAMPLES_PER_FRAME, TAG_NORMAL};
 const MAX_SPEAKER_BUFFER: usize = FRAME_SIZE * 5;
 use crate::error::AppError;
 use iroh::SecretKey;
-use iroh_social_types::short_id;
+use proscenium_types::short_id;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};

@@ -3,7 +3,7 @@ use crate::constants::{
     RELAY_CHECK_INTERVAL, RELAY_WAIT_ATTEMPTS, SYNC_CONCURRENCY,
 };
 use crate::state::{AppState, SyncCommand};
-use iroh_social_types::short_id;
+use proscenium_types::short_id;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

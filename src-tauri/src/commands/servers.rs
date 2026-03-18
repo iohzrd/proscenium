@@ -1,7 +1,7 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
 use iroh::SecretKey;
-use iroh_social_types::{
+use proscenium_types::{
     PostSearchResponse, RegistrationPayload, RegistrationRequest, ServerEntry, ServerFeedResponse,
     ServerInfo, ServerUser, TrendingResponse, UserSearchResponse, Visibility, now_millis,
     sign_registration,
@@ -305,7 +305,7 @@ pub(crate) async fn sync_profile_to_server_inner(
         bio: Option<String>,
         avatar_hash: Option<String>,
         signature: String,
-        delegation: iroh_social_types::SigningKeyDelegation,
+        delegation: proscenium_types::SigningKeyDelegation,
     }
 
     let update = ProfileUpdate {
