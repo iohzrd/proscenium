@@ -1,11 +1,2 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = []
-
-[target.x86_64-pc-windows-msvc.env]
-OPUS_STATIC = { value = "1", force = true }
-
-[target.i686-pc-windows-msvc.env]
-OPUS_STATIC = { value = "1", force = true }
-
-[target.aarch64-pc-windows-msvc.env]
-OPUS_STATIC = { value = "1", force = true }
