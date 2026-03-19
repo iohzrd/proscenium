@@ -80,6 +80,48 @@ pub async fn add_blob_bytes(
     add_blob_data(&state.blob_store, &state.endpoint, &data).await
 }
 
+/// Add a blob from RGBA pixel data (used by clipboard paste).
+/// Returns `{ hash, ticket, filename, size, mime_type }`.
+#[tauri::command]
+pub async fn add_blob_from_rgba(
+    state: State<'_, Arc<AppState>>,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> CmdResult<serde_json::Value> {
+    let png_data = tokio::task::spawn_blocking(move || {
+        let mut buf = Vec::new();
+        let mut encoder = png::Encoder::new(std::io::Cursor::new(&mut buf), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|e| AppError::Other(format!("png encode error: {e}")))?;
+        writer
+            .write_image_data(&data)
+            .map_err(|e| AppError::Other(format!("png write error: {e}")))?;
+        drop(writer);
+        Ok::<Vec<u8>, AppError>(buf)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("task join error: {e}")))??;
+
+    let size = png_data.len();
+    let blob_result = add_blob_data(&state.blob_store, &state.endpoint, &png_data).await?;
+    let hash = blob_result["hash"].as_str().unwrap_or_default().to_string();
+    let ticket = blob_result["ticket"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(serde_json::json!({
+        "hash": hash,
+        "ticket": ticket,
+        "filename": "clipboard.png",
+        "size": size,
+        "mime_type": "image/png",
+    }))
+}
+
 /// Add a blob from a local file path (used by native drag-and-drop).
 /// Returns `{ hash, ticket, filename, size, mime_type }`.
 #[tauri::command]

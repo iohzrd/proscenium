@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
+  import { readImage } from "@tauri-apps/plugin-clipboard-manager";
   import { platform } from "@tauri-apps/plugin-os";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
   import { isImage, isVideo } from "$lib/utils";
@@ -51,7 +52,9 @@
           dragging = false;
         } else if (type === "drop") {
           dragging = false;
-          const paths: string[] = (event.payload as { type: string; paths: string[] }).paths;
+          const paths: string[] = (
+            event.payload as { type: string; paths: string[] }
+          ).paths;
           if (paths.length > 0) {
             await upload.addFilesFromPaths(paths);
           }
@@ -97,6 +100,21 @@
     posting = false;
   }
 
+  async function handlePaste(e: ClipboardEvent) {
+    if (isMobile) return;
+    try {
+      const img = await readImage();
+      const rgba = await img.rgba();
+      const { width, height } = await img.size();
+      await img.close();
+      if (rgba.length === 0) return;
+      e.preventDefault();
+      await upload.addImageFromRgba(rgba, width, height);
+    } catch {
+      // No image in clipboard — let the default text paste through.
+    }
+  }
+
   function handleKey(e: KeyboardEvent) {
     if (mentionAutocomplete?.handleKey(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
@@ -122,6 +140,7 @@
     maxlength={MAX_POST_LENGTH}
     onkeydown={handleKey}
     oninput={mention.handleInput}
+    onpaste={handlePaste}
   ></textarea>
   <div class="compose-meta">
     <span class="hint">Shift+Enter for newline</span>

@@ -65,6 +65,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .setup(|app| setup::initialize(app))
@@ -101,6 +102,7 @@ pub fn run() {
             fetch_blob,
             add_blob_bytes,
             add_blob_from_path,
+            add_blob_from_rgba,
             fetch_blob_bytes,
             refetch_blob_bytes,
             get_node_status,
