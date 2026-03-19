@@ -253,10 +253,6 @@
 
     <PostComposer pubkey={node.pubkey} onsubmitted={loadFeed} />
 
-    {#if del.pendingId}
-      <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
-    {/if}
-
     <hr class="divider" />
 
     {#if liveStages.size > 0}
@@ -312,6 +308,10 @@
       </div>
     {/if}
   </div>
+{/if}
+
+{#if del.pendingId}
+  <DeleteConfirmModal onconfirm={del.execute} oncancel={del.cancel} />
 {/if}
 
 {#if toast.message}

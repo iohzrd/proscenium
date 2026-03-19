@@ -80,6 +80,40 @@ pub async fn add_blob_bytes(
     add_blob_data(&state.blob_store, &state.endpoint, &data).await
 }
 
+/// Add a blob from a local file path (used by native drag-and-drop).
+/// Returns `{ hash, ticket, filename, size, mime_type }`.
+#[tauri::command]
+pub async fn add_blob_from_path(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> CmdResult<serde_json::Value> {
+    let file_path = std::path::Path::new(&path);
+    let data = tokio::fs::read(file_path)
+        .await
+        .map_err(|e| AppError::Other(format!("failed to read {path}: {e}")))?;
+    let filename = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let size = data.len();
+    let mime_type = mime_guess::from_path(file_path)
+        .first_or_octet_stream()
+        .to_string();
+    let blob_result = add_blob_data(&state.blob_store, &state.endpoint, &data).await?;
+    let hash = blob_result["hash"].as_str().unwrap_or_default().to_string();
+    let ticket = blob_result["ticket"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    Ok(serde_json::json!({
+        "hash": hash,
+        "ticket": ticket,
+        "filename": filename,
+        "size": size,
+        "mime_type": mime_type,
+    }))
+}
+
 #[tauri::command]
 pub async fn fetch_blob_bytes(
     state: State<'_, Arc<AppState>>,

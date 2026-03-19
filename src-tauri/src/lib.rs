@@ -100,6 +100,7 @@ pub fn run() {
             add_blob,
             fetch_blob,
             add_blob_bytes,
+            add_blob_from_path,
             fetch_blob_bytes,
             refetch_blob_bytes,
             get_node_status,

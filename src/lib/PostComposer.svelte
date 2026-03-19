@@ -1,12 +1,15 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { platform } from "@tauri-apps/plugin-os";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
   import { isImage, isVideo } from "$lib/utils";
+  import type { PendingAttachment } from "$lib/types";
   import {
     useMentionAutocomplete,
     useFileUpload,
   } from "$lib/composables.svelte";
+  import { onMount } from "svelte";
 
   const MAX_POST_LENGTH = 10_000;
   const isMobile = platform() === "android" || platform() === "ios";
@@ -21,6 +24,7 @@
 
   let newPost = $state("");
   let posting = $state(false);
+  let dragging = $state(false);
   let fileInput = $state<HTMLInputElement>(null!);
   let cameraInput = $state<HTMLInputElement>(null!);
   let mentionAutocomplete = $state<MentionAutocomplete>();
@@ -32,6 +36,40 @@
   );
 
   const upload = useFileUpload();
+
+  onMount(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    getCurrentWebview()
+      .onDragDropEvent(async (event) => {
+        if (cancelled) return;
+        const { type } = event.payload;
+        if (type === "enter" || type === "over") {
+          dragging = true;
+        } else if (type === "leave") {
+          dragging = false;
+        } else if (type === "drop") {
+          dragging = false;
+          const paths: string[] = (event.payload as { type: string; paths: string[] }).paths;
+          if (paths.length > 0) {
+            await upload.addFilesFromPaths(paths);
+          }
+        }
+      })
+      .then((fn) => {
+        if (cancelled) {
+          fn();
+        } else {
+          unlisten = fn;
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  });
 
   async function submitPost() {
     if ((!newPost.trim() && upload.attachments.length === 0) || posting) return;
@@ -68,7 +106,7 @@
   }
 </script>
 
-<div class="compose">
+<div class="compose" class:drag-over={dragging}>
   <MentionAutocomplete
     bind:this={mentionAutocomplete}
     query={mention.query}
@@ -175,6 +213,13 @@
   .compose {
     position: relative;
     margin-bottom: 1.25rem;
+    border: 2px solid transparent;
+    border-radius: var(--radius-xl);
+    transition: border-color 0.15s;
+  }
+
+  .compose.drag-over {
+    border-color: var(--color-accent);
   }
 
   .compose-textarea {

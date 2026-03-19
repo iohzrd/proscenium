@@ -1,8 +1,8 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
 import type { PendingAttachment } from "$lib/types";
-import { copyToClipboard, setupInfiniteScroll, uploadFiles } from "$lib/utils";
+import { copyToClipboard, isImage, isVideo, setupInfiniteScroll, uploadFiles } from "$lib/utils";
 
 // --- useToast ---
 
@@ -203,10 +203,8 @@ export function useFileUpload() {
   let uploading = $state(false);
   let errorMessage = $state("");
 
-  async function handleFiles(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const files = input.files;
-    if (!files || files.length === 0) return;
+  async function addFiles(files: FileList) {
+    if (files.length === 0) return;
     uploading = true;
     try {
       const uploaded = await uploadFiles(files);
@@ -217,6 +215,49 @@ export function useFileUpload() {
       setTimeout(() => (errorMessage = ""), 4000);
     }
     uploading = false;
+  }
+
+  async function addFilesFromPaths(paths: string[]) {
+    if (paths.length === 0) return;
+    uploading = true;
+    try {
+      for (const path of paths) {
+        const result: {
+          hash: string;
+          ticket: string;
+          filename: string;
+          size: number;
+          mime_type: string;
+        } = await invoke("add_blob_from_path", { path });
+        const previewUrl =
+          isImage(result.mime_type) || isVideo(result.mime_type)
+            ? convertFileSrc(path)
+            : "";
+        attachments = [
+          ...attachments,
+          {
+            hash: result.hash,
+            ticket: result.ticket,
+            mime_type: result.mime_type,
+            filename: result.filename,
+            size: result.size,
+            previewUrl,
+          },
+        ];
+      }
+    } catch (err) {
+      errorMessage = "Failed to upload file";
+      console.error("Failed to upload file:", err);
+      setTimeout(() => (errorMessage = ""), 4000);
+    }
+    uploading = false;
+  }
+
+  async function handleFiles(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const files = input.files;
+    if (!files || files.length === 0) return;
+    await addFiles(files);
     input.value = "";
   }
 
@@ -247,6 +288,8 @@ export function useFileUpload() {
       return errorMessage;
     },
     handleFiles,
+    addFiles,
+    addFilesFromPaths,
     removeAttachment,
     revokeAll,
     clear,
