@@ -40,8 +40,8 @@ impl Storage {
     pub async fn mute_user(&self, pubkey: &str) -> Result<(), AppError> {
         let now = now_millis() as i64;
         sqlx::query(
-            "INSERT INTO mutes (pubkey, created_at, state, last_changed_at) VALUES (?1, ?2, 'active', ?2)
-             ON CONFLICT(pubkey) DO UPDATE SET state='active', last_changed_at=?2",
+            "INSERT INTO moderation (pubkey, kind, created_at, state, last_changed_at) VALUES (?1, 'mute', ?2, 'active', ?2)
+             ON CONFLICT(pubkey, kind) DO UPDATE SET state='active', last_changed_at=?2",
         )
         .bind(pubkey)
         .bind(now)
@@ -52,36 +52,40 @@ impl Storage {
 
     pub async fn unmute_user(&self, pubkey: &str) -> Result<(), AppError> {
         let now = now_millis() as i64;
-        sqlx::query("UPDATE mutes SET state='removed', last_changed_at=?2 WHERE pubkey=?1")
-            .bind(pubkey)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE moderation SET state='removed', last_changed_at=?2 WHERE pubkey=?1 AND kind='mute'",
+        )
+        .bind(pubkey)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     pub async fn is_muted(&self, pubkey: &str) -> Result<bool, AppError> {
-        let exists: bool =
-            sqlx::query_scalar("SELECT COUNT(*) > 0 FROM mutes WHERE pubkey=?1 AND state='active'")
-                .bind(pubkey)
-                .fetch_one(&self.pool)
-                .await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM moderation WHERE pubkey=?1 AND kind='mute' AND state='active'",
+        )
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(exists)
     }
 
     pub async fn get_muted_pubkeys(&self) -> Result<Vec<String>, AppError> {
-        let rows =
-            sqlx::query("SELECT pubkey FROM mutes WHERE state='active' ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT pubkey FROM moderation WHERE kind='mute' AND state='active' ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     pub async fn block_user(&self, pubkey: &str) -> Result<(), AppError> {
         let now = now_millis() as i64;
         sqlx::query(
-            "INSERT INTO blocks (pubkey, created_at, state, last_changed_at) VALUES (?1, ?2, 'active', ?2)
-             ON CONFLICT(pubkey) DO UPDATE SET state='active', last_changed_at=?2",
+            "INSERT INTO moderation (pubkey, kind, created_at, state, last_changed_at) VALUES (?1, 'block', ?2, 'active', ?2)
+             ON CONFLICT(pubkey, kind) DO UPDATE SET state='active', last_changed_at=?2",
         )
         .bind(pubkey)
         .bind(now)
@@ -92,17 +96,19 @@ impl Storage {
 
     pub async fn unblock_user(&self, pubkey: &str) -> Result<(), AppError> {
         let now = now_millis() as i64;
-        sqlx::query("UPDATE blocks SET state='removed', last_changed_at=?2 WHERE pubkey=?1")
-            .bind(pubkey)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE moderation SET state='removed', last_changed_at=?2 WHERE pubkey=?1 AND kind='block'",
+        )
+        .bind(pubkey)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     pub async fn is_blocked(&self, pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM blocks WHERE pubkey=?1 AND state='active'",
+            "SELECT COUNT(*) > 0 FROM moderation WHERE pubkey=?1 AND kind='block' AND state='active'",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)
@@ -111,17 +117,17 @@ impl Storage {
     }
 
     pub async fn get_blocked_pubkeys(&self) -> Result<Vec<String>, AppError> {
-        let rows =
-            sqlx::query("SELECT pubkey FROM blocks WHERE state='active' ORDER BY created_at DESC")
-                .fetch_all(&self.pool)
-                .await?;
+        let rows = sqlx::query(
+            "SELECT pubkey FROM moderation WHERE kind='block' AND state='active' ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     pub async fn is_hidden(&self, pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM mutes WHERE pubkey=?1 AND state='active')
-                 OR EXISTS(SELECT 1 FROM blocks WHERE pubkey=?1 AND state='active')",
+            "SELECT COUNT(*) > 0 FROM moderation WHERE pubkey=?1 AND state='active'",
         )
         .bind(pubkey)
         .fetch_one(&self.pool)

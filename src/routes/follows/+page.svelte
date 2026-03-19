@@ -6,8 +6,7 @@
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
   import type {
-    FollowEntry,
-    FollowerEntry,
+    SocialGraphEntry,
     FollowRequestEntry,
   } from "$lib/types";
   import {
@@ -16,8 +15,8 @@
     useCopyFeedback,
   } from "$lib/composables.svelte";
 
-  let follows = $state<FollowEntry[]>([]);
-  let followers = $state<FollowerEntry[]>([]);
+  let follows = $state<SocialGraphEntry[]>([]);
+  let followers = $state<SocialGraphEntry[]>([]);
   let followRequests = $state<FollowRequestEntry[]>([]);
   let pendingRequestCount = $state(0);
   let mutedPubkeys = $state<string[]>([]);
@@ -27,8 +26,6 @@
   let addingFollow = $state(false);
   let pendingUnfollowPubkey = $state<string | null>(null);
   let activeTab = $state<"following" | "followers" | "requests">("following");
-  let editingAlias = $state<string | null>(null);
-  let aliasInput = $state("");
   const isMobile = platform() === "android" || platform() === "ios";
   let showScanner = $state(false);
 
@@ -178,21 +175,8 @@
   function handleGlobalKey(e: KeyboardEvent) {
     if (e.key === "Escape") {
       if (pendingUnfollowPubkey) cancelUnfollow();
-      else if (editingAlias) editingAlias = null;
       else if (showScanner) showScanner = false;
     }
-  }
-
-  async function saveAlias() {
-    if (!editingAlias) return;
-    try {
-      const alias = aliasInput.trim() || null;
-      await invoke("update_follow_alias", { pubkey: editingAlias, alias });
-      await loadFollows();
-    } catch (e) {
-      status = `Error: ${e}`;
-    }
-    editingAlias = null;
   }
 
   onMount(() => {
@@ -317,18 +301,8 @@
 
     <div class="follow-list">
       {#each follows as f (f.pubkey)}
-        <PersonItem pubkey={f.pubkey} alias={f.alias}>
+        <PersonItem pubkey={f.pubkey}>
           {#snippet actions()}
-            <button
-              class="btn-elevated"
-              onclick={(e) => {
-                e.preventDefault();
-                editingAlias = f.pubkey;
-                aliasInput = f.alias ?? "";
-              }}
-            >
-              {f.alias ? "Edit alias" : "Set alias"}
-            </button>
             <button
               class="btn-elevated"
               onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
@@ -349,39 +323,6 @@
         </p>
       {/each}
     </div>
-
-    {#if editingAlias}
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <div
-        class="modal-overlay"
-        onclick={() => (editingAlias = null)}
-        role="presentation"
-      >
-        <!-- svelte-ignore a11y_interactive_supports_focus -->
-        <div
-          class="modal"
-          onclick={(e) => e.stopPropagation()}
-          role="dialog"
-          aria-label="Set alias"
-        >
-          <p>Set a local alias for this user</p>
-          <input
-            class="input-base alias-input"
-            bind:value={aliasInput}
-            placeholder="Alias (leave empty to clear)"
-            onkeydown={(e) => {
-              if (e.key === "Enter") saveAlias();
-            }}
-          />
-          <div class="modal-actions">
-            <button class="modal-cancel" onclick={() => (editingAlias = null)}
-              >Cancel</button
-            >
-            <button class="modal-confirm save" onclick={saveAlias}>Save</button>
-          </div>
-        </div>
-      </div>
-    {/if}
   {:else if activeTab === "followers"}
     <div class="follow-list">
       {#each followers as f (f.pubkey)}
@@ -624,10 +565,6 @@
 
   .moderation-header.blocked {
     color: var(--color-error-light);
-  }
-
-  .alias-input {
-    margin-bottom: 1rem;
   }
 
   .btn-approve {

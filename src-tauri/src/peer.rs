@@ -9,9 +9,9 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use proscenium_types::{
-    FollowRequest, FollowResponse, IdentityResponse, LinkQrPayload, PEER_ALPN, PeerRequest,
-    PeerResponse, SigningKeyDelegation, Visibility, derive_transport_key, now_millis, short_id,
-    sign_follow_request, verify_follow_request,
+    FollowRequest, FollowResponse, FollowersListResponse, FollowsListResponse, IdentityResponse,
+    LinkQrPayload, PEER_ALPN, PeerRequest, PeerResponse, SigningKeyDelegation, Visibility,
+    derive_transport_key, now_millis, short_id, sign_follow_request, verify_follow_request,
 };
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -465,6 +465,122 @@ impl PeerHandler {
         conn.closed().await;
         Ok(())
     }
+
+    async fn handle_follows_list_request(
+        &self,
+        my_pubkey: &str,
+        remote_str: &str,
+        mut send: iroh::endpoint::SendStream,
+        conn: &Connection,
+    ) -> Result<(), AcceptError> {
+        let remote_pubkey = self
+            .storage
+            .get_master_pubkey_for_transport(remote_str)
+            .await
+            .unwrap_or_else(|| remote_str.to_string());
+
+        let visibility = self
+            .storage
+            .get_visibility(my_pubkey)
+            .await
+            .unwrap_or(Visibility::Public);
+        let allowed = match visibility {
+            Visibility::Public => true,
+            Visibility::Listed => self
+                .storage
+                .is_follower(my_pubkey, &remote_pubkey)
+                .await
+                .unwrap_or(false),
+            Visibility::Private => self
+                .storage
+                .is_mutual(my_pubkey, &remote_pubkey)
+                .await
+                .unwrap_or(false),
+        };
+
+        let share = allowed && crate::preferences::get_share_follows(&self.storage).await;
+
+        let follows = if share {
+            self.storage
+                .get_follows(my_pubkey)
+                .await
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let response = PeerResponse::FollowsList(FollowsListResponse {
+            pubkey: my_pubkey.to_string(),
+            follows,
+            hidden: !share,
+        });
+
+        let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&resp_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+        conn.closed().await;
+        Ok(())
+    }
+
+    async fn handle_followers_list_request(
+        &self,
+        my_pubkey: &str,
+        remote_str: &str,
+        mut send: iroh::endpoint::SendStream,
+        conn: &Connection,
+    ) -> Result<(), AcceptError> {
+        let remote_pubkey = self
+            .storage
+            .get_master_pubkey_for_transport(remote_str)
+            .await
+            .unwrap_or_else(|| remote_str.to_string());
+
+        let visibility = self
+            .storage
+            .get_visibility(my_pubkey)
+            .await
+            .unwrap_or(Visibility::Public);
+        let allowed = match visibility {
+            Visibility::Public => true,
+            Visibility::Listed => self
+                .storage
+                .is_follower(my_pubkey, &remote_pubkey)
+                .await
+                .unwrap_or(false),
+            Visibility::Private => self
+                .storage
+                .is_mutual(my_pubkey, &remote_pubkey)
+                .await
+                .unwrap_or(false),
+        };
+
+        let share = allowed && crate::preferences::get_share_followers(&self.storage).await;
+
+        let followers = if share {
+            self.storage
+                .get_followers(my_pubkey)
+                .await
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
+        let response = PeerResponse::FollowersList(FollowersListResponse {
+            pubkey: my_pubkey.to_string(),
+            followers,
+            hidden: !share,
+        });
+
+        let resp_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+        send.write_all(&resp_bytes)
+            .await
+            .map_err(AcceptError::from_err)?;
+        send.finish().map_err(AcceptError::from_err)?;
+        conn.closed().await;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for PeerHandler {
@@ -519,6 +635,8 @@ impl ProtocolHandler for PeerHandler {
                 PeerRequest::Push(_) => "push",
                 PeerRequest::FollowRequest(_) => "follow-request",
                 PeerRequest::IdentityRequest => "identity-request",
+                PeerRequest::FollowsListRequest => "follows-list",
+                PeerRequest::FollowersListRequest => "followers-list",
                 PeerRequest::LinkRequest { .. } => "link-request",
                 PeerRequest::DeviceSyncRequest { .. } => "device-sync",
             },
@@ -560,6 +678,14 @@ impl ProtocolHandler for PeerHandler {
                     .await
             }
             PeerRequest::IdentityRequest => self.handle_identity_request(send, &conn).await,
+            PeerRequest::FollowsListRequest => {
+                self.handle_follows_list_request(&my_pubkey, &remote_str, send, &conn)
+                    .await
+            }
+            PeerRequest::FollowersListRequest => {
+                self.handle_followers_list_request(&my_pubkey, &remote_str, send, &conn)
+                    .await
+            }
             PeerRequest::LinkRequest { noise_init } => {
                 self.handle_link_request(send, noise_init, &conn).await
             }
@@ -581,6 +707,60 @@ impl ProtocolHandler for PeerHandler {
                 .await
             }
         }
+    }
+}
+
+/// Client: fetch a remote peer's follow list.
+pub async fn fetch_remote_follows(
+    endpoint: &Endpoint,
+    target: EndpointId,
+) -> Result<FollowsListResponse, AppError> {
+    let addr = EndpointAddr::from(target);
+    let conn = endpoint.connect(addr, PEER_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let req_bytes = serde_json::to_vec(&PeerRequest::FollowsListRequest)?;
+    send.write_all(&req_bytes).await?;
+    send.finish()?;
+
+    let resp_bytes = recv.read_to_end(1_000_000).await?;
+    let response: PeerResponse = serde_json::from_slice(&resp_bytes)?;
+
+    conn.close(0u32.into(), b"done");
+
+    match response {
+        PeerResponse::FollowsList(list) => Ok(list),
+        other => Err(AppError::Other(format!(
+            "unexpected response: expected FollowsList, got {:?}",
+            std::mem::discriminant(&other)
+        ))),
+    }
+}
+
+/// Client: fetch a remote peer's followers list.
+pub async fn fetch_remote_followers(
+    endpoint: &Endpoint,
+    target: EndpointId,
+) -> Result<FollowersListResponse, AppError> {
+    let addr = EndpointAddr::from(target);
+    let conn = endpoint.connect(addr, PEER_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+
+    let req_bytes = serde_json::to_vec(&PeerRequest::FollowersListRequest)?;
+    send.write_all(&req_bytes).await?;
+    send.finish()?;
+
+    let resp_bytes = recv.read_to_end(1_000_000).await?;
+    let response: PeerResponse = serde_json::from_slice(&resp_bytes)?;
+
+    conn.close(0u32.into(), b"done");
+
+    match response {
+        PeerResponse::FollowersList(list) => Ok(list),
+        other => Err(AppError::Other(format!(
+            "unexpected response: expected FollowersList, got {:?}",
+            std::mem::discriminant(&other)
+        ))),
     }
 }
 

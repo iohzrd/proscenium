@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import Avatar from "$lib/Avatar.svelte";
   import { getDisplayName, getCachedAvatarTicket, shortId } from "$lib/utils";
-  import type { FollowEntry, FollowerEntry } from "$lib/types";
+  import type { SocialGraphEntry } from "$lib/types";
 
   let {
     query,
@@ -33,8 +33,8 @@
   async function searchUsers(q: string) {
     const lowerQ = q.toLowerCase();
     try {
-      const follows: FollowEntry[] = await invoke("get_follows");
-      const followers: FollowerEntry[] = await invoke("get_followers");
+      const follows: SocialGraphEntry[] = await invoke("get_follows");
+      const followers: SocialGraphEntry[] = await invoke("get_followers");
       const seen = new Set<string>();
       const items: { pubkey: string; name: string }[] = [];
 

@@ -27,7 +27,8 @@ pub async fn approve_follow_request(
     let approved = state.storage.approve_follow_request(&pubkey).await?;
     if approved {
         let now = now_millis();
-        let _ = state.storage.upsert_follower(&pubkey, now).await;
+        let my_id = state.identity.read().await.master_pubkey.clone();
+        let _ = state.storage.upsert_follower(&my_id, &pubkey, now).await;
     }
     Ok(approved)
 }

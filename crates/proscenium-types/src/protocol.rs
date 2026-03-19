@@ -2,8 +2,8 @@ use crate::delegation::{SigningKeyDelegation, SigningKeyRotation};
 use crate::signing::{hex_to_signature, signature_to_hex};
 use crate::stage::StageTicket;
 use crate::types::{
-    DeviceEntry, DeviceSyncVector, FollowSyncEntry, Interaction, ModerationSyncEntry, Post,
-    Profile, RatchetSessionExport,
+    DeviceEntry, DeviceSyncVector, FollowEntry, Interaction, ModerationEntry, Post, Profile,
+    RatchetSessionExport, SocialGraphEntry,
 };
 use iroh::{PublicKey, SecretKey};
 use iroh_gossip::TopicId;
@@ -97,6 +97,10 @@ pub enum PeerRequest {
     FollowRequest(FollowRequest),
     /// Ask a peer "who are you?" -- resolves transport NodeId to master pubkey.
     IdentityRequest,
+    /// Request a peer's public follow list.
+    FollowsListRequest,
+    /// Request a peer's public followers list.
+    FollowersListRequest,
     /// Device pairing: new device sends Noise IK+PSK init message.
     LinkRequest {
         /// Noise IK+PSK handshake init message (opaque bytes).
@@ -127,6 +131,10 @@ pub enum PeerResponse {
         /// LinkBundleData encrypted with the Noise transport.
         encrypted_bundle: Vec<u8>,
     },
+    /// Response containing a peer's follows list.
+    FollowsList(FollowsListResponse),
+    /// Response containing a peer's followers list.
+    FollowersList(FollowersListResponse),
     /// Device-to-device sync: responder accepts and sends its own vector.
     DeviceSyncAccepted {
         /// Signature of the initiator's challenge (proves signing key).
@@ -169,6 +177,24 @@ pub enum FollowResponse {
     Approved(Box<IdentityResponse>),
     Denied,
     Pending,
+}
+
+/// Response to a FollowsListRequest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowsListResponse {
+    pub pubkey: String,
+    pub follows: Vec<SocialGraphEntry>,
+    /// True if the user has hidden their follow list.
+    pub hidden: bool,
+}
+
+/// Response to a FollowersListRequest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowersListResponse {
+    pub pubkey: String,
+    pub followers: Vec<SocialGraphEntry>,
+    /// True if the user has hidden their followers list.
+    pub hidden: bool,
 }
 
 /// Phase 1: Client sends summary of what it has for an author.
@@ -237,9 +263,8 @@ pub enum SyncFrame {
 pub enum DeviceSyncFrame {
     Posts(Vec<Post>),
     Interactions(Vec<Interaction>),
-    Follows(Vec<FollowSyncEntry>),
-    Mutes(Vec<ModerationSyncEntry>),
-    Blocks(Vec<ModerationSyncEntry>),
+    Follows(Vec<FollowEntry>),
+    Moderation(Vec<ModerationEntry>),
     Bookmarks(Vec<String>),
     RatchetSessions(Vec<RatchetSessionExport>),
 }

@@ -371,92 +371,81 @@ async fn post_media_filter() {
 #[tokio::test]
 async fn social_follow_and_unfollow() {
     let s = test_storage().await;
-    let entry = FollowEntry {
+    let entry = SocialGraphEntry {
         pubkey: "peer_a".to_string(),
-        alias: Some("Alice".to_string()),
         followed_at: 1000,
+        first_seen: 0,
+        last_seen: 0,
+        is_online: false,
     };
-    s.follow(&entry).await.unwrap();
+    s.follow("me", &entry).await.unwrap();
 
-    assert!(s.is_following("peer_a").await.unwrap());
-    let follows = s.get_follows().await.unwrap();
+    assert!(s.is_following("me", "peer_a").await.unwrap());
+    let follows = s.get_follows("me").await.unwrap();
     assert_eq!(follows.len(), 1);
-    assert_eq!(follows[0].alias.as_deref(), Some("Alice"));
+    assert_eq!(follows[0].pubkey, "peer_a");
 
-    s.unfollow("peer_a").await.unwrap();
-    assert!(!s.is_following("peer_a").await.unwrap());
-    assert!(s.get_follows().await.unwrap().is_empty());
+    s.unfollow("me", "peer_a").await.unwrap();
+    assert!(!s.is_following("me", "peer_a").await.unwrap());
+    assert!(s.get_follows("me").await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn social_refollow_after_unfollow() {
     let s = test_storage().await;
-    let entry = FollowEntry {
+    let entry = SocialGraphEntry {
         pubkey: "peer_a".to_string(),
-        alias: None,
         followed_at: 1000,
+        first_seen: 0,
+        last_seen: 0,
+        is_online: false,
     };
-    s.follow(&entry).await.unwrap();
-    s.unfollow("peer_a").await.unwrap();
-    assert!(!s.is_following("peer_a").await.unwrap());
+    s.follow("me", &entry).await.unwrap();
+    s.unfollow("me", "peer_a").await.unwrap();
+    assert!(!s.is_following("me", "peer_a").await.unwrap());
 
     // Re-follow
-    s.follow(&entry).await.unwrap();
-    assert!(s.is_following("peer_a").await.unwrap());
-}
-
-#[tokio::test]
-async fn social_update_follow_alias() {
-    let s = test_storage().await;
-    let entry = FollowEntry {
-        pubkey: "peer_a".to_string(),
-        alias: None,
-        followed_at: 1000,
-    };
-    s.follow(&entry).await.unwrap();
-    s.update_follow_alias("peer_a", Some("Renamed"))
-        .await
-        .unwrap();
-
-    let follows = s.get_follows().await.unwrap();
-    assert_eq!(follows[0].alias.as_deref(), Some("Renamed"));
+    s.follow("me", &entry).await.unwrap();
+    assert!(s.is_following("me", "peer_a").await.unwrap());
 }
 
 #[tokio::test]
 async fn social_followers() {
     let s = test_storage().await;
-    let is_new = s.upsert_follower("f1", 1000).await.unwrap();
+    let is_new = s.upsert_follower("me", "f1", 1000).await.unwrap();
     assert!(is_new);
 
-    let is_new2 = s.upsert_follower("f1", 2000).await.unwrap();
+    let is_new2 = s.upsert_follower("me", "f1", 2000).await.unwrap();
     assert!(!is_new2); // already exists
 
-    assert!(s.is_follower("f1").await.unwrap());
-    assert!(!s.is_follower("nobody").await.unwrap());
+    assert!(s.is_follower("me", "f1").await.unwrap());
+    assert!(!s.is_follower("me", "nobody").await.unwrap());
 
-    let followers = s.get_followers().await.unwrap();
+    let followers = s.get_followers("me").await.unwrap();
     assert_eq!(followers.len(), 1);
     assert!(followers[0].is_online);
     assert_eq!(followers[0].last_seen, 2000);
 
-    s.set_follower_offline("f1").await.unwrap();
-    let followers = s.get_followers().await.unwrap();
+    s.set_follower_offline("me", "f1").await.unwrap();
+    let followers = s.get_followers("me").await.unwrap();
     assert!(!followers[0].is_online);
 }
 
 #[tokio::test]
 async fn social_mutual() {
     let s = test_storage().await;
-    let entry = FollowEntry {
+    let entry = SocialGraphEntry {
         pubkey: "peer".to_string(),
-        alias: None,
         followed_at: 1000,
+        first_seen: 0,
+        last_seen: 0,
+        is_online: false,
     };
-    s.follow(&entry).await.unwrap();
-    assert!(!s.is_mutual("peer").await.unwrap()); // not a follower yet
+    s.follow("me", &entry).await.unwrap();
+    assert!(!s.is_mutual("me", "peer").await.unwrap()); // not a follower yet
 
-    s.upsert_follower("peer", 2000).await.unwrap();
-    assert!(s.is_mutual("peer").await.unwrap()); // now mutual
+    s.upsert_follower("me", "peer", 2000).await.unwrap();
+    assert!(s.is_mutual("me", "peer").await.unwrap()); // now mutual
 }
 
 #[tokio::test]

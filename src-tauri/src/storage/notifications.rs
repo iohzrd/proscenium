@@ -41,8 +41,7 @@ impl Storage {
         limit: usize,
         before: Option<u64>,
     ) -> Result<Vec<Notification>, AppError> {
-        let hidden =
-            "AND n.actor NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
+        let hidden = "AND n.actor NOT IN (SELECT pubkey FROM moderation WHERE state='active')";
         let rows = match before {
             Some(b) => {
                 let sql = format!(

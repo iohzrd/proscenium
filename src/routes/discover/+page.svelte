@@ -10,7 +10,7 @@
     TrendingHashtag,
     UserSearchResponse,
     PostSearchResponse,
-    FollowEntry,
+    SocialGraphEntry,
   } from "$lib/types";
 
   type Tab = "users" | "posts" | "trending";
@@ -34,7 +34,7 @@
 
   const node = useNodeInit(async () => {
     myPubkey = await invoke<string>("get_pubkey");
-    const follows: FollowEntry[] = await invoke("get_follows");
+    const follows: SocialGraphEntry[] = await invoke("get_follows");
     followedPubkeys = new Set(follows.map((f) => f.pubkey));
     servers = await invoke("list_servers");
     if (servers.length > 0) {

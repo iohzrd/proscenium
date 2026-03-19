@@ -154,7 +154,7 @@ impl Storage {
         let b64 = base64::engine::general_purpose::STANDARD;
 
         let profile = self.get_profile(master_pubkey).await.ok().flatten();
-        let follows = self.get_follows().await.unwrap_or_default();
+        let follows = self.get_follows(master_pubkey).await.unwrap_or_default();
         let bookmarks = self.get_all_bookmark_ids().await.unwrap_or_default();
         let blocked_users = self.get_blocked_pubkeys().await.unwrap_or_default();
         let muted_users = self.get_muted_pubkeys().await.unwrap_or_default();
@@ -186,7 +186,7 @@ impl Storage {
         }
 
         for follow in &bundle.follows {
-            self.follow(follow).await?;
+            self.follow(master_pubkey, follow).await?;
         }
 
         for post_id in &bundle.bookmarks {

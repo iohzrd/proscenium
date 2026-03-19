@@ -57,8 +57,7 @@ impl Storage {
     }
 
     pub async fn get_feed(&self, q: &FeedQuery) -> Result<Vec<Post>, AppError> {
-        let hidden =
-            "AND p.author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
+        let hidden = "AND p.author NOT IN (SELECT pubkey FROM moderation WHERE state='active')";
         let rows = match q.before {
             Some(b) => {
                 let sql = format!(
@@ -314,7 +313,7 @@ impl Storage {
         limit: usize,
         before: Option<u64>,
     ) -> Result<Vec<Post>, AppError> {
-        let hidden = "AND author NOT IN (SELECT pubkey FROM mutes UNION SELECT pubkey FROM blocks)";
+        let hidden = "AND author NOT IN (SELECT pubkey FROM moderation WHERE state='active')";
         let rows = match before {
             Some(b) => {
                 let sql = format!(

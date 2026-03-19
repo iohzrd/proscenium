@@ -2,7 +2,13 @@ import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
 import type { PendingAttachment } from "$lib/types";
-import { copyToClipboard, isImage, isVideo, setupInfiniteScroll, uploadFiles } from "$lib/utils";
+import {
+  copyToClipboard,
+  isImage,
+  isVideo,
+  setupInfiniteScroll,
+  uploadFiles,
+} from "$lib/utils";
 
 // --- useToast ---
 
@@ -276,7 +282,11 @@ export function useFileUpload() {
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext("2d")!;
-      const imageData = new ImageData(new Uint8ClampedArray(rgba), width, height);
+      const imageData = new ImageData(
+        new Uint8ClampedArray(rgba),
+        width,
+        height,
+      );
       ctx.putImageData(imageData, 0, 0);
       const previewUrl = canvas.toDataURL("image/png");
       attachments = [

@@ -41,9 +41,10 @@ pub async fn get_muted_pubkeys(state: State<'_, Arc<AppState>>) -> CmdResult<Vec
 
 #[tauri::command]
 pub async fn block_user(state: State<'_, Arc<AppState>>, pubkey: String) -> CmdResult<()> {
-    let is_following = state.storage.is_following(&pubkey).await?;
+    let my_id = state.identity.read().await.master_pubkey.clone();
+    let is_following = state.storage.is_following(&my_id, &pubkey).await?;
     if is_following {
-        state.storage.unfollow(&pubkey).await?;
+        state.storage.unfollow(&my_id, &pubkey).await?;
         state.gossip.unfollow_user(&pubkey).await;
     }
     state.storage.block_user(&pubkey).await?;

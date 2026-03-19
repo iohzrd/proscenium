@@ -262,38 +262,24 @@ async fn send_deltas(
         write_frame(data_send, &frame_bytes).await?;
     }
 
-    // Mutes: send newer entries
-    let mute_deltas: Vec<_> = our_vector
-        .mutes
+    // Moderation (mutes + blocks): send newer entries
+    let mod_deltas: Vec<_> = our_vector
+        .moderation
         .into_iter()
         .filter(|m| {
-            if let Some(peer_entry) = peer_vector.mutes.iter().find(|pm| pm.pubkey == m.pubkey) {
+            if let Some(peer_entry) = peer_vector
+                .moderation
+                .iter()
+                .find(|pm| pm.pubkey == m.pubkey && pm.kind == m.kind)
+            {
                 m.last_changed_at > peer_entry.last_changed_at
             } else {
                 true
             }
         })
         .collect();
-    if !mute_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Mutes(mute_deltas);
-        let frame_bytes = serde_json::to_vec(&frame)?;
-        write_frame(data_send, &frame_bytes).await?;
-    }
-
-    // Blocks: send newer entries
-    let block_deltas: Vec<_> = our_vector
-        .blocks
-        .into_iter()
-        .filter(|b| {
-            if let Some(peer_entry) = peer_vector.blocks.iter().find(|pb| pb.pubkey == b.pubkey) {
-                b.last_changed_at > peer_entry.last_changed_at
-            } else {
-                true
-            }
-        })
-        .collect();
-    if !block_deltas.is_empty() {
-        let frame = DeviceSyncFrame::Blocks(block_deltas);
+    if !mod_deltas.is_empty() {
+        let frame = DeviceSyncFrame::Moderation(mod_deltas);
         let frame_bytes = serde_json::to_vec(&frame)?;
         write_frame(data_send, &frame_bytes).await?;
     }
@@ -369,13 +355,10 @@ async fn import_deltas(
                 }
             }
             DeviceSyncFrame::Follows(entries) => {
-                stats.follows_merged += storage.merge_follows_lww(&entries).await?;
+                stats.follows_merged += storage.merge_follows_lww(master_pubkey, &entries).await?;
             }
-            DeviceSyncFrame::Mutes(entries) => {
-                stats.mutes_merged += storage.merge_mutes_lww(&entries).await?;
-            }
-            DeviceSyncFrame::Blocks(entries) => {
-                stats.blocks_merged += storage.merge_blocks_lww(&entries).await?;
+            DeviceSyncFrame::Moderation(entries) => {
+                stats.mutes_merged += storage.merge_moderation_lww(&entries).await?;
             }
             DeviceSyncFrame::Bookmarks(ids) => {
                 stats.bookmarks_added += storage.merge_bookmarks(&ids).await?;

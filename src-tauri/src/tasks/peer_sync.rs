@@ -145,7 +145,8 @@ async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
 }
 
 async fn get_follows(state: &AppState) -> Vec<String> {
-    match state.storage.get_follows().await {
+    let my_id = state.identity.read().await.master_pubkey.clone();
+    match state.storage.get_follows(&my_id).await {
         Ok(entries) => entries.into_iter().map(|e| e.pubkey).collect(),
         Err(e) => {
             log::error!("[peer-sync] failed to load follows: {e}");

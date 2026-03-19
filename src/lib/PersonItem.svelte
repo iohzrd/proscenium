@@ -5,13 +5,11 @@
 
   let {
     pubkey,
-    alias,
     showOnlineStatus = false,
     isOnline = false,
     actions,
   }: {
     pubkey: string;
-    alias?: string | null;
     showOnlineStatus?: boolean;
     isOnline?: boolean;
     actions?: Snippet;
@@ -23,9 +21,7 @@
     {#await getDisplayName(pubkey, "") then name}
       <Avatar {pubkey} {name} ticket={getCachedAvatarTicket(pubkey)} />
       <div class="follow-identity">
-        {#if alias}
-          <span class="display-name">{alias}</span>
-        {:else if name !== shortId(pubkey)}
+        {#if name !== shortId(pubkey)}
           <span class="display-name">{name}</span>
         {/if}
         <code>{shortId(pubkey)}</code>

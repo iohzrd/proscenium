@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use proscenium_types::{
-    DeviceSyncVector, FollowSyncEntry, ModerationSyncEntry, RatchetSessionExport, RatchetSyncEntry,
+    DeviceSyncVector, FollowEntry, ModerationEntry, RatchetSessionExport, RatchetSyncEntry,
 };
 use sqlx::Row;
 
@@ -36,48 +36,42 @@ impl Storage {
         .unwrap_or(0);
 
         // Full follow list with LWW timestamps
-        let follow_rows =
-            sqlx::query("SELECT pubkey, alias, followed_at, state, last_changed_at FROM follows")
-                .fetch_all(&self.pool)
-                .await?;
-        let follows: Vec<FollowSyncEntry> = follow_rows
-            .iter()
-            .map(|row| FollowSyncEntry {
-                pubkey: row.get(0),
-                alias: row.get(1),
-                followed_at: row.get::<i64, _>(2) as u64,
-                state: row.get(3),
-                last_changed_at: row.get::<i64, _>(4) as u64,
-            })
+        let follow_rows: Vec<(String, i64, String, i64)> = sqlx::query_as(
+            "SELECT followee, followed_at, state, last_changed_at FROM social_graph
+             WHERE follower = ?1 AND followed_at IS NOT NULL",
+        )
+        .bind(master_pubkey)
+        .fetch_all(&self.pool)
+        .await?;
+        let follows: Vec<FollowEntry> = follow_rows
+            .into_iter()
+            .map(
+                |(pubkey, followed_at, state, last_changed_at)| FollowEntry {
+                    pubkey,
+                    followed_at: followed_at as u64,
+                    state,
+                    last_changed_at: last_changed_at as u64,
+                },
+            )
             .collect();
 
-        // Full mute list with LWW timestamps
-        let mute_rows = sqlx::query("SELECT pubkey, created_at, state, last_changed_at FROM mutes")
-            .fetch_all(&self.pool)
-            .await?;
-        let mutes: Vec<ModerationSyncEntry> = mute_rows
-            .iter()
-            .map(|row| ModerationSyncEntry {
-                pubkey: row.get(0),
-                created_at: row.get::<i64, _>(1) as u64,
-                state: row.get(2),
-                last_changed_at: row.get::<i64, _>(3) as u64,
-            })
-            .collect();
-
-        // Full block list with LWW timestamps
-        let block_rows =
-            sqlx::query("SELECT pubkey, created_at, state, last_changed_at FROM blocks")
-                .fetch_all(&self.pool)
-                .await?;
-        let blocks: Vec<ModerationSyncEntry> = block_rows
-            .iter()
-            .map(|row| ModerationSyncEntry {
-                pubkey: row.get(0),
-                created_at: row.get::<i64, _>(1) as u64,
-                state: row.get(2),
-                last_changed_at: row.get::<i64, _>(3) as u64,
-            })
+        // Full moderation list (mutes + blocks) with LWW timestamps
+        let mod_rows: Vec<(String, String, i64, String, i64)> = sqlx::query_as(
+            "SELECT pubkey, kind, created_at, state, last_changed_at FROM moderation",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let moderation: Vec<ModerationEntry> = mod_rows
+            .into_iter()
+            .map(
+                |(pubkey, kind, created_at, state, last_changed_at)| ModerationEntry {
+                    pubkey,
+                    kind,
+                    created_at: created_at as u64,
+                    state,
+                    last_changed_at: last_changed_at as u64,
+                },
+            )
             .collect();
 
         // All bookmark IDs
@@ -111,22 +105,27 @@ impl Storage {
             interaction_count: interaction_count as u64,
             newest_interaction_ts: newest_interaction_ts as u64,
             follows,
-            mutes,
-            blocks,
+            moderation,
             bookmarks,
             ratchet_summaries,
             dm_newest_ts: dm_newest_ts as u64,
         })
     }
 
-    pub async fn merge_follows_lww(&self, entries: &[FollowSyncEntry]) -> Result<u32, AppError> {
+    pub async fn merge_follows_lww(
+        &self,
+        me: &str,
+        entries: &[FollowEntry],
+    ) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for entry in entries {
-            let local_changed: Option<i64> =
-                sqlx::query_scalar("SELECT last_changed_at FROM follows WHERE pubkey = ?1")
-                    .bind(&entry.pubkey)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let local_changed: Option<i64> = sqlx::query_scalar(
+                "SELECT last_changed_at FROM social_graph WHERE follower = ?1 AND followee = ?2",
+            )
+            .bind(me)
+            .bind(&entry.pubkey)
+            .fetch_optional(&self.pool)
+            .await?;
 
             let should_update = match local_changed {
                 Some(local_ts) => entry.last_changed_at > local_ts as u64,
@@ -135,13 +134,13 @@ impl Storage {
 
             if should_update {
                 sqlx::query(
-                    "INSERT INTO follows (pubkey, alias, followed_at, state, last_changed_at)
+                    "INSERT INTO social_graph (follower, followee, followed_at, state, last_changed_at)
                      VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(pubkey) DO UPDATE SET
-                        alias = ?2, followed_at = ?3, state = ?4, last_changed_at = ?5",
+                     ON CONFLICT(follower, followee) DO UPDATE SET
+                        followed_at = ?3, state = ?4, last_changed_at = ?5",
                 )
+                .bind(me)
                 .bind(&entry.pubkey)
-                .bind(&entry.alias)
                 .bind(entry.followed_at as i64)
                 .bind(&entry.state)
                 .bind(entry.last_changed_at as i64)
@@ -153,14 +152,16 @@ impl Storage {
         Ok(merged)
     }
 
-    pub async fn merge_mutes_lww(&self, entries: &[ModerationSyncEntry]) -> Result<u32, AppError> {
+    pub async fn merge_moderation_lww(&self, entries: &[ModerationEntry]) -> Result<u32, AppError> {
         let mut merged = 0u32;
         for entry in entries {
-            let local_changed: Option<i64> =
-                sqlx::query_scalar("SELECT last_changed_at FROM mutes WHERE pubkey = ?1")
-                    .bind(&entry.pubkey)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let local_changed: Option<i64> = sqlx::query_scalar(
+                "SELECT last_changed_at FROM moderation WHERE pubkey = ?1 AND kind = ?2",
+            )
+            .bind(&entry.pubkey)
+            .bind(&entry.kind)
+            .fetch_optional(&self.pool)
+            .await?;
 
             let should_update = match local_changed {
                 Some(local_ts) => entry.last_changed_at > local_ts as u64,
@@ -169,45 +170,13 @@ impl Storage {
 
             if should_update {
                 sqlx::query(
-                    "INSERT INTO mutes (pubkey, created_at, state, last_changed_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(pubkey) DO UPDATE SET
-                        created_at = ?2, state = ?3, last_changed_at = ?4",
+                    "INSERT INTO moderation (pubkey, kind, created_at, state, last_changed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(pubkey, kind) DO UPDATE SET
+                        created_at = ?3, state = ?4, last_changed_at = ?5",
                 )
                 .bind(&entry.pubkey)
-                .bind(entry.created_at as i64)
-                .bind(&entry.state)
-                .bind(entry.last_changed_at as i64)
-                .execute(&self.pool)
-                .await?;
-                merged += 1;
-            }
-        }
-        Ok(merged)
-    }
-
-    pub async fn merge_blocks_lww(&self, entries: &[ModerationSyncEntry]) -> Result<u32, AppError> {
-        let mut merged = 0u32;
-        for entry in entries {
-            let local_changed: Option<i64> =
-                sqlx::query_scalar("SELECT last_changed_at FROM blocks WHERE pubkey = ?1")
-                    .bind(&entry.pubkey)
-                    .fetch_optional(&self.pool)
-                    .await?;
-
-            let should_update = match local_changed {
-                Some(local_ts) => entry.last_changed_at > local_ts as u64,
-                None => true,
-            };
-
-            if should_update {
-                sqlx::query(
-                    "INSERT INTO blocks (pubkey, created_at, state, last_changed_at)
-                     VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(pubkey) DO UPDATE SET
-                        created_at = ?2, state = ?3, last_changed_at = ?4",
-                )
-                .bind(&entry.pubkey)
+                .bind(&entry.kind)
                 .bind(entry.created_at as i64)
                 .bind(&entry.state)
                 .bind(entry.last_changed_at as i64)

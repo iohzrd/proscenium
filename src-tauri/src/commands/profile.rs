@@ -96,10 +96,11 @@ pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> CmdResult<NodeS
     let addr = state.endpoint.addr();
     let relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let has_relay = relay_url.is_some();
+    let my_id = state.identity.read().await.master_pubkey.clone();
     let follow_count = state.gossip.get_subscription_count().await;
     let follower_count = state
         .storage
-        .get_followers()
+        .get_followers(&my_id)
         .await
         .map(|f| f.len())
         .unwrap_or(0);

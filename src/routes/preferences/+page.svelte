@@ -18,6 +18,10 @@
   let dhtDiscovery = $state(false);
   let mdnsLoading = $state(false);
   let dhtLoading = $state(false);
+  let shareFollows = $state(true);
+  let shareFollowers = $state(true);
+  let shareFollowsLoading = $state(false);
+  let shareFollowersLoading = $state(false);
 
   async function loadServers() {
     try {
@@ -86,10 +90,13 @@
     }
     await loadServers();
     try {
-      [mdnsDiscovery, dhtDiscovery] = await Promise.all([
-        invoke<boolean>("get_mdns_discovery"),
-        invoke<boolean>("get_dht_discovery"),
-      ]);
+      [mdnsDiscovery, dhtDiscovery, shareFollows, shareFollowers] =
+        await Promise.all([
+          invoke<boolean>("get_mdns_discovery"),
+          invoke<boolean>("get_dht_discovery"),
+          invoke<boolean>("get_share_follows"),
+          invoke<boolean>("get_share_followers"),
+        ]);
     } catch {
       // preferences not available yet
     }
@@ -117,6 +124,30 @@
       console.error("Failed to toggle DHT:", e);
     }
     dhtLoading = false;
+  }
+
+  async function toggleShareFollows() {
+    shareFollowsLoading = true;
+    try {
+      const next = !shareFollows;
+      await invoke("set_share_follows", { enabled: next });
+      shareFollows = next;
+    } catch (e) {
+      console.error("Failed to toggle share follows:", e);
+    }
+    shareFollowsLoading = false;
+  }
+
+  async function toggleShareFollowers() {
+    shareFollowersLoading = true;
+    try {
+      const next = !shareFollowers;
+      await invoke("set_share_followers", { enabled: next });
+      shareFollowers = next;
+    } catch (e) {
+      console.error("Failed to toggle share followers:", e);
+    }
+    shareFollowersLoading = false;
   }
 </script>
 
@@ -236,6 +267,40 @@
     </button>
   </div>
   <p class="setting-hint">Changes take effect on next restart.</p>
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <span class="toggle-label">Share follow list</span>
+      <p class="toggle-desc">
+        Allow others to see who you follow when they visit your profile.
+      </p>
+    </div>
+    <button
+      class="toggle-switch"
+      class:active={shareFollows}
+      onclick={toggleShareFollows}
+      disabled={shareFollowsLoading}
+      aria-label="Toggle share follows"
+    >
+      <span class="toggle-knob"></span>
+    </button>
+  </div>
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <span class="toggle-label">Share followers list</span>
+      <p class="toggle-desc">
+        Allow others to see who follows you when they visit your profile.
+      </p>
+    </div>
+    <button
+      class="toggle-switch"
+      class:active={shareFollowers}
+      onclick={toggleShareFollowers}
+      disabled={shareFollowersLoading}
+      aria-label="Toggle share followers"
+    >
+      <span class="toggle-knob"></span>
+    </button>
+  </div>
 </section>
 
 <section class="settings-section">

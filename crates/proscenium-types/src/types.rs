@@ -97,16 +97,12 @@ pub struct DeviceEntry {
     pub added_at: u64,
 }
 
+/// A relationship in the social graph. Represents either a follow or follower
+/// depending on query direction. All fields are present; unused ones default to 0/false.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowEntry {
+pub struct SocialGraphEntry {
     pub pubkey: String,
-    pub alias: Option<String>,
     pub followed_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowerEntry {
-    pub pubkey: String,
     pub first_seen: u64,
     pub last_seen: u64,
     pub is_online: bool,
@@ -145,7 +141,7 @@ pub struct LinkBundleData {
     /// User profile.
     pub profile: Option<Profile>,
     /// Follow list.
-    pub follows: Vec<FollowEntry>,
+    pub follows: Vec<SocialGraphEntry>,
     /// Bookmarked post IDs.
     pub bookmarks: Vec<String>,
     /// Blocked user pubkeys.
@@ -167,9 +163,8 @@ pub struct RatchetSessionExport {
 
 /// Follow entry with LWW state for device sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FollowSyncEntry {
+pub struct FollowEntry {
     pub pubkey: String,
-    pub alias: Option<String>,
     pub followed_at: u64,
     pub state: String,
     pub last_changed_at: u64,
@@ -177,8 +172,9 @@ pub struct FollowSyncEntry {
 
 /// Moderation entry (mute or block) with LWW state for device sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ModerationSyncEntry {
+pub struct ModerationEntry {
     pub pubkey: String,
+    pub kind: String,
     pub created_at: u64,
     pub state: String,
     pub last_changed_at: u64,
@@ -352,11 +348,9 @@ pub struct DeviceSyncVector {
     pub interaction_count: u64,
     pub newest_interaction_ts: u64,
     /// Full follow list with LWW timestamps.
-    pub follows: Vec<FollowSyncEntry>,
-    /// Full mute list with LWW timestamps.
-    pub mutes: Vec<ModerationSyncEntry>,
-    /// Full block list with LWW timestamps.
-    pub blocks: Vec<ModerationSyncEntry>,
+    pub follows: Vec<FollowEntry>,
+    /// Full moderation list (mutes + blocks) with LWW timestamps.
+    pub moderation: Vec<ModerationEntry>,
     /// All bookmark post IDs.
     pub bookmarks: Vec<String>,
     /// Ratchet session summaries (peer + updated_at).

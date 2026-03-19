@@ -85,7 +85,8 @@ impl GossipService {
     /// network-health task. Must be called once after setup is complete.
     pub async fn start_background(&self, token: CancellationToken) {
         // Subscribe to all current follows.
-        let follows = self.storage.get_follows().await.unwrap_or_default();
+        let my_id = self.identity.read().await.master_pubkey.clone();
+        let follows = self.storage.get_follows(&my_id).await.unwrap_or_default();
         for f in follows {
             let node_ids = self
                 .storage
@@ -236,20 +237,21 @@ impl GossipService {
     /// Get the list of recipients for direct push based on visibility.
     /// Listed: all followers. Private: only mutuals.
     async fn push_recipients(&self) -> Vec<String> {
+        let my_id = self.identity.read().await.master_pubkey.clone();
         let visibility = self.my_visibility().await;
         match visibility {
             Visibility::Public => vec![],
             Visibility::Listed => self
                 .storage
-                .get_followers()
+                .get_followers(&my_id)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|f| f.pubkey)
                 .collect(),
             Visibility::Private => {
-                let followers = self.storage.get_followers().await.unwrap_or_default();
-                let follows = self.storage.get_follows().await.unwrap_or_default();
+                let followers = self.storage.get_followers(&my_id).await.unwrap_or_default();
+                let follows = self.storage.get_follows(&my_id).await.unwrap_or_default();
                 let follow_set: std::collections::HashSet<&str> =
                     follows.iter().map(|f| f.pubkey.as_str()).collect();
                 followers
@@ -396,7 +398,7 @@ impl GossipService {
                                 };
 
                             let now = now_millis();
-                            match storage.upsert_follower(&pubkey, now).await {
+                            match storage.upsert_follower(&my_id, &pubkey, now).await {
                                 Ok(is_new) => {
                                     let _ = app_handle.emit("follower-changed", &pubkey);
                                     if is_new {
@@ -414,7 +416,7 @@ impl GossipService {
                                 }
                             }
 
-                            if storage.is_following(&pubkey).await.unwrap_or(false) {
+                            if storage.is_following(&my_id, &pubkey).await.unwrap_or(false) {
                                 log::info!(
                                     "[gossip-own] followed peer {} came online",
                                     short_id(&pubkey),
@@ -430,7 +432,7 @@ impl GossipService {
                                 .await
                                 .unwrap_or(transport_id);
 
-                            if let Err(e) = storage.set_follower_offline(&pubkey).await {
+                            if let Err(e) = storage.set_follower_offline(&my_id, &pubkey).await {
                                 log::error!("[gossip-own] failed to update follower: {e}");
                             }
                             let _ = app_handle.emit("follower-changed", &pubkey);

@@ -36,7 +36,11 @@ pub async fn handle_sync(
     match visibility {
         Visibility::Public => {} // anyone can sync
         Visibility::Listed => {
-            if !storage.is_follower(&remote_pubkey).await.unwrap_or(false) {
+            if !storage
+                .is_follower(node_id, &remote_pubkey)
+                .await
+                .unwrap_or(false)
+            {
                 log::warn!(
                     "[sync-server] rejecting non-follower {} (listed profile)",
                     short_id(&remote_pubkey)
@@ -45,7 +49,11 @@ pub async fn handle_sync(
             }
         }
         Visibility::Private => {
-            if !storage.is_mutual(&remote_pubkey).await.unwrap_or(false) {
+            if !storage
+                .is_mutual(node_id, &remote_pubkey)
+                .await
+                .unwrap_or(false)
+            {
                 log::warn!(
                     "[sync-server] rejecting non-mutual {} (private profile)",
                     short_id(&remote_pubkey)

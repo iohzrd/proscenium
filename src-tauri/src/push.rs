@@ -76,14 +76,20 @@ pub async fn handle_push(
 
     let allowed = match my_visibility {
         Visibility::Public | Visibility::Listed => {
-            storage.is_follower(&remote_pubkey).await.unwrap_or(false)
+            storage
+                .is_follower(node_id, &remote_pubkey)
+                .await
+                .unwrap_or(false)
                 || storage
-                    .get_follows()
+                    .get_follows(node_id)
                     .await
                     .map(|f| f.iter().any(|e| e.pubkey == remote_pubkey))
                     .unwrap_or(false)
         }
-        Visibility::Private => storage.is_mutual(&remote_pubkey).await.unwrap_or(false),
+        Visibility::Private => storage
+            .is_mutual(node_id, &remote_pubkey)
+            .await
+            .unwrap_or(false),
     };
 
     if !allowed {

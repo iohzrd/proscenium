@@ -94,9 +94,10 @@ pub fn run() {
             get_post,
             follow_user,
             unfollow_user,
-            update_follow_alias,
             get_follows,
             get_followers,
+            get_remote_follows,
+            get_remote_followers,
             get_peer_node_ids,
             add_blob,
             fetch_blob,
@@ -172,6 +173,10 @@ pub fn run() {
             set_mdns_discovery,
             get_dht_discovery,
             set_dht_discovery,
+            get_share_follows,
+            set_share_follows,
+            get_share_followers,
+            set_share_followers,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

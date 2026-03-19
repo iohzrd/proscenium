@@ -38,17 +38,24 @@ export interface Profile {
   visibility: Visibility;
 }
 
-export interface FollowEntry {
+export interface SocialGraphEntry {
   pubkey: string;
-  alias: string | null;
   followed_at: number;
-}
-
-export interface FollowerEntry {
-  pubkey: string;
   first_seen: number;
   last_seen: number;
   is_online: boolean;
+}
+
+export interface RemoteSocialResult {
+  follows: SocialGraphEntry[];
+  hidden: boolean;
+  cached: boolean;
+}
+
+export interface RemoteFollowersResult {
+  followers: SocialGraphEntry[];
+  hidden: boolean;
+  cached: boolean;
 }
 
 export interface NodeStatus {
