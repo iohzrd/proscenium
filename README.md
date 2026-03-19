@@ -83,6 +83,26 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - [Node.js](https://nodejs.org/) (v18+)
 - [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform
 
+### Linux (GNOME)
+
+The system tray icon requires `libayatana-appindicator`. GNOME does not display tray icons by default -- you need the [AppIndicator extension](https://extensions.gnome.org/extension/615/appindicator-support/):
+
+```bash
+# Arch
+pacman -S gnome-shell-extension-appindicator
+# Ubuntu/Debian
+apt install gnome-shell-extension-appindicator
+# Fedora
+dnf install gnome-shell-extension-appindicator
+```
+
+Enable and restart your session:
+
+```bash
+gnome-extensions enable appindicatorsupport@rgcjonas.gmail.com
+# Log out and back in
+```
+
 ## Development
 
 ```bash
@@ -200,16 +220,63 @@ See [todos/community-server.md](todos/community-server.md) for the full design d
 
 ## Direct Messaging
 
-End-to-end encrypted direct messaging over a custom QUIC protocol (`proscenium/dm/1`). E2E encryption uses X25519 key exchange derived from each user's existing ed25519 identity, with a Noise IK handshake for session establishment and a Double Ratchet for per-message forward secrecy. Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
+End-to-end encrypted direct messaging over a custom QUIC protocol (`proscenium/dm/1`). Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
 
-- Noise IK + Double Ratchet (Signal Protocol pattern) with ChaCha20-Poly1305
-- Typing indicators (debounced, sent over encrypted channel)
+### Encryption Scheme
+
+Encryption is a two-phase process: a one-time session establishment, then per-message encryption with forward secrecy.
+
+**Phase 1: Noise IK Handshake (Session Establishment)**
+
+Each user has an X25519 DM key derived from their master key via HKDF. When Alice first messages Bob, a `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake is performed over a dedicated QUIC bi-directional stream:
+
+1. Alice looks up Bob's X25519 DM public key from cached peer delegations
+2. Alice sends `DmHandshake::Init` containing the Noise message and her DM public key
+3. Bob processes the Noise message with his X25519 private key, verifies the Noise IK-authenticated initiator key matches the claimed sender (preventing impersonation), and responds with `DmHandshake::Response`
+4. Both sides extract the 32-byte handshake hash as a shared secret
+
+The "IK" pattern means the initiator knows the responder's long-term public key in advance, and the initiator's long-term key is encrypted and authenticated to the responder in the first message -- both sides are mutually authenticated.
+
+**Phase 2: Double Ratchet (Ongoing Messages)**
+
+The Noise shared secret seeds a Double Ratchet (Signal Protocol pattern):
+
+- **Root key ratchet**: `HKDF-SHA256(root_key, dh_output, info="proscenium-dm-rk")` derives a new root key and chain key (64 bytes, split in half)
+- **Chain key ratchet**: `HKDF-SHA256(chain_key, info="proscenium-dm-ck-msg")` derives a one-time message key; `HKDF-SHA256(chain_key, info="proscenium-dm-ck-chain")` derives the next chain key
+- **Message encryption**: ChaCha20-Poly1305 with a zero nonce (safe because each message key is used exactly once)
+- **DH ratchet step**: Each direction change generates a fresh X25519 keypair and performs a new DH exchange, providing forward secrecy -- compromising current keys cannot decrypt past messages
+
+Each encrypted message carries a ratchet header: the sender's current DH public key, message number, and previous chain length. This allows the receiver to perform DH ratchet steps and handle out-of-order delivery (up to 100 skipped messages).
+
+**At-Rest Encryption**
+
+Ratchet session state is stored in SQLite encrypted with ChaCha20-Poly1305. The storage key is derived via `HKDF-SHA256(dm_secret_key, info="proscenium-ratchet-storage-v1")`. Format: `base64(12-byte random nonce || ciphertext)`.
+
+### Wire Format
+
+Messages are serialized as JSON over QUIC bi-directional streams. An encrypted envelope contains:
+
+```
+sender:          hex-encoded X25519 DM public key
+ratchet_header:  { dh_public, message_number, previous_chain_length }
+ciphertext:      ChaCha20-Poly1305 encrypted payload
+```
+
+The encrypted payload (`DmPayload`) can be: `Message` (text + media), `Delivered`, `Read`, `Typing`, `CallOffer`, `CallAnswer`, `CallReject`, or `CallHangup`. All payload types use the same ratchet channel, so call signaling is also end-to-end encrypted.
+
+### Delivery and Queuing
+
+Messages are sent directly peer-to-peer with no intermediary. If the recipient is offline, the pre-encrypted envelope is queued to a local outbox. A background task retries delivery every 15 seconds, with an immediate retry on `Notify` when new messages are queued. Successfully delivered messages receive a `DmAck` response over the QUIC stream, triggering a `dm-delivered` event to the frontend.
+
+### Features
+
+- Typing indicators (debounced, sent over the encrypted ratchet channel)
 - Read receipts (sent back to peer on conversation open)
 - Media attachments in DMs (images, videos, files)
-- Offline message queuing with background retry (60-second outbox flush)
 - Delivery acknowledgment over QUIC with real-time status updates
 - Conversation list with unread badges and message previews
 - Start conversations from any user's profile page
+- Blocked peers are rejected at the protocol handler level before any decryption occurs
 
 See [todos/direct-messaging.md](todos/direct-messaging.md) for the original design document.
 
