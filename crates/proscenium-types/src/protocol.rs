@@ -1,5 +1,6 @@
 use crate::delegation::{SigningKeyDelegation, SigningKeyRotation};
 use crate::signing::{hex_to_signature, signature_to_hex};
+use crate::stage::StageTicket;
 use crate::types::{
     DeviceEntry, DeviceSyncVector, FollowSyncEntry, Interaction, ModerationSyncEntry, Post,
     Profile, RatchetSessionExport,
@@ -182,6 +183,17 @@ pub struct SyncRequest {
     pub newest_interaction_timestamp: u64,
 }
 
+/// A live stage announcement, included in sync responses so peers that
+/// come online after the gossip broadcast can still discover active stages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageAnnouncement {
+    pub stage_id: String,
+    pub title: String,
+    pub ticket: StageTicket,
+    pub host_pubkey: String,
+    pub started_at: u64,
+}
+
 /// Phase 1: Server responds with its counts and whether timestamp catch-up suffices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncSummary {
@@ -194,6 +206,9 @@ pub struct SyncSummary {
     /// The sync mode the server will use for streaming.
     pub mode: SyncMode,
     pub profile: Option<Profile>,
+    /// If the peer is currently hosting a live stage, included here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_stage: Option<StageAnnouncement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

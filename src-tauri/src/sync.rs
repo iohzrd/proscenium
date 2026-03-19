@@ -8,7 +8,7 @@ use proscenium_types::{
     Interaction, PEER_ALPN, PeerRequest, Post, Profile, SyncFrame, SyncMode, SyncRequest,
     SyncSummary, Visibility, short_id,
 };
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// Server-side sync handler, dispatched from the unified PeerHandler.
 /// The initial PeerRequest::Sync has already been read; `send` is the response side
@@ -20,6 +20,7 @@ pub async fn handle_sync(
     conn: &Connection,
     mut send: iroh::endpoint::SendStream,
     req: SyncRequest,
+    stage_handle: &crate::stage::StageActorHandle,
 ) -> Result<(), AcceptError> {
     // Resolve transport NodeId to master pubkey for access control checks
     let remote_pubkey = storage
@@ -110,6 +111,8 @@ pub async fn handle_sync(
         mode,
     );
 
+    let active_stage = stage_handle.get_active_announcement().await;
+
     let summary = SyncSummary {
         server_post_count,
         server_interaction_count,
@@ -117,6 +120,7 @@ pub async fn handle_sync(
         interactions_after_count,
         mode,
         profile,
+        active_stage,
     };
     let summary_bytes = serde_json::to_vec(&summary).map_err(AcceptError::from_err)?;
 
@@ -234,6 +238,7 @@ pub struct SyncResult {
     pub profile: Option<Profile>,
     pub remote_post_count: u64,
     pub mode: SyncMode,
+    pub active_stage: Option<proscenium_types::StageAnnouncement>,
 }
 
 /// Client: sync posts from a remote peer using the three-phase protocol.
@@ -316,6 +321,7 @@ pub async fn sync_from_peer(
             profile: summary.profile,
             remote_post_count: summary.server_post_count,
             mode: SyncMode::UpToDate,
+            active_stage: summary.active_stage,
         });
     }
 
@@ -394,6 +400,7 @@ pub async fn sync_from_peer(
         profile: summary.profile,
         remote_post_count: summary.server_post_count,
         mode: summary.mode,
+        active_stage: summary.active_stage,
     })
 }
 
@@ -478,6 +485,26 @@ pub async fn sync_one_peer(
                 let stored =
                     process_sync_result(storage, pubkey, &sync_result, label, my_id, app_handle)
                         .await;
+
+                // Emit stage announcement if the peer is hosting a live stage.
+                if let Some(stage) = &sync_result.active_stage {
+                    log::info!(
+                        "[{label}] discovered live stage \"{}\" from {}",
+                        stage.title,
+                        short_id(pubkey),
+                    );
+                    let _ = app_handle.emit(
+                        "stage-announced",
+                        serde_json::json!({
+                            "stage_id": stage.stage_id,
+                            "title": stage.title,
+                            "ticket": stage.ticket.to_string(),
+                            "host_pubkey": stage.host_pubkey,
+                            "started_at": stage.started_at,
+                        }),
+                    );
+                }
+
                 log::info!(
                     "[{label}] stored {stored}/{} posts from {} via {} (mode={:?})",
                     sync_result.posts.len(),

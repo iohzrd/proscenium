@@ -284,6 +284,10 @@ pub enum StageCommand {
     GetState {
         reply: oneshot::Sender<Option<StageState>>,
     },
+    /// Query the active stage announcement (if hosting). Used by sync handler.
+    GetActiveAnnouncement {
+        reply: oneshot::Sender<Option<proscenium_types::StageAnnouncement>>,
+    },
 }
 
 // ---- Actor handle -------------------------------------------------------
@@ -360,6 +364,20 @@ impl StageActorHandle {
         if self
             .cmd_tx
             .send(StageCommand::GetState { reply: tx })
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        rx.await.unwrap_or(None)
+    }
+
+    /// Query the active stage announcement if this node is currently hosting a stage.
+    pub async fn get_active_announcement(&self) -> Option<proscenium_types::StageAnnouncement> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(StageCommand::GetActiveAnnouncement { reply: tx })
             .await
             .is_err()
         {
@@ -625,6 +643,9 @@ impl StageActor {
             }
             StageCommand::GetState { reply } => {
                 let _ = reply.send(self.build_state());
+            }
+            StageCommand::GetActiveAnnouncement { reply } => {
+                let _ = reply.send(self.build_active_announcement());
             }
         }
     }
@@ -1788,6 +1809,23 @@ impl StageActor {
             participants,
             started_at: s.started_at,
             ticket: s.ticket.as_ref().map(|t| t.to_string()),
+        })
+    }
+
+    /// Build a stage announcement from the active stage, if this node is the host.
+    fn build_active_announcement(&self) -> Option<proscenium_types::StageAnnouncement> {
+        let s = self.active.as_ref()?;
+        // Only include the announcement if we are the host
+        if s.my_role != StageRole::Host {
+            return None;
+        }
+        let ticket = s.ticket.as_ref()?;
+        Some(proscenium_types::StageAnnouncement {
+            stage_id: s.stage_id.clone(),
+            title: s.title.clone(),
+            ticket: ticket.clone(),
+            host_pubkey: s.host_pubkey.clone(),
+            started_at: s.started_at,
         })
     }
 

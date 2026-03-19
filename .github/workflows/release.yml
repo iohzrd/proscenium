@@ -62,7 +62,7 @@ jobs:
           CMAKE_POLICY_VERSION_MINIMUM: '3.5'
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'Iroh Social ${{ github.ref_name }}'
+          releaseName: 'Proscenium ${{ github.ref_name }}'
           releaseBody: 'See the assets to download and install.'
           releaseDraft: true
           prerelease: false

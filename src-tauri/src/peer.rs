@@ -1,5 +1,6 @@
 use crate::error::AppError;
 use crate::gossip::GossipService;
+use crate::stage::StageActorHandle;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{
@@ -36,6 +37,7 @@ pub struct PeerHandler {
     gossip: GossipService,
     pending_link: PendingLinkState,
     app_handle: AppHandle,
+    stage_handle: StageActorHandle,
 }
 
 impl PeerHandler {
@@ -44,6 +46,7 @@ impl PeerHandler {
         identity: SharedIdentity,
         gossip: GossipService,
         app_handle: AppHandle,
+        stage_handle: StageActorHandle,
     ) -> Self {
         Self {
             storage,
@@ -51,6 +54,7 @@ impl PeerHandler {
             gossip,
             pending_link: Arc::new(tokio::sync::Mutex::new(None)),
             app_handle,
+            stage_handle,
         }
     }
 
@@ -535,6 +539,7 @@ impl ProtocolHandler for PeerHandler {
                     &conn,
                     send,
                     sync_req,
+                    &self.stage_handle,
                 )
                 .await
             }

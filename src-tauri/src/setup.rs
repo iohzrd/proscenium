@@ -204,13 +204,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         handle.clone(),
     );
 
-    let peer_handler = PeerHandler::new(
-        storage.clone(),
-        identity.clone(),
-        gossip_service.clone(),
-        handle.clone(),
-    );
-
     let stage_handler = StageHandler::new(
         endpoint.clone(),
         gossip_service.gossip_handle(),
@@ -218,6 +211,14 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         storage.clone(),
         gossip_service.clone(),
         handle.clone(),
+    );
+
+    let peer_handler = PeerHandler::new(
+        storage.clone(),
+        identity.clone(),
+        gossip_service.clone(),
+        handle.clone(),
+        stage_handler.actor_handle(),
     );
 
     let router = Router::builder(endpoint.clone())
