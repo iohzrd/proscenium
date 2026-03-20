@@ -5,6 +5,11 @@ use std::sync::Arc;
 use tauri::State;
 
 #[tauri::command]
+pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    state.storage.wipe_all_data().await
+}
+
+#[tauri::command]
 pub async fn get_mdns_discovery(state: State<'_, Arc<AppState>>) -> CmdResult<bool> {
     state
         .storage

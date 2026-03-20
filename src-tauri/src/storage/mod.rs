@@ -112,6 +112,36 @@ impl Storage {
         Ok(Self { pool })
     }
 
+    /// Delete all user data from every table (except schema_migrations).
+    pub async fn wipe_all_data(&self) -> Result<(), AppError> {
+        let tables = [
+            "push_outbox",
+            "dm_outbox",
+            "dm_ratchet_sessions",
+            "dm_messages",
+            "dm_conversations",
+            "notifications",
+            "interactions",
+            "posts",
+            "bookmarks",
+            "follow_requests",
+            "moderation",
+            "remote_social_meta",
+            "social_graph",
+            "peer_device_announcements",
+            "linked_devices",
+            "peer_delegations",
+            "profiles",
+            "servers",
+            "preferences",
+        ];
+        for table in tables {
+            let sql = format!("DELETE FROM {table}");
+            sqlx::raw_sql(&sql).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     async fn run_migrations(pool: &SqlitePool) -> Result<(), AppError> {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migrations (

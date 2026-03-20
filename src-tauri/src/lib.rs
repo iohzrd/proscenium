@@ -241,6 +241,7 @@ pub fn run() {
             set_share_follows,
             get_share_followers,
             set_share_followers,
+            wipe_all_data,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
