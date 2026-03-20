@@ -380,7 +380,10 @@
         <button class="modal-cancel" onclick={() => (showWipeConfirm = false)}
           >Cancel</button
         >
-        <button class="modal-confirm modal-confirm-danger" onclick={wipeAllData} disabled={wiping}
+        <button
+          class="modal-confirm modal-confirm-danger"
+          onclick={wipeAllData}
+          disabled={wiping}
           >{wiping ? "Deleting..." : "Delete everything"}</button
         >
       </div>
