@@ -67,15 +67,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             }
             _ => {}
         })
-        .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::Click { .. } = event
-                && let Some(w) = tray.app_handle().get_webview_window("main")
-            {
-                let _ = w.show();
-                let _ = w.unminimize();
-                let _ = w.set_focus();
-            }
-        })
+        .show_menu_on_left_click(true)
         .build(app)?;
 
     Ok(())
