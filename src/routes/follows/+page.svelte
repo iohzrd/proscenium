@@ -5,10 +5,7 @@
   import PersonItem from "$lib/PersonItem.svelte";
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
-  import type {
-    SocialGraphEntry,
-    FollowRequestEntry,
-  } from "$lib/types";
+  import type { SocialGraphEntry, FollowRequestEntry } from "$lib/types";
   import {
     useNodeInit,
     useEventListeners,

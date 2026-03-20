@@ -10,6 +10,8 @@
     "core:default",
     "core:webview:allow-set-webview-zoom",
     "deep-link:default",
+    "fs:allow-read-file",
+    "fs:scope-home",
     "log:default",
     "notification:default",
     "opener:default",

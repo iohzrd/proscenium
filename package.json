@@ -1,6 +1,6 @@
 {
   "name": "proscenium",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "",
   "type": "module",
   "scripts": {
@@ -19,6 +19,7 @@
     "@tauri-apps/plugin-barcode-scanner": "^2.4.4",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-deep-link": "^2.4.7",
+    "@tauri-apps/plugin-fs": "^2.4.5",
     "@tauri-apps/plugin-haptics": "^2.3.2",
     "@tauri-apps/plugin-notification": "^2",
     "@tauri-apps/plugin-opener": "^2",
@@ -31,7 +32,7 @@
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@tauri-apps/cli": "^2.10.1",
     "prettier-plugin-svelte": "^3.5.1",
-    "svelte": "^5.53.12",
+    "svelte": "^5.54.0",
     "svelte-check": "^4.4.5",
     "typescript": "~5.9.3",
     "vite": "^7.3.1"

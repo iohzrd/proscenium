@@ -24,7 +24,7 @@
   <nav class="sidebar-nav">
     <a href="/" class:active={currentPath === "/"}>
       <Icon name="home" />
-      <span class="nav-label">Arc</span>
+      <span class="nav-label">Timeline</span>
     </a>
     <a href="/activity" class:active={currentPath === "/activity"}>
       <Icon name="bell" />

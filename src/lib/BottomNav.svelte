@@ -37,7 +37,7 @@
 <nav class="bottom-nav">
   <a href="/" class:active={currentPath === "/"} onclick={closeMore}>
     <Icon name="home" size={22} />
-    <span class="tab-label">Arc</span>
+    <span class="tab-label">Timeline</span>
   </a>
   <a
     href="/activity"

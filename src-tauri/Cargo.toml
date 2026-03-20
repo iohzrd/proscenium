@@ -42,9 +42,10 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 snow = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-deep-link = "2"
+tauri-plugin-fs = "2"
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"

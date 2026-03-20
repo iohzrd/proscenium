@@ -1,4 +1,5 @@
-import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
+import { readFile } from "@tauri-apps/plugin-fs";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
 import type { PendingAttachment } from "$lib/types";
@@ -235,10 +236,12 @@ export function useFileUpload() {
           size: number;
           mime_type: string;
         } = await invoke("add_blob_from_path", { path });
-        const previewUrl =
-          isImage(result.mime_type) || isVideo(result.mime_type)
-            ? convertFileSrc(path)
-            : "";
+        let previewUrl = "";
+        if (isImage(result.mime_type) || isVideo(result.mime_type)) {
+          const bytes = await readFile(path);
+          const blob = new Blob([bytes], { type: result.mime_type });
+          previewUrl = URL.createObjectURL(blob);
+        }
         attachments = [
           ...attachments,
           {

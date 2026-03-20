@@ -21,6 +21,65 @@ mod tasks;
 mod util;
 
 use commands::*;
+#[cfg(not(mobile))]
+use tauri::Manager;
+
+#[cfg(not(mobile))]
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::{
+        image::Image,
+        menu::{MenuBuilder, MenuItemBuilder},
+        tray::TrayIconBuilder,
+    };
+
+    let show = MenuItemBuilder::with_id("show", "Show").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app).items(&[&show, &quit]).build()?;
+
+    // Embed the PNG and decode to RGBA for the tray icon.
+    // On Linux, the tray-icon crate re-encodes this as PNG and writes to a temp file
+    // for libayatana-appindicator to pick up.
+    let png_bytes = include_bytes!("../icons/128x128.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    let mut reader = decoder.read_info().expect("invalid tray icon png");
+    let buf_size = reader.output_buffer_size().expect("invalid png info");
+    let mut rgba = vec![0u8; buf_size];
+    let info = reader
+        .next_frame(&mut rgba)
+        .expect("failed to decode tray icon");
+    rgba.truncate(info.buffer_size());
+    let icon = Image::new_owned(rgba, info.width, info.height);
+
+    TrayIconBuilder::new()
+        .icon(icon)
+        .menu(&menu)
+        .tooltip("Proscenium")
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let tauri::tray::TrayIconEvent::Click { .. } = event
+                && let Some(w) = tray.app_handle().get_webview_window("main")
+            {
+                let _ = w.show();
+                let _ = w.unminimize();
+                let _ = w.set_focus();
+            }
+        })
+        .build(app)?;
+
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -66,9 +125,14 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
-        .setup(|app| setup::initialize(app))
+        .setup(|app| {
+            #[cfg(not(mobile))]
+            setup_tray(app)?;
+            setup::initialize(app)
+        })
         .invoke_handler(tauri::generate_handler![
             get_node_id,
             get_pubkey,
@@ -180,5 +244,18 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_app, _event| {});
+        .run(|app, event| {
+            #[cfg(not(mobile))]
+            if let tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                // Hide the window instead of closing
+                api.prevent_close();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
+        });
 }
