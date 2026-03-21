@@ -162,7 +162,12 @@
 </script>
 
 {#if lightbox.src}
-  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
+  <Lightbox
+    src={lightbox.src}
+    alt={lightbox.alt}
+    attachment={lightbox.attachment}
+    onclose={lightbox.close}
+  />
 {/if}
 
 <h2 class="page-title">Notifications</h2>

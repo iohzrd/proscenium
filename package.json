@@ -1,6 +1,6 @@
 {
   "name": "proscenium",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "",
   "type": "module",
   "scripts": {
@@ -19,6 +19,7 @@
     "@tauri-apps/plugin-barcode-scanner": "^2.4.4",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-deep-link": "^2.4.7",
+    "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
     "@tauri-apps/plugin-haptics": "^2.3.2",
     "@tauri-apps/plugin-notification": "^2",

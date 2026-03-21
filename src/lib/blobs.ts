@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeFile } from "@tauri-apps/plugin-fs";
 import { setContext, getContext } from "svelte";
 import type { MediaAttachment } from "$lib/types";
 
@@ -46,14 +48,13 @@ export function createBlobCache() {
     return url;
   }
 
-  async function downloadFile(att: MediaAttachment): Promise<void> {
-    const url = await getBlobUrl(att);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = att.filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  async function saveFileAs(att: MediaAttachment): Promise<void> {
+    const path = await save({ defaultPath: att.filename });
+    if (!path) return;
+    const bytes: number[] = await invoke("fetch_blob_bytes", {
+      ticket: att.ticket,
+    });
+    await writeFile(path, new Uint8Array(bytes));
   }
 
   function revokeAll(): void {
@@ -70,5 +71,11 @@ export function createBlobCache() {
     }
   }
 
-  return { getBlobUrl, refetchBlobUrl, downloadFile, revokeAll, revokeStale };
+  return {
+    getBlobUrl,
+    refetchBlobUrl,
+    saveFileAs,
+    revokeAll,
+    revokeStale,
+  };
 }

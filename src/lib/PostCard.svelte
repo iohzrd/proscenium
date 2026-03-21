@@ -7,7 +7,7 @@
   import ReplyContextBlock from "$lib/ReplyContextBlock.svelte";
   import QuotedPostEmbed from "$lib/QuotedPostEmbed.svelte";
   import { useDisplayName } from "$lib/name.svelte";
-  import type { Post } from "$lib/types";
+  import type { MediaAttachment, Post } from "$lib/types";
   import { getCachedAvatarTicket, renderContent } from "$lib/utils";
 
   let {
@@ -29,7 +29,7 @@
     onreply?: (post: Post) => void;
     ondelete?: (id: string) => void;
     onquote?: (post: Post) => void;
-    onlightbox?: (src: string, alt: string) => void;
+    onlightbox?: (src: string, alt: string, att: MediaAttachment) => void;
   } = $props();
 
   // Repost-only: a quote with no original content

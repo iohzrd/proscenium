@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { readFile } from "@tauri-apps/plugin-fs";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { onMount } from "svelte";
-import type { PendingAttachment } from "$lib/types";
+import type { MediaAttachment, PendingAttachment } from "$lib/types";
 import {
   copyToClipboard,
   isImage,
@@ -442,15 +442,18 @@ export function usePullToRefresh(onRefresh: () => Promise<void>) {
 export function useLightbox() {
   let src = $state("");
   let alt = $state("");
+  let attachment = $state<MediaAttachment | undefined>(undefined);
 
-  function open(s: string, a: string) {
+  function open(s: string, a: string, att?: MediaAttachment) {
     src = s;
     alt = a;
+    attachment = att;
   }
 
   function close() {
     src = "";
     alt = "";
+    attachment = undefined;
   }
 
   return {
@@ -459,6 +462,9 @@ export function useLightbox() {
     },
     get alt() {
       return alt;
+    },
+    get attachment() {
+      return attachment;
     },
     open,
     close,

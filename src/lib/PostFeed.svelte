@@ -2,7 +2,7 @@
   import PostCard from "$lib/PostCard.svelte";
   import ReplyComposer from "$lib/ReplyComposer.svelte";
   import QuoteComposer from "$lib/QuoteComposer.svelte";
-  import type { Post } from "$lib/types";
+  import type { MediaAttachment, Post } from "$lib/types";
 
   let {
     posts,
@@ -23,7 +23,7 @@
     showReplyContext?: boolean;
     onreload?: () => void;
     ondelete?: (id: string) => void;
-    onlightbox: (src: string, alt: string) => void;
+    onlightbox: (src: string, alt: string, att: MediaAttachment) => void;
   } = $props();
 
   let replyingTo = $state<Post | null>(null);

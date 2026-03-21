@@ -328,6 +328,10 @@
                     {#await blobs.getBlobUrl(att) then url}
                       <img src={url} alt={att.filename} class="media-img" />
                     {/await}
+                    <button
+                      class="dm-save-as-btn"
+                      onclick={() => blobs.saveFileAs(att)}>Save As</button
+                    >
                   {:else if isVideo(att.mime_type)}
                     {#await blobs.getBlobUrl(att) then url}
                       <video
@@ -337,17 +341,25 @@
                         preload="metadata"
                       ></video>
                     {/await}
+                    <button
+                      class="dm-save-as-btn"
+                      onclick={() => blobs.saveFileAs(att)}>Save As</button
+                    >
                   {:else if isAudio(att.mime_type)}
                     {#await blobs.getBlobUrl(att) then url}
                       <div class="audio-attachment">
                         <span class="audio-filename">{att.filename}</span>
                         <audio src={url} controls preload="metadata"></audio>
+                        <button
+                          class="dm-save-as-btn"
+                          onclick={() => blobs.saveFileAs(att)}>Save As</button
+                        >
                       </div>
                     {/await}
                   {:else}
                     <button
                       class="file-attachment"
-                      onclick={() => blobs.downloadFile(att)}
+                      onclick={() => blobs.saveFileAs(att)}
                     >
                       <span class="file-icon">&#128196;</span>
                       <span class="file-name">{att.filename}</span>
@@ -703,5 +715,24 @@
     justify-content: center;
     color: var(--text-tertiary);
     font-size: var(--text-base);
+  }
+
+  .dm-save-as-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: var(--text-xs, 0.7rem);
+    padding: 0.15rem 0.4rem;
+    cursor: pointer;
+    margin-top: 0.2rem;
+    transition:
+      border-color var(--transition-fast),
+      color var(--transition-fast);
+  }
+
+  .dm-save-as-btn:hover {
+    border-color: var(--accent-medium);
+    color: var(--accent-light);
   }
 </style>

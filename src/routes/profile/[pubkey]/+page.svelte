@@ -335,7 +335,12 @@
 {/if}
 
 {#if lightbox.src}
-  <Lightbox src={lightbox.src} alt={lightbox.alt} onclose={lightbox.close} />
+  <Lightbox
+    src={lightbox.src}
+    alt={lightbox.alt}
+    attachment={lightbox.attachment}
+    onclose={lightbox.close}
+  />
 {/if}
 
 {#if node.loading}

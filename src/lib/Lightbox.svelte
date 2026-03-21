@@ -1,14 +1,27 @@
 <script lang="ts">
+  import type { MediaAttachment } from "$lib/types";
+  import { getBlobContext } from "$lib/blobs";
+  import { showContextMenu } from "$lib/context-menu";
+
   interface Props {
     src: string;
     alt: string;
+    attachment?: MediaAttachment;
     onclose: () => void;
   }
 
-  let { src, alt, onclose }: Props = $props();
+  let { src, alt, attachment, onclose }: Props = $props();
+  const { saveFileAs } = getBlobContext();
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") onclose();
+  }
+
+  function handleContextMenu(e: MouseEvent) {
+    if (!attachment) return;
+    showContextMenu(e, [
+      { text: "Save Image As...", action: () => saveFileAs(attachment!) },
+    ]);
   }
 </script>
 
@@ -19,7 +32,13 @@
   <button class="lightbox-close" onclick={onclose} aria-label="Close lightbox">
     &times;
   </button>
-  <img {src} {alt} class="lightbox-img" onclick={(e) => e.stopPropagation()} />
+  <img
+    {src}
+    {alt}
+    class="lightbox-img"
+    onclick={(e) => e.stopPropagation()}
+    oncontextmenu={handleContextMenu}
+  />
 </div>
 
 <style>
