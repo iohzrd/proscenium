@@ -28,7 +28,6 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn get_peer_delegation(
         &self,
         master_pubkey: &str,

@@ -6,7 +6,6 @@ pub const HEADER_SIZE: usize = 9;
 /// Auth tag byte: normal Opus frame (no checkpoint).
 pub const TAG_NORMAL: u8 = 0x00;
 /// Auth tag byte: checkpoint frame carrying hash-chain proof.
-#[allow(dead_code)]
 pub const TAG_CHECKPOINT: u8 = 0x01;
 
 /// Encode a header + payload into a single buffer for sending on a QUIC stream.

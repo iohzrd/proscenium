@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-#[allow(dead_code)]
 /// Where a listener should connect to receive the mixed audio stream.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioAssignment {
@@ -9,14 +8,12 @@ pub struct AudioAssignment {
 }
 
 /// Source type tracked by the topology manager.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum SourceKind {
     Host,
     Relay,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct Source {
     kind: SourceKind,
@@ -32,14 +29,12 @@ struct Source {
 ///
 /// Phase 3 implementation: supports host-direct and volunteer relays.
 /// Relay tree (multi-tier) is Phase 5.
-#[allow(dead_code)]
 pub struct TopologyManager {
     sources: Vec<Source>,
     /// pubkey -> assigned source endpoint_id
     assignments: HashMap<String, String>,
 }
 
-#[allow(dead_code)]
 impl TopologyManager {
     /// Create a new topology manager. `host_endpoint_id` is the host's transport NodeId.
     /// `host_capacity` is how many direct listeners the host will serve (default 15).
@@ -66,30 +61,6 @@ impl TopologyManager {
                 assigned: 0,
             });
         }
-    }
-
-    /// Remove a relay (relay left or was revoked).
-    /// Returns the pubkeys of listeners that were assigned to it (need reassignment).
-    pub fn remove_relay(&mut self, endpoint_id: &str) -> Vec<String> {
-        let evicted: Vec<String> = self
-            .assignments
-            .iter()
-            .filter(|(_, src)| src.as_str() == endpoint_id)
-            .map(|(pk, _)| pk.clone())
-            .collect();
-
-        for pk in &evicted {
-            self.assignments.remove(pk);
-        }
-        self.sources.retain(|s| s.endpoint_id != endpoint_id);
-
-        // Decrement assigned counts
-        for s in &mut self.sources {
-            // Already removed the source; counts for remaining are unchanged
-            let _ = s;
-        }
-
-        evicted
     }
 
     /// Assign (or reassign) a listener to a source. Returns the `AudioAssignment`.
@@ -132,43 +103,5 @@ impl TopologyManager {
         Some(AudioAssignment {
             source_endpoint_id: endpoint_id,
         })
-    }
-
-    /// Release a listener assignment (listener left).
-    pub fn release_listener(&mut self, pubkey: &str) {
-        if let Some(endpoint_id) = self.assignments.remove(pubkey)
-            && let Some(s) = self
-                .sources
-                .iter_mut()
-                .find(|s| s.endpoint_id == endpoint_id)
-        {
-            s.assigned = s.assigned.saturating_sub(1);
-        }
-    }
-
-    /// Get the current topology map (pubkey -> AudioAssignment).
-    pub fn topology(&self) -> HashMap<String, AudioAssignment> {
-        self.assignments
-            .iter()
-            .map(|(pk, src)| {
-                (
-                    pk.clone(),
-                    AudioAssignment {
-                        source_endpoint_id: src.clone(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    /// Update the host's direct capacity (e.g., from settings change).
-    pub fn set_host_capacity(&mut self, capacity: u32) {
-        if let Some(s) = self
-            .sources
-            .iter_mut()
-            .find(|s| matches!(s.kind, SourceKind::Host))
-        {
-            s.capacity = capacity;
-        }
     }
 }

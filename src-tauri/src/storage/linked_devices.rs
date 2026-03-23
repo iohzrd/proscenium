@@ -36,7 +36,6 @@ impl Storage {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn get_linked_devices(&self) -> Result<Vec<DeviceEntry>, AppError> {
         let rows = sqlx::query(
             "SELECT node_id, device_name, is_primary, added_at FROM linked_devices ORDER BY added_at ASC",

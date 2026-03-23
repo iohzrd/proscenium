@@ -4,7 +4,6 @@ use crate::audio::{
 };
 use crate::dm::DmHandler;
 use crate::error::AppError;
-use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -26,8 +25,6 @@ struct ActiveCall {
 #[derive(Clone)]
 pub struct CallHandler {
     storage: Arc<Storage>,
-    #[allow(dead_code)] // will be used for caller authentication
-    identity: SharedIdentity,
     endpoint: Endpoint,
     dm: DmHandler,
     app_handle: AppHandle,
@@ -37,14 +34,12 @@ pub struct CallHandler {
 impl CallHandler {
     pub fn new(
         storage: Arc<Storage>,
-        identity: SharedIdentity,
         endpoint: Endpoint,
         dm: DmHandler,
         app_handle: AppHandle,
     ) -> Self {
         Self {
             storage,
-            identity,
             endpoint,
             dm,
             app_handle,

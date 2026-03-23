@@ -300,17 +300,4 @@ impl Storage {
             fetched_at: fetched_at.map(|t| t as u64),
         }))
     }
-
-    #[allow(dead_code)]
-    pub async fn clear_remote_social_cache(&self, remote_pubkey: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM social_graph WHERE follower = ?1 OR followee = ?1")
-            .bind(remote_pubkey)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM remote_social_meta WHERE pubkey = ?1")
-            .bind(remote_pubkey)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
 }

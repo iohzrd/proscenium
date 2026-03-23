@@ -18,7 +18,6 @@ use tokio_util::sync::CancellationToken;
 pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long without a heartbeat before a participant is considered gone.
-#[allow(dead_code)]
 pub const PRESENCE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(45);
 
 /// Live gossip control plane for one Stage room.

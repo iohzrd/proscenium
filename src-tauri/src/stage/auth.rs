@@ -160,11 +160,6 @@ impl ListenerAuthState {
             }
         }
     }
-
-    #[allow(dead_code)]
-    pub fn is_verified(&self) -> bool {
-        self.verified
-    }
 }
 
 // ---- Wire format helper -------------------------------------------------

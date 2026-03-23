@@ -76,7 +76,6 @@ impl OpusDecoder {
     }
 
     /// Generate comfort noise / silence for a lost packet (PLC).
-    #[allow(dead_code)]
     pub fn decode_loss(&mut self) -> Result<Vec<f32>, opus::Error> {
         let mut output = vec![0.0f32; FRAME_SIZE];
         let decoded = self.decoder.decode_float(&[], &mut output, false)?;

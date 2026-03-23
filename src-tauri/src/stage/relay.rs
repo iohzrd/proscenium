@@ -5,7 +5,6 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-#[allow(dead_code)]
 /// A single Opus audio frame forwarded to all relay subscribers.
 #[derive(Clone, Debug)]
 pub struct RelayFrame {
@@ -18,11 +17,9 @@ pub struct RelayFrame {
 
 // ---- Command enum -------------------------------------------------------
 
-#[allow(dead_code)]
 pub enum RelayCommand {
     /// New downstream listener connected — add their send stream to the relay fanout.
     AddDownstream(SendStream),
-    Shutdown,
 }
 
 // ---- Handle -------------------------------------------------------------
@@ -33,7 +30,6 @@ pub struct RelayHandle {
     cmd_tx: mpsc::Sender<RelayCommand>,
 }
 
-#[allow(dead_code)]
 impl RelayHandle {
     pub async fn add_downstream(&self, stream: SendStream) -> Result<(), AppError> {
         self.cmd_tx
@@ -45,7 +41,6 @@ impl RelayHandle {
 
 // ---- Actor --------------------------------------------------------------
 
-#[allow(dead_code)]
 /// Spawn the RelayActor.
 ///
 /// The relay reads frames from `upstream` (a `RecvStream` from the host or
@@ -81,7 +76,7 @@ async fn run_relay(
                             run_downstream_subscriber(stream, &mut rx, sub_cancel).await;
                         });
                     }
-                    Some(RelayCommand::Shutdown) | None => break,
+                    None => break,
                 }
             }
 

@@ -444,14 +444,10 @@ pub async fn process_sync_result(
 // ---------------------------------------------------------------------------
 
 /// Stats returned from `sync_one_peer`.
-#[allow(dead_code)]
 pub struct SyncOneResult {
     pub stored: usize,
     pub posts: Vec<Post>,
-    pub interactions: Vec<Interaction>,
     pub remote_post_count: u64,
-    pub mode: SyncMode,
-    pub profile: Option<Profile>,
 }
 
 /// Sync from a single peer: resolve transport NodeIds, try each, run sync protocol,
@@ -523,10 +519,7 @@ pub async fn sync_one_peer(
                 return Ok(SyncOneResult {
                     stored,
                     posts: sync_result.posts,
-                    interactions: sync_result.interactions,
                     remote_post_count: sync_result.remote_post_count,
-                    mode: sync_result.mode,
-                    profile: sync_result.profile,
                 });
             }
             Ok(Err(e)) => {

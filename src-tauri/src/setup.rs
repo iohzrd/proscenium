@@ -170,7 +170,6 @@ async fn build_network_stack(
 
     let call_handler = CallHandler::new(
         storage.clone(),
-        identity.clone(),
         endpoint.clone(),
         dm_handler.clone(),
         handle.clone(),
@@ -180,7 +179,6 @@ async fn build_network_stack(
         endpoint.clone(),
         gossip_service.gossip_handle(),
         identity.clone(),
-        storage.clone(),
         gossip_service.clone(),
         handle.clone(),
     );

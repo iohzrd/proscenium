@@ -97,10 +97,4 @@ impl Fanout {
 
         token
     }
-
-    /// Number of currently active subscriber tasks. Useful for load metrics.
-    #[allow(dead_code)]
-    pub fn subscriber_count(&self) -> usize {
-        self.tx.receiver_count()
-    }
 }

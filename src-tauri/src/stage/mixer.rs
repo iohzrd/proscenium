@@ -10,23 +10,16 @@ use iroh::SecretKey;
 use proscenium_types::short_id;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 // ---- Command enum -------------------------------------------------------
 
-#[allow(dead_code)]
 pub enum MixerCommand {
     /// New speaker joined — register their decoded PCM channel with the mixer.
     AddSpeaker {
         pubkey: String,
         pcm_rx: mpsc::Receiver<Vec<f32>>,
-    },
-    /// Speaker left or was demoted — remove their input from the mix.
-    RemoveSpeaker(String),
-    /// Query current per-speaker RMS levels (for SpeakerActivity gossip).
-    GetLevels {
-        reply: oneshot::Sender<HashMap<String, f32>>,
     },
     /// Mark a speaker as the local host and provide a direct PCM channel for
     /// mix-minus playback. The host receives all other speakers except themselves.
@@ -34,7 +27,6 @@ pub enum MixerCommand {
         pubkey: String,
         pcm_tx: mpsc::Sender<Vec<f32>>,
     },
-    Shutdown,
 }
 
 // ---- Handle -------------------------------------------------------------
@@ -45,7 +37,6 @@ pub struct MixerHandle {
     cmd_tx: mpsc::Sender<MixerCommand>,
 }
 
-#[allow(dead_code)]
 impl MixerHandle {
     pub async fn add_speaker(
         &self,
@@ -56,26 +47,6 @@ impl MixerHandle {
             .send(MixerCommand::AddSpeaker { pubkey, pcm_rx })
             .await
             .map_err(|_| AppError::Other("mixer actor closed".into()))
-    }
-
-    pub async fn remove_speaker(&self, pubkey: String) -> Result<(), AppError> {
-        self.cmd_tx
-            .send(MixerCommand::RemoveSpeaker(pubkey))
-            .await
-            .map_err(|_| AppError::Other("mixer actor closed".into()))
-    }
-
-    pub async fn get_levels(&self) -> HashMap<String, f32> {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(MixerCommand::GetLevels { reply: tx })
-            .await
-            .is_err()
-        {
-            return HashMap::new();
-        }
-        rx.await.unwrap_or_default()
     }
 
     pub async fn set_host_speaker(
@@ -177,22 +148,10 @@ async fn run_mixer(
                         buffers.insert(pubkey.clone(), (Vec::new(), 0.0));
                         speaker_channels.push((pubkey, pcm_rx));
                     }
-                    Some(MixerCommand::RemoveSpeaker(pubkey)) => {
-                        log::info!("[mixer] removing speaker {}", short_id(&pubkey));
-                        buffers.remove(&pubkey);
-                        speaker_channels.retain(|(pk, _)| pk != &pubkey);
-                    }
-                    Some(MixerCommand::GetLevels { reply }) => {
-                        let levels: HashMap<String, f32> = buffers
-                            .iter()
-                            .map(|(pk, (_, rms))| (pk.clone(), *rms))
-                            .collect();
-                        let _ = reply.send(levels);
-                    }
                     Some(MixerCommand::SetHostSpeaker { pubkey, pcm_tx }) => {
                         host_speaker = Some((pubkey, pcm_tx));
                     }
-                    Some(MixerCommand::Shutdown) | None => break,
+                    None => break,
                 }
             }
 
