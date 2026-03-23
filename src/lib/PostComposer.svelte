@@ -9,6 +9,7 @@
   import {
     useMentionAutocomplete,
     useFileUpload,
+    autogrow,
   } from "$lib/composables.svelte";
   import { onMount } from "svelte";
 
@@ -136,11 +137,12 @@
     class="input-base compose-textarea"
     bind:value={newPost}
     placeholder="What's on your mind?"
-    rows="3"
+    rows="1"
     maxlength={MAX_POST_LENGTH}
     onkeydown={handleKey}
     oninput={mention.handleInput}
     onpaste={handlePaste}
+    use:autogrow
   ></textarea>
   <div class="compose-meta">
     <span class="hint">Shift+Enter for newline</span>
@@ -245,7 +247,8 @@
     border-radius: var(--radius-xl);
     padding: 0.75rem;
     font-size: var(--text-lg);
-    resize: vertical;
+    resize: none;
+    overflow: hidden;
   }
 
   .compose-meta {

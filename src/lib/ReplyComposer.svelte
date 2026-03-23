@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete } from "$lib/composables.svelte";
+  import { useMentionAutocomplete, autogrow } from "$lib/composables.svelte";
 
   let {
     replyToId,
@@ -68,9 +68,10 @@
     class="textarea-base"
     bind:value={content}
     placeholder="Write a reply..."
-    rows="2"
+    rows="1"
     onkeydown={handleKey}
     oninput={mention.handleInput}
+    use:autogrow
   ></textarea>
   <div class="composer-actions">
     <button class="btn-cancel" onclick={oncancel}>Cancel</button>

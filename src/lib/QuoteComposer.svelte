@@ -3,7 +3,7 @@
   import type { Post } from "$lib/types";
   import { shortId, getDisplayName } from "$lib/utils";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete } from "$lib/composables.svelte";
+  import { useMentionAutocomplete, autogrow } from "$lib/composables.svelte";
 
   let {
     quotedPost,
@@ -88,9 +88,10 @@
     class="textarea-base"
     bind:value={content}
     placeholder="Add your commentary (optional)..."
-    rows="2"
+    rows="1"
     onkeydown={handleKey}
     oninput={mention.handleInput}
+    use:autogrow
   ></textarea>
   <div class="composer-actions">
     <button class="btn-cancel" onclick={oncancel}>Cancel</button>

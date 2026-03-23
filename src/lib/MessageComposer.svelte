@@ -2,6 +2,7 @@
   import { platform } from "@tauri-apps/plugin-os";
   import type { PendingAttachment, MediaAttachment } from "$lib/types";
   import { isImage, uploadFiles } from "$lib/utils";
+  import { autogrow } from "$lib/composables.svelte";
 
   let {
     onsubmit,
@@ -150,6 +151,7 @@
     onkeydown={handleKeydown}
     oninput={handleInput}
     rows="1"
+    use:autogrow
   ></textarea>
   <button
     class="btn-accent send-btn"
@@ -263,7 +265,7 @@
     font-size: var(--text-base);
     resize: none;
     min-height: 36px;
-    max-height: 120px;
+    max-height: 40vh;
   }
 
   .send-btn {
