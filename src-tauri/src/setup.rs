@@ -51,8 +51,12 @@ fn load_dm_key_index(data_dir: &std::path::Path) -> u32 {
 }
 
 /// Derive all key material from the master key and build an Identity struct.
-fn build_identity(data_dir: &std::path::Path, transport_node_id: String) -> Identity {
+fn build_identity(data_dir: &std::path::Path) -> Identity {
     let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
+    let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, 0);
+    let transport_node_id = SecretKey::from_bytes(&transport_key_bytes)
+        .public()
+        .to_string();
     let master_secret = SecretKey::from_bytes(&master_secret_key_bytes);
     let signing_key_index = load_signing_key_index(data_dir);
     let signing_secret_key_bytes = derive_signing_key(&master_secret_key_bytes, signing_key_index);
@@ -337,9 +341,8 @@ pub async fn rebuild_for_recovery(state: &Arc<AppState>) -> Result<(), AppError>
     .await
     .map_err(|e| AppError::Other(e.to_string()))?;
 
-    // 4. Update identity with new key material and the new transport NodeId.
-    let new_transport_node_id = net.endpoint.id().to_string();
-    let new_identity = build_identity(&data_dir, new_transport_node_id);
+    // 4. Update identity with new key material.
+    let new_identity = build_identity(&data_dir);
 
     log::info!(
         "[recovery] new master pubkey: {}",
@@ -405,7 +408,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
 
     // Build a placeholder identity (transport_node_id filled in after endpoint bind).
     // We need SharedIdentity before building the network stack because handlers hold it.
-    let identity_data = build_identity(&data_dir, String::new());
+    let identity_data = build_identity(&data_dir);
 
     log::info!("[setup] master pubkey: {}", &identity_data.master_pubkey);
     log::info!(
@@ -413,6 +416,10 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         &identity_data.signing_key.public().to_string()
     );
     log::info!("[setup] DM pubkey: {}", &identity_data.dm_pubkey);
+    log::info!(
+        "[setup] Transport NodeId: {}",
+        &identity_data.transport_node_id
+    );
 
     let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(identity_data));
 
@@ -424,13 +431,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         &master_secret_key_bytes,
     )
     .await?;
-
-    // Now fill in the transport_node_id.
-    {
-        let mut id = identity.write().await;
-        id.transport_node_id = net.endpoint.id().to_string();
-        log::info!("[setup] Transport NodeId: {}", &id.transport_node_id);
-    }
 
     log::info!("[setup] addr (immediate): {:?}", net.endpoint.addr());
 
