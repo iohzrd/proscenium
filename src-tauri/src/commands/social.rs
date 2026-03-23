@@ -57,13 +57,13 @@ pub async fn follow_user(state: State<'_, Arc<AppState>>, node_id: String) -> Cm
     };
     state.storage.follow(&my_id, &entry).await?;
     state
-        .gossip
+        .gossip()
         .follow_user(pubkey.clone(), node_ids.clone())
         .await?;
     log::info!("[follow] subscribed to gossip for {}", short_id(&pubkey));
 
     // Queue an immediate background sync for the new followee without blocking the command.
-    let _ = state.sync_tx.send(SyncCommand::SyncPeer(pubkey)).await;
+    let _ = state.sync_tx().send(SyncCommand::SyncPeer(pubkey)).await;
 
     Ok(())
 }
@@ -73,7 +73,7 @@ pub async fn unfollow_user(state: State<'_, Arc<AppState>>, pubkey: String) -> C
     let my_id = state.identity.read().await.master_pubkey.clone();
     log::info!("[follow] unfollowing {}...", short_id(&pubkey));
     state.storage.unfollow(&my_id, &pubkey).await?;
-    state.gossip.unfollow_user(&pubkey).await;
+    state.gossip().unfollow_user(&pubkey).await;
     let deleted = state
         .storage
         .delete_posts_by_author(&pubkey)
@@ -111,7 +111,8 @@ async fn resolve_peer_identity(
     node_id: &str,
 ) -> CmdResult<proscenium_types::IdentityResponse> {
     let target: iroh::EndpointId = node_id.parse()?;
-    match crate::peer::query_identity(&state.endpoint, target).await {
+    let ep = state.endpoint();
+    match crate::peer::query_identity(&ep, target).await {
         Ok(identity) => {
             log::info!(
                 "[identity] resolved {} -> master={}",
@@ -168,7 +169,7 @@ pub async fn get_remote_follows(
         let Ok(target) = node_id.parse() else {
             continue;
         };
-        match crate::peer::fetch_remote_follows(&state.endpoint, target).await {
+        match crate::peer::fetch_remote_follows(&state.endpoint(), target).await {
             Ok(resp) => {
                 let _ = state
                     .storage
@@ -229,7 +230,7 @@ pub async fn get_remote_followers(
         let Ok(target) = node_id.parse() else {
             continue;
         };
-        match crate::peer::fetch_remote_followers(&state.endpoint, target).await {
+        match crate::peer::fetch_remote_followers(&state.endpoint(), target).await {
             Ok(resp) => {
                 let _ = state
                     .storage

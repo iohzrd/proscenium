@@ -17,20 +17,20 @@ pub async fn start_device_link(
     transfer_master_key: bool,
 ) -> CmdResult<LinkQrPayload> {
     let relay_url = state
-        .endpoint
+        .endpoint()
         .addr()
         .relay_urls()
         .next()
         .map(|u| u.to_string());
     state
-        .peer
+        .peer()
         .start_link_session(transfer_master_key, relay_url)
         .await
 }
 
 #[tauri::command]
 pub async fn cancel_device_link(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
-    state.peer.cancel_link_session().await;
+    state.peer().cancel_link_session().await;
     Ok(())
 }
 
@@ -67,7 +67,7 @@ pub async fn link_with_device(
     let addr = iroh::EndpointAddr::from(target);
     let conn = tokio::time::timeout(
         std::time::Duration::from_secs(15),
-        state.endpoint.connect(addr, PEER_ALPN),
+        state.endpoint().connect(addr, PEER_ALPN),
     )
     .await
     .map_err(|_| "connection timeout")??;
@@ -154,7 +154,7 @@ pub async fn force_device_sync(state: State<'_, Arc<AppState>>) -> CmdResult<()>
         (id.master_pubkey.clone(), id.signing_secret_key_bytes)
     };
     crate::device_sync::sync_all_devices(
-        &state.endpoint,
+        &state.endpoint(),
         &state.storage,
         &master_pubkey,
         &signing_secret_key_bytes,

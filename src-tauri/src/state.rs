@@ -7,7 +7,7 @@ use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Commands sent to the peer sync task to trigger on-demand syncs.
@@ -51,32 +51,73 @@ pub struct Identity {
     pub delegation: proscenium_types::SigningKeyDelegation,
 }
 
-/// Shared, mutable identity — the canonical source for all key material.
-pub type SharedIdentity = Arc<RwLock<Identity>>;
+/// Shared, mutable identity -- the canonical source for all key material.
+pub type SharedIdentity = Arc<tokio::sync::RwLock<Identity>>;
 
-pub struct AppState {
-    pub(crate) app_handle: tauri::AppHandle,
-    pub(crate) identity: SharedIdentity,
-    pub(crate) storage: Arc<Storage>,
-    /// Local blob storage (add/get bytes). For fetching remote blobs use `blobs`.
-    pub(crate) blob_store: FsStore,
-    pub(crate) http_client: reqwest::Client,
+/// Networking and protocol state that gets rebuilt during identity recovery.
+pub struct NetworkStack {
+    pub(crate) endpoint: Endpoint,
     pub(crate) gossip: GossipService,
     pub(crate) dm: DmHandler,
     pub(crate) call: CallHandler,
     pub(crate) peer: PeerHandler,
     pub(crate) stage: StageHandler,
-    pub(crate) endpoint: Endpoint,
     pub(crate) blobs: BlobsProtocol,
-    /// Send on-demand sync commands to the peer sync task.
     pub(crate) sync_tx: mpsc::Sender<SyncCommand>,
-    /// Cancellation token for graceful shutdown of all background tasks.
     pub(crate) shutdown: CancellationToken,
-    // Held alive to keep all protocol handler registrations active.
-    _router: Router,
+    pub(crate) _router: Router,
+}
+
+pub struct AppState {
+    pub(crate) app_handle: tauri::AppHandle,
+    pub(crate) identity: SharedIdentity,
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) blob_store: FsStore,
+    pub(crate) http_client: reqwest::Client,
+    pub(crate) net: std::sync::RwLock<NetworkStack>,
 }
 
 impl AppState {
+    pub fn endpoint(&self) -> Endpoint {
+        self.net.read().unwrap().endpoint.clone()
+    }
+
+    pub fn gossip(&self) -> GossipService {
+        self.net.read().unwrap().gossip.clone()
+    }
+
+    pub fn dm(&self) -> DmHandler {
+        self.net.read().unwrap().dm.clone()
+    }
+
+    pub fn call(&self) -> CallHandler {
+        self.net.read().unwrap().call.clone()
+    }
+
+    pub fn peer(&self) -> PeerHandler {
+        self.net.read().unwrap().peer.clone()
+    }
+
+    pub fn stage(&self) -> StageHandler {
+        self.net.read().unwrap().stage.clone()
+    }
+
+    pub fn blobs(&self) -> BlobsProtocol {
+        self.net.read().unwrap().blobs.clone()
+    }
+
+    pub fn sync_tx(&self) -> mpsc::Sender<SyncCommand> {
+        self.net.read().unwrap().sync_tx.clone()
+    }
+
+    pub fn shutdown(&self) -> CancellationToken {
+        self.net.read().unwrap().shutdown.clone()
+    }
+
+    pub fn replace_net(&self, net: NetworkStack) {
+        *self.net.write().unwrap() = net;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         app_handle: tauri::AppHandle,
@@ -84,16 +125,7 @@ impl AppState {
         storage: Arc<Storage>,
         blob_store: FsStore,
         http_client: reqwest::Client,
-        gossip: GossipService,
-        dm: DmHandler,
-        call: CallHandler,
-        peer: PeerHandler,
-        stage: StageHandler,
-        endpoint: Endpoint,
-        blobs: BlobsProtocol,
-        router: Router,
-        sync_tx: mpsc::Sender<SyncCommand>,
-        shutdown: CancellationToken,
+        net: NetworkStack,
     ) -> Self {
         Self {
             app_handle,
@@ -101,16 +133,7 @@ impl AppState {
             storage,
             blob_store,
             http_client,
-            gossip,
-            dm,
-            call,
-            peer,
-            stage,
-            endpoint,
-            blobs,
-            sync_tx,
-            shutdown,
-            _router: router,
+            net: std::sync::RwLock::new(net),
         }
     }
 }

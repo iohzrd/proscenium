@@ -35,7 +35,7 @@ pub async fn repost(
     validate_post(&post)?;
     sign_post(&mut post, &SecretKey::from_bytes(&signing_key_bytes));
     state.storage.insert_post(&post).await?;
-    state.gossip.broadcast_post(&post).await?;
+    state.gossip().broadcast_post(&post).await?;
     Ok(post)
 }
 
@@ -75,7 +75,7 @@ pub async fn create_post(
         &post.id,
         media_count
     );
-    state.gossip.broadcast_post(&post).await?;
+    state.gossip().broadcast_post(&post).await?;
     log::info!("[post] broadcast post {}", &post.id);
     Ok(post)
 }
@@ -93,7 +93,7 @@ pub async fn unrepost(state: State<'_, Arc<AppState>>, target_post_id: String) -
     if let Some(id) = id {
         let signature = sign_delete_post(&id, &my_id, &SecretKey::from_bytes(&signing_key_bytes));
         state
-            .gossip
+            .gossip()
             .broadcast_delete(&id, &my_id, &signature)
             .await?;
     }
@@ -116,7 +116,7 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> CmdResu
     let removed = state.storage.delete_post(&id).await?;
     log::info!("[post] delete post {id}: removed={removed}");
     state
-        .gossip
+        .gossip()
         .broadcast_delete(&id, &my_id, &signature)
         .await?;
     log::info!("[post] broadcast delete {id}");

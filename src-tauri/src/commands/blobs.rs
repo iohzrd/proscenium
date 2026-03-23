@@ -55,14 +55,17 @@ pub async fn add_blob(
     state: State<'_, Arc<AppState>>,
     content: String,
 ) -> CmdResult<serde_json::Value> {
-    add_blob_data(&state.blob_store, &state.endpoint, content.as_bytes()).await
+    let ep = state.endpoint();
+    add_blob_data(&state.blob_store, &ep, content.as_bytes()).await
 }
 
 #[tauri::command]
 pub async fn fetch_blob(state: State<'_, Arc<AppState>>, ticket: String) -> CmdResult<String> {
     let ticket = parse_ticket(&ticket)?;
     log::info!("[blob] fetching text blob {}...", ticket.hash());
-    let bytes = fetch_blob_data(&state.endpoint, &state.blobs, &state.blob_store, &ticket).await?;
+    let ep = state.endpoint();
+    let blobs = state.blobs();
+    let bytes = fetch_blob_data(&ep, &blobs, &state.blob_store, &ticket).await?;
     log::info!(
         "[blob] fetched text blob {} ({} bytes)",
         ticket.hash(),
@@ -77,7 +80,8 @@ pub async fn add_blob_bytes(
     state: State<'_, Arc<AppState>>,
     data: Vec<u8>,
 ) -> CmdResult<serde_json::Value> {
-    add_blob_data(&state.blob_store, &state.endpoint, &data).await
+    let ep = state.endpoint();
+    add_blob_data(&state.blob_store, &ep, &data).await
 }
 
 /// Add a blob from RGBA pixel data (used by clipboard paste).
@@ -107,7 +111,8 @@ pub async fn add_blob_from_rgba(
     .map_err(|e| AppError::Other(format!("task join error: {e}")))??;
 
     let size = png_data.len();
-    let blob_result = add_blob_data(&state.blob_store, &state.endpoint, &png_data).await?;
+    let ep = state.endpoint();
+    let blob_result = add_blob_data(&state.blob_store, &ep, &png_data).await?;
     let hash = blob_result["hash"].as_str().unwrap_or_default().to_string();
     let ticket = blob_result["ticket"]
         .as_str()
@@ -141,7 +146,8 @@ pub async fn add_blob_from_path(
     let mime_type = mime_guess::from_path(file_path)
         .first_or_octet_stream()
         .to_string();
-    let blob_result = add_blob_data(&state.blob_store, &state.endpoint, &data).await?;
+    let ep = state.endpoint();
+    let blob_result = add_blob_data(&state.blob_store, &ep, &data).await?;
     let hash = blob_result["hash"].as_str().unwrap_or_default().to_string();
     let ticket = blob_result["ticket"]
         .as_str()
@@ -166,7 +172,9 @@ pub async fn fetch_blob_bytes(
         return Ok(bytes.to_vec());
     }
     log::info!("[blob] fetching {} from remote...", ticket.hash());
-    let bytes = fetch_blob_data(&state.endpoint, &state.blobs, &state.blob_store, &ticket).await?;
+    let ep = state.endpoint();
+    let blobs = state.blobs();
+    let bytes = fetch_blob_data(&ep, &blobs, &state.blob_store, &ticket).await?;
     log::info!(
         "[blob] fetched {} from remote ({} bytes)",
         ticket.hash(),
@@ -185,7 +193,9 @@ pub async fn refetch_blob_bytes(
         "[blob] re-fetching {} from remote (ignoring local cache)...",
         ticket.hash()
     );
-    let bytes = fetch_blob_data(&state.endpoint, &state.blobs, &state.blob_store, &ticket).await?;
+    let ep = state.endpoint();
+    let blobs = state.blobs();
+    let bytes = fetch_blob_data(&ep, &blobs, &state.blob_store, &ticket).await?;
     log::info!(
         "[blob] re-fetched {} from remote ({} bytes)",
         ticket.hash(),

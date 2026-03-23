@@ -10,8 +10,9 @@ pub async fn sync_posts(
     pubkey: String,
 ) -> CmdResult<FrontendSyncResult> {
     let my_id = state.identity.read().await.master_pubkey.clone();
+    let ep = state.endpoint();
     let result = crate::sync::sync_one_peer(
-        &state.endpoint,
+        &ep,
         &state.storage,
         &pubkey,
         &my_id,
@@ -38,7 +39,7 @@ pub async fn get_sync_status(
 #[tauri::command]
 pub async fn sync_all_peers(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     state
-        .sync_tx
+        .sync_tx()
         .send(SyncCommand::SyncAll)
         .await
         .map_err(|_| "sync task unavailable")?;

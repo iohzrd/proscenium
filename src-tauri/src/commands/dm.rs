@@ -76,7 +76,7 @@ pub async fn send_dm(
 
     log::info!("[dm-cmd] stored message {} locally", short_id(&msg_id));
     log::info!("[dm-cmd] sending to {}", short_id(&to));
-    match state.dm.send_dm(&to, dm_msg).await {
+    match state.dm().send_dm(&to, dm_msg).await {
         Ok(()) => log::info!("[dm-cmd] send completed to {}", short_id(&to)),
         Err(e) => log::error!("[dm-cmd] send failed to {}: {e}", short_id(&to)),
     }
@@ -155,7 +155,7 @@ pub async fn send_dm_signal(
         }
         other => return Err(format!("unknown signal type: {other}").into()),
     };
-    if let Err(e) = state.dm.send_signal(&to, payload).await {
+    if let Err(e) = state.dm().send_signal(&to, payload).await {
         log::info!(
             "[dm-signal] failed to send {signal_type} to {}: {e}",
             short_id(&to)

@@ -28,6 +28,12 @@
   let verifyError = $state("");
   let verifying = $state(false);
 
+  // Recovery state
+  let recoveryPhrase = $state("");
+  let recovering = $state(false);
+  let recoveryError = $state("");
+  let recoveryComplete = $state(false);
+
   const visibilityOptions: {
     value: Visibility;
     label: string;
@@ -61,11 +67,11 @@
         goto("/");
         return;
       }
-      // Check if seed phrase was already backed up (returning user)
+      // Check if seed phrase was already backed up (returning user or recovery)
       const backedUp = await invoke<boolean>("is_seed_phrase_backed_up");
       if (backedUp) {
-        // Skip seed phrase steps
-        step = 0;
+        // Skip straight to profile creation
+        step = 3;
       }
     } catch {
       setTimeout(() => location.reload(), 500);
@@ -130,6 +136,24 @@
 
   function skipBackup() {
     step = 3;
+  }
+
+  async function recoverFromPhrase() {
+    const trimmed = recoveryPhrase.trim();
+    const words = trimmed.split(/\s+/);
+    if (words.length !== 24) {
+      recoveryError = "Recovery phrase must be exactly 24 words.";
+      return;
+    }
+    recovering = true;
+    recoveryError = "";
+    try {
+      await invoke("recover_from_seed_phrase", { phrase: trimmed });
+      recoveryComplete = true;
+    } catch (e) {
+      recoveryError = `Recovery failed: ${e}`;
+    }
+    recovering = false;
   }
 
   async function handleAvatarUpload(e: Event) {
@@ -233,6 +257,55 @@
       >
         Continue
       </button>
+      <button class="skip-btn" onclick={() => (step = -1)}>
+        Recover existing identity
+      </button>
+    </div>
+  {:else if step === -1}
+    <div class="step">
+      {#if recoveryComplete}
+        <h2>Identity Recovered</h2>
+        <p class="desc">
+          Your identity has been restored. Set up your profile to get started.
+        </p>
+        <button class="btn-accent primary-btn" onclick={() => (step = 3)}>
+          Create Profile
+        </button>
+      {:else}
+        <h2>Recover Your Identity</h2>
+        <p class="desc">
+          Enter your 24-word recovery phrase to restore your identity on this
+          device. This will replace any existing identity.
+        </p>
+
+        <label class="field">
+          <span class="field-label">Recovery Phrase</span>
+          <textarea
+            class="input-base recovery-textarea"
+            bind:value={recoveryPhrase}
+            placeholder="Enter your 24 words separated by spaces"
+            rows="4"
+            autocapitalize="none"
+            autocomplete="off"
+            spellcheck="false"
+          ></textarea>
+        </label>
+
+        {#if recoveryError}
+          <p class="error">{recoveryError}</p>
+        {/if}
+
+        <div class="actions">
+          <button class="secondary-btn" onclick={() => (step = 0)}>Back</button>
+          <button
+            class="btn-accent primary-btn"
+            onclick={recoverFromPhrase}
+            disabled={!recoveryPhrase.trim() || recovering}
+          >
+            {recovering ? "Recovering..." : "Recover Identity"}
+          </button>
+        </div>
+      {/if}
     </div>
   {:else if step === 1}
     <div class="step">
@@ -539,6 +612,13 @@
 
   .skip-btn:hover {
     color: var(--text-secondary);
+  }
+
+  .recovery-textarea {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    resize: vertical;
+    min-height: 80px;
   }
 
   /* Verify */

@@ -29,7 +29,7 @@ pub async fn like_post(
     };
     sign_interaction(&mut interaction, &SecretKey::from_bytes(&signing_key_bytes));
     state.storage.save_interaction(&interaction).await?;
-    state.gossip.broadcast_interaction(&interaction).await?;
+    state.gossip().broadcast_interaction(&interaction).await?;
     Ok(interaction)
 }
 
@@ -47,7 +47,7 @@ pub async fn unlike_post(state: State<'_, Arc<AppState>>, target_post_id: String
         let signature =
             sign_delete_interaction(&id, &my_id, &SecretKey::from_bytes(&signing_key_bytes));
         state
-            .gossip
+            .gossip()
             .broadcast_delete_interaction(&id, &my_id, &signature)
             .await?;
     }

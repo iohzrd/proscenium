@@ -3,7 +3,7 @@ use crate::state::AppState;
 use std::sync::Arc;
 
 pub fn spawn(state: Arc<AppState>) {
-    let token = state.shutdown.child_token();
+    let token = state.shutdown().child_token();
     tokio::spawn(async move {
         tokio::select! {
             _ = token.cancelled() => {}
@@ -25,15 +25,16 @@ async fn run(state: Arc<AppState>) {
         };
 
         crate::device_sync::sync_all_devices(
-            &state.endpoint,
+            &state.endpoint(),
             &state.storage,
             &master_pubkey,
             &signing_secret_key_bytes,
         )
         .await;
 
+        let shutdown = state.shutdown();
         tokio::select! {
-            _ = state.shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(DEVICE_SYNC_INTERVAL) => {}
         }
     }

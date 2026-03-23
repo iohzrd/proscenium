@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub fn spawn(state: Arc<AppState>, sync_rx: mpsc::Receiver<SyncCommand>) {
-    let token = state.shutdown.child_token();
+    let token = state.shutdown().child_token();
     tokio::spawn(async move {
         tokio::select! {
             _ = token.cancelled() => {}
@@ -37,8 +37,9 @@ async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
     let mut last_activity = std::time::Instant::now();
 
     loop {
+        let shutdown = state.shutdown();
         tokio::select! {
-            _ = state.shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => break,
 
             cmd = sync_rx.recv() => {
                 let Some(cmd) = cmd else { break };
@@ -85,7 +86,7 @@ async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
 
 async fn wait_for_relay(state: &AppState) {
     for attempt in 0..RELAY_WAIT_ATTEMPTS {
-        if state.endpoint.addr().relay_urls().next().is_some() {
+        if state.endpoint().addr().relay_urls().next().is_some() {
             log::info!("[peer-sync] relay connected (attempt {attempt})");
             return;
         }
@@ -121,7 +122,7 @@ async fn startup_sync(state: Arc<AppState>) {
 async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
     let my_id = state.identity.read().await.master_pubkey.clone();
     match crate::sync::sync_one_peer(
-        &state.endpoint,
+        &state.endpoint(),
         &state.storage,
         pubkey,
         &my_id,

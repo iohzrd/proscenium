@@ -67,8 +67,9 @@ pub async fn send_follow_request_to_peer(
         )
     };
 
+    let ep = state.endpoint();
     let response = crate::peer::send_follow_request(
-        &state.endpoint,
+        &ep,
         &state.storage,
         target,
         &master_pubkey,

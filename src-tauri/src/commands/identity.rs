@@ -4,6 +4,7 @@ use iroh::SecretKey;
 use proscenium_types::{
     SigningKeyDelegation, derive_signing_key, now_millis, sign_delegation, sign_rotation,
 };
+use std::str::FromStr;
 use std::sync::Arc;
 use tauri::{Manager, State};
 
@@ -80,7 +81,7 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
     );
 
     state
-        .gossip
+        .gossip()
         .broadcast_signing_key_rotation(&rotation)
         .await?;
 
@@ -109,7 +110,10 @@ pub async fn rotate_signing_key(state: State<'_, Arc<AppState>>) -> CmdResult<St
     {
         log::error!("[rotate] failed to cache own announcement: {e}");
     }
-    state.gossip.broadcast_linked_devices(&announcement).await?;
+    state
+        .gossip()
+        .broadcast_linked_devices(&announcement)
+        .await?;
 
     let servers = state.storage.get_registered_servers().await?;
     let new_signing_sk = SecretKey::from_bytes(&new_signing_bytes);
@@ -202,4 +206,45 @@ pub async fn verify_seed_phrase_words(
         }
     }
     Ok(true)
+}
+
+/// Recover identity from a BIP39 recovery phrase.
+/// Validates the phrase, extracts the master key entropy, overwrites the master key file,
+/// resets derived key indices, wipes social data, and rebuilds the networking stack in place.
+#[tauri::command]
+pub async fn recover_from_seed_phrase(
+    state: State<'_, Arc<AppState>>,
+    phrase: String,
+) -> CmdResult<()> {
+    let mnemonic = bip39::Mnemonic::from_str(phrase.trim())
+        .map_err(|e| format!("Invalid recovery phrase: {e}"))?;
+
+    let entropy = mnemonic.to_entropy();
+    let master_key_bytes: [u8; 32] = entropy
+        .try_into()
+        .map_err(|_| "Recovery phrase did not produce 32 bytes of entropy")?;
+
+    let data_dir = state.app_handle.path().app_data_dir()?;
+
+    // Write the recovered master key.
+    std::fs::write(data_dir.join("master_key.key"), master_key_bytes)?;
+
+    // Reset derived key indices to 0 so setup re-derives from scratch.
+    let _ = std::fs::remove_file(data_dir.join("signing_key.key"));
+    let _ = std::fs::remove_file(data_dir.join("signing_key_index"));
+    let _ = std::fs::remove_file(data_dir.join("dm_key_index"));
+    let _ = std::fs::remove_file(data_dir.join("transport_key.key"));
+    let _ = std::fs::remove_file(data_dir.join("device_index"));
+
+    // The user obviously has the phrase -- mark it as backed up.
+    std::fs::write(data_dir.join(".seed_backed_up"), b"1")?;
+
+    // Wipe all social data so the app starts fresh with the recovered identity.
+    state.storage.wipe_all_data().await?;
+
+    // Rebuild the networking stack in place with the new identity.
+    let state_arc: Arc<AppState> = Arc::clone(&state);
+    crate::setup::rebuild_for_recovery(&state_arc).await?;
+
+    Ok(())
 }

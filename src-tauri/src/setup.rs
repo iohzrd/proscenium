@@ -1,9 +1,10 @@
 use crate::call::CallHandler;
 use crate::dm::DmHandler;
+use crate::error::AppError;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
 use crate::stage::StageHandler;
-use crate::state::{AppState, Identity, SharedIdentity, SyncCommand};
+use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand};
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
@@ -49,34 +50,14 @@ fn load_dm_key_index(data_dir: &std::path::Path) -> u32 {
     }
 }
 
-pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    {
-        use tauri_plugin_deep_link::DeepLinkExt;
-        if let Err(e) = app.deep_link().register_all() {
-            log::error!("[setup] failed to register deep link schemes: {e}");
-        }
-    }
-
-    let handle = app.handle().clone();
-    tauri::async_runtime::block_on(setup(handle))
-}
-
-async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = handle
-        .path()
-        .app_data_dir()
-        .expect("failed to resolve app data dir");
-    std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
-    log::info!("[setup] data dir: {}", data_dir.display());
-
-    // Derive all key material.
+/// Derive all key material from the master key and build an Identity struct.
+fn build_identity(data_dir: &std::path::Path, transport_node_id: String) -> Identity {
     let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
     let master_secret = SecretKey::from_bytes(&master_secret_key_bytes);
-    let signing_key_index = load_signing_key_index(&data_dir);
+    let signing_key_index = load_signing_key_index(data_dir);
     let signing_secret_key_bytes = derive_signing_key(&master_secret_key_bytes, signing_key_index);
     let signing_key = SecretKey::from_bytes(&signing_secret_key_bytes);
-    let dm_key_index = load_dm_key_index(&data_dir);
+    let dm_key_index = load_dm_key_index(data_dir);
     let dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes, dm_key_index);
     let (dm_x25519_private, dm_x25519_public) =
         crate::crypto::x25519_keypair_from_raw(&dm_secret_key_bytes);
@@ -90,15 +71,41 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         now_millis(),
     );
 
-    // Open the database early so we can read preferences before binding the endpoint.
-    let storage = Arc::new(
-        Storage::open(&data_dir.join("social.db"))
-            .await
-            .expect("failed to open database"),
-    );
-    log::info!("[setup] database opened");
+    let ratchet_storage_key = crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes);
 
-    // Load discovery preferences.
+    Identity {
+        master_secret_key_bytes,
+        master_pubkey: master_secret.public().to_string(),
+        signing_secret_key_bytes,
+        signing_key,
+        signing_key_index,
+        dm_secret_key_bytes,
+        dm_pubkey: hex::encode(dm_x25519_public),
+        dm_key_index,
+        dm_x25519_private,
+        dm_x25519_public,
+        ratchet_storage_key,
+        transport_node_id,
+        delegation,
+    }
+}
+
+/// Build the networking stack: endpoint, gossip, handlers, router.
+/// Returns the stack plus channel receivers needed by background tasks.
+async fn build_network_stack(
+    handle: &tauri::AppHandle,
+    identity: SharedIdentity,
+    storage: Arc<Storage>,
+    blob_store: &FsStore,
+    master_secret_key_bytes: &[u8; 32],
+) -> Result<
+    (
+        NetworkStack,
+        mpsc::Receiver<SyncCommand>,
+        mpsc::UnboundedReceiver<crate::dm::CallSignal>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let mdns_enabled = crate::preferences::get_mdns_discovery(&storage).await;
     let dht_enabled = crate::preferences::get_dht_discovery(&storage).await;
     log::info!(
@@ -107,8 +114,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         if dht_enabled { "enabled" } else { "disabled" },
     );
 
-    // Bind the transport endpoint (needed for transport_node_id before building Identity).
-    let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, 0);
+    let transport_key_bytes = derive_transport_key(master_secret_key_bytes, 0);
     log::info!("[setup] binding iroh endpoint...");
     let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(SecretKey::from_bytes(&transport_key_bytes))
@@ -130,52 +136,14 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
 
     let endpoint = builder.bind().await.expect("failed to bind iroh endpoint");
 
-    // Derive the ratchet storage key (used by DmHandler, stored in Identity so it
-    // can be updated atomically when the DM key is rotated).
-    let ratchet_storage_key = crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes);
-
-    // Build the plain Identity struct first, then wrap in SharedIdentity.
-    // This lets the rest of setup.rs use field access directly without lock overhead.
-    let identity_data = Identity {
-        master_secret_key_bytes,
-        master_pubkey: master_secret.public().to_string(),
-        signing_secret_key_bytes,
-        signing_key,
-        signing_key_index,
-        dm_secret_key_bytes,
-        dm_pubkey: hex::encode(dm_x25519_public),
-        dm_key_index,
-        dm_x25519_private,
-        dm_x25519_public,
-        ratchet_storage_key,
-        transport_node_id: endpoint.id().to_string(),
-        delegation,
-    };
-
-    log::info!("[setup] master pubkey: {}", &identity_data.master_pubkey);
-    log::info!(
-        "[setup] signing pubkey: {}",
-        &identity_data.signing_key.public().to_string()
-    );
-    log::info!("[setup] DM pubkey: {}", &identity_data.dm_pubkey);
-    log::info!(
-        "[setup] Transport NodeId: {}",
-        &identity_data.transport_node_id
-    );
-    log::info!("[setup] addr (immediate): {:?}", endpoint.addr());
-
-    let blobs_dir = data_dir.join("blobs");
-    let blob_store = FsStore::load(&blobs_dir)
-        .await
-        .expect("failed to open blob store");
-    log::info!("[setup] blob store opened at {}", blobs_dir.display());
-
-    let blobs = BlobsProtocol::new(&blob_store, None);
+    let blobs_dir = handle
+        .path()
+        .app_data_dir()
+        .expect("failed to resolve app data dir")
+        .join("blobs");
+    let blobs = BlobsProtocol::new(blob_store, None);
     let gossip = Gossip::builder().spawn(endpoint.clone());
     log::info!("[setup] gossip started");
-
-    // Wrap identity now that all plain uses are done.
-    let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(identity_data));
 
     let gossip_service = GossipService::new(
         gossip.clone(),
@@ -231,17 +199,77 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         .spawn();
     log::info!("[setup] router spawned");
 
-    if let Err(e) = gossip_service.start_own_feed().await {
+    let shutdown = CancellationToken::new();
+    let (sync_tx, sync_rx) = mpsc::channel::<SyncCommand>(64);
+
+    let _ = blobs_dir; // used for logging context only in original code
+
+    let net = NetworkStack {
+        endpoint,
+        gossip: gossip_service,
+        dm: dm_handler,
+        call: call_handler,
+        peer: peer_handler,
+        stage: stage_handler,
+        blobs,
+        sync_tx,
+        shutdown,
+        _router: router,
+    };
+
+    Ok((net, sync_rx, call_signal_rx))
+}
+
+/// Start background services on the networking stack.
+async fn start_services(
+    state: &Arc<AppState>,
+    sync_rx: mpsc::Receiver<SyncCommand>,
+    mut call_signal_rx: mpsc::UnboundedReceiver<crate::dm::CallSignal>,
+) {
+    let shutdown = state.shutdown();
+    state
+        .gossip()
+        .start_background(shutdown.child_token())
+        .await;
+    state.dm().start_background(shutdown.child_token());
+    crate::tasks::spawn_all(state.clone(), sync_rx);
+
+    let call = state.call();
+    tokio::spawn(async move {
+        while let Some(signal) = call_signal_rx.recv().await {
+            match signal.payload {
+                proscenium_types::DmPayload::CallOffer { call_id, .. } => {
+                    call.on_call_offer(&call_id, &signal.peer_pubkey).await;
+                }
+                proscenium_types::DmPayload::CallAnswer { call_id } => {
+                    call.on_call_answered(&call_id, &signal.peer_pubkey).await;
+                }
+                proscenium_types::DmPayload::CallReject { call_id }
+                | proscenium_types::DmPayload::CallHangup { call_id } => {
+                    call.on_call_ended(&call_id).await;
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// Broadcast initial gossip state (own feed, profile, device announcement).
+async fn broadcast_initial_state(state: &Arc<AppState>) {
+    let gossip = state.gossip();
+
+    if let Err(e) = gossip.start_own_feed().await {
         log::error!("[setup] failed to start own feed: {e}");
     } else {
         log::info!("[setup] own gossip feed started");
     }
 
     {
-        let id = identity.read().await;
-        if let Ok(Some(profile)) = storage.get_profile(&id.master_pubkey).await {
-            drop(id);
-            if let Err(e) = gossip_service.broadcast_profile(&profile).await {
+        let id = state.identity.read().await;
+        let master_pubkey = id.master_pubkey.clone();
+        drop(id);
+        if let Ok(Some(profile)) = state.storage.get_profile(&master_pubkey).await {
+            if let Err(e) = gossip.broadcast_profile(&profile).await {
                 log::error!("[setup] failed to broadcast profile: {e}");
             } else {
                 log::info!("[setup] broadcast profile: {}", profile.display_name);
@@ -250,9 +278,10 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     }
 
     {
-        let id = identity.read().await;
+        let id = state.identity.read().await;
         let now = now_millis();
-        if let Err(e) = storage
+        if let Err(e) = state
+            .storage
             .upsert_linked_device(&id.transport_node_id, "Primary Device", true, true, now)
             .await
         {
@@ -275,12 +304,135 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         sign_linked_devices_announcement(&mut announcement, &id.signing_key);
         drop(id);
 
-        if let Err(e) = gossip_service.broadcast_linked_devices(&announcement).await {
+        if let Err(e) = gossip.broadcast_linked_devices(&announcement).await {
             log::error!("[setup] failed to broadcast device announcement: {e}");
         } else {
             log::info!("[setup] broadcast single-device announcement");
         }
     }
+}
+
+/// Rebuild the networking stack after identity recovery.
+/// Cancels all background tasks, updates identity from disk, builds fresh
+/// networking, and restarts all services.
+pub async fn rebuild_for_recovery(state: &Arc<AppState>) -> Result<(), AppError> {
+    log::info!("[recovery] starting network rebuild...");
+
+    // 1. Cancel all background tasks.
+    state.shutdown().cancel();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // 2. Reload key material from disk.
+    let data_dir = state.app_handle.path().app_data_dir()?;
+    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
+
+    // 3. Build new networking stack.
+    let (net, sync_rx, call_signal_rx) = build_network_stack(
+        &state.app_handle,
+        state.identity.clone(),
+        state.storage.clone(),
+        &state.blob_store,
+        &master_secret_key_bytes,
+    )
+    .await
+    .map_err(|e| AppError::Other(e.to_string()))?;
+
+    // 4. Update identity with new key material and the new transport NodeId.
+    let new_transport_node_id = net.endpoint.id().to_string();
+    let new_identity = build_identity(&data_dir, new_transport_node_id);
+
+    log::info!(
+        "[recovery] new master pubkey: {}",
+        &new_identity.master_pubkey
+    );
+    log::info!(
+        "[recovery] new transport NodeId: {}",
+        &new_identity.transport_node_id
+    );
+
+    {
+        let mut id = state.identity.write().await;
+        *id = new_identity;
+    }
+
+    // 5. Swap networking stack.
+    state.replace_net(net);
+
+    // 6. Start services and broadcast initial state.
+    start_services(state, sync_rx, call_signal_rx).await;
+    broadcast_initial_state(state).await;
+
+    log::info!("[recovery] network rebuild complete");
+    Ok(())
+}
+
+pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        use tauri_plugin_deep_link::DeepLinkExt;
+        if let Err(e) = app.deep_link().register_all() {
+            log::error!("[setup] failed to register deep link schemes: {e}");
+        }
+    }
+
+    let handle = app.handle().clone();
+    tauri::async_runtime::block_on(setup(handle))
+}
+
+async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = handle
+        .path()
+        .app_data_dir()
+        .expect("failed to resolve app data dir");
+    std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
+    log::info!("[setup] data dir: {}", data_dir.display());
+
+    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
+
+    // Open the database early so we can read preferences before binding the endpoint.
+    let storage = Arc::new(
+        Storage::open(&data_dir.join("social.db"))
+            .await
+            .expect("failed to open database"),
+    );
+    log::info!("[setup] database opened");
+
+    let blobs_dir = data_dir.join("blobs");
+    let blob_store = FsStore::load(&blobs_dir)
+        .await
+        .expect("failed to open blob store");
+    log::info!("[setup] blob store opened at {}", blobs_dir.display());
+
+    // Build a placeholder identity (transport_node_id filled in after endpoint bind).
+    // We need SharedIdentity before building the network stack because handlers hold it.
+    let identity_data = build_identity(&data_dir, String::new());
+
+    log::info!("[setup] master pubkey: {}", &identity_data.master_pubkey);
+    log::info!(
+        "[setup] signing pubkey: {}",
+        &identity_data.signing_key.public().to_string()
+    );
+    log::info!("[setup] DM pubkey: {}", &identity_data.dm_pubkey);
+
+    let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(identity_data));
+
+    let (net, sync_rx, call_signal_rx) = build_network_stack(
+        &handle,
+        identity.clone(),
+        storage.clone(),
+        &blob_store,
+        &master_secret_key_bytes,
+    )
+    .await?;
+
+    // Now fill in the transport_node_id.
+    {
+        let mut id = identity.write().await;
+        id.transport_node_id = net.endpoint.id().to_string();
+        log::info!("[setup] Transport NodeId: {}", &id.transport_node_id);
+    }
+
+    log::info!("[setup] addr (immediate): {:?}", net.endpoint.addr());
 
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -289,53 +441,17 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         .build()
         .expect("failed to build HTTP client");
 
-    let shutdown = CancellationToken::new();
-    let (sync_tx, sync_rx) = mpsc::channel::<SyncCommand>(64);
-
     let state = Arc::new(AppState::new(
         handle.clone(),
         identity,
         storage,
         blob_store,
         http_client,
-        gossip_service,
-        dm_handler,
-        call_handler,
-        peer_handler,
-        stage_handler,
-        endpoint,
-        blobs,
-        router,
-        sync_tx,
-        shutdown.clone(),
+        net,
     ));
 
-    state.gossip.start_background(shutdown.child_token()).await;
-    state.dm.start_background(shutdown.child_token());
-    crate::tasks::spawn_all(state.clone(), sync_rx);
-
-    // Route call signals from DM ratchet to CallHandler
-    {
-        let call = state.call.clone();
-        let mut rx = call_signal_rx;
-        tokio::spawn(async move {
-            while let Some(signal) = rx.recv().await {
-                match signal.payload {
-                    proscenium_types::DmPayload::CallOffer { call_id, .. } => {
-                        call.on_call_offer(&call_id, &signal.peer_pubkey).await;
-                    }
-                    proscenium_types::DmPayload::CallAnswer { call_id } => {
-                        call.on_call_answered(&call_id, &signal.peer_pubkey).await;
-                    }
-                    proscenium_types::DmPayload::CallReject { call_id }
-                    | proscenium_types::DmPayload::CallHangup { call_id } => {
-                        call.on_call_ended(&call_id).await;
-                    }
-                    _ => {}
-                }
-            }
-        });
-    }
+    start_services(&state, sync_rx, call_signal_rx).await;
+    broadcast_initial_state(&state).await;
 
     handle.manage(state);
     log::info!("[setup] app state ready");

@@ -54,7 +54,7 @@ pub async fn save_my_profile(
 
     if old_visibility != new_visibility {
         state
-            .gossip
+            .gossip()
             .handle_visibility_change(old_visibility, new_visibility, &profile)
             .await?;
         log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
@@ -63,7 +63,7 @@ pub async fn save_my_profile(
     state.storage.save_profile(&node_id, &profile).await?;
     log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
 
-    state.gossip.broadcast_profile(&profile).await?;
+    state.gossip().broadcast_profile(&profile).await?;
 
     if let Ok(servers) = state.storage.get_servers().await {
         for server in servers {
@@ -93,11 +93,11 @@ pub async fn get_remote_profile(
 #[tauri::command]
 pub async fn get_node_status(state: State<'_, Arc<AppState>>) -> CmdResult<NodeStatus> {
     let transport_node_id = state.identity.read().await.transport_node_id.clone();
-    let addr = state.endpoint.addr();
+    let addr = state.endpoint().addr();
     let relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let has_relay = relay_url.is_some();
     let my_id = state.identity.read().await.master_pubkey.clone();
-    let follow_count = state.gossip.get_subscription_count().await;
+    let follow_count = state.gossip().get_subscription_count().await;
     let follower_count = state
         .storage
         .get_followers(&my_id)
