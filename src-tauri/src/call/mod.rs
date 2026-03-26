@@ -121,10 +121,15 @@ impl CallHandler {
     /// Called when we receive a CallAnswer from the peer (via DM handler).
     /// Establishes the audio QUIC connection and starts streaming.
     pub async fn on_call_answered(&self, call_id: &str, peer_pubkey: &str) {
-        let cancel = {
-            let lock = self.active_call.lock().await;
-            match &*lock {
-                Some(call) if call.call_id == call_id => call.cancel.clone(),
+        {
+            let mut lock = self.active_call.lock().await;
+            match &mut *lock {
+                Some(call) if call.call_id == call_id => {
+                    // Cancel the ringing timeout, then replace with a fresh token
+                    // so the audio session gets a live (uncancelled) token.
+                    call.cancel.cancel();
+                    call.cancel = CancellationToken::new();
+                }
                 _ => {
                     log::warn!(
                         "[call] received answer for unknown call {}",
@@ -133,9 +138,7 @@ impl CallHandler {
                     return;
                 }
             }
-        };
-        // Cancel the timeout
-        cancel.cancel();
+        }
 
         self.emit_call_event(call_id, peer_pubkey, CallState::Active);
 
@@ -236,10 +239,14 @@ impl CallHandler {
     /// caller to open the CALL_ALPN connection (handled by ProtocolHandler::accept).
     pub async fn accept_call(&self, call_id: &str) -> Result<(), AppError> {
         let peer_pubkey = {
-            let lock = self.active_call.lock().await;
-            match &*lock {
+            let mut lock = self.active_call.lock().await;
+            match &mut *lock {
                 Some(call) if call.call_id == call_id => {
-                    call.cancel.cancel(); // cancel timeout
+                    // Cancel the incoming-call timeout, then replace with a fresh
+                    // token so the audio session (ProtocolHandler::accept) gets a
+                    // live token.
+                    call.cancel.cancel();
+                    call.cancel = CancellationToken::new();
                     call.peer_pubkey.clone()
                 }
                 _ => return Err(AppError::Other("no incoming call with that ID".into())),
