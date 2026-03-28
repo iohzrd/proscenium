@@ -3,7 +3,8 @@ use super::fanout::Fanout;
 use super::mixer::MixerHandle;
 use super::relay;
 use super::speaker_mixer::SpeakerMixerHandle;
-use super::{CONN_TYPE_LISTENER, CONN_TYPE_SPEAKER, SfuHub};
+use super::state::SfuHub;
+use super::{CONN_TYPE_LISTENER, CONN_TYPE_SPEAKER};
 use crate::audio::{
     AudioCapture, AudioPlayback, EchoCanceller, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME,
     TAG_NORMAL, read_audio_frame, write_audio_frame,

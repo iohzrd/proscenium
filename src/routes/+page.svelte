@@ -20,7 +20,7 @@
     useDeleteConfirm,
     useLightbox,
     usePullToRefresh,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
 
   let syncing = $state(false);
   let posts = $state<Post[]>([]);

@@ -2,21 +2,15 @@
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Avatar from "$lib/Avatar.svelte";
   import MessageComposer from "$lib/MessageComposer.svelte";
+  import ChatHeader from "$lib/messages/ChatHeader.svelte";
+  import MessageBubble from "$lib/messages/MessageBubble.svelte";
+  import TypingIndicator from "$lib/messages/TypingIndicator.svelte";
   import type { StoredMessage, Profile, MediaAttachment } from "$lib/types";
-  import {
-    shortId,
-    getDisplayName,
-    getCachedAvatarTicket,
-    isImage,
-    isVideo,
-    isAudio,
-    formatSize,
-  } from "$lib/utils";
+  import { getDisplayName, getCachedAvatarTicket } from "$lib/utils";
   import { createBlobCache } from "$lib/blobs";
   import { hapticNotification } from "$lib/haptics";
-  import { useNodeInit, useEventListeners } from "$lib/composables.svelte";
+  import { useNodeInit, useEventListeners } from "$lib/composables";
 
   let pubkey: string = $derived(page.params.pubkey ?? "");
   let peerName = $state("");
@@ -156,13 +150,6 @@
     retryingIds = new Set(retryingIds);
   }
 
-  function formatTime(ts: number): string {
-    return new Date(ts).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-
   function isSameDay(ts1: number, ts2: number): boolean {
     const d1 = new Date(ts1);
     const d2 = new Date(ts2);
@@ -283,18 +270,11 @@
   </div>
 {:else}
   <div class="chat-layout">
-    <div class="chat-header">
-      <a href="/messages" class="back-btn">&larr;</a>
-      <Avatar
-        {pubkey}
-        name={peerName}
-        ticket={peerProfile?.avatar_ticket ?? getCachedAvatarTicket(pubkey)}
-        size={32}
-      />
-      <div class="header-info">
-        <span class="header-name">{peerName}</span>
-      </div>
-    </div>
+    <ChatHeader
+      {pubkey}
+      {peerName}
+      avatarTicket={peerProfile?.avatar_ticket ?? getCachedAvatarTicket(pubkey)}
+    />
 
     <div
       class="messages-container"
@@ -313,93 +293,14 @@
             <span>{formatDate(msg.timestamp)}</span>
           </div>
         {/if}
-        <div
-          class="message-row"
-          class:sent={msg.from_pubkey === node.pubkey}
-          class:received={msg.from_pubkey !== node.pubkey}
-          class:failed-msg={msg.from_pubkey === node.pubkey &&
-            failedIds.has(msg.id)}
-        >
-          <div class="message-bubble">
-            {#if msg.media && msg.media.length > 0}
-              <div class="message-media">
-                {#each msg.media as att}
-                  {#if isImage(att.mime_type)}
-                    {#await blobs.getBlobUrl(att) then url}
-                      <img src={url} alt={att.filename} class="media-img" />
-                    {/await}
-                    <button
-                      class="dm-save-as-btn"
-                      onclick={() => blobs.saveFileAs(att)}>Save As</button
-                    >
-                  {:else if isVideo(att.mime_type)}
-                    {#await blobs.getBlobUrl(att) then url}
-                      <video
-                        src={url}
-                        controls
-                        class="media-video"
-                        preload="metadata"
-                      ></video>
-                    {/await}
-                    <button
-                      class="dm-save-as-btn"
-                      onclick={() => blobs.saveFileAs(att)}>Save As</button
-                    >
-                  {:else if isAudio(att.mime_type)}
-                    {#await blobs.getBlobUrl(att) then url}
-                      <div class="audio-attachment">
-                        <span class="audio-filename">{att.filename}</span>
-                        <audio src={url} controls preload="metadata"></audio>
-                        <button
-                          class="dm-save-as-btn"
-                          onclick={() => blobs.saveFileAs(att)}>Save As</button
-                        >
-                      </div>
-                    {/await}
-                  {:else}
-                    <button
-                      class="file-attachment"
-                      onclick={() => blobs.saveFileAs(att)}
-                    >
-                      <span class="file-icon">&#128196;</span>
-                      <span class="file-name">{att.filename}</span>
-                      <span class="file-size">{formatSize(att.size)}</span>
-                    </button>
-                  {/if}
-                {/each}
-              </div>
-            {/if}
-            {#if msg.content}
-              <p class="message-text">{msg.content}</p>
-            {/if}
-            <div class="message-meta">
-              <span class="message-time">{formatTime(msg.timestamp)}</span>
-              {#if msg.from_pubkey === node.pubkey}
-                {#if msg.read}
-                  <span class="delivery-status read" title="Read">Read</span>
-                {:else if msg.delivered}
-                  <span class="delivery-status delivered" title="Delivered"
-                    >Delivered</span
-                  >
-                {:else if failedIds.has(msg.id)}
-                  <button
-                    class="delivery-status failed"
-                    onclick={() => retryMessage(msg.id)}
-                    title="Tap to retry"
-                  >
-                    Failed -- Tap to retry
-                  </button>
-                {:else if retryingIds.has(msg.id)}
-                  <span class="delivery-status retrying">Retrying...</span>
-                {:else}
-                  <span class="delivery-status pending" title="Sending..."
-                    >Sending</span
-                  >
-                {/if}
-              {/if}
-            </div>
-          </div>
-        </div>
+        <MessageBubble
+          {msg}
+          isSent={msg.from_pubkey === node.pubkey}
+          isFailed={failedIds.has(msg.id)}
+          isRetrying={retryingIds.has(msg.id)}
+          {blobs}
+          onretry={retryMessage}
+        />
       {:else}
         <div class="empty-chat">
           <p>No messages yet. Say hello!</p>
@@ -407,14 +308,7 @@
       {/each}
 
       {#if peerTyping}
-        <div class="typing-indicator">
-          <span class="typing-name">{peerName}</span> is typing
-          <span class="typing-dots">
-            <span class="dot"></span>
-            <span class="dot"></span>
-            <span class="dot"></span>
-          </span>
-        </div>
+        <TypingIndicator {peerName} />
       {/if}
     </div>
 
@@ -432,38 +326,6 @@
     flex-direction: column;
     height: calc(100dvh - 60px - env(safe-area-inset-top, 0px));
     margin: -1rem -1rem calc(-2rem - env(safe-area-inset-bottom, 0px));
-  }
-
-  .chat-header {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.75rem 1rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-base);
-    flex-shrink: 0;
-  }
-
-  .back-btn {
-    color: var(--accent-medium);
-    text-decoration: none;
-    font-size: var(--text-icon-lg);
-    padding: 0.25rem;
-  }
-
-  .back-btn:hover {
-    color: var(--accent-light);
-  }
-
-  .header-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .header-name {
-    font-weight: 600;
-    font-size: var(--text-lg);
-    color: var(--text-primary);
   }
 
   .messages-container {
@@ -499,215 +361,6 @@
     border-radius: var(--radius-full);
   }
 
-  .message-row {
-    display: flex;
-  }
-
-  .message-row.sent {
-    justify-content: flex-end;
-  }
-
-  .message-row.received {
-    justify-content: flex-start;
-  }
-
-  .message-bubble {
-    max-width: 75%;
-    padding: 0.5rem 0.75rem;
-    border-radius: var(--radius-2xl);
-    word-break: break-word;
-  }
-
-  .sent .message-bubble {
-    background: var(--accent);
-    color: var(--text-on-accent);
-    border-bottom-right-radius: var(--radius-sm);
-  }
-
-  .received .message-bubble {
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-bottom-left-radius: var(--radius-sm);
-  }
-
-  .message-text {
-    margin: 0;
-    white-space: pre-wrap;
-    font-size: var(--text-base);
-    line-height: 1.4;
-  }
-
-  .message-media {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    margin-bottom: 0.3rem;
-  }
-
-  .media-img {
-    max-width: 100%;
-    max-height: 300px;
-    border-radius: var(--radius-lg);
-    object-fit: contain;
-    cursor: pointer;
-  }
-
-  .media-video {
-    max-width: 100%;
-    max-height: 300px;
-    border-radius: var(--radius-lg);
-  }
-
-  .audio-attachment {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3rem;
-    width: 100%;
-  }
-
-  .audio-filename {
-    color: var(--accent-light);
-    font-size: var(--text-sm);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .audio-attachment audio {
-    width: 100%;
-    height: 36px;
-    border-radius: var(--radius-sm);
-  }
-
-  .file-attachment {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-hover);
-    border-radius: var(--radius-md);
-    padding: 0.4rem 0.6rem;
-    color: var(--accent-light);
-    font-size: var(--text-base);
-    cursor: pointer;
-  }
-
-  .file-attachment:hover {
-    background: var(--bg-elevated-hover);
-  }
-
-  .file-icon {
-    font-size: var(--text-icon);
-  }
-
-  .file-name {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .file-size {
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    flex-shrink: 0;
-  }
-
-  .message-meta {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    margin-top: 0.2rem;
-    justify-content: flex-end;
-  }
-
-  .message-time {
-    font-size: var(--text-xs);
-    opacity: 0.6;
-  }
-
-  .delivery-status {
-    font-size: var(--text-xs);
-    opacity: 0.6;
-  }
-
-  .delivery-status.delivered {
-    color: var(--color-delivered);
-  }
-
-  .delivery-status.read {
-    color: var(--color-read);
-  }
-
-  .failed-msg .message-bubble {
-    border: 1px solid var(--danger-bg);
-  }
-
-  .delivery-status.failed {
-    background: none;
-    border: none;
-    color: var(--color-error-light);
-    font-size: var(--text-xs);
-    cursor: pointer;
-    padding: 0;
-    text-decoration: underline;
-    text-decoration-style: dotted;
-  }
-
-  .delivery-status.retrying {
-    color: var(--color-warning);
-  }
-
-  .typing-indicator {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-    padding: 0.3rem 0;
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    font-style: italic;
-  }
-
-  .typing-name {
-    color: var(--accent-medium);
-    font-style: normal;
-    font-weight: 600;
-  }
-
-  .typing-dots {
-    display: inline-flex;
-    gap: 2px;
-    margin-left: 2px;
-  }
-
-  .dot {
-    width: 4px;
-    height: 4px;
-    border-radius: 50%;
-    background: var(--text-secondary);
-    animation: bounce 1.2s infinite;
-  }
-
-  .dot:nth-child(2) {
-    animation-delay: 0.2s;
-  }
-
-  .dot:nth-child(3) {
-    animation-delay: 0.4s;
-  }
-
-  @keyframes bounce {
-    0%,
-    60%,
-    100% {
-      transform: translateY(0);
-    }
-    30% {
-      transform: translateY(-4px);
-    }
-  }
-
   .empty-chat {
     flex: 1;
     display: flex;
@@ -715,24 +368,5 @@
     justify-content: center;
     color: var(--text-tertiary);
     font-size: var(--text-base);
-  }
-
-  .dm-save-as-btn {
-    background: none;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
-    color: var(--text-secondary);
-    font-size: var(--text-xs, 0.7rem);
-    padding: 0.15rem 0.4rem;
-    cursor: pointer;
-    margin-top: 0.2rem;
-    transition:
-      border-color var(--transition-fast),
-      color var(--transition-fast);
-  }
-
-  .dm-save-as-btn:hover {
-    border-color: var(--accent-medium);
-    color: var(--accent-light);
   }
 </style>

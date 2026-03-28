@@ -12,7 +12,7 @@
     useEventListeners,
     useInfiniteScroll,
     useLightbox,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
 
   let postId: string = $derived(page.params.id ?? "");
   let post = $state<Post | null>(null);

@@ -11,6 +11,11 @@
     StageEvent,
   } from "$lib/types";
   import { shortId } from "$lib/utils";
+  import StageLanding from "$lib/stage/StageLanding.svelte";
+  import StageChat from "$lib/stage/StageChat.svelte";
+  import StageControlBar from "$lib/stage/StageControlBar.svelte";
+  import ParticipantPopover from "$lib/stage/ParticipantPopover.svelte";
+  import FloatingReactions from "$lib/stage/FloatingReactions.svelte";
 
   // --- state ---
 
@@ -33,7 +38,6 @@
   }
   let chatMessages = $state<ChatMessage[]>([]);
   let chatInput = $state("");
-  let chatEl = $state<HTMLDivElement | null>(null);
 
   // reactions
   interface FloatingReaction {
@@ -157,9 +161,6 @@
             text: ev.text,
           },
         ];
-        setTimeout(() => {
-          if (chatEl) chatEl.scrollTop = chatEl.scrollHeight;
-        }, 0);
         break;
       }
       case "ended":
@@ -310,13 +311,6 @@
     }
   }
 
-  function handleChatKey(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendChat();
-    }
-  }
-
   // --- lifecycle ---
 
   onMount(() => {
@@ -347,83 +341,28 @@
     };
   });
 
-  const QUICK_REACTIONS = ["👏", "❤️", "🔥", "😂", "💯", "🎉"];
+  const QUICK_REACTIONS = [
+    "\u{1F44F}",
+    "\u{2764}\u{FE0F}",
+    "\u{1F525}",
+    "\u{1F602}",
+    "\u{1F4AF}",
+    "\u{1F389}",
+  ];
 </script>
 
 <div class="stage-page">
   {#if !stage}
-    <!-- Landing -->
-    <div class="stage-landing">
-      <h1 class="stage-heading">
-        <Icon name="radio" size={28} />
-        Stage
-      </h1>
-      <p class="stage-subheading">Live audio rooms for your community</p>
-
-      {#if errorMsg}
-        <div class="stage-error">{errorMsg}</div>
-      {/if}
-
-      <div class="stage-cards">
-        <div class="stage-card">
-          <h2>Create a Stage</h2>
-          <input
-            class="stage-input"
-            type="text"
-            placeholder="Stage title"
-            bind:value={createTitle}
-            disabled={busy}
-            onkeydown={(e) => e.key === "Enter" && createStage()}
-          />
-          <button
-            class="btn-primary"
-            onclick={createStage}
-            disabled={busy || !createTitle.trim()}
-          >
-            {busy ? "Creating..." : "Create Stage"}
-          </button>
-        </div>
-
-        <div class="stage-divider">or</div>
-
-        <div class="stage-card">
-          <h2>Join a Stage</h2>
-          <input
-            class="stage-input"
-            type="text"
-            placeholder="Paste invite ticket"
-            bind:value={joinTicket}
-            disabled={busy}
-            onkeydown={(e) => e.key === "Enter" && joinStage()}
-          />
-          <button
-            class="btn-primary"
-            onclick={joinStage}
-            disabled={busy || !joinTicket.trim()}
-          >
-            {busy ? "Joining..." : "Join Stage"}
-          </button>
-        </div>
-      </div>
-
-      {#if createdTicket}
-        <div class="ticket-share">
-          <p class="ticket-label">Share this invite ticket:</p>
-          <div class="ticket-row">
-            <input
-              class="ticket-input"
-              type="text"
-              readonly
-              value={createdTicket}
-              onclick={(e) => (e.target as HTMLInputElement).select()}
-            />
-            <button class="btn-icon" onclick={copyTicket} title="Copy">
-              <Icon name="copy" size={16} />
-            </button>
-          </div>
-        </div>
-      {/if}
-    </div>
+    <StageLanding
+      bind:createTitle
+      bind:joinTicket
+      {createdTicket}
+      {errorMsg}
+      {busy}
+      oncreate={createStage}
+      onjoin={joinStage}
+      oncopyticket={copyTicket}
+    />
   {:else}
     <!-- Room view -->
     <div class="stage-room">
@@ -540,85 +479,22 @@
         </div>
 
         <!-- Chat panel -->
-        <div class="room-sidebar">
-          <div class="chat-messages" bind:this={chatEl}>
-            {#each chatMessages as msg}
-              <div class="chat-msg">
-                <span class="chat-author">{msg.name}</span>
-                <span class="chat-text">{msg.text}</span>
-              </div>
-            {/each}
-            {#if chatMessages.length === 0}
-              <div class="chat-empty">No messages yet</div>
-            {/if}
-          </div>
-          <div class="chat-input-row">
-            <input
-              class="chat-input"
-              type="text"
-              placeholder="Chat..."
-              bind:value={chatInput}
-              onkeydown={handleChatKey}
-            />
-            <button
-              class="btn-send"
-              onclick={sendChat}
-              disabled={!chatInput.trim()}
-            >
-              Send
-            </button>
-          </div>
-        </div>
+        <StageChat messages={chatMessages} bind:chatInput onsend={sendChat} />
       </div>
 
       <!-- Bottom controls -->
-      <div class="room-controls">
-        <div class="controls-left">
-          {#if isSpeaker}
-            <button
-              class="ctrl-btn"
-              class:ctrl-muted={selfMuted}
-              onclick={toggleMute}
-              title={selfMuted ? "Unmute" : "Mute"}
-            >
-              <Icon name={selfMuted ? "mic-off" : "mic"} size={18} />
-              <span>{selfMuted ? "Unmute" : "Mute"}</span>
-            </button>
-          {:else}
-            <button
-              class="ctrl-btn"
-              class:ctrl-active={handRaised}
-              onclick={toggleHand}
-              title={handRaised ? "Lower hand" : "Raise hand"}
-            >
-              <Icon name="hand" size={18} />
-              <span>{handRaised ? "Lower Hand" : "Raise Hand"}</span>
-            </button>
-          {/if}
-        </div>
-
-        <div class="reactions-bar">
-          {#each QUICK_REACTIONS as emoji}
-            <button class="reaction-btn" onclick={() => sendReaction(emoji)}
-              >{emoji}</button
-            >
-          {/each}
-        </div>
-
-        <div class="controls-right">
-          {#if isHost}
-            <button class="ctrl-btn ctrl-danger" onclick={endStage}>
-              <Icon name="log-out" size={18} />
-              <span>End Stage</span>
-            </button>
-          {:else}
-            <button class="ctrl-btn ctrl-danger" onclick={leaveStage}>
-              <Icon name="log-out" size={18} />
-              <span>Leave</span>
-            </button>
-          {/if}
-        </div>
-      </div>
+      <StageControlBar
+        {isSpeaker}
+        {isHost}
+        {selfMuted}
+        {handRaised}
+        quickReactions={QUICK_REACTIONS}
+        ontoggleMute={toggleMute}
+        ontoggleHand={toggleHand}
+        onsendReaction={sendReaction}
+        onleave={leaveStage}
+        onend={endStage}
+      />
     </div>
 
     <!-- Participant action popover -->
@@ -627,52 +503,17 @@
         (p) => p.pubkey === selectedParticipant,
       )}
       {#if target && target.pubkey !== stage.my_pubkey}
-        <button
-          class="popover-backdrop"
-          onclick={() => (selectedParticipant = null)}
-          aria-label="Close"
-        ></button>
-        <div class="participant-popover">
-          <div class="popover-header">
-            <Avatar
-              pubkey={target.pubkey}
-              name={displayName(target)}
-              size={40}
-            />
-            <span class="popover-name">{displayName(target)}</span>
-          </div>
-          <div class="popover-actions">
-            {#if target.role === "Listener"}
-              <button
-                class="popover-btn"
-                onclick={() => promoteSpeaker(target.pubkey)}
-              >
-                Promote to Speaker
-              </button>
-            {:else if target.role === "Speaker"}
-              <button
-                class="popover-btn"
-                onclick={() => demoteSpeaker(target.pubkey)}
-              >
-                Demote to Listener
-              </button>
-            {/if}
-          </div>
-          <button
-            class="popover-close"
-            onclick={() => (selectedParticipant = null)}
-            aria-label="Close"
-          >
-            <Icon name="x" size={16} />
-          </button>
-        </div>
+        <ParticipantPopover
+          {target}
+          onpromote={promoteSpeaker}
+          ondemote={demoteSpeaker}
+          onclose={() => (selectedParticipant = null)}
+        />
       {/if}
     {/if}
 
     <!-- Floating reactions -->
-    {#each reactions as r (r.id)}
-      <span class="floating-reaction" style="left:{r.x}%">{r.emoji}</span>
-    {/each}
+    <FloatingReactions {reactions} />
   {/if}
 </div>
 
@@ -681,169 +522,6 @@
     min-height: 80vh;
     display: flex;
     flex-direction: column;
-  }
-
-  /* Landing */
-
-  .stage-landing {
-    max-width: 640px;
-    margin: 2rem auto;
-    display: flex;
-    flex-direction: column;
-    gap: 1.5rem;
-  }
-
-  .stage-heading {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: var(--text-2xl);
-    font-weight: 700;
-    color: var(--text-primary);
-    margin: 0;
-  }
-
-  .stage-subheading {
-    color: var(--text-muted);
-    margin: 0;
-  }
-
-  .stage-error {
-    background: var(--danger-bg);
-    border: 1px solid var(--danger-border);
-    color: var(--danger-text);
-    padding: 0.75rem 1rem;
-    border-radius: var(--radius-md);
-    font-size: var(--text-sm);
-  }
-
-  .stage-cards {
-    display: flex;
-    gap: 1rem;
-    align-items: flex-start;
-    flex-wrap: wrap;
-  }
-
-  .stage-card {
-    flex: 1;
-    min-width: 220px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    padding: 1.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .stage-card h2 {
-    margin: 0;
-    font-size: var(--text-lg);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .stage-divider {
-    align-self: center;
-    color: var(--text-muted);
-    font-size: var(--text-sm);
-    padding: 0 0.5rem;
-  }
-
-  .stage-input {
-    width: 100%;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    color: var(--text-primary);
-    font-size: var(--text-base);
-    padding: 0.6rem 0.75rem;
-    box-sizing: border-box;
-  }
-
-  .stage-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-
-  .btn-primary {
-    background: var(--accent);
-    color: var(--text-on-accent);
-    border: none;
-    border-radius: var(--radius-md);
-    padding: 0.65rem 1.25rem;
-    font-size: var(--text-base);
-    font-weight: 600;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-    width: 100%;
-  }
-
-  .btn-primary:hover:not(:disabled) {
-    background: var(--accent-dark);
-  }
-
-  .btn-primary:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  .ticket-share {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    padding: 1rem 1.25rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .ticket-label {
-    margin: 0;
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-    font-weight: 500;
-  }
-
-  .ticket-row {
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-  }
-
-  .ticket-input {
-    flex: 1;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    padding: 0.5rem 0.75rem;
-    font-family: monospace;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    cursor: text;
-  }
-
-  .ticket-input:focus {
-    outline: none;
-  }
-
-  .btn-icon {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 0.5rem;
-    cursor: pointer;
-    color: var(--text-secondary);
-    display: flex;
-    align-items: center;
-    transition: background var(--transition-fast);
-    flex-shrink: 0;
-  }
-
-  .btn-icon:hover {
-    background: var(--bg-elevated-hover);
   }
 
   /* Room */
@@ -1160,309 +838,13 @@
     align-items: center;
   }
 
-  /* Chat */
-
-  .room-sidebar {
-    width: 280px;
-    flex-shrink: 0;
-    display: flex;
-    flex-direction: column;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-2xl);
-    overflow: hidden;
-  }
-
-  .chat-messages {
-    flex: 1;
-    overflow-y: auto;
-    padding: 0.85rem 0.85rem 0.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .chat-empty {
-    color: var(--text-muted);
-    font-size: var(--text-xs);
-    text-align: center;
-    padding: 1.5rem 1rem;
-  }
-
-  .chat-msg {
-    font-size: var(--text-sm);
-    word-break: break-word;
-    line-height: 1.4;
-  }
-
-  .chat-author {
-    font-weight: 700;
-    color: var(--accent-medium);
-    margin-right: 0.3rem;
-  }
-
-  .chat-text {
-    color: var(--text-secondary);
-  }
-
-  .chat-input-row {
-    display: flex;
-    gap: 0.4rem;
-    padding: 0.6rem;
-    border-top: 1px solid var(--border);
-  }
-
-  .chat-input {
-    flex: 1;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--text-primary);
-    font-size: var(--text-sm);
-    padding: 0.4rem 0.75rem;
-  }
-
-  .chat-input:focus {
-    outline: none;
-    border-color: var(--accent);
-  }
-
-  .btn-send {
-    background: var(--accent);
-    color: var(--text-on-accent);
-    border: none;
-    border-radius: var(--radius-full);
-    padding: 0.4rem 0.9rem;
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    transition: background var(--transition-fast);
-    flex-shrink: 0;
-  }
-
-  .btn-send:disabled {
-    opacity: 0.35;
-    cursor: default;
-  }
-
-  .btn-send:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  /* Controls bar */
-
-  .room-controls {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.85rem 0 0;
-    border-top: 1px solid var(--border);
-    margin-top: 0.75rem;
-    flex-shrink: 0;
-    gap: 1rem;
-  }
-
-  .controls-left,
-  .controls-right {
-    flex: 0 0 auto;
-  }
-
-  .reactions-bar {
-    display: flex;
-    gap: 0.3rem;
-    justify-content: center;
-  }
-
-  .reaction-btn {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    padding: 0.35rem 0.55rem;
-    font-size: 1.1rem;
-    cursor: pointer;
-    transition:
-      background var(--transition-fast),
-      transform var(--transition-fast);
-    line-height: 1;
-  }
-
-  .reaction-btn:hover {
-    background: var(--bg-elevated);
-    transform: scale(1.2);
-  }
-
-  .ctrl-btn {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.5rem 1.1rem;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-full);
-    color: var(--text-primary);
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    transition:
-      background var(--transition-fast),
-      border-color var(--transition-fast);
-    white-space: nowrap;
-  }
-
-  .ctrl-btn:hover {
-    background: var(--bg-elevated-hover);
-  }
-
-  .ctrl-btn.ctrl-muted {
-    background: var(--color-warning-bg);
-    color: var(--color-warning);
-    border-color: var(--color-warning-border);
-  }
-
-  .ctrl-btn.ctrl-active {
-    background: var(--accent-light-hover-bg);
-    color: var(--accent-light);
-    border-color: var(--accent-light-faint);
-  }
-
-  .ctrl-btn.ctrl-danger {
-    background: var(--color-error-bg-subtle);
-    color: var(--color-error-light);
-    border-color: var(--color-error-light-border);
-  }
-
-  .ctrl-btn.ctrl-danger:hover {
-    background: var(--color-error-bg-hover);
-  }
-
-  /* Popover */
-
-  .popover-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 100;
-    background: transparent;
-    border: none;
-    padding: 0;
-    cursor: default;
-  }
-
-  .participant-popover {
-    position: fixed;
-    bottom: 5rem;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 101;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
-    padding: 1rem 1.25rem;
-    box-shadow: var(--shadow-md);
-    min-width: 220px;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .popover-header {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-
-  .popover-name {
-    font-weight: 600;
-    color: var(--text-primary);
-    font-size: var(--text-base);
-  }
-
-  .popover-actions {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-  }
-
-  .popover-btn {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 0.5rem 0.75rem;
-    font-size: var(--text-sm);
-    font-weight: 600;
-    cursor: pointer;
-    text-align: left;
-    color: var(--text-primary);
-    transition: background var(--transition-fast);
-  }
-
-  .popover-btn:hover {
-    background: var(--bg-elevated-hover);
-  }
-
-  .popover-close {
-    position: absolute;
-    top: 0.5rem;
-    right: 0.5rem;
-    background: none;
-    border: none;
-    cursor: pointer;
-    color: var(--text-muted);
-    padding: 0.25rem;
-    display: flex;
-    align-items: center;
-  }
-
-  /* Floating reactions */
-
-  .floating-reaction {
-    position: fixed;
-    bottom: 6rem;
-    font-size: 2rem;
-    pointer-events: none;
-    animation: float-up 2s ease-out forwards;
-    z-index: 200;
-  }
-
-  @keyframes float-up {
-    0% {
-      transform: translateY(0);
-      opacity: 1;
-    }
-    100% {
-      transform: translateY(-120px);
-      opacity: 0;
-    }
-  }
-
   @media (max-width: 640px) {
-    .room-sidebar {
-      display: none;
-    }
-
     .stage-room {
       height: calc(100vh - var(--bottom-nav-height) - 2rem);
     }
 
-    .stage-cards {
-      flex-direction: column;
-    }
-
-    .stage-divider {
-      align-self: stretch;
-      text-align: center;
-    }
-
     .speaker-card {
       width: 100px;
-    }
-
-    .reactions-bar {
-      gap: 0.2rem;
-    }
-
-    .reaction-btn {
-      padding: 0.3rem 0.4rem;
-      font-size: 1rem;
     }
   }
 </style>

@@ -10,7 +10,7 @@
     useNodeInit,
     useEventListeners,
     useCopyFeedback,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
 
   let follows = $state<SocialGraphEntry[]>([]);
   let followers = $state<SocialGraphEntry[]>([]);

@@ -13,7 +13,7 @@
     useEventListeners,
     useInfiniteScroll,
     useLightbox,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
 
   let notifications = $state<AppNotification[]>([]);
   let sentinel = $state<HTMLDivElement>(null!);

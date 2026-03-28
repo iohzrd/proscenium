@@ -1,52 +1,44 @@
+mod broadcast;
 mod handlers;
+mod health;
+mod own_feed;
+mod subscriptions;
 
 #[cfg(target_os = "android")]
 use crate::constants::ANDROID_NET_INTERVAL;
-use crate::constants::{GOSSIP_HEARTBEAT_INTERVAL, HEALTH_TICK_INTERVAL, WAKE_THRESHOLD};
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
-use bytes::Bytes;
-use futures_lite::StreamExt;
-use iroh::{Endpoint, EndpointId};
-use iroh_gossip::{
-    Gossip,
-    api::{Event, GossipSender},
-};
-use proscenium_types::{
-    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, PushMessage,
-    SigningKeyRotation, StageTicket, Visibility, now_millis, short_id, user_feed_topic,
-};
+use iroh::Endpoint;
+use iroh_gossip::{Gossip, api::GossipSender};
+use proscenium_types::{Profile, PushMessage, Visibility, short_id};
 use std::collections::HashMap;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
-use tauri::{AppHandle, Emitter};
+use std::sync::{Arc, atomic::AtomicBool};
+use tauri::AppHandle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-struct GossipInner {
-    my_sender: Option<GossipSender>,
-    own_feed_handle: Option<JoinHandle<()>>,
+pub(crate) struct GossipInner {
+    pub(crate) my_sender: Option<GossipSender>,
+    pub(crate) own_feed_handle: Option<JoinHandle<()>>,
     /// Maps peer master pubkey to (task_handle, has_neighbor_flag).
-    subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
+    pub(crate) subscriptions: HashMap<String, (JoinHandle<()>, Arc<AtomicBool>)>,
     /// Receiver for reconnect signals -- moved out by start_background.
-    reconnect_rx: Option<mpsc::UnboundedReceiver<String>>,
+    pub(crate) reconnect_rx: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 /// Cloneable gossip service -- direct async methods, no command channel.
 #[derive(Clone)]
 pub struct GossipService {
-    gossip: Gossip,
-    endpoint: Endpoint,
-    identity: SharedIdentity,
-    storage: Arc<Storage>,
-    app_handle: AppHandle,
-    inner: Arc<tokio::sync::Mutex<GossipInner>>,
+    pub(crate) gossip: Gossip,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) identity: SharedIdentity,
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) app_handle: AppHandle,
+    pub(crate) inner: Arc<tokio::sync::Mutex<GossipInner>>,
     /// Sender for reconnect signals -- cloned into each subscription task.
-    reconnect_tx: mpsc::UnboundedSender<String>,
+    pub(crate) reconnect_tx: mpsc::UnboundedSender<String>,
 }
 
 impl GossipService {
@@ -148,85 +140,7 @@ impl GossipService {
         }
     }
 
-    async fn reconnect_loop(
-        &self,
-        mut rx: mpsc::UnboundedReceiver<String>,
-        token: CancellationToken,
-    ) {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                Some(pubkey) = rx.recv() => {
-                    // Brief backoff before reconnecting.
-                    tokio::select! {
-                        _ = token.cancelled() => break,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                    }
-                    let node_ids = self
-                        .storage
-                        .get_peer_transport_node_ids(&pubkey)
-                        .await
-                        .unwrap_or_default();
-                    if node_ids.is_empty() {
-                        log::warn!(
-                            "[gossip-reconnect] no NodeIds for {}, skipping",
-                            short_id(&pubkey)
-                        );
-                        continue;
-                    }
-                    log::info!("[gossip-reconnect] reconnecting to {}", short_id(&pubkey));
-                    if let Err(e) = self.follow_user(pubkey.clone(), node_ids).await {
-                        log::error!(
-                            "[gossip-reconnect] failed to reconnect to {}: {e}",
-                            short_id(&pubkey)
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    async fn network_health_task(&self, token: CancellationToken) {
-        let mut last_tick = std::time::Instant::now();
-        let mut last_heartbeat = std::time::Instant::now();
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => break,
-                _ = tokio::time::sleep(HEALTH_TICK_INTERVAL) => {}
-            }
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(last_tick);
-            last_tick = now;
-
-            if elapsed > WAKE_THRESHOLD {
-                log::info!(
-                    "[wake] sleep/wake detected ({:.0}s elapsed), refreshing network",
-                    elapsed.as_secs_f64()
-                );
-                self.endpoint.network_change().await;
-                self.refresh_all().await;
-            }
-
-            if last_heartbeat.elapsed() >= GOSSIP_HEARTBEAT_INTERVAL {
-                last_heartbeat = std::time::Instant::now();
-                if let Err(e) = self.broadcast_heartbeat().await {
-                    log::error!("[heartbeat] broadcast failed: {e}");
-                }
-            }
-        }
-    }
-
-    /// Re-queue reconnect for all subscriptions whose tasks have exited.
-    pub async fn refresh_all(&self) {
-        let inner = self.inner.lock().await;
-        for (pubkey, (handle, _)) in &inner.subscriptions {
-            if handle.is_finished() {
-                let _ = self.reconnect_tx.send(pubkey.clone());
-            }
-        }
-    }
-
-    async fn my_visibility(&self) -> Visibility {
+    pub(crate) async fn my_visibility(&self) -> Visibility {
         self.storage
             .get_visibility(&self.identity.read().await.master_pubkey)
             .await
@@ -264,7 +178,7 @@ impl GossipService {
 
     /// Fire-and-forget: attempt direct push to all visibility-appropriate recipients.
     /// If a recipient is offline the message is dropped -- sync is the reliable fallback.
-    async fn attempt_push(&self, msg: PushMessage) {
+    pub(crate) async fn attempt_push(&self, msg: PushMessage) {
         let recipients = self.push_recipients().await;
         if recipients.is_empty() {
             return;
@@ -327,415 +241,5 @@ impl GossipService {
         }
 
         Ok(())
-    }
-
-    pub async fn stop_own_feed(&self) {
-        let mut inner = self.inner.lock().await;
-        if let Some(handle) = inner.own_feed_handle.take() {
-            handle.abort();
-            inner.my_sender = None;
-            log::info!("[gossip] stopped own feed topic");
-        }
-    }
-
-    async fn start_own_feed_unconditional(&self) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-        if inner
-            .own_feed_handle
-            .as_ref()
-            .is_some_and(|h| !h.is_finished())
-        {
-            return Ok(());
-        }
-
-        let my_id = self.identity.read().await.master_pubkey.clone();
-        let topic = user_feed_topic(&my_id);
-        log::info!("[gossip] starting own feed topic for {}", short_id(&my_id));
-
-        let topic_handle = self.gossip.subscribe(topic, vec![]).await?;
-        let (sender, receiver) = topic_handle.split();
-        inner.my_sender = Some(sender);
-
-        let storage = self.storage.clone();
-        let endpoint = self.endpoint.clone();
-        let app_handle = self.app_handle.clone();
-        let handle = tokio::spawn(async move {
-            log::info!("[gossip-own] listener started for own feed neighbors");
-            let mut receiver = receiver;
-            loop {
-                match receiver.try_next().await {
-                    Ok(Some(event)) => match &event {
-                        Event::NeighborUp(endpoint_id) => {
-                            let transport_id = endpoint_id.to_string();
-                            log::info!(
-                                "[gossip-own] new follower transport: {}",
-                                short_id(&transport_id)
-                            );
-
-                            let pubkey =
-                                match crate::peer::query_identity(&endpoint, *endpoint_id).await {
-                                    Ok(identity) => {
-                                        let master = identity.master_pubkey.clone();
-                                        let _ = storage.cache_peer_identity(&identity).await;
-                                        if let Some(profile) = &identity.profile {
-                                            let _ = storage.save_profile(&master, profile).await;
-                                        }
-                                        log::info!(
-                                            "[gossip-own] resolved follower {} -> master={}",
-                                            short_id(&transport_id),
-                                            short_id(&master),
-                                        );
-                                        master
-                                    }
-                                    Err(e) => {
-                                        log::warn!(
-                                            "[gossip-own] failed to resolve identity for {}: {e}",
-                                            short_id(&transport_id),
-                                        );
-                                        transport_id.clone()
-                                    }
-                                };
-
-                            let now = now_millis();
-                            match storage.upsert_follower(&my_id, &pubkey, now).await {
-                                Ok(is_new) => {
-                                    let _ = app_handle.emit("follower-changed", &pubkey);
-                                    if is_new {
-                                        let _ = storage
-                                            .insert_notification(
-                                                "follower", &pubkey, None, None, now,
-                                            )
-                                            .await;
-                                        let _ = app_handle.emit("new-follower", &pubkey);
-                                        let _ = app_handle.emit("notification-received", ());
-                                    }
-                                }
-                                Err(e) => {
-                                    log::error!("[gossip-own] failed to store follower: {e}");
-                                }
-                            }
-
-                            if storage.is_following(&my_id, &pubkey).await.unwrap_or(false) {
-                                log::info!(
-                                    "[gossip-own] followed peer {} came online",
-                                    short_id(&pubkey),
-                                );
-                            }
-                        }
-                        Event::NeighborDown(endpoint_id) => {
-                            let transport_id = endpoint_id.to_string();
-                            log::info!("[gossip-own] follower left: {}", short_id(&transport_id));
-
-                            let pubkey = storage
-                                .get_master_pubkey_for_transport(&transport_id)
-                                .await
-                                .unwrap_or(transport_id);
-
-                            if let Err(e) = storage.set_follower_offline(&my_id, &pubkey).await {
-                                log::error!("[gossip-own] failed to update follower: {e}");
-                            }
-                            let _ = app_handle.emit("follower-changed", &pubkey);
-                        }
-                        _ => {}
-                    },
-                    Ok(None) => {
-                        log::warn!("[gossip-own] own feed stream ended");
-                        break;
-                    }
-                    Err(e) => {
-                        log::error!("[gossip-own] own feed receiver error: {e}");
-                        break;
-                    }
-                }
-            }
-            log::warn!("[gossip-own] own feed stream ended");
-        });
-
-        inner.own_feed_handle = Some(handle);
-        Ok(())
-    }
-
-    pub async fn start_own_feed(&self) -> Result<(), AppError> {
-        let visibility = self.my_visibility().await;
-        if visibility != Visibility::Public {
-            log::info!("[gossip] skipping own feed topic (visibility={visibility})");
-            return Ok(());
-        }
-        self.start_own_feed_unconditional().await
-    }
-
-    /// Serialize and broadcast a gossip message if we have an active sender.
-    /// Returns `true` if the message was broadcast, `false` if no sender is active.
-    async fn broadcast_msg(&self, msg: &GossipMessage, label: &str) -> Result<bool, AppError> {
-        let sender = self.inner.lock().await.my_sender.clone();
-        if let Some(sender) = sender {
-            let payload = serde_json::to_vec(msg)?;
-            sender.broadcast(Bytes::from(payload)).await?;
-            log::info!("[gossip] broadcast {label}");
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub async fn broadcast_heartbeat(&self) -> Result<(), AppError> {
-        self.broadcast_msg(&GossipMessage::Heartbeat, "heartbeat")
-            .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_profile(&self, profile: &Profile) -> Result<(), AppError> {
-        let msg = GossipMessage::ProfileUpdate(profile.clone());
-        if !self
-            .broadcast_msg(&msg, &format!("profile: {}", profile.display_name))
-            .await?
-        {
-            let my_id = self.identity.read().await.master_pubkey.clone();
-            self.attempt_push(PushMessage {
-                author: my_id,
-                posts: vec![],
-                interactions: vec![],
-                profile: Some(profile.clone()),
-            })
-            .await;
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_post(&self, post: &Post) -> Result<(), AppError> {
-        let msg = GossipMessage::NewPost(post.clone());
-        if !self
-            .broadcast_msg(&msg, &format!("post {}", &post.id))
-            .await?
-        {
-            let my_id = self.identity.read().await.master_pubkey.clone();
-            self.attempt_push(PushMessage {
-                author: my_id,
-                posts: vec![post.clone()],
-                interactions: vec![],
-                profile: None,
-            })
-            .await;
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_delete(
-        &self,
-        id: &str,
-        author: &str,
-        signature: &str,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::DeletePost {
-            id: id.to_string(),
-            author: author.to_string(),
-            signature: signature.to_string(),
-        };
-        if !self.broadcast_msg(&msg, &format!("delete {id}")).await? {
-            log::debug!("[gossip] delete post {id}: no gossip sender, peers will sync");
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_interaction(&self, interaction: &Interaction) -> Result<(), AppError> {
-        let msg = GossipMessage::NewInteraction(interaction.clone());
-        let label = format!(
-            "{:?} on post {}",
-            interaction.kind, &interaction.target_post_id
-        );
-        if !self.broadcast_msg(&msg, &label).await? {
-            let my_id = self.identity.read().await.master_pubkey.clone();
-            self.attempt_push(PushMessage {
-                author: my_id,
-                posts: vec![],
-                interactions: vec![interaction.clone()],
-                profile: None,
-            })
-            .await;
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_delete_interaction(
-        &self,
-        id: &str,
-        author: &str,
-        signature: &str,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::DeleteInteraction {
-            id: id.to_string(),
-            author: author.to_string(),
-            signature: signature.to_string(),
-        };
-        if !self
-            .broadcast_msg(&msg, &format!("delete interaction {id}"))
-            .await?
-        {
-            log::debug!("[gossip] delete interaction {id}: no gossip sender, peers will sync");
-        }
-        Ok(())
-    }
-
-    pub async fn broadcast_linked_devices(
-        &self,
-        announcement: &LinkedDevicesAnnouncement,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::LinkedDevices(announcement.clone());
-        self.broadcast_msg(
-            &msg,
-            &format!("device announcement v{}", announcement.version),
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub async fn broadcast_signing_key_rotation(
-        &self,
-        rotation: &SigningKeyRotation,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::SigningKeyRotation(rotation.clone());
-        self.broadcast_msg(
-            &msg,
-            &format!("signing key rotation to index {}", rotation.new_key_index),
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Announce a new Stage room on the host's own user-feed gossip topic so followers discover it.
-    pub async fn broadcast_stage_announcement(
-        &self,
-        stage_id: String,
-        title: String,
-        ticket: StageTicket,
-        host_pubkey: String,
-        started_at: u64,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::StageAnnouncement {
-            stage_id,
-            title,
-            ticket,
-            host_pubkey,
-            started_at,
-        };
-        self.broadcast_msg(&msg, "stage announcement").await?;
-        Ok(())
-    }
-
-    /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic.
-    pub async fn broadcast_stage_ended(&self, stage_id: String) -> Result<(), AppError> {
-        let msg = GossipMessage::StageEnded { stage_id };
-        self.broadcast_msg(&msg, "stage ended").await?;
-        Ok(())
-    }
-
-    /// Subscribe to a user's gossip feed topic.
-    /// `pubkey` is the master pubkey (permanent identity).
-    /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
-    pub async fn follow_user(
-        &self,
-        pubkey: String,
-        transport_node_ids: Vec<String>,
-    ) -> Result<(), AppError> {
-        let mut inner = self.inner.lock().await;
-
-        // Skip if already subscribed with a live task; clean up finished handles.
-        if let Some((handle, _)) = inner.subscriptions.get(&pubkey) {
-            if !handle.is_finished() {
-                log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
-                return Ok(());
-            }
-            inner.subscriptions.remove(&pubkey);
-        }
-
-        let topic = user_feed_topic(&pubkey);
-        let bootstrap: Vec<EndpointId> = transport_node_ids
-            .iter()
-            .filter_map(|id| id.parse().ok())
-            .collect();
-
-        if bootstrap.is_empty() {
-            return Err(AppError::Other(format!(
-                "no valid transport NodeIds for gossip bootstrap of {}",
-                short_id(&pubkey)
-            )));
-        }
-
-        log::info!(
-            "[gossip] subscribing to {} with {} bootstrap nodes",
-            short_id(&pubkey),
-            bootstrap.len(),
-        );
-        let topic_handle = self.gossip.subscribe(topic, bootstrap).await?;
-        let (sender, receiver) = topic_handle.split();
-        log::info!("[gossip] subscribed to {}", short_id(&pubkey));
-
-        let storage = self.storage.clone();
-        let pk = pubkey.clone();
-        let my_id = self.identity.read().await.master_pubkey.clone();
-        let app_handle = self.app_handle.clone();
-        let has_neighbor = Arc::new(AtomicBool::new(false));
-        let has_neighbor_task = has_neighbor.clone();
-        let reconnect_tx = self.reconnect_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            log::info!("[gossip-rx] listener started for {}", short_id(&pk));
-            let _sender_hold = sender;
-            let mut receiver = receiver;
-            loop {
-                match receiver.try_next().await {
-                    Ok(Some(event)) => match &event {
-                        Event::Received(msg) => {
-                            Self::handle_follow_message(
-                                &storage,
-                                &pk,
-                                &my_id,
-                                &app_handle,
-                                &msg.content,
-                            )
-                            .await;
-                        }
-                        Event::NeighborUp(_) => {
-                            has_neighbor_task.store(true, Ordering::Relaxed);
-                            log::info!("[gossip-rx] neighbor up for {}", short_id(&pk));
-                        }
-                        Event::NeighborDown(_) => {
-                            log::info!("[gossip-rx] neighbor down for {}", short_id(&pk));
-                        }
-                        other => {
-                            log::info!("[gossip-rx] event from {}: {other:?}", short_id(&pk));
-                        }
-                    },
-                    Ok(None) => {
-                        log::warn!("[gossip-rx] stream ended for {}", short_id(&pk));
-                        break;
-                    }
-                    Err(e) => {
-                        log::error!("[gossip-rx] receiver error for {}: {e}", short_id(&pk));
-                        break;
-                    }
-                }
-            }
-            log::warn!(
-                "[gossip-rx] stream for {} ended, requesting reconnect",
-                short_id(&pk)
-            );
-            let _ = reconnect_tx.send(pk);
-        });
-
-        inner.subscriptions.insert(pubkey, (handle, has_neighbor));
-        Ok(())
-    }
-
-    pub async fn unfollow_user(&self, pubkey: &str) {
-        let mut inner = self.inner.lock().await;
-        if let Some((handle, _)) = inner.subscriptions.remove(pubkey) {
-            log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
-            handle.abort();
-        }
-    }
-
-    pub async fn get_subscription_count(&self) -> usize {
-        self.inner.lock().await.subscriptions.len()
     }
 }

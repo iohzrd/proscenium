@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete, autogrow } from "$lib/composables.svelte";
+  import { useMentionAutocomplete, autogrow } from "$lib/composables";
 
   let {
     replyToId,

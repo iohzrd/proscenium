@@ -2,7 +2,7 @@
   import { platform } from "@tauri-apps/plugin-os";
   import type { PendingAttachment, MediaAttachment } from "$lib/types";
   import { isImage, uploadFiles } from "$lib/utils";
-  import { autogrow } from "$lib/composables.svelte";
+  import { autogrow } from "$lib/composables";
 
   let {
     onsubmit,

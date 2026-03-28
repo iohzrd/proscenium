@@ -4,10 +4,14 @@
   import { onMount } from "svelte";
   import Lightbox from "$lib/Lightbox.svelte";
   import QrModal from "$lib/QrModal.svelte";
-  import Avatar from "$lib/Avatar.svelte";
   import PostFeed from "$lib/PostFeed.svelte";
   import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import ProfileEditor from "$lib/ProfileEditor.svelte";
+  import ProfileHeaderCard from "$lib/profile/ProfileHeaderCard.svelte";
+  import ProfileIdSection from "$lib/profile/ProfileIdSection.svelte";
+  import ProfileActions from "$lib/profile/ProfileActions.svelte";
+  import SocialGraphAccordion from "$lib/profile/SocialGraphAccordion.svelte";
+  import MediaFilterBar from "$lib/profile/MediaFilterBar.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import type {
     Post,
@@ -27,7 +31,7 @@
     useInfiniteScroll,
     useDeleteConfirm,
     useLightbox,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
 
   let pubkey: string = $derived(page.params.pubkey ?? "");
   let profile = $state<Profile | null>(null);
@@ -49,17 +53,6 @@
   let transportNodeIds = $state<string[]>([]);
   let remoteFollows = $state<RemoteSocialResult | null>(null);
   let remoteFollowers = $state<RemoteFollowersResult | null>(null);
-  let showFollowsList = $state(false);
-  let showFollowersList = $state(false);
-
-  const FILTERS = [
-    { value: "all", label: "All" },
-    { value: "images", label: "Images" },
-    { value: "videos", label: "Videos" },
-    { value: "audio", label: "Audio" },
-    { value: "files", label: "Files" },
-    { value: "text", label: "Text" },
-  ] as const;
 
   const blobs = createBlobCache();
   setBlobContext(blobs);
@@ -365,186 +358,47 @@
       oncancel={() => (editingProfile = false)}
     />
   {:else}
-    <div class="profile-header">
-      <Avatar
-        {pubkey}
-        name={displayName}
-        {isSelf}
-        ticket={profile?.avatar_ticket}
-        size={56}
-      />
-      <div class="profile-info">
-        <h2>{displayName}</h2>
-        {#if profile?.visibility && profile.visibility !== "public"}
-          <span class="visibility-badge"
-            >{profile.visibility === "private" ? "Private" : "Listed"}</span
-          >
-        {/if}
-        {#if profile?.bio}
-          <p class="bio">{profile.bio}</p>
-        {/if}
-      </div>
-      {#if isSelf}
-        <button
-          class="btn-elevated edit-btn"
-          onclick={() => (editingProfile = true)}>Edit</button
-        >
-      {/if}
-    </div>
+    <ProfileHeaderCard
+      {pubkey}
+      {displayName}
+      {profile}
+      {isSelf}
+      onEdit={() => (editingProfile = true)}
+    />
   {/if}
 
-  <div class="id-section">
-    <div class="id-row">
-      <span class="id-label">Public Key</span>
-      <code>{pubkey}</code>
-      <button
-        class="btn-elevated copy-btn"
-        onclick={() => copyFb.copy(pubkey, "pubkey")}
-      >
-        {copyFb.feedback === "pubkey" ? "Copied!" : "Copy"}
-      </button>
-      <button class="btn-elevated copy-btn" onclick={() => (showQr = true)}
-        >QR</button
-      >
-    </div>
-    {#each transportNodeIds as nid, i}
-      <div class="id-row">
-        <span class="id-label"
-          >Node ID{transportNodeIds.length > 1 ? ` ${i + 1}` : ""}</span
-        >
-        <code>{nid}</code>
-        <button
-          class="btn-elevated copy-btn"
-          onclick={() => copyFb.copy(nid, `transport-${i}`)}
-        >
-          {copyFb.feedback === `transport-${i}` ? "Copied!" : "Copy"}
-        </button>
-      </div>
-    {/each}
-  </div>
+  <ProfileIdSection
+    {pubkey}
+    {transportNodeIds}
+    copyFeedback={copyFb.feedback}
+    onCopy={copyFb.copy}
+    onShowQr={() => (showQr = true)}
+  />
 
   {#if !isSelf}
-    <div class="action-row">
-      <button
-        class="follow-toggle"
-        class:following={isFollowing}
-        onclick={toggleFollow}
-        disabled={toggling || isBlocked}
-      >
-        {#if toggling}<span class="btn-spinner"></span>{:else}{isFollowing
-            ? "Unfollow"
-            : "Follow"}{/if}
-      </button>
-      <a href="/messages/{pubkey}" class="message-btn">Message</a>
-      <button class="call-btn" onclick={startCall} disabled={isBlocked}>
-        Call
-      </button>
-    </div>
-    <div class="moderation-row">
-      <button
-        class="mod-btn mute"
-        class:active={isMuted}
-        onclick={toggleMute}
-        disabled={togglingMute}
-      >
-        {#if togglingMute}<span class="btn-spinner"></span>{:else}{isMuted
-            ? "Unmute"
-            : "Mute"}{/if}
-      </button>
-      <button
-        class="mod-btn block"
-        class:active={isBlocked}
-        onclick={toggleBlock}
-        disabled={togglingBlock}
-      >
-        {#if togglingBlock}<span class="btn-spinner"></span>{:else}{isBlocked
-            ? "Unblock"
-            : "Block"}{/if}
-      </button>
-    </div>
+    <ProfileActions
+      {pubkey}
+      {isFollowing}
+      {toggling}
+      {isBlocked}
+      {isMuted}
+      {togglingMute}
+      {togglingBlock}
+      onToggleFollow={toggleFollow}
+      onToggleMute={toggleMute}
+      onToggleBlock={toggleBlock}
+      onStartCall={startCall}
+    />
   {/if}
 
-  {#if !isSelf && (remoteFollows || remoteFollowers)}
-    <div class="social-graph">
-      {#if remoteFollows}
-        <button
-          class="social-toggle"
-          onclick={() => (showFollowsList = !showFollowsList)}
-        >
-          Following
-          {#if remoteFollows.hidden}
-            <span class="hidden-badge">Hidden</span>
-          {:else}
-            ({remoteFollows.follows.length})
-          {/if}
-          <span class="toggle-arrow"
-            >{showFollowsList ? "\u25BC" : "\u25B6"}</span
-          >
-        </button>
-        {#if showFollowsList && !remoteFollows.hidden}
-          <ul class="social-list">
-            {#each remoteFollows.follows as f (f.pubkey)}
-              <li>
-                <a href="/profile/{f.pubkey}" class="social-link">
-                  <Avatar
-                    pubkey={f.pubkey}
-                    name={shortId(f.pubkey)}
-                    size={28}
-                  />
-                  <span class="social-name">{shortId(f.pubkey)}</span>
-                </a>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      {/if}
-
-      {#if remoteFollowers}
-        <button
-          class="social-toggle"
-          onclick={() => (showFollowersList = !showFollowersList)}
-        >
-          Followers
-          {#if remoteFollowers.hidden}
-            <span class="hidden-badge">Hidden</span>
-          {:else}
-            ({remoteFollowers.followers.length})
-          {/if}
-          <span class="toggle-arrow"
-            >{showFollowersList ? "\u25BC" : "\u25B6"}</span
-          >
-        </button>
-        {#if showFollowersList && !remoteFollowers.hidden}
-          <ul class="social-list">
-            {#each remoteFollowers.followers as f (f.pubkey)}
-              <li>
-                <a href="/profile/{f.pubkey}" class="social-link">
-                  <Avatar
-                    pubkey={f.pubkey}
-                    name={shortId(f.pubkey)}
-                    size={28}
-                  />
-                  <span class="social-name">{shortId(f.pubkey)}</span>
-                </a>
-              </li>
-            {/each}
-          </ul>
-        {/if}
-      {/if}
-    </div>
+  {#if !isSelf}
+    <SocialGraphAccordion {remoteFollows} {remoteFollowers} />
   {/if}
 
-  <div class="filter-bar">
-    {#each FILTERS as f (f.value)}
-      <button
-        class="filter-chip"
-        class:active={mediaFilter === f.value}
-        onclick={() => (mediaFilter = f.value)}
-      >
-        {f.label}
-      </button>
-    {/each}
-  </div>
+  <MediaFilterBar
+    {mediaFilter}
+    onFilterChange={(value) => (mediaFilter = value)}
+  />
 
   <h3 class="section-title">
     Posts{posts.length > 0
@@ -597,295 +451,6 @@
 {/if}
 
 <style>
-  .social-graph {
-    margin: 1rem 0;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    overflow: hidden;
-  }
-
-  .social-toggle {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    width: 100%;
-    padding: 0.75rem 1rem;
-    background: var(--bg-surface);
-    border: none;
-    border-bottom: 1px solid var(--border);
-    color: var(--text-primary);
-    font-size: var(--text-base);
-    font-weight: 500;
-    cursor: pointer;
-    text-align: left;
-  }
-
-  .social-toggle:last-child,
-  .social-toggle + .social-list + .social-toggle {
-    border-bottom: none;
-  }
-
-  .social-toggle:hover {
-    background: var(--bg-deep);
-  }
-
-  .toggle-arrow {
-    margin-left: auto;
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-  }
-
-  .hidden-badge {
-    font-size: var(--text-sm);
-    color: var(--text-muted);
-    font-weight: 400;
-    font-style: italic;
-  }
-
-  .social-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    max-height: 300px;
-    overflow-y: auto;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .social-list li {
-    border-bottom: 1px solid var(--border);
-  }
-
-  .social-list li:last-child {
-    border-bottom: none;
-  }
-
-  .social-link {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.5rem 1rem;
-    text-decoration: none;
-    color: var(--text-primary);
-  }
-
-  .social-link:hover {
-    background: var(--bg-deep);
-  }
-
-  .social-name {
-    font-size: var(--text-sm);
-  }
-
-  .profile-header {
-    display: flex;
-    align-items: center;
-    gap: 1rem;
-    margin-bottom: 1rem;
-  }
-
-  .profile-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .profile-info h2 {
-    margin: 0;
-    color: var(--accent-medium);
-    font-size: var(--text-xl);
-  }
-
-  .bio {
-    margin: 0.25rem 0 0;
-    color: var(--text-secondary);
-    font-size: var(--text-base);
-  }
-
-  .visibility-badge {
-    display: inline-block;
-    font-size: var(--text-sm);
-    color: var(--color-warning);
-    border: 1px solid var(--color-warning-border);
-    border-radius: var(--radius-sm);
-    padding: 0.15rem 0.5rem;
-    margin-top: 0.25rem;
-  }
-
-  .id-section {
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-    margin-bottom: 1rem;
-  }
-
-  .id-row {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .id-label {
-    color: var(--text-secondary);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    font-weight: 600;
-    min-width: 5.5rem;
-    flex-shrink: 0;
-  }
-
-  code {
-    background: var(--bg-deep);
-    padding: 0.5rem 0.75rem;
-    border-radius: var(--radius-md);
-    font-size: var(--text-sm);
-    word-break: break-all;
-    color: var(--color-link);
-    flex: 1;
-    font-family: var(--font-mono);
-  }
-
-  .action-row {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-  }
-
-  .follow-toggle {
-    flex: 1;
-    background: var(--accent);
-    color: var(--text-on-accent);
-    border: none;
-    border-radius: var(--radius-md);
-    padding: 0.5rem;
-    font-size: var(--text-base);
-    font-weight: 600;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 2.2rem;
-  }
-
-  .message-btn {
-    background: var(--bg-elevated);
-    color: var(--accent-light);
-    border: none;
-    border-radius: var(--radius-md);
-    padding: 0.5rem 1rem;
-    font-size: var(--text-base);
-    font-weight: 600;
-    cursor: pointer;
-    text-decoration: none;
-    text-align: center;
-    transition: background var(--transition-normal);
-  }
-
-  .message-btn:hover {
-    background: var(--bg-elevated-hover);
-  }
-
-  .call-btn {
-    background: var(--color-success);
-    color: white;
-    border: none;
-    border-radius: var(--radius-md);
-    padding: 0.5rem 1rem;
-    font-size: var(--text-base);
-    font-weight: 600;
-    cursor: pointer;
-    transition: background var(--transition-normal);
-  }
-
-  .call-btn:hover:not(:disabled) {
-    background: #16a34a;
-  }
-
-  .call-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .follow-toggle:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .follow-toggle.following {
-    background: transparent;
-    color: var(--color-error-light);
-    border: 1px solid var(--color-error-light-border);
-  }
-
-  .follow-toggle.following:hover:not(:disabled) {
-    background: var(--color-error-light-bg);
-  }
-
-  .moderation-row {
-    display: flex;
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-  }
-
-  .mod-btn {
-    flex: 1;
-    background: transparent;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    padding: 0.35rem;
-    font-size: var(--text-base);
-    font-weight: 500;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 1.8rem;
-    transition:
-      color var(--transition-fast),
-      background var(--transition-fast),
-      border-color var(--transition-fast);
-  }
-
-  .mod-btn.mute {
-    color: var(--text-secondary);
-  }
-
-  .mod-btn.mute:hover:not(:disabled) {
-    color: var(--color-warning);
-    border-color: var(--color-warning-border);
-    background: var(--color-warning-bg-subtle);
-  }
-
-  .mod-btn.mute.active {
-    color: var(--color-warning);
-    border-color: var(--color-warning-border);
-  }
-
-  .mod-btn.mute.active:hover:not(:disabled) {
-    background: var(--color-warning-bg-subtle);
-  }
-
-  .mod-btn.block {
-    color: var(--text-secondary);
-  }
-
-  .mod-btn.block:hover:not(:disabled) {
-    color: var(--color-error);
-    border-color: var(--color-error-border);
-    background: var(--color-error-bg-subtle);
-  }
-
-  .mod-btn.block.active {
-    color: var(--color-error);
-    border-color: var(--color-error-border);
-  }
-
-  .mod-btn.block.active:hover:not(:disabled) {
-    background: var(--color-error-bg-subtle);
-  }
-
-  .filter-bar {
-    margin-bottom: 0.75rem;
-  }
-
   .section-title {
     margin-bottom: 0.75rem;
   }
@@ -906,12 +471,5 @@
     padding: 0.75rem;
     border-top: 1px solid var(--border);
     margin-top: 0.5rem;
-  }
-
-  .edit-btn {
-    padding: 0.4rem 0.85rem;
-    font-size: var(--text-base);
-    font-weight: 500;
-    flex-shrink: 0;
   }
 </style>

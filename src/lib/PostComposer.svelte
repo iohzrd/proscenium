@@ -10,7 +10,7 @@
     useMentionAutocomplete,
     useFileUpload,
     autogrow,
-  } from "$lib/composables.svelte";
+  } from "$lib/composables";
   import { onMount } from "svelte";
 
   const MAX_POST_LENGTH = 10_000;

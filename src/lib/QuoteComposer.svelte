@@ -3,7 +3,7 @@
   import type { Post } from "$lib/types";
   import { shortId, getDisplayName } from "$lib/utils";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete, autogrow } from "$lib/composables.svelte";
+  import { useMentionAutocomplete, autogrow } from "$lib/composables";
 
   let {
     quotedPost,

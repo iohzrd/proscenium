@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import Icon from "$lib/Icon.svelte";
-  import { useNodeInit } from "$lib/composables.svelte";
+  import { useNodeInit } from "$lib/composables";
   import type {
     ServerEntry,
     ServerInfo,
