@@ -3,6 +3,7 @@
   import type { CallState } from "$lib/types";
   import { shortId, getDisplayName } from "$lib/utils";
   import Avatar from "$lib/Avatar.svelte";
+  import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
 
   let {
     callId,
@@ -17,6 +18,7 @@
   } = $props();
 
   let muted = $state(false);
+  let showDevices = $state(false);
   let duration = $state(0);
   let durationInterval: ReturnType<typeof setInterval> | null = null;
   let peerName = $state("");
@@ -103,8 +105,19 @@
         <button class="call-btn mute" class:muted onclick={toggleMute}>
           {muted ? "Unmute" : "Mute"}
         </button>
+        <button
+          class="call-btn devices-btn"
+          onclick={() => (showDevices = !showDevices)}
+        >
+          Audio
+        </button>
         <button class="call-btn hangup" onclick={hangup}>Hang up</button>
       </div>
+      {#if showDevices}
+        <div class="call-devices">
+          <AudioDeviceSelect liveCall={true} />
+        </div>
+      {/if}
     {:else if callState === "failed"}
       <div class="call-status call-failed">Call failed</div>
     {/if}
@@ -219,5 +232,20 @@
   .call-btn.mute.muted {
     background: var(--color-warning);
     color: #1a1a2e;
+  }
+
+  .call-btn.devices-btn {
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+
+  .call-btn.devices-btn:hover {
+    background: var(--bg-elevated-hover);
+  }
+
+  .call-devices {
+    width: 100%;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border);
   }
 </style>

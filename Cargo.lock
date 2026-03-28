@@ -5611,7 +5611,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "aec3",
  "base64 0.22.1",
@@ -5627,8 +5627,10 @@ dependencies = [
  "iroh",
  "iroh-blobs",
  "iroh-gossip",
+ "jni",
  "log",
  "mime_guess",
+ "ndk-context",
  "opus",
  "png 0.18.1",
  "proscenium-types",
@@ -5662,7 +5664,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "getrandom 0.4.2",
  "hex",

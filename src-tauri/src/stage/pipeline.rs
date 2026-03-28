@@ -338,7 +338,7 @@ pub(super) async fn run_host_playback(
     far_end_tx: mpsc::Sender<Vec<f32>>,
     cancel: CancellationToken,
 ) {
-    let (mut prod, _playback) = match AudioPlayback::start() {
+    let (mut prod, _playback) = match AudioPlayback::start(None) {
         Ok(p) => p,
         Err(e) => {
             log::error!("[stage-host] failed to start playback: {e}");
@@ -464,7 +464,7 @@ async fn run_listener_once(
 
     // Adaptive jitter buffer.
     //
-    // AudioPlayback::start() owns ring buffer creation and the cpal stream.
+    // AudioPlayback::start(None) owns ring buffer creation and the cpal stream.
     // PlaybackProducer is the sole write path; the cpal callback is the sole
     // reader. Capacity is PLAYBACK_CAPACITY_FRAMES (defined in playback.rs).
     //
@@ -482,7 +482,7 @@ async fn run_listener_once(
     const DRIFT_INTERVAL: usize = 250; // ~5 s at 20 ms/frame before drifting down
 
     // cpal starts immediately (outputs silence until pre-fill completes).
-    let (mut prod, playback) = match AudioPlayback::start() {
+    let (mut prod, playback) = match AudioPlayback::start(None) {
         Ok(p) => p,
         Err(e) => {
             log::error!("[stage-listener] failed to start playback: {e}");
@@ -791,7 +791,7 @@ async fn run_speaker_once(
     let (cap_tx, mut cap_raw_rx) = mpsc::channel::<Vec<f32>>(32);
     let (fwd_tx, fwd_rx) = mpsc::channel::<Vec<f32>>(32);
     std::thread::spawn(move || {
-        let _capture = match AudioCapture::start(cap_tx) {
+        let _capture = match AudioCapture::start(cap_tx, None) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("[stage-speaker] mic capture failed: {e}");

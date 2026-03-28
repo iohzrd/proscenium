@@ -370,7 +370,7 @@ impl StageActor {
                 });
                 let mic_cancel = cancel.child_token();
                 tokio::spawn(async move {
-                    let _capture = match AudioCapture::start(cap_tx) {
+                    let _capture = match AudioCapture::start(cap_tx, None) {
                         Ok(c) => c,
                         Err(e) => {
                             log::warn!("[stage-host] host mic capture failed: {e}");

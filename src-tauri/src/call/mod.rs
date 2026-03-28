@@ -1,9 +1,10 @@
 use crate::audio::{
-    AudioCapture, AudioPlayback, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME, TAG_NORMAL,
-    read_audio_frame, write_audio_frame,
+    AudioCapture, AudioPlayback, EchoCanceller, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME,
+    SharedCapture, SharedPlayback, TAG_NORMAL, android, read_audio_frame, write_audio_frame,
 };
 use crate::dm::DmHandler;
 use crate::error::AppError;
+use crate::preferences;
 use crate::storage::Storage;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -20,6 +21,10 @@ struct ActiveCall {
     peer_pubkey: String,
     cancel: CancellationToken,
     muted: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared handle to the active audio capture (if audio session is running).
+    capture: SharedCapture,
+    /// Shared handle to the active audio playback (if audio session is running).
+    playback: SharedPlayback,
 }
 
 #[derive(Clone)]
@@ -58,39 +63,126 @@ impl CallHandler {
         );
     }
 
+    /// Load audio device preferences from storage.
+    /// Returns (input_device, output_device) where None means "use default".
+    async fn audio_device_prefs(&self) -> (Option<String>, Option<String>) {
+        let input = self
+            .storage
+            .get_preference(preferences::AUDIO_INPUT_DEVICE)
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        let output = self
+            .storage
+            .get_preference(preferences::AUDIO_OUTPUT_DEVICE)
+            .await
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty());
+        (input, output)
+    }
+
+    /// Switch the input (microphone) device mid-call. Saves the preference
+    /// and immediately rebuilds the capture stream on the new device.
+    pub async fn switch_input_device(&self, name: &str) -> Result<(), AppError> {
+        // Save preference
+        let pref_value = if name.is_empty() { "" } else { name };
+        self.storage
+            .set_preference(preferences::AUDIO_INPUT_DEVICE, pref_value)
+            .await?;
+
+        let device_name = if name.is_empty() { None } else { Some(name) };
+
+        // Switch the live stream if a call is active
+        let lock = self.active_call.lock().await;
+        if let Some(call) = &*lock {
+            let mut cap = call.capture.lock().unwrap();
+            if let Some(capture) = cap.as_mut() {
+                capture
+                    .switch_device(device_name)
+                    .map_err(|e| AppError::Other(format!("failed to switch input device: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch the output (speaker) device mid-call. Saves the preference
+    /// and immediately rebuilds the playback stream on the new device.
+    pub async fn switch_output_device(&self, name: &str) -> Result<(), AppError> {
+        let pref_value = if name.is_empty() { "" } else { name };
+        self.storage
+            .set_preference(preferences::AUDIO_OUTPUT_DEVICE, pref_value)
+            .await?;
+
+        let device_name = if name.is_empty() { None } else { Some(name) };
+
+        let lock = self.active_call.lock().await;
+        if let Some(call) = &*lock {
+            let mut pb = call.playback.lock().unwrap();
+            if let Some(playback) = pb.as_mut() {
+                playback
+                    .switch_device(device_name)
+                    .map_err(|e| AppError::Other(format!("failed to switch output device: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild the live cpal capture and playback streams on the default
+    /// device. Called after Android audio route changes -- Android kills
+    /// the old AAudio streams when the communication device changes, so
+    /// we must build new ones.
+    pub async fn rebuild_streams(&self) {
+        let lock = self.active_call.lock().await;
+        let Some(call) = &*lock else { return };
+
+        if let Some(capture) = call.capture.lock().unwrap().as_mut()
+            && let Err(e) = capture.switch_device(None)
+        {
+            log::warn!("[call] failed to rebuild capture stream: {e}");
+        }
+        if let Some(playback) = call.playback.lock().unwrap().as_mut()
+            && let Err(e) = playback.switch_device(None)
+        {
+            log::warn!("[call] failed to rebuild playback stream: {e}");
+        }
+        log::info!("[call] rebuilt audio streams after route change");
+    }
+
     /// Initiate an outgoing call to a peer. Sends a CallOffer via the DM ratchet,
     /// then opens a QUIC connection on CALL_ALPN for audio.
     pub async fn start_call(&self, peer_pubkey: &str) -> Result<String, AppError> {
-        // Reject if already in a call
+        let call_id = crate::util::generate_id();
+        let cancel = CancellationToken::new();
+
+        // Hold the lock across DM send to prevent rapid-tap races
         {
-            let lock = self.active_call.lock().await;
+            let mut lock = self.active_call.lock().await;
             if lock.is_some() {
                 return Err(AppError::Other("already in a call".into()));
             }
-        }
 
-        let call_id = crate::util::generate_id();
-        log::info!(
-            "[call] starting call {} to {}",
-            short_id(&call_id),
-            short_id(peer_pubkey)
-        );
+            log::info!(
+                "[call] starting call {} to {}",
+                short_id(&call_id),
+                short_id(peer_pubkey)
+            );
 
-        // Send call offer via E2E encrypted DM channel
-        let offer = DmPayload::CallOffer {
-            call_id: call_id.clone(),
-            video: false,
-        };
-        self.dm.send_signal(peer_pubkey, offer).await?;
+            // Send call offer via E2E encrypted DM channel
+            let offer = DmPayload::CallOffer {
+                call_id: call_id.clone(),
+                video: false,
+            };
+            self.dm.send_signal(peer_pubkey, offer).await?;
 
-        let cancel = CancellationToken::new();
-        {
-            let mut lock = self.active_call.lock().await;
             *lock = Some(ActiveCall {
                 call_id: call_id.clone(),
                 peer_pubkey: peer_pubkey.to_string(),
                 cancel: cancel.clone(),
                 muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                capture: Arc::new(std::sync::Mutex::new(None)),
+                playback: Arc::new(std::sync::Mutex::new(None)),
             });
         }
 
@@ -209,6 +301,8 @@ impl CallHandler {
                 peer_pubkey: peer_pubkey.to_string(),
                 cancel: cancel.clone(),
                 muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                capture: Arc::new(std::sync::Mutex::new(None)),
+                playback: Arc::new(std::sync::Mutex::new(None)),
             });
         }
 
@@ -242,9 +336,6 @@ impl CallHandler {
             let mut lock = self.active_call.lock().await;
             match &mut *lock {
                 Some(call) if call.call_id == call_id => {
-                    // Cancel the incoming-call timeout, then replace with a fresh
-                    // token so the audio session (ProtocolHandler::accept) gets a
-                    // live token.
                     call.cancel.cancel();
                     call.cancel = CancellationToken::new();
                     call.peer_pubkey.clone()
@@ -277,7 +368,6 @@ impl CallHandler {
                     call.peer_pubkey
                 }
                 Some(other) => {
-                    // Put it back, wrong call
                     let pk = other.peer_pubkey.clone();
                     *lock = Some(other);
                     return Err(AppError::Other(format!(
@@ -313,6 +403,7 @@ impl CallHandler {
         };
         let _ = self.dm.send_signal(&call.peer_pubkey, hangup).await;
         self.emit_call_event(&call.call_id, &call.peer_pubkey, CallState::Ended);
+        android::restore_default_routing();
         log::info!("[call] hung up {}", short_id(&call.call_id));
         Ok(())
     }
@@ -345,16 +436,21 @@ impl CallHandler {
             *lock = None;
             drop(lock);
             self.emit_call_event(call_id, &pk, CallState::Ended);
+            android::restore_default_routing();
         }
     }
 
     /// Run a bidirectional audio session over an established QUIC connection.
-    /// Spawns capture + send and receive + playback tasks.
     async fn run_audio_session(&self, conn: Connection, call_id: &str, peer_pubkey: &str) {
-        let (call_cancel, muted) = {
+        let (call_cancel, muted, shared_capture, shared_playback) = {
             let lock = self.active_call.lock().await;
             match &*lock {
-                Some(c) if c.call_id == call_id => (c.cancel.clone(), c.muted.clone()),
+                Some(c) if c.call_id == call_id => (
+                    c.cancel.clone(),
+                    c.muted.clone(),
+                    c.capture.clone(),
+                    c.playback.clone(),
+                ),
                 _ => return,
             }
         };
@@ -371,14 +467,79 @@ impl CallHandler {
         };
 
         let session_cancel = call_cancel.child_token();
+        let (input_dev, output_dev) = self.audio_device_prefs().await;
 
-        // Spawn send task (capture -> encode -> send)
+        // On Android, set MODE_IN_COMMUNICATION before opening audio streams
+        android::enter_communication_mode();
+
+        // AEC pipeline:
+        //   mic capture -> raw_mic_tx/rx -> AEC thread -> aec_out_tx/rx -> send loop
+        //   recv loop -> far_end_tx/rx -> AEC thread (render)
+        let (raw_mic_tx, mut raw_mic_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
+        let (aec_out_tx, aec_out_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
+        let (far_end_tx, mut far_end_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(20);
+
+        // Start mic capture into the raw channel
+        let capture = match AudioCapture::start(raw_mic_tx, input_dev.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("[call] failed to start audio capture: {e}");
+                self.emit_call_event(call_id, peer_pubkey, CallState::Failed);
+                *self.active_call.lock().await = None;
+                return;
+            }
+        };
+        *shared_capture.lock().unwrap() = Some(capture);
+
+        // Spawn AEC processing thread (std::thread -- AEC is CPU-bound)
+        let aec_muted = muted.clone();
+        let aec_cancel = session_cancel.clone();
+        std::thread::spawn(move || {
+            let mut aec = match EchoCanceller::new() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("[call] failed to create AEC: {e}");
+                    return;
+                }
+            };
+            log::info!("[call] AEC thread started");
+            while let Some(raw) = raw_mic_rx.blocking_recv() {
+                if aec_cancel.is_cancelled() {
+                    break;
+                }
+                // Drain all pending far-end (playback) samples into AEC render
+                while let Ok(far) = far_end_rx.try_recv() {
+                    aec.render(&far);
+                }
+                let cleaned = aec.process_capture(&raw);
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let out = if aec_muted.load(std::sync::atomic::Ordering::Relaxed) {
+                    vec![0.0f32; cleaned.len()]
+                } else {
+                    cleaned
+                };
+                if aec_out_tx.blocking_send(out).is_err() {
+                    break;
+                }
+            }
+            log::info!("[call] AEC thread ended");
+        });
+
+        // Spawn send task (reads AEC-cleaned samples -> encode -> send)
         let send_cancel = session_cancel.clone();
-        let send_task = tokio::spawn(Self::send_audio_loop(send, send_cancel, muted));
+        let send_task = tokio::spawn(Self::send_audio_loop(send, send_cancel, aec_out_rx));
 
-        // Spawn receive task (receive -> decode -> playback)
+        // Spawn receive task (receive -> decode -> playback + far-end feed)
         let recv_cancel = session_cancel.clone();
-        let recv_task = tokio::spawn(Self::recv_audio_loop(recv, recv_cancel));
+        let recv_task = tokio::spawn(Self::recv_audio_loop(
+            recv,
+            recv_cancel,
+            output_dev,
+            shared_playback,
+            far_end_tx,
+        ));
 
         // Wait for either task to finish or call to be cancelled
         tokio::select! {
@@ -410,22 +571,12 @@ impl CallHandler {
         }
     }
 
-    /// Capture audio from mic, encode to Opus, send over QUIC.
+    /// Read AEC-cleaned samples, encode to Opus, send over QUIC.
     async fn send_audio_loop(
         mut send: iroh::endpoint::SendStream,
         cancel: CancellationToken,
-        muted: Arc<std::sync::atomic::AtomicBool>,
+        mut rx: tokio::sync::mpsc::Receiver<Vec<f32>>,
     ) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
-
-        let _capture = match AudioCapture::start(tx) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("[call] failed to start audio capture: {e}");
-                return;
-            }
-        };
-
         let mut encoder = match OpusEncoder::new() {
             Ok(e) => e,
             Err(e) => {
@@ -442,12 +593,6 @@ impl CallHandler {
                 _ = cancel.cancelled() => break,
                 samples = rx.recv() => {
                     let Some(samples) = samples else { break };
-                    // When muted, feed silence to the encoder to maintain timing
-                    let samples = if muted.load(std::sync::atomic::Ordering::Relaxed) {
-                        vec![0.0f32; samples.len()]
-                    } else {
-                        samples
-                    };
                     let packets = encoder.push_samples(&samples);
                     for packet in packets {
                         if let Err(e) = write_audio_frame(
@@ -467,8 +612,14 @@ impl CallHandler {
         log::info!("[call] send loop ended (sent {seq} frames)");
     }
 
-    /// Receive Opus frames from QUIC, decode, play back.
-    async fn recv_audio_loop(mut recv: iroh::endpoint::RecvStream, cancel: CancellationToken) {
+    /// Receive Opus frames from QUIC, decode, play back, and feed AEC far-end.
+    async fn recv_audio_loop(
+        mut recv: iroh::endpoint::RecvStream,
+        cancel: CancellationToken,
+        output_device: Option<String>,
+        shared_playback: SharedPlayback,
+        far_end_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    ) {
         let mut decoder = match OpusDecoder::new() {
             Ok(d) => d,
             Err(e) => {
@@ -477,13 +628,16 @@ impl CallHandler {
             }
         };
 
-        let (mut prod, _playback) = match AudioPlayback::start() {
+        let (mut prod, playback) = match AudioPlayback::start(output_device.as_deref()) {
             Ok(p) => p,
             Err(e) => {
                 log::error!("[call] failed to start audio playback: {e}");
                 return;
             }
         };
+
+        // Store in shared handle so switch_output_device can reach it
+        *shared_playback.lock().unwrap() = Some(playback);
 
         let mut frames_received: u32 = 0;
 
@@ -495,6 +649,8 @@ impl CallHandler {
                         Ok(Some((_seq, _ts, _tag, payload))) => {
                             match decoder.decode(&payload) {
                                 Ok(samples) => {
+                                    // Feed far-end reference to AEC before playback
+                                    let _ = far_end_tx.try_send(samples.clone());
                                     let pushed = prod.push(&samples);
                                     if pushed < samples.len() {
                                         log::debug!("[call] ring buffer full, dropped {} samples", samples.len() - pushed);
@@ -518,6 +674,9 @@ impl CallHandler {
                 }
             }
         }
+
+        // Clear the shared handle
+        *shared_playback.lock().unwrap() = None;
 
         log::info!("[call] recv loop ended ({frames_received} frames received)");
     }
@@ -546,10 +705,14 @@ impl ProtocolHandler for CallHandler {
             .unwrap_or_else(|| remote_str.clone());
 
         // Check we have an active call with this peer
-        let call_id = {
+        let (call_id, shared_capture, shared_playback) = {
             let lock = self.active_call.lock().await;
             match &*lock {
-                Some(call) if call.peer_pubkey == peer_pubkey => call.call_id.clone(),
+                Some(call) if call.peer_pubkey == peer_pubkey => (
+                    call.call_id.clone(),
+                    call.capture.clone(),
+                    call.playback.clone(),
+                ),
                 _ => {
                     log::warn!(
                         "[call] rejecting unexpected audio connection from {}",
@@ -576,11 +739,72 @@ impl ProtocolHandler for CallHandler {
             (call.cancel.child_token(), call.muted.clone())
         };
 
+        let (input_dev, output_dev) = self.audio_device_prefs().await;
+
+        // On Android, set MODE_IN_COMMUNICATION before opening audio streams
+        android::enter_communication_mode();
+
+        // AEC pipeline (same as run_audio_session)
+        let (raw_mic_tx, mut raw_mic_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
+        let (aec_out_tx, aec_out_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
+        let (far_end_tx, mut far_end_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(20);
+
+        let capture = match AudioCapture::start(raw_mic_tx, input_dev.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("[call] failed to start audio capture: {e}");
+                return Err(AcceptError::from_err(std::io::Error::other(format!(
+                    "failed to start audio capture: {e}"
+                ))));
+            }
+        };
+        *shared_capture.lock().unwrap() = Some(capture);
+
+        let aec_muted = muted.clone();
+        let aec_cancel = session_cancel.clone();
+        std::thread::spawn(move || {
+            let mut aec = match EchoCanceller::new() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("[call] failed to create AEC: {e}");
+                    return;
+                }
+            };
+            log::info!("[call] AEC thread started (accept)");
+            while let Some(raw) = raw_mic_rx.blocking_recv() {
+                if aec_cancel.is_cancelled() {
+                    break;
+                }
+                while let Ok(far) = far_end_rx.try_recv() {
+                    aec.render(&far);
+                }
+                let cleaned = aec.process_capture(&raw);
+                if cleaned.is_empty() {
+                    continue;
+                }
+                let out = if aec_muted.load(std::sync::atomic::Ordering::Relaxed) {
+                    vec![0.0f32; cleaned.len()]
+                } else {
+                    cleaned
+                };
+                if aec_out_tx.blocking_send(out).is_err() {
+                    break;
+                }
+            }
+            log::info!("[call] AEC thread ended (accept)");
+        });
+
         let send_cancel = session_cancel.clone();
         let recv_cancel = session_cancel.clone();
 
-        let send_task = tokio::spawn(Self::send_audio_loop(send, send_cancel, muted));
-        let recv_task = tokio::spawn(Self::recv_audio_loop(recv, recv_cancel));
+        let send_task = tokio::spawn(Self::send_audio_loop(send, send_cancel, aec_out_rx));
+        let recv_task = tokio::spawn(Self::recv_audio_loop(
+            recv,
+            recv_cancel,
+            output_dev,
+            shared_playback,
+            far_end_tx,
+        ));
 
         tokio::select! {
             _ = session_cancel.cancelled() => {}

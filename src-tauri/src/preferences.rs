@@ -4,6 +4,8 @@ pub const MDNS_DISCOVERY: &str = "mdns_discovery";
 pub const DHT_DISCOVERY: &str = "dht_discovery";
 pub const SHARE_FOLLOWS: &str = "share_follows";
 pub const SHARE_FOLLOWERS: &str = "share_followers";
+pub const AUDIO_INPUT_DEVICE: &str = "audio_input_device";
+pub const AUDIO_OUTPUT_DEVICE: &str = "audio_output_device";
 
 pub async fn get_mdns_discovery(storage: &Storage) -> bool {
     storage

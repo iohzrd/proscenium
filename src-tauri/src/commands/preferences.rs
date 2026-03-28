@@ -1,3 +1,4 @@
+use crate::audio::{self, AudioDevice};
 use crate::error::CmdResult;
 use crate::preferences;
 use crate::state::AppState;
@@ -65,4 +66,67 @@ pub async fn set_share_followers(state: State<'_, Arc<AppState>>, enabled: bool)
         .storage
         .set_bool_preference(preferences::SHARE_FOLLOWERS, enabled)
         .await
+}
+
+#[tauri::command]
+pub fn list_audio_input_devices() -> Vec<AudioDevice> {
+    audio::list_input_devices()
+}
+
+#[tauri::command]
+pub fn list_audio_output_devices() -> Vec<AudioDevice> {
+    audio::list_output_devices()
+}
+
+#[tauri::command]
+pub async fn get_audio_input_device(state: State<'_, Arc<AppState>>) -> CmdResult<Option<String>> {
+    state
+        .storage
+        .get_preference(preferences::AUDIO_INPUT_DEVICE)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_audio_input_device(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> CmdResult<()> {
+    if name.is_empty() {
+        // Empty string means "use default" -- remove the preference
+        state
+            .storage
+            .set_preference(preferences::AUDIO_INPUT_DEVICE, "")
+            .await
+    } else {
+        state
+            .storage
+            .set_preference(preferences::AUDIO_INPUT_DEVICE, &name)
+            .await
+    }
+}
+
+#[tauri::command]
+pub async fn get_audio_output_device(state: State<'_, Arc<AppState>>) -> CmdResult<Option<String>> {
+    state
+        .storage
+        .get_preference(preferences::AUDIO_OUTPUT_DEVICE)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_audio_output_device(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+) -> CmdResult<()> {
+    if name.is_empty() {
+        state
+            .storage
+            .set_preference(preferences::AUDIO_OUTPUT_DEVICE, "")
+            .await
+    } else {
+        state
+            .storage
+            .set_preference(preferences::AUDIO_OUTPUT_DEVICE, &name)
+            .await
+    }
 }

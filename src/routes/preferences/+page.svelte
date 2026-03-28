@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import Icon from "$lib/Icon.svelte";
+  import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
   import type { ServerEntry } from "$lib/types";
 
   let nodeId = $state("");
@@ -241,6 +242,15 @@
     Link multiple devices to share your identity, follows, and messages.
   </p>
   <a href="/preferences/devices" class="server-manage-link">Manage devices</a>
+</section>
+
+<section class="settings-section">
+  <h3>Audio</h3>
+  <p class="section-desc">
+    Choose which microphone and speaker to use for calls and stages. Changes
+    apply to the next call.
+  </p>
+  <AudioDeviceSelect />
 </section>
 
 <section class="settings-section">

@@ -2,10 +2,11 @@ use cpal::StreamConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer as _, Producer as _, Split as _};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
+use super::capture::device_name;
 use super::codec::{CHANNELS, FRAME_SIZE, SAMPLE_RATE};
 
 /// Ring buffer capacity in frames. Callers cannot exceed this depth.
@@ -20,7 +21,7 @@ pub const PLAYBACK_CAPACITY_FRAMES: usize = 10;
 /// Read underrun feedback with [`PlaybackProducer::drain_underruns`] to drive
 /// adaptive pre-fill depth in the caller.
 pub struct PlaybackProducer {
-    inner: ringbuf::HeapProd<f32>,
+    inner: Arc<Mutex<ringbuf::HeapProd<f32>>>,
     underruns: Arc<AtomicUsize>,
 }
 
@@ -28,7 +29,7 @@ impl PlaybackProducer {
     /// Push samples into the jitter buffer. Returns the number actually pushed;
     /// any remainder was dropped because the buffer was full.
     pub fn push(&mut self, samples: &[f32]) -> usize {
-        self.inner.push_slice(samples)
+        self.inner.lock().unwrap().push_slice(samples)
     }
 
     /// Atomically read and reset the accumulated underrun count since the last
@@ -39,9 +40,12 @@ impl PlaybackProducer {
 }
 
 /// Audio playback handle. Owns the cpal output stream and the consumer half of
-/// the ring buffer. Drop to stop playback.
+/// the ring buffer. Drop to stop playback. Supports mid-call device switching.
 pub struct AudioPlayback {
-    _stream: cpal::Stream,
+    stream: cpal::Stream,
+    /// Shared producer handle -- allows swapping the ring buffer on device switch.
+    producer: Arc<Mutex<ringbuf::HeapProd<f32>>>,
+    underruns: Arc<AtomicUsize>,
 }
 
 fn stream_config() -> StreamConfig {
@@ -56,60 +60,102 @@ fn stream_config() -> StreamConfig {
     }
 }
 
-fn device_name(device: &cpal::Device) -> String {
-    device
-        .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
+/// Find an output device by name, falling back to the default.
+fn find_output_device(name: Option<&str>) -> Result<cpal::Device, cpal::BuildStreamError> {
+    let host = cpal::default_host();
+    if let Some(name) = name {
+        if let Some(device) = host
+            .output_devices()
+            .ok()
+            .and_then(|mut devices| devices.find(|d| device_name(d) == name))
+        {
+            return Ok(device);
+        }
+        log::warn!("[audio-playback] device '{name}' not found, using default");
+    }
+    host.default_output_device()
+        .ok_or(cpal::BuildStreamError::DeviceNotAvailable)
+}
+
+/// Build a new output stream + ring buffer pair.
+fn build_playback_stream(
+    device_name_pref: Option<&str>,
+    underruns: &Arc<AtomicUsize>,
+) -> Result<(ringbuf::HeapProd<f32>, cpal::Stream), cpal::BuildStreamError> {
+    let device = find_output_device(device_name_pref)?;
+    let config = stream_config();
+
+    log::info!("[audio-playback] device: {}", device_name(&device));
+
+    let ring = ringbuf::HeapRb::<f32>::new(PLAYBACK_CAPACITY_FRAMES * FRAME_SIZE);
+    let (prod, mut cons) = ring.split();
+
+    let underruns_cb = underruns.clone();
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let available = cons.pop_slice(data);
+            if available < data.len() {
+                underruns_cb.fetch_add(1, Ordering::Relaxed);
+                data[available..].fill(0.0);
+            }
+        },
+        |err| log::error!("[audio-playback] stream error: {err}"),
+        None,
+    )?;
+    stream
+        .play()
+        .map_err(|e| cpal::BuildStreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: e.to_string(),
+            },
+        })?;
+
+    Ok((prod, stream))
 }
 
 impl AudioPlayback {
-    /// Start playing audio on the default output device.
-    ///
-    /// Creates a lock-free ring buffer with [`PLAYBACK_CAPACITY_FRAMES`] frames
-    /// of capacity, starts the cpal stream, and returns a [`PlaybackProducer`]
-    /// for pushing PCM samples. The cpal callback is fully lock-free: it calls
-    /// `pop_slice` and zero-fills any underrun, incrementing the counter on the
-    /// producer handle.
-    pub fn start() -> Result<(PlaybackProducer, Self), cpal::BuildStreamError> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or(cpal::BuildStreamError::DeviceNotAvailable)?;
-        let config = stream_config();
-
-        log::info!("[audio-playback] device: {}", device_name(&device));
-
-        let ring = ringbuf::HeapRb::<f32>::new(PLAYBACK_CAPACITY_FRAMES * FRAME_SIZE);
-        let (prod, mut cons) = ring.split();
-
+    /// Start playing audio on the specified device (or default if None).
+    pub fn start(
+        device_name_pref: Option<&str>,
+    ) -> Result<(PlaybackProducer, Self), cpal::BuildStreamError> {
         let underruns = Arc::new(AtomicUsize::new(0));
-        let underruns_cb = underruns.clone();
+        let (prod, stream) = build_playback_stream(device_name_pref, &underruns)?;
 
-        let stream = device.build_output_stream(
-            &config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let available = cons.pop_slice(data);
-                if available < data.len() {
-                    underruns_cb.fetch_add(1, Ordering::Relaxed);
-                    data[available..].fill(0.0);
-                }
-            },
-            |err| log::error!("[audio-playback] stream error: {err}"),
-            None,
-        )?;
-        stream
-            .play()
-            .map_err(|e| cpal::BuildStreamError::BackendSpecific {
-                err: cpal::BackendSpecificError {
-                    description: e.to_string(),
-                },
-            })?;
+        let producer = Arc::new(Mutex::new(prod));
 
-        let producer = PlaybackProducer {
-            inner: prod,
-            underruns,
+        let playback_producer = PlaybackProducer {
+            inner: producer.clone(),
+            underruns: underruns.clone(),
         };
-        Ok((producer, Self { _stream: stream }))
+        Ok((
+            playback_producer,
+            Self {
+                stream,
+                producer,
+                underruns,
+            },
+        ))
+    }
+
+    /// Switch to a different output device mid-stream. Builds a new stream
+    /// and ring buffer, swaps the producer so the decode thread feeds the new
+    /// buffer, then drops the old stream.
+    pub fn switch_device(
+        &mut self,
+        device_name_pref: Option<&str>,
+    ) -> Result<(), cpal::BuildStreamError> {
+        let (new_prod, new_stream) = build_playback_stream(device_name_pref, &self.underruns)?;
+        // Swap the producer under the lock so the decode thread starts
+        // pushing into the new ring buffer immediately.
+        *self.producer.lock().unwrap() = new_prod;
+        self.stream = new_stream; // old stream dropped here
+        Ok(())
     }
 }
+
+unsafe impl Send for AudioPlayback {}
+
+/// Shared handle for mid-call device switching from the command layer.
+pub type SharedPlayback = Arc<std::sync::Mutex<Option<AudioPlayback>>>;

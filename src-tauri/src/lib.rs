@@ -214,6 +214,10 @@ pub fn run() {
             reject_call,
             hangup_call,
             toggle_mute_call,
+            switch_call_input_device,
+            switch_call_output_device,
+            list_android_audio_devices,
+            set_android_audio_device,
             create_stage,
             join_stage,
             leave_stage,
@@ -235,6 +239,12 @@ pub fn run() {
             set_share_follows,
             get_share_followers,
             set_share_followers,
+            list_audio_input_devices,
+            list_audio_output_devices,
+            get_audio_input_device,
+            set_audio_input_device,
+            get_audio_output_device,
+            set_audio_output_device,
             wipe_all_data,
         ])
         .build(tauri::generate_context!())

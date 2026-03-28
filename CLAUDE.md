@@ -4,6 +4,7 @@
 
 - **DON'T BOTHER WITH BACKWARD COMPATIBILITY.**
 - Always thoroughly study all existing code relevant to your current task before offering changes.
+- **ALWAYS** thoroughly and completely research the APIs/libraries relevant to the task at hand BEFORE writing ANY code.
 - **NEVER USE EMOJIS** in code or commits.
 - Always use latest dependency versions possible.
 - Always run code formatters before committing (`cargo fmt` for backend, `npm run check` and `npx prettier --plugin prettier-plugin-svelte --write "src/**/*.{ts,svelte}" 2>&1` for frontend).
@@ -15,6 +16,7 @@
 ## Task Continuity (anti-compaction-drift)
 
 Before starting any multi-step task, create `docs/current-task.md` with:
+
 - **Goal**: description of what we are trying to accomplish
 - **Plan**: numbered list of steps
 - **Status**: which step is in progress, which are done

@@ -51,7 +51,7 @@ pub(super) fn spawn_speaker_mixer(cancel: CancellationToken) -> SpeakerMixerHand
 }
 
 async fn run_speaker_mixer(mut cmd_rx: mpsc::Receiver<SpeakerMixerCmd>, cancel: CancellationToken) {
-    let (mut prod, _playback) = match AudioPlayback::start() {
+    let (mut prod, _playback) = match AudioPlayback::start(None) {
         Ok(p) => p,
         Err(e) => {
             log::error!("[stage-speaker-mixer] failed to start playback: {e}");
