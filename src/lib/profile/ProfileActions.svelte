@@ -108,7 +108,7 @@
 
   .call-btn {
     background: var(--color-success);
-    color: white;
+    color: var(--text-on-accent);
     border: none;
     border-radius: var(--radius-md);
     padding: 0.5rem 1rem;
@@ -119,7 +119,7 @@
   }
 
   .call-btn:hover:not(:disabled) {
-    background: #16a34a;
+    background: var(--color-success-hover);
   }
 
   .call-btn:disabled {

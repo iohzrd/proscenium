@@ -131,7 +131,7 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.75);
+    background: var(--overlay-medium);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -204,16 +204,16 @@
 
   .call-btn.accept {
     background: var(--color-success);
-    color: white;
+    color: var(--text-on-accent);
   }
 
   .call-btn.accept:hover {
-    background: #16a34a;
+    background: var(--color-success-hover);
   }
 
   .call-btn.hangup {
     background: var(--color-error);
-    color: white;
+    color: var(--text-on-accent);
   }
 
   .call-btn.hangup:hover {
@@ -231,7 +231,7 @@
 
   .call-btn.mute.muted {
     background: var(--color-warning);
-    color: #1a1a2e;
+    color: var(--bg-base);
   }
 
   .call-btn.devices-btn {

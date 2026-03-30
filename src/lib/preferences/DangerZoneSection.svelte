@@ -94,12 +94,12 @@
   }
 
   .danger-section {
-    border-color: var(--color-error, #ef4444);
+    border-color: var(--color-error);
   }
 
   .wipe-btn {
-    background: var(--color-error, #ef4444);
-    color: #fff;
+    background: var(--color-error);
+    color: var(--text-on-accent);
     border: none;
     border-radius: var(--radius-md);
     padding: 0.5rem 1rem;
@@ -125,8 +125,8 @@
   }
 
   .modal-confirm-danger {
-    background: var(--color-error, #ef4444);
-    border-color: var(--color-error, #ef4444);
+    background: var(--color-error);
+    border-color: var(--color-error);
   }
 
   .modal-confirm-danger:hover:not(:disabled) {

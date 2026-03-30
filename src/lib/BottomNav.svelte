@@ -139,7 +139,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 2px;
+    gap: var(--space-xs);
     padding: var(--space-xs) var(--space-sm);
     color: var(--text-muted);
     text-decoration: none;
@@ -155,7 +155,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 2px;
+    gap: var(--space-xs);
     padding: var(--space-xs) var(--space-sm);
     color: var(--text-muted);
     background: none;
@@ -187,7 +187,7 @@
     background: var(--accent);
     color: var(--text-on-accent);
     font-weight: 700;
-    font-size: 0.55rem;
+    font-size: var(--text-xs);
     min-width: 14px;
     height: 14px;
     padding: 0 3px;

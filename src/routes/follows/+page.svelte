@@ -565,8 +565,8 @@
   }
 
   .btn-approve {
-    background: var(--color-success, #22c55e);
-    color: #fff;
+    background: var(--color-success);
+    color: var(--text-on-accent);
     border: none;
     border-radius: var(--radius-md);
     padding: 0.35rem 0.75rem;

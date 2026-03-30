@@ -33,6 +33,7 @@
   --color-error-dark-hover: #b91c1c;
   --color-warning: #f59e0b;
   --color-success: #22c55e;
+  --color-success-hover: #16a34a;
   --color-bookmark: #fbbf24;
   --color-link: #7dd3fc;
   --color-delivered: #a7f3d0;
@@ -82,6 +83,7 @@
   --overlay-medium: rgba(0, 0, 0, 0.7);
   --overlay-light: rgba(0, 0, 0, 0.6);
   --overlay-white-faint: rgba(255, 255, 255, 0.3);
+  --overlay-white-subtle: rgba(255, 255, 255, 0.2);
 
   /* -- Z-index layers -- */
   --z-nav: 10;

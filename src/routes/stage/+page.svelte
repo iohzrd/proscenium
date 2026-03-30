@@ -631,7 +631,7 @@
 
   .my-role-badge.role-speaker {
     background: var(--color-success);
-    color: white;
+    color: var(--text-on-accent);
   }
 
   .room-body {
@@ -721,7 +721,7 @@
     bottom: -2px;
     right: -2px;
     background: var(--color-error);
-    color: white;
+    color: var(--text-on-accent);
     border-radius: 50%;
     width: 20px;
     height: 20px;
@@ -752,8 +752,8 @@
   }
 
   .role-pip.cohost {
-    background: var(--color-warning, #f59e0b);
-    color: #1a1a2e;
+    background: var(--color-warning);
+    color: var(--bg-base);
   }
 
   /* Raised hands */
@@ -792,11 +792,11 @@
     cursor: pointer;
     transition: background var(--transition-fast);
     background: var(--color-success);
-    color: white;
+    color: var(--text-on-accent);
   }
 
   .btn-promote:hover {
-    background: #16a34a;
+    background: var(--color-success-hover);
   }
 
   /* Listeners section */

@@ -180,8 +180,8 @@
     position: absolute;
     top: 0.5rem;
     right: 0.5rem;
-    background: rgba(0, 0, 0, 0.7);
-    border: 1px solid rgba(255, 255, 255, 0.2);
+    background: var(--overlay-medium);
+    border: 1px solid var(--overlay-white-subtle);
     border-radius: var(--radius-sm);
     color: var(--text-primary);
     font-size: var(--text-xs, 0.7rem);
@@ -197,7 +197,7 @@
   }
 
   .save-as-overlay:hover {
-    background: rgba(0, 0, 0, 0.9);
+    background: var(--overlay-dark);
     border-color: var(--accent-medium);
   }
 

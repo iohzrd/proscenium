@@ -70,8 +70,8 @@
     display: flex;
     align-items: center;
     gap: 0.25rem;
-    background: var(--color-error, #e53e3e);
-    color: #fff;
+    background: var(--color-error);
+    color: var(--text-on-accent);
     font-size: 0.65rem;
     font-weight: 700;
     letter-spacing: 0.06em;
