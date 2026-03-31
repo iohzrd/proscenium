@@ -1,4 +1,4 @@
-use opus::{Channels, Decoder, Encoder};
+use opus::{Application, Bitrate, Channels, Decoder, Encoder};
 
 /// Opus sample rate (48 kHz, mandatory for Opus).
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -8,6 +8,8 @@ pub const FRAME_DURATION_MS: u32 = 20;
 pub const SAMPLES_PER_FRAME: usize = (SAMPLE_RATE * FRAME_DURATION_MS / 1000) as usize;
 /// We operate in mono for voice.
 pub const CHANNELS: Channels = Channels::Mono;
+/// We operate in voice mode.
+pub const MODE: Application = Application::Voip;
 /// Total samples per frame (mono = same as SAMPLES_PER_FRAME).
 pub const FRAME_SIZE: usize = SAMPLES_PER_FRAME;
 /// Maximum Opus packet size in bytes.
@@ -21,7 +23,10 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     pub fn new() -> Result<Self, opus::Error> {
-        let encoder = Encoder::new(SAMPLE_RATE, CHANNELS, opus::Application::Voip)?;
+        let mut encoder = Encoder::new(SAMPLE_RATE, CHANNELS, MODE)?;
+        encoder.set_bitrate(Bitrate::Bits(64_000))?;
+        encoder.set_inband_fec(true)?;
+        encoder.set_packet_loss_perc(10)?;
         Ok(Self {
             encoder,
             buffer: Vec::with_capacity(FRAME_SIZE * 2),
