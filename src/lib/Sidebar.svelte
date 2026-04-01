@@ -102,6 +102,18 @@
     padding: var(--space-lg) 0;
   }
 
+  /* Pillar inner-edge glow */
+  .sidebar::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 32px;
+    background: linear-gradient(to left, rgba(124, 58, 237, 0.25), transparent);
+    pointer-events: none;
+  }
+
   .sidebar-brand {
     padding: var(--space-md) var(--space-xl);
     font-size: var(--text-xl);
@@ -126,7 +138,7 @@
     text-decoration: none;
     font-weight: 600;
     font-size: var(--text-base);
-    border-radius: var(--radius-lg);
+    border-radius: var(--radius-lg) 0 0 var(--radius-lg);
     transition:
       color var(--transition-fast),
       background var(--transition-fast);
@@ -134,12 +146,14 @@
 
   .sidebar-nav a:hover {
     color: var(--accent-light);
-    background: var(--bg-surface);
+    background: transparent;
+    border-right: 2px solid rgba(167, 139, 250, 0.3);
   }
 
   .sidebar-nav a.active {
     color: var(--accent-medium);
-    background: var(--bg-surface);
+    background: transparent;
+    border-right: 3px solid var(--accent);
   }
 
   .sidebar-footer {

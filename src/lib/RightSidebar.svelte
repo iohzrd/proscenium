@@ -37,6 +37,22 @@
     gap: var(--space-xl);
   }
 
+  /* Pillar inner-edge glow */
+  .right-sidebar::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 32px;
+    background: linear-gradient(
+      to right,
+      rgba(124, 58, 237, 0.25),
+      transparent
+    );
+    pointer-events: none;
+  }
+
   @media (min-width: 1150px) {
     .right-sidebar {
       display: flex;
