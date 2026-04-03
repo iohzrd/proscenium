@@ -4,11 +4,11 @@
 
 :root {
   /* -- Background surfaces (darkest to lightest) -- */
-  --bg-base: #1a1a2e;
-  --bg-deep: #0f0f23;
-  --bg-surface: #16213e;
-  --bg-elevated: #2a2a4a;
-  --bg-elevated-hover: #3a3a5a;
+  --bg-base: #000000;
+  --bg-deep: #000000;
+  --bg-surface: #0f0f0f;
+  --bg-elevated: #171717;
+  --bg-elevated-hover: #202020;
 
   /* -- Text -- */
   --text-primary: #e0e0e0;
@@ -40,10 +40,10 @@
   --color-read: #60a5fa;
 
   /* -- Borders -- */
-  --border: #2a2a4a;
-  --border-hover: #3a3a5a;
-  --border-faint: #2a2a4a40;
-  --border-faintest: #2a2a4a20;
+  --border: #161616;
+  --border-hover: #222222;
+  --border-faint: #16161640;
+  --border-faintest: #16161620;
 
   /* -- Alpha variants -- */
   --accent-light-faint: #c4b5fd40;
@@ -72,10 +72,10 @@
   --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
 
   /* -- Danger zone (relay banner, sync failures) -- */
-  --danger-bg: #7f1d1d;
-  --danger-bg-subtle: #1a0a0a;
-  --danger-bg-subtle-hover: #2a0a0a;
-  --danger-border: #991b1b;
+  --danger-bg: #0f0404;
+  --danger-bg-subtle: #080202;
+  --danger-bg-subtle-hover: #120505;
+  --danger-border: #2a0808;
   --danger-text: #fca5a5;
 
   /* -- Overlays -- */
