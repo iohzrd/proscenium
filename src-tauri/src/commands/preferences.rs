@@ -106,6 +106,22 @@ pub async fn set_audio_input_device(
 }
 
 #[tauri::command]
+pub async fn get_accent_color(state: State<'_, Arc<AppState>>) -> CmdResult<Option<String>> {
+    state
+        .storage
+        .get_preference(preferences::ACCENT_COLOR)
+        .await
+}
+
+#[tauri::command]
+pub async fn set_accent_color(state: State<'_, Arc<AppState>>, name: String) -> CmdResult<()> {
+    state
+        .storage
+        .set_preference(preferences::ACCENT_COLOR, &name)
+        .await
+}
+
+#[tauri::command]
 pub async fn get_audio_output_device(state: State<'_, Arc<AppState>>) -> CmdResult<Option<String>> {
     state
         .storage

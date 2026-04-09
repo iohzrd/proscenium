@@ -6,6 +6,7 @@ pub const SHARE_FOLLOWS: &str = "share_follows";
 pub const SHARE_FOLLOWERS: &str = "share_followers";
 pub const AUDIO_INPUT_DEVICE: &str = "audio_input_device";
 pub const AUDIO_OUTPUT_DEVICE: &str = "audio_output_device";
+pub const ACCENT_COLOR: &str = "accent_color";
 
 pub async fn get_mdns_discovery(storage: &Storage) -> bool {
     storage

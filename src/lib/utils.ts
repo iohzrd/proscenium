@@ -2,11 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Profile, PendingAttachment } from "$lib/types";
 
 const AVATAR_COLORS = [
-  "#7c3aed",
+  "#dc2626",
   "#2563eb",
   "#059669",
   "#d97706",
-  "#dc2626",
+  "#7c3aed",
   "#db2777",
   "#4f46e5",
   "#0891b2",

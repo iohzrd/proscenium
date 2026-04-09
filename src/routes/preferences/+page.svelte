@@ -6,6 +6,7 @@
   import PrivacyToggles from "$lib/preferences/PrivacyToggles.svelte";
   import SecuritySection from "$lib/preferences/SecuritySection.svelte";
   import DangerZoneSection from "$lib/preferences/DangerZoneSection.svelte";
+  import AccentPicker from "$lib/preferences/AccentPicker.svelte";
 
   let nodeId = $state("");
   let pubkey = $state("");
@@ -59,6 +60,8 @@
     </p>
     <AudioDeviceSelect />
   </section>
+
+  <AccentPicker />
 
   <PrivacyToggles />
 

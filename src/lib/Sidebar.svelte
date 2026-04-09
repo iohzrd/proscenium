@@ -110,7 +110,11 @@
     right: 0;
     bottom: 0;
     width: 32px;
-    background: linear-gradient(to left, rgba(124, 58, 237, 0.25), transparent);
+    background: linear-gradient(
+      to left,
+      rgba(var(--accent-rgb), 0.25),
+      transparent
+    );
     pointer-events: none;
   }
 

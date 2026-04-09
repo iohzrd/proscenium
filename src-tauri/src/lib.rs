@@ -245,6 +245,8 @@ pub fn run() {
             set_audio_input_device,
             get_audio_output_device,
             set_audio_output_device,
+            get_accent_color,
+            set_accent_color,
             wipe_all_data,
         ])
         .build(tauri::generate_context!())

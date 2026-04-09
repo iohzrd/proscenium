@@ -47,7 +47,7 @@
     width: 32px;
     background: linear-gradient(
       to right,
-      rgba(124, 58, 237, 0.25),
+      rgba(var(--accent-rgb), 0.25),
       transparent
     );
     pointer-events: none;

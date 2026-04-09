@@ -2,7 +2,7 @@
 name = "proscenium"
 version.workspace = true
 description = "A Tauri App"
-authors = ["you"]
+authors = ["iohzrd"]
 edition.workspace = true
 
 [lib]

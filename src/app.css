@@ -19,12 +19,13 @@
   --text-post: #e8e8e8;
   --text-quoted: #aaa;
 
-  /* -- Accent (purple) -- */
-  --accent: #7c3aed;
-  --accent-hover: #6d28d9;
-  --accent-light: #c4b5fd;
-  --accent-light-hover: #e0d4ff;
-  --accent-medium: #a78bfa;
+  /* -- Accent (default: red, overridden by user preset) -- */
+  --accent: #dc2626;
+  --accent-hover: #b91c1c;
+  --accent-light: #fca5a5;
+  --accent-light-hover: #fecaca;
+  --accent-medium: #f87171;
+  --accent-rgb: 220, 38, 38;
 
   /* -- Semantic colors -- */
   --color-error: #ef4444;
@@ -46,8 +47,8 @@
   --border-faintest: #16161620;
 
   /* -- Alpha variants -- */
-  --accent-light-faint: #c4b5fd40;
-  --accent-light-hover-bg: #c4b5fd12;
+  --accent-light-faint: #fca5a540;
+  --accent-light-hover-bg: #fca5a512;
   --color-error-light-border: #f8717140;
   --color-error-light-bg: #f8717120;
   --color-error-light-hover-bg: #f8717112;

@@ -25,6 +25,7 @@
   import BottomNav from "$lib/BottomNav.svelte";
   import MobileHeader from "$lib/MobileHeader.svelte";
   import CallOverlay from "$lib/CallOverlay.svelte";
+  import { applyAccent, DEFAULT_ACCENT } from "$lib/accent";
 
   const ZOOM_KEY = "app-zoom-level";
   const ZOOM_STEP = 0.2;
@@ -121,6 +122,9 @@
     invoke<string>("get_pubkey")
       .then((id) => (pubkey = id))
       .catch(() => {});
+    invoke<string | null>("get_accent_color")
+      .then((name) => applyAccent(name ?? DEFAULT_ACCENT))
+      .catch(() => applyAccent(DEFAULT_ACCENT));
     pollStatus();
     pollUnread();
     pollUnreadNotifications();
@@ -324,8 +328,8 @@
     height: 48px;
     background: linear-gradient(
       to bottom,
-      rgba(124, 58, 237, 0.22) 0%,
-      rgba(124, 58, 237, 0.05) 60%,
+      rgba(var(--accent-rgb), 0.22) 0%,
+      rgba(var(--accent-rgb), 0.05) 60%,
       transparent 100%
     );
     z-index: var(--z-sidebar);
