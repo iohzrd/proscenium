@@ -335,7 +335,7 @@
   .divider {
     border: none;
     border-top: 1px solid var(--border);
-    margin: 0.25rem 0 1rem;
+    margin: 0.25rem 0 0;
   }
 
   .live-stages {
@@ -353,10 +353,8 @@
     display: flex;
     flex-direction: column;
     gap: 0.4rem;
-    padding: 0.6rem 0.85rem;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-xl);
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
     margin-bottom: 1rem;
   }
 

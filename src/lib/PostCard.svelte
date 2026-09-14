@@ -132,17 +132,9 @@
 
 <style>
   .post {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-2xl);
-    padding: 0.875rem 1rem;
-    margin-bottom: 0.4rem;
-    transition: border-color var(--transition-normal);
+    padding: 1.1rem 0.25rem;
+    border-bottom: 1px solid var(--border);
     animation: fadeIn var(--transition-slow) ease-out;
-  }
-
-  .post:hover {
-    border-color: var(--border-hover);
   }
 
   .repost-label {
@@ -193,9 +185,12 @@
   }
 
   .author {
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
     font-weight: 600;
-    font-size: var(--text-base);
-    color: var(--accent-light);
+    font-size: var(--text-lg);
+    letter-spacing: -0.005em;
+    color: var(--text-primary);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -232,6 +227,7 @@
   .time-link {
     color: var(--text-tertiary);
     font-size: var(--text-sm);
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
     text-decoration: none;
   }
@@ -246,7 +242,7 @@
     white-space: pre-wrap;
     word-break: break-word;
     font-size: var(--text-lg);
-    line-height: 1.55;
+    line-height: 1.6;
     color: var(--text-post);
   }
 

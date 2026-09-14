@@ -102,26 +102,13 @@
     padding: var(--space-lg) 0;
   }
 
-  /* Pillar inner-edge glow */
-  .sidebar::after {
-    content: "";
-    position: absolute;
-    top: 0;
-    right: 0;
-    bottom: 0;
-    width: 32px;
-    background: linear-gradient(
-      to left,
-      rgba(var(--accent-rgb), 0.25),
-      transparent
-    );
-    pointer-events: none;
-  }
-
   .sidebar-brand {
     padding: var(--space-md) var(--space-xl);
-    font-size: var(--text-xl);
-    font-weight: 700;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: 500;
+    font-size: var(--text-2xl);
+    letter-spacing: -0.02em;
     color: var(--text-primary);
     margin-bottom: var(--space-lg);
   }
@@ -140,24 +127,24 @@
     padding: var(--space-md) var(--space-lg);
     color: var(--text-muted);
     text-decoration: none;
-    font-weight: 600;
+    font-weight: 500;
     font-size: var(--text-base);
-    border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+    border-radius: var(--radius-lg);
+    border-left: 2px solid transparent;
     transition:
       color var(--transition-fast),
       background var(--transition-fast);
   }
 
   .sidebar-nav a:hover {
-    color: var(--accent-light);
-    background: transparent;
-    border-right: 2px solid rgba(167, 139, 250, 0.3);
+    color: var(--text-primary);
+    background: var(--bg-surface);
   }
 
   .sidebar-nav a.active {
-    color: var(--accent-medium);
-    background: transparent;
-    border-right: 3px solid var(--accent);
+    color: var(--text-primary);
+    background: var(--bg-surface);
+    border-left-color: var(--accent);
   }
 
   .sidebar-footer {
@@ -180,12 +167,10 @@
 
   .status-dot.connected {
     background: var(--color-success);
-    box-shadow: 0 0 4px var(--glow-success);
   }
 
   .status-dot.disconnected {
     background: var(--color-error);
-    box-shadow: 0 0 4px var(--glow-error);
   }
 
   .status-text {

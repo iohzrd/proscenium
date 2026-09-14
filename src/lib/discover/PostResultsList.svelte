@@ -44,14 +44,11 @@
   .post-list {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
   }
 
   .feed-post {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    padding: 0.75rem 1rem;
+    padding: 0.85rem 0.25rem;
+    border-bottom: 1px solid var(--border);
   }
 
   .post-meta {
@@ -62,7 +59,10 @@
   }
 
   .post-author {
-    color: var(--accent-light);
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
+    font-size: var(--text-base);
+    color: var(--text-primary);
     text-decoration: none;
     font-weight: 600;
   }

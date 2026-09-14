@@ -45,16 +45,8 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-2xl);
-    padding: 0.75rem 1rem;
-    margin-bottom: 0.5rem;
-    transition: border-color var(--transition-normal);
-  }
-
-  .follow-item:hover {
-    border-color: var(--border-hover);
+    padding: 0.85rem 0.25rem;
+    border-bottom: 1px solid var(--border);
   }
 
   .follow-info {
@@ -78,9 +70,11 @@
   }
 
   .display-name {
+    font-family: var(--font-display);
+    font-optical-sizing: auto;
     font-weight: 600;
-    color: var(--accent-light);
-    font-size: var(--text-base);
+    color: var(--text-primary);
+    font-size: var(--text-lg);
   }
 
   code {

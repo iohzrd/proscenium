@@ -56,8 +56,8 @@
 
   .profile-info h2 {
     margin: 0;
-    color: var(--accent-medium);
-    font-size: var(--text-xl);
+    color: var(--text-primary);
+    font-size: var(--text-2xl);
   }
 
   .bio {

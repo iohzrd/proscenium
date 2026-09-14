@@ -2,14 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Profile, PendingAttachment } from "$lib/types";
 
 const AVATAR_COLORS = [
-  "#dc2626",
-  "#2563eb",
-  "#059669",
-  "#d97706",
-  "#7c3aed",
-  "#db2777",
-  "#4f46e5",
-  "#0891b2",
+  "#c24b3f",
+  "#4f7fc0",
+  "#5f9a5a",
+  "#d0853a",
+  "#8a6fc4",
+  "#c4628c",
+  "#6272b8",
+  "#40978f",
 ];
 
 export function avatarColor(pubkey: string): string {

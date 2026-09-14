@@ -6,79 +6,73 @@ export interface AccentPreset {
   accentLight: string;
   accentLightHover: string;
   accentMedium: string;
-  accentRgb: string; // for rgba() gradients
 }
 
+// Desaturated, warm-leaning accents. Keys are persisted by the backend, so
+// the names stay stable while the values change.
 export const ACCENT_PRESETS: Record<string, AccentPreset> = {
   red: {
     name: "red",
-    label: "Red",
-    accent: "#dc2626",
-    accentHover: "#b91c1c",
-    accentLight: "#fca5a5",
-    accentLightHover: "#fecaca",
-    accentMedium: "#f87171",
-    accentRgb: "220, 38, 38",
+    label: "Terracotta",
+    accent: "#c24b3f",
+    accentHover: "#a83f35",
+    accentLight: "#e9a89f",
+    accentLightHover: "#f2c7c1",
+    accentMedium: "#dc7d72",
   },
   purple: {
     name: "purple",
-    label: "Purple",
-    accent: "#7c3aed",
-    accentHover: "#6d28d9",
-    accentLight: "#c4b5fd",
-    accentLightHover: "#e0d4ff",
-    accentMedium: "#a78bfa",
-    accentRgb: "124, 58, 237",
+    label: "Heather",
+    accent: "#8a6fc4",
+    accentHover: "#785fae",
+    accentLight: "#c9bae8",
+    accentLightHover: "#ded4f2",
+    accentMedium: "#ab97d8",
   },
   blue: {
     name: "blue",
-    label: "Blue",
-    accent: "#2563eb",
-    accentHover: "#1d4ed8",
-    accentLight: "#93c5fd",
-    accentLightHover: "#bfdbfe",
-    accentMedium: "#60a5fa",
-    accentRgb: "37, 99, 235",
+    label: "Slate Blue",
+    accent: "#4f7fc0",
+    accentHover: "#436ea9",
+    accentLight: "#a9c2e4",
+    accentLightHover: "#c5d6ee",
+    accentMedium: "#7ca0d4",
   },
   green: {
     name: "green",
-    label: "Green",
-    accent: "#16a34a",
-    accentHover: "#15803d",
-    accentLight: "#86efac",
-    accentLightHover: "#bbf7d0",
-    accentMedium: "#4ade80",
-    accentRgb: "22, 163, 74",
+    label: "Moss",
+    accent: "#5f9a5a",
+    accentHover: "#52874e",
+    accentLight: "#b4d4ae",
+    accentLightHover: "#cce2c8",
+    accentMedium: "#88b982",
   },
   orange: {
     name: "orange",
-    label: "Orange",
-    accent: "#ea580c",
-    accentHover: "#c2410c",
-    accentLight: "#fdba74",
-    accentLightHover: "#fed7aa",
-    accentMedium: "#fb923c",
-    accentRgb: "234, 88, 12",
+    label: "Ochre",
+    accent: "#d0853a",
+    accentHover: "#b97432",
+    accentLight: "#eec69c",
+    accentLightHover: "#f4d9bb",
+    accentMedium: "#e2a666",
   },
   pink: {
     name: "pink",
-    label: "Pink",
-    accent: "#db2777",
-    accentHover: "#be185d",
-    accentLight: "#f9a8d4",
-    accentLightHover: "#fbcfe8",
-    accentMedium: "#f472b6",
-    accentRgb: "219, 39, 119",
+    label: "Rose",
+    accent: "#c4628c",
+    accentHover: "#ad547b",
+    accentLight: "#e9b3c8",
+    accentLightHover: "#f1cbda",
+    accentMedium: "#d78aab",
   },
   teal: {
     name: "teal",
-    label: "Teal",
-    accent: "#0d9488",
-    accentHover: "#0f766e",
-    accentLight: "#5eead4",
-    accentLightHover: "#99f6e4",
-    accentMedium: "#2dd4bf",
-    accentRgb: "13, 148, 136",
+    label: "Verdigris",
+    accent: "#40978f",
+    accentHover: "#37847d",
+    accentLight: "#a4d1cc",
+    accentLightHover: "#c0e0dc",
+    accentMedium: "#70b6af",
   },
 };
 
@@ -92,7 +86,6 @@ export function applyAccent(name: string): void {
   root.style.setProperty("--accent-light", preset.accentLight);
   root.style.setProperty("--accent-light-hover", preset.accentLightHover);
   root.style.setProperty("--accent-medium", preset.accentMedium);
-  root.style.setProperty("--accent-rgb", preset.accentRgb);
 
   // Derived alpha variants
   root.style.setProperty("--accent-light-faint", preset.accentLight + "40");

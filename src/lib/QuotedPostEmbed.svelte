@@ -63,17 +63,15 @@
   .quoted-post {
     display: block;
     margin-top: 0.6rem;
-    padding: 0.6rem 0.75rem;
-    background: var(--bg-deep);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+    padding: 0.4rem 0 0.4rem 0.85rem;
+    border-left: 2px solid var(--border-hover);
     text-decoration: none;
     color: inherit;
     transition: border-color var(--transition-normal);
   }
 
   .quoted-post:hover {
-    border-color: var(--border-hover);
+    border-color: var(--accent-medium);
   }
 
   .quoted-post.unavailable {

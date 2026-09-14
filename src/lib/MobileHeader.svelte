@@ -36,8 +36,11 @@
   }
 
   .app-name {
-    font-size: var(--text-lg);
-    font-weight: 700;
+    font-family: var(--font-display);
+    font-style: italic;
+    font-weight: 500;
+    font-size: var(--text-xl);
+    letter-spacing: -0.02em;
     color: var(--text-primary);
   }
 
@@ -50,12 +53,10 @@
 
   .status-dot.connected {
     background: var(--color-success);
-    box-shadow: 0 0 4px var(--glow-success);
   }
 
   .status-dot.disconnected {
     background: var(--color-error);
-    box-shadow: 0 0 4px var(--glow-error);
   }
 
   @media (min-width: 768px) {

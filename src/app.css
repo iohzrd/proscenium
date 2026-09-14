@@ -1,88 +1,87 @@
+@import "@fontsource-variable/fraunces";
+@import "@fontsource-variable/fraunces/wght-italic.css";
+@import "@fontsource-variable/inter";
+
 /* ==========================================================================
    Design Tokens
    ========================================================================== */
 
 :root {
-  /* -- Background surfaces (darkest to lightest) -- */
-  --bg-base: #000000;
-  --bg-deep: #000000;
-  --bg-surface: #0f0f0f;
-  --bg-elevated: #171717;
-  --bg-elevated-hover: #202020;
+  /* -- Background surfaces (darkest to lightest), warm-tinted -- */
+  --bg-base: #141210;
+  --bg-deep: #0f0e0c;
+  --bg-surface: #1b1917;
+  --bg-elevated: #242220;
+  --bg-elevated-hover: #2c2a27;
 
   /* -- Text -- */
-  --text-primary: #e0e0e0;
-  --text-secondary: #9a9aaa;
-  --text-tertiary: #8a8a9a;
-  --text-muted: #7f7f92;
+  --text-primary: #ece6db;
+  --text-secondary: #b4ab9d;
+  --text-tertiary: #8f8678;
+  --text-muted: #6f6759;
   --text-on-accent: #ffffff;
-  --text-post: #e8e8e8;
-  --text-quoted: #aaa;
+  --text-post: #efe9de;
+  --text-quoted: #b4ab9d;
 
   /* -- Accent (default: red, overridden by user preset) -- */
-  --accent: #dc2626;
-  --accent-hover: #b91c1c;
-  --accent-light: #fca5a5;
-  --accent-light-hover: #fecaca;
-  --accent-medium: #f87171;
-  --accent-rgb: 220, 38, 38;
+  --accent: #c24b3f;
+  --accent-hover: #a83f35;
+  --accent-light: #e9a89f;
+  --accent-light-hover: #f2c7c1;
+  --accent-medium: #dc7d72;
 
   /* -- Semantic colors -- */
-  --color-error: #ef4444;
-  --color-error-light: #f87171;
-  --color-error-dark: #dc2626;
-  --color-error-dark-hover: #b91c1c;
-  --color-warning: #f59e0b;
-  --color-success: #22c55e;
-  --color-success-hover: #16a34a;
-  --color-bookmark: #fbbf24;
-  --color-link: #7dd3fc;
-  --color-delivered: #a7f3d0;
-  --color-read: #60a5fa;
+  --color-error: #d4574c;
+  --color-error-light: #e5877e;
+  --color-error-dark: #b8463c;
+  --color-error-dark-hover: #9e3b32;
+  --color-warning: #d8a03a;
+  --color-success: #6aa564;
+  --color-success-hover: #5a9154;
+  --color-bookmark: #d8a03a;
+  --color-link: #8fb4d9;
+  --color-delivered: #b9d9b5;
+  --color-read: #8fb4d9;
 
-  /* -- Borders -- */
-  --border: #161616;
-  --border-hover: #222222;
-  --border-faint: #16161640;
-  --border-faintest: #16161620;
+  /* -- Borders (hairlines, visible against surfaces) -- */
+  --border: #2b2724;
+  --border-hover: #3c3733;
+  --border-faint: #2b272499;
+  --border-faintest: #2b272466;
 
   /* -- Alpha variants -- */
-  --accent-light-faint: #fca5a540;
-  --accent-light-hover-bg: #fca5a512;
-  --color-error-light-border: #f8717140;
-  --color-error-light-bg: #f8717120;
-  --color-error-light-hover-bg: #f8717112;
-  --color-warning-border: #f59e0b40;
-  --color-warning-bg: #f59e0b20;
-  --color-error-border: #ef444440;
-  --color-error-bg-subtle: #ef444410;
-  --color-bookmark-hover-bg: #fbbf2412;
-  --color-warning-bg-subtle: #f59e0b10;
-  --color-error-bg-hover: #ef444415;
+  --accent-light-faint: #e9a89f40;
+  --accent-light-hover-bg: #e9a89f12;
+  --color-error-light-border: #e5877e40;
+  --color-error-light-bg: #e5877e20;
+  --color-error-light-hover-bg: #e5877e12;
+  --color-warning-border: #d8a03a40;
+  --color-warning-bg: #d8a03a20;
+  --color-error-border: #d4574c40;
+  --color-error-bg-subtle: #d4574c10;
+  --color-bookmark-hover-bg: #d8a03a12;
+  --color-warning-bg-subtle: #d8a03a10;
+  --color-error-bg-hover: #d4574c15;
 
   /* -- White alpha variants (for button spinners on accent bg) -- */
   --white-faint: rgba(255, 255, 255, 0.25);
 
-  /* -- Glow (box-shadow alpha variants) -- */
-  --glow-success: #22c55e80;
-  --glow-error: #ef444480;
-
-  /* -- Shadows -- */
-  --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.4);
-  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
-  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.5);
+  /* -- Shadows (warm black, low spread) -- */
+  --shadow-sm: 0 1px 2px rgba(10, 8, 6, 0.5);
+  --shadow-md: 0 4px 10px rgba(10, 8, 6, 0.45);
+  --shadow-lg: 0 10px 28px rgba(10, 8, 6, 0.55);
 
   /* -- Danger zone (relay banner, sync failures) -- */
-  --danger-bg: #0f0404;
-  --danger-bg-subtle: #080202;
-  --danger-bg-subtle-hover: #120505;
-  --danger-border: #2a0808;
-  --danger-text: #fca5a5;
+  --danger-bg: #1f100e;
+  --danger-bg-subtle: #170c0a;
+  --danger-bg-subtle-hover: #24130f;
+  --danger-border: #3a1c18;
+  --danger-text: #e9a89f;
 
   /* -- Overlays -- */
-  --overlay-dark: rgba(0, 0, 0, 0.92);
-  --overlay-medium: rgba(0, 0, 0, 0.7);
-  --overlay-light: rgba(0, 0, 0, 0.6);
+  --overlay-dark: rgba(12, 10, 8, 0.92);
+  --overlay-medium: rgba(12, 10, 8, 0.7);
+  --overlay-light: rgba(12, 10, 8, 0.6);
   --overlay-white-faint: rgba(255, 255, 255, 0.3);
   --overlay-white-subtle: rgba(255, 255, 255, 0.2);
 
@@ -100,12 +99,12 @@
   --transition-normal: 0.2s;
   --transition-slow: 0.3s;
 
-  /* -- Border radius -- */
-  --radius-sm: 4px;
-  --radius-md: 6px;
-  --radius-lg: 8px;
-  --radius-xl: 10px;
-  --radius-2xl: 12px;
+  /* -- Border radius (small; edges read as print, not as tiles) -- */
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+  --radius-2xl: 8px;
   --radius-pill: 11px;
   --radius-full: 999px;
 
@@ -118,24 +117,29 @@
   --space-2xl: 2rem;
 
   /* -- Font sizes -- */
-  --text-xs: 0.65rem;
-  --text-sm: 0.75rem;
-  --text-base: 0.875rem;
-  --text-lg: 0.95rem;
-  --text-xl: 1.1rem;
-  --text-2xl: 1.3rem;
-  --text-3xl: 1.8rem;
+  --text-xs: 0.7rem;
+  --text-sm: 0.78rem;
+  --text-base: 0.9rem;
+  --text-lg: 1rem;
+  --text-xl: 1.2rem;
+  --text-2xl: 1.5rem;
+  --text-3xl: 2.1rem;
   --text-icon: 1rem;
   --text-icon-lg: 1.2rem;
   --text-icon-xl: 1.5rem;
 
-  /* -- Font family -- */
+  /* -- Font families -- */
+  --font-body:
+    "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  --font-display:
+    "Fraunces Variable", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
   --font-mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
 
   /* -- Layout -- */
   --sidebar-width: 240px;
   --right-sidebar-width: 240px;
-  --content-max-width: 720px;
+  --content-max-width: 680px;
   --bottom-nav-height: 56px;
   --mobile-header-height: 48px;
   --z-sidebar: 10;
@@ -155,16 +159,36 @@
 
 body {
   margin: 0;
-  font-family:
-    "Inter",
-    -apple-system,
-    BlinkMacSystemFont,
-    "Segoe UI",
-    sans-serif;
+  font-family: var(--font-body);
   font-size: 15px;
   line-height: 1.5;
   color: var(--text-primary);
   background-color: var(--bg-base);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Headings use the display serif at a light weight and tight tracking. */
+h1,
+h2,
+h3 {
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-optical-sizing: auto;
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+
+h1 {
+  font-size: var(--text-3xl);
+}
+
+h2 {
+  font-size: var(--text-2xl);
+}
+
+h3 {
+  font-size: var(--text-xl);
 }
 
 /* Normalize form elements: inherit font-family */
@@ -243,7 +267,7 @@ button:disabled {
 
 .textarea-base {
   width: 100%;
-  background: var(--bg-deep);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   padding: 0.6rem 0.75rem;
@@ -261,11 +285,15 @@ button:disabled {
 /* -- Section title (thread replies, profile posts) -- */
 
 .section-title {
-  color: var(--text-secondary);
-  font-size: var(--text-base);
+  color: var(--text-tertiary);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.12em;
   margin: 0 0 0.5rem;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
 }
 
 /* -- Form fields (profile editing, welcome) -- */
@@ -276,10 +304,11 @@ button:disabled {
 
 .field-label {
   display: block;
-  font-size: var(--text-base);
-  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-tertiary);
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.12em;
   margin-bottom: 0.3rem;
 }
 
@@ -364,7 +393,8 @@ button .btn-spinner {
 .modal {
   background: var(--bg-surface);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-2xl);
+  box-shadow: var(--shadow-lg);
   padding: 1.5rem;
   max-width: 320px;
   width: 90%;
@@ -429,6 +459,7 @@ button .btn-spinner {
   left: 50%;
   transform: translateX(-50%);
   background: var(--bg-elevated);
+  border: 1px solid var(--border-hover);
   color: var(--text-primary);
   padding: 0.6rem 1.25rem;
   border-radius: var(--radius-lg);
@@ -476,9 +507,11 @@ button .btn-spinner {
 /* -- Page title -- */
 
 .page-title {
-  font-size: var(--text-xl);
+  font-size: var(--text-2xl);
   color: var(--text-primary);
-  margin: 0 0 0.75rem;
+  margin: 0 0 1rem;
+  padding-bottom: 0.6rem;
+  border-bottom: 1px solid var(--border);
 }
 
 /* -- Filter bar / chips -- */
@@ -491,9 +524,9 @@ button .btn-spinner {
 }
 
 .filter-chip {
-  background: var(--bg-elevated);
+  background: transparent;
   color: var(--text-secondary);
-  border: 1px solid transparent;
+  border: 1px solid var(--border);
   border-radius: var(--radius-full);
   padding: 0.4rem 0.85rem;
   font-size: var(--text-sm);

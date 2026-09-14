@@ -37,22 +37,6 @@
     gap: var(--space-xl);
   }
 
-  /* Pillar inner-edge glow */
-  .right-sidebar::before {
-    content: "";
-    position: absolute;
-    top: 0;
-    left: 0;
-    bottom: 0;
-    width: 32px;
-    background: linear-gradient(
-      to right,
-      rgba(var(--accent-rgb), 0.25),
-      transparent
-    );
-    pointer-events: none;
-  }
-
   @media (min-width: 1150px) {
     .right-sidebar {
       display: flex;
@@ -60,18 +44,18 @@
   }
 
   .panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-2xl);
-    padding: var(--space-lg);
+    padding: 0;
   }
 
   .panel-title {
-    font-size: var(--text-base);
-    font-weight: 700;
-    color: var(--text-secondary);
+    font-family: var(--font-body);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    color: var(--text-tertiary);
     text-transform: uppercase;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.12em;
     margin: 0 0 var(--space-md);
+    padding-bottom: var(--space-sm);
+    border-bottom: 1px solid var(--border);
   }
 </style>

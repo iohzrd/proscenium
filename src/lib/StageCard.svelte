@@ -52,8 +52,8 @@
     justify-content: space-between;
     gap: 0.75rem;
     background: var(--bg-surface);
-    border: 1px solid var(--accent-medium);
-    border-radius: var(--radius-2xl);
+    border-left: 2px solid var(--accent);
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
     padding: 0.75rem 1rem;
     margin-bottom: 0.4rem;
     animation: fadeIn var(--transition-slow) ease-out;

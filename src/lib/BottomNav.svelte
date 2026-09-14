@@ -172,7 +172,7 @@
 
   .tab-label {
     font-size: var(--text-xs);
-    font-weight: 600;
+    font-weight: 500;
   }
 
   .tab-icon-wrap {
