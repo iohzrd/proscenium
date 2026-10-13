@@ -1,25 +1,17 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
+  import { useNodeInit } from "$lib/composables";
   import ServerManagement from "$lib/preferences/ServerManagement.svelte";
   import PrivacyToggles from "$lib/preferences/PrivacyToggles.svelte";
   import SecuritySection from "$lib/preferences/SecuritySection.svelte";
   import DangerZoneSection from "$lib/preferences/DangerZoneSection.svelte";
   import AccentPicker from "$lib/preferences/AccentPicker.svelte";
 
-  let nodeId = $state("");
-  let pubkey = $state("");
+  const node = useNodeInit(async () => {});
 
-  onMount(async () => {
-    try {
-      [nodeId, pubkey] = await Promise.all([
-        invoke<string>("get_node_id"),
-        invoke<string>("get_pubkey"),
-      ]);
-    } catch {
-      // Node not ready
-    }
+  onMount(() => {
+    node.init();
   });
 </script>
 
@@ -30,16 +22,19 @@
     <h3>Identity</h3>
     <div class="setting-row">
       <span class="setting-label">Node ID</span>
-      <code class="setting-value">{nodeId || "..."}</code>
+      <code class="setting-value">{node.nodeId || "..."}</code>
     </div>
     <div class="setting-row">
       <span class="setting-label">Public Key</span>
-      <code class="setting-value">{pubkey || "..."}</code>
+      <code class="setting-value">{node.pubkey || "..."}</code>
     </div>
     <p class="setting-hint">
       Node ID is your transport address (share to connect). Public Key is your
       permanent identity.
     </p>
+    {#if node.error}
+      <p class="setting-hint" role="alert">{node.error}</p>
+    {/if}
   </section>
 
   <ServerManagement />

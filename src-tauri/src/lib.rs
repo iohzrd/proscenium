@@ -1,6 +1,8 @@
+mod announcement;
 mod audio;
 mod call;
 mod commands;
+mod confirm;
 mod constants;
 mod crypto;
 mod device_sync;
@@ -63,6 +65,10 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
                 }
             }
             "quit" => {
+                // `exit` triggers `RunEvent::ExitRequested`, whose handler stops the
+                // network. The call here covers the case where `exit` cannot reach
+                // the event loop and ends the process directly.
+                setup::shutdown_for_exit(app);
                 app.exit(0);
             }
             _ => {}
@@ -123,6 +129,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
+        .manage(DroppedPaths::default())
+        .on_window_event(record_dropped_paths)
         .setup(|app| {
             #[cfg(not(mobile))]
             setup_tray(app)?;
@@ -158,8 +166,6 @@ pub fn run() {
             get_remote_follows,
             get_remote_followers,
             get_peer_node_ids,
-            add_blob,
-            fetch_blob,
             add_blob_bytes,
             add_blob_from_path,
             add_blob_from_rgba,
@@ -173,6 +179,7 @@ pub fn run() {
             delete_dm_message,
             get_unread_dm_count,
             send_dm_signal,
+            flush_dm_outbox,
             toggle_bookmark,
             is_bookmarked,
             mute_user,
@@ -233,6 +240,9 @@ pub fn run() {
             stage_send_reaction,
             stage_send_chat,
             stage_volunteer_relay,
+            stage_kick,
+            stage_ban,
+            stage_mute_speaker,
             get_mdns_discovery,
             set_mdns_discovery,
             get_dht_discovery,
@@ -254,6 +264,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            // Stop the network stack (at most 3 s) before the process exits or restarts.
+            if let tauri::RunEvent::ExitRequested { .. } = &event {
+                setup::shutdown_for_exit(app);
+            }
+
             #[cfg(not(mobile))]
             if let tauri::RunEvent::WindowEvent {
                 event: tauri::WindowEvent::CloseRequested { api, .. },

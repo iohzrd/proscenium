@@ -7,19 +7,31 @@
   import Timeago from "$lib/Timeago.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import type { AppNotification, Post } from "$lib/types";
-  import { getDisplayName, shortId } from "$lib/utils";
+  import {
+    coalesce,
+    dedupeById,
+    getCachedDisplayName,
+    getDisplayName,
+    isWindowActive,
+    mergeFirstPage,
+    shortId,
+  } from "$lib/utils";
   import {
     useNodeInit,
     useEventListeners,
     useInfiniteScroll,
     useLightbox,
+    useToast,
   } from "$lib/composables";
+
+  const PAGE_SIZE = 30;
+  // Largest number of rows one refresh reads again.
+  const REFRESH_MAX = 90;
 
   let notifications = $state<AppNotification[]>([]);
   let sentinel = $state<HTMLDivElement>(null!);
   let filter = $state("all");
   let postCache = $state<Record<string, Post>>({});
-  let nameCache = $state<Record<string, string>>({});
 
   const FILTERS = [
     { value: "all", label: "All" },
@@ -28,9 +40,11 @@
     { value: "reply", label: "Replies" },
     { value: "quote", label: "Quotes" },
     { value: "follower", label: "Followers" },
+    { value: "follow_request", label: "Requests" },
   ] as const;
 
-  const blobs = createBlobCache();
+  const toast = useToast();
+  const blobs = createBlobCache({ onError: toast.show });
   setBlobContext(blobs);
 
   const lightbox = useLightbox();
@@ -41,78 +55,111 @@
       : notifications.filter((n) => n.kind === filter),
   );
 
-  async function resolveName(pubkey: string): Promise<string> {
-    if (nameCache[pubkey]) return nameCache[pubkey];
-    const name = await getDisplayName(pubkey, node.pubkey);
-    nameCache = { ...nameCache, [pubkey]: name };
-    return name;
+  function actorName(pubkey: string): string {
+    if (pubkey === node.pubkey) return "You";
+    return getCachedDisplayName(pubkey) ?? shortId(pubkey);
   }
 
+  /** Load the posts and actor names that `notifs` reference and that are not cached. */
   async function fetchPostsForNotifications(notifs: AppNotification[]) {
     const ids = new Set<string>();
-    for (const n of notifs) {
-      if (n.post_id && !postCache[n.post_id]) ids.add(n.post_id);
-      if (n.target_post_id && !postCache[n.target_post_id])
-        ids.add(n.target_post_id);
-    }
     const actors = new Set<string>();
     for (const n of notifs) {
-      if (!nameCache[n.actor]) actors.add(n.actor);
+      if (n.post_id && !postCache[n.post_id]) ids.add(n.post_id);
+      if (n.target_post_id && !postCache[n.target_post_id]) {
+        ids.add(n.target_post_id);
+      }
+      actors.add(n.actor);
     }
     const postPromises = [...ids].map(async (id) => {
       try {
         const post: Post | null = await invoke("get_post", { id });
-        if (post) {
-          postCache = { ...postCache, [id]: post };
-        }
+        if (post) postCache[id] = post;
       } catch {
         // post may have been deleted
       }
     });
-    const namePromises = [...actors].map((pubkey) => resolveName(pubkey));
+    const namePromises = [...actors].map((pubkey) =>
+      getDisplayName(pubkey, node.pubkey),
+    );
     await Promise.all([...postPromises, ...namePromises]);
   }
 
+  /** Clear the unread state. Returns early unless the window is active. */
+  function markRead() {
+    if (!isWindowActive()) return;
+    invoke("mark_notifications_read").catch((e) =>
+      console.error("Failed to mark notifications read:", e),
+    );
+  }
+
   const node = useNodeInit(async () => {
-    await loadNotifications();
-    await invoke("mark_notifications_read");
+    await refreshNotifications();
+    markRead();
   });
 
-  async function loadNotifications() {
+  /**
+   * Read the first rows of the notification list again and merge them into
+   * `notifications` by id. Rows loaded by pagination beyond the refreshed
+   * range are kept.
+   */
+  const refreshNotifications = coalesce(async () => {
+    const limit = Math.min(
+      Math.max(PAGE_SIZE, notifications.length),
+      REFRESH_MAX,
+    );
     try {
-      const result: AppNotification[] = await invoke("get_notifications", {
-        limit: 30,
+      const fresh: AppNotification[] = await invoke("get_notifications", {
+        limit,
       });
-      notifications = result;
-      scroll.setHasMore(result.length);
-      await fetchPostsForNotifications(result);
+      const merged = mergeFirstPage(notifications, fresh, limit, "desc");
+      notifications = merged.items;
+      if (merged.exhausted) scroll.setNoMore();
+      else if (!merged.keptExisting) scroll.reset();
+      await fetchPostsForNotifications(fresh);
     } catch (e) {
+      toast.show("Failed to load notifications");
       console.error("Failed to load notifications:", e);
     }
-  }
+  });
 
   const scroll = useInfiniteScroll(
     () => sentinel,
     async () => {
+      const last = notifications[notifications.length - 1];
+      if (!last) return false;
       try {
-        const oldest = notifications[notifications.length - 1];
         const more: AppNotification[] = await invoke("get_notifications", {
-          limit: 30,
-          before: oldest.timestamp,
+          limit: PAGE_SIZE,
+          before: last.timestamp,
+          beforeId: last.id,
         });
-        if (more.length === 0) {
+        // The cursor row is no longer the last row: this page is outdated.
+        if (notifications[notifications.length - 1]?.id !== last.id) return;
+        const known = new Set(notifications.map((n) => n.id));
+        const added = dedupeById(more).filter((n) => !known.has(n.id));
+        if (added.length === 0) {
           scroll.setNoMore();
-        } else {
-          notifications = [...notifications, ...more];
-          scroll.setHasMore(more.length);
-          await fetchPostsForNotifications(more);
+          return;
         }
+        notifications = [...notifications, ...added];
+        scroll.setHasMore(more.length);
+        await fetchPostsForNotifications(added);
       } catch (e) {
+        toast.show("Failed to load more notifications");
         console.error("Failed to load more notifications:", e);
+        return false;
       }
     },
-    30,
+    PAGE_SIZE,
   );
+
+  function selectFilter(value: string) {
+    filter = value;
+    // A filter with few matches leaves the sentinel in view without an
+    // intersection change; request the next page explicitly.
+    scroll.checkSentinel();
+  }
 
   function postForNotification(n: AppNotification): Post | undefined {
     if (n.kind === "like") {
@@ -121,7 +168,7 @@
     return n.post_id ? postCache[n.post_id] : undefined;
   }
 
-  function notifLabel(kind: string): string {
+  function notifLabel(kind: AppNotification["kind"]): string {
     switch (kind) {
       case "mention":
         return "mentioned you";
@@ -133,9 +180,15 @@
         return "quoted your post";
       case "follower":
         return "started following you";
+      case "follow_request":
+        return "requested to follow you";
       default:
         return "";
     }
+  }
+
+  function handleActivation() {
+    if (!node.loading) markRead();
   }
 
   $effect(() => {
@@ -144,17 +197,19 @@
 
   onMount(() => {
     node.init();
+    const onEvent = () => {
+      refreshNotifications();
+      markRead();
+    };
     const cleanupListeners = useEventListeners({
-      "notification-received": () => {
-        loadNotifications();
-        invoke("mark_notifications_read");
-      },
-      "mentioned-in-post": () => {
-        loadNotifications();
-        invoke("mark_notifications_read");
-      },
+      "notification-received": onEvent,
+      "mentioned-in-post": onEvent,
     });
+    window.addEventListener("focus", handleActivation);
+    document.addEventListener("visibilitychange", handleActivation);
     return () => {
+      window.removeEventListener("focus", handleActivation);
+      document.removeEventListener("visibilitychange", handleActivation);
       cleanupListeners();
       blobs.revokeAll();
     };
@@ -177,7 +232,7 @@
     <button
       class="filter-chip"
       class:active={filter === f.value}
-      onclick={() => (filter = f.value)}
+      onclick={() => selectFilter(f.value)}
     >
       {f.label}
     </button>
@@ -189,47 +244,69 @@
     <div class="spinner"></div>
     <p>Loading notifications...</p>
   </div>
-{:else if filtered.length === 0}
+{:else if node.error}
   <div class="empty">
-    <p>No notifications yet.</p>
-    <p class="hint">
-      Mentions, likes, replies, quotes, and new followers will appear here.
-    </p>
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
   </div>
 {:else}
-  <div class="notifications">
-    {#each filtered as notif (notif.id)}
-      {@const post = postForNotification(notif)}
-      <div class="notif" class:unread={!notif.read}>
-        <div class="notif-header">
-          <a href="/profile/{notif.actor}" class="notif-actor">
-            <Avatar
-              pubkey={notif.actor}
-              name={nameCache[notif.actor] || shortId(notif.actor)}
-              size={28}
-            />
-            <span class="actor-name"
-              >{nameCache[notif.actor] || shortId(notif.actor)}</span
-            >
-          </a>
-          <span class="notif-label">{notifLabel(notif.kind)}</span>
-          <Timeago timestamp={notif.timestamp} />
-        </div>
-
-        {#if notif.kind === "follower"}
-          <a href="/profile/{notif.actor}" class="follower-link">View profile</a
-          >
-        {:else if post}
-          <div class="notif-post">
-            <PostCard {post} pubkey={node.pubkey} onlightbox={lightbox.open} />
+  {#if filtered.length === 0}
+    <div class="empty">
+      {#if filter === "all"}
+        <p>No notifications yet.</p>
+        <p class="hint">
+          Mentions, likes, replies, quotes, new followers, and follow requests
+          will appear here.
+        </p>
+      {:else if scroll.hasMore && notifications.length > 0}
+        <p>No notifications of this type in the loaded range.</p>
+      {:else}
+        <p>No notifications of this type.</p>
+      {/if}
+    </div>
+  {:else}
+    <div class="notifications">
+      {#each filtered as notif (notif.id)}
+        {@const post = postForNotification(notif)}
+        <div class="notif" class:unread={!notif.read}>
+          <div class="notif-header">
+            <a href="/profile/{notif.actor}" class="notif-actor">
+              <Avatar
+                pubkey={notif.actor}
+                name={actorName(notif.actor)}
+                size={28}
+              />
+              <span class="actor-name">{actorName(notif.actor)}</span>
+            </a>
+            <span class="notif-label">{notifLabel(notif.kind)}</span>
+            <Timeago timestamp={notif.timestamp} />
           </div>
-        {:else}
-          <p class="notif-deleted">Post no longer available</p>
-        {/if}
-      </div>
-    {/each}
-  </div>
 
+          {#if notif.kind === "follower"}
+            <a href="/profile/{notif.actor}" class="follower-link"
+              >View profile</a
+            >
+          {:else if notif.kind === "follow_request"}
+            <a href="/follows?tab=requests" class="follower-link"
+              >Review in Requests</a
+            >
+          {:else if post}
+            <div class="notif-post">
+              <PostCard
+                {post}
+                pubkey={node.pubkey}
+                onlightbox={lightbox.open}
+              />
+            </div>
+          {:else}
+            <p class="notif-deleted">Post no longer available</p>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- Outside the branch above: a filter without matches must not remove the sentinel. -->
   {#if scroll.hasMore && notifications.length > 0}
     <div bind:this={sentinel} class="sentinel">
       {#if scroll.loadingMore}
@@ -237,6 +314,12 @@
       {/if}
     </div>
   {/if}
+{/if}
+
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
+  </div>
 {/if}
 
 <style>

@@ -1,4 +1,5 @@
-use crate::signing::{hex_to_signature, signature_to_hex};
+use crate::signing::{canonical_bytes, hex_to_signature, signature_to_hex};
+use crate::validation::{is_valid_dm_pubkey, is_valid_pubkey};
 use hkdf::Hkdf;
 use iroh::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,9 @@ pub struct SigningKeyDelegation {
     pub signature: String,
 }
 
+const DELEGATION_TAG: &str = "proscenium/delegation/2";
+const ROTATION_TAG: &str = "proscenium/signing-key-rotation/2";
+
 /// Canonical bytes for signing a SigningKeyDelegation.
 fn delegation_signing_bytes(
     master_pubkey: &str,
@@ -64,15 +68,15 @@ fn delegation_signing_bytes(
     dm_key_index: u32,
     issued_at: u64,
 ) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "master_pubkey": master_pubkey,
-        "signing_pubkey": signing_pubkey,
-        "key_index": key_index,
-        "dm_pubkey": dm_pubkey,
-        "dm_key_index": dm_key_index,
-        "issued_at": issued_at,
-    }))
-    .expect("json serialization should not fail")
+    canonical_bytes(&(
+        DELEGATION_TAG,
+        master_pubkey,
+        signing_pubkey,
+        key_index,
+        dm_pubkey,
+        dm_key_index,
+        issued_at,
+    ))
 }
 
 /// Create and sign a SigningKeyDelegation.
@@ -133,15 +137,14 @@ fn rotation_signing_bytes(
     new_key_index: u32,
     timestamp: u64,
 ) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({
-        "action": "signing_key_rotation",
-        "master_pubkey": master_pubkey,
-        "old_signing_pubkey": old_signing_pubkey,
-        "new_signing_pubkey": new_signing_pubkey,
-        "new_key_index": new_key_index,
-        "timestamp": timestamp,
-    }))
-    .expect("json serialization should not fail")
+    canonical_bytes(&(
+        ROTATION_TAG,
+        master_pubkey,
+        old_signing_pubkey,
+        new_signing_pubkey,
+        new_key_index,
+        timestamp,
+    ))
 }
 
 /// Create and sign a SigningKeyRotation.
@@ -208,16 +211,23 @@ pub fn verify_rotation(rotation: &SigningKeyRotation) -> Result<(), String> {
 }
 
 /// Verify a SigningKeyDelegation's signature against the master public key.
+/// Also requires the master and signing pubkeys to be in canonical string form and the
+/// DM pubkey to be 64 lowercase hex digits.
 pub fn verify_delegation(delegation: &SigningKeyDelegation) -> Result<(), String> {
+    if !is_valid_pubkey(&delegation.master_pubkey) {
+        return Err("invalid master pubkey".to_string());
+    }
+    if !is_valid_pubkey(&delegation.signing_pubkey) {
+        return Err("invalid signing pubkey".to_string());
+    }
+    if !is_valid_dm_pubkey(&delegation.dm_pubkey) {
+        return Err("invalid DM pubkey".to_string());
+    }
     let sig = hex_to_signature(&delegation.signature)?;
     let master_pubkey: PublicKey = delegation
         .master_pubkey
         .parse()
         .map_err(|e| format!("invalid master pubkey: {e}"))?;
-    let _signing_pubkey: PublicKey = delegation
-        .signing_pubkey
-        .parse()
-        .map_err(|e| format!("invalid signing pubkey: {e}"))?;
     let bytes = delegation_signing_bytes(
         &delegation.master_pubkey,
         &delegation.signing_pubkey,

@@ -1,32 +1,50 @@
 <script lang="ts">
+  import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
   import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
+  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import PersonItem from "$lib/PersonItem.svelte";
   import ScannerModal from "$lib/ScannerModal.svelte";
   import { hapticImpact } from "$lib/haptics";
   import type { SocialGraphEntry, FollowRequestEntry } from "$lib/types";
+  import { dedupeBy, getCachedDisplayName, isPubkeyFormat } from "$lib/utils";
   import {
     useNodeInit,
     useEventListeners,
     useCopyFeedback,
+    useToast,
   } from "$lib/composables";
+  import ConfirmDialog from "../ConfirmDialog.svelte";
+
+  type Tab = "following" | "followers" | "requests";
 
   let follows = $state<SocialGraphEntry[]>([]);
   let followers = $state<SocialGraphEntry[]>([]);
   let followRequests = $state<FollowRequestEntry[]>([]);
-  let pendingRequestCount = $state(0);
   let mutedPubkeys = $state<string[]>([]);
   let blockedPubkeys = $state<string[]>([]);
-  let newPubkey = $state("");
-  let status = $state("");
+  let newNodeId = $state("");
   let addingFollow = $state(false);
   let pendingUnfollowPubkey = $state<string | null>(null);
-  let activeTab = $state<"following" | "followers" | "requests">("following");
+  // `/follows?tab=requests` opens the Requests tab.
+  let activeTab = $state<Tab>(
+    page.url.searchParams.get("tab") === "requests" ? "requests" : "following",
+  );
   const isMobile = platform() === "android" || platform() === "ios";
   let showScanner = $state(false);
+  // Identity read from a scanned invite code, waiting for confirmation.
+  let scanned = $state<{ pubkey: string; nodeId: string } | null>(null);
+
+  let pendingRequests = $derived(
+    followRequests.filter((r) => r.status === "pending"),
+  );
+  let resolvedRequests = $derived(
+    followRequests.filter((r) => r.status !== "pending"),
+  );
 
   const copyFb = useCopyFeedback();
+  const toast = useToast();
 
   const node = useNodeInit(async () => {
     await Promise.all([
@@ -40,69 +58,84 @@
 
   async function loadFollows() {
     try {
-      follows = await invoke("get_follows");
+      const list: SocialGraphEntry[] = await invoke("get_follows");
+      follows = dedupeBy(list, (f) => f.pubkey);
     } catch (e) {
+      toast.show("Failed to load follows");
       console.error("Failed to load follows:", e);
     }
   }
 
   async function loadFollowers() {
     try {
-      followers = await invoke("get_followers");
+      const list: SocialGraphEntry[] = await invoke("get_followers");
+      followers = dedupeBy(list, (f) => f.pubkey);
     } catch (e) {
+      toast.show("Failed to load followers");
       console.error("Failed to load followers:", e);
     }
   }
 
   async function loadMuted() {
     try {
-      mutedPubkeys = await invoke("get_muted_pubkeys");
+      const list: string[] = await invoke("get_muted_pubkeys");
+      mutedPubkeys = [...new Set(list)];
     } catch (e) {
+      toast.show("Failed to load muted users");
       console.error("Failed to load muted:", e);
     }
   }
 
   async function loadBlocked() {
     try {
-      blockedPubkeys = await invoke("get_blocked_pubkeys");
+      const list: string[] = await invoke("get_blocked_pubkeys");
+      blockedPubkeys = [...new Set(list)];
     } catch (e) {
+      toast.show("Failed to load blocked users");
       console.error("Failed to load blocked:", e);
     }
   }
 
   async function loadFollowRequests() {
     try {
-      followRequests = await invoke("get_follow_requests");
-      pendingRequestCount = followRequests.filter(
-        (r) => r.status === "pending",
-      ).length;
+      const list: FollowRequestEntry[] = await invoke("get_follow_requests");
+      followRequests = dedupeBy(list, (r) => r.pubkey);
     } catch (e) {
+      toast.show("Failed to load follow requests");
       console.error("Failed to load follow requests:", e);
     }
   }
 
   async function approveRequest(pubkey: string) {
     try {
-      await invoke("approve_follow_request", { pubkey });
+      const approved: boolean = await invoke("approve_follow_request", {
+        pubkey,
+      });
       await loadFollowRequests();
       await loadFollowers();
-      hapticImpact("light");
-      status = "Approved!";
-      setTimeout(() => (status = ""), 2000);
+      if (approved) {
+        hapticImpact("light");
+        toast.show("Approved", "success");
+      } else {
+        toast.show("The request is no longer pending");
+      }
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
   }
 
   async function denyRequest(pubkey: string) {
     try {
-      await invoke("deny_follow_request", { pubkey });
+      const denied: boolean = await invoke("deny_follow_request", { pubkey });
       await loadFollowRequests();
-      hapticImpact("light");
-      status = "Denied";
-      setTimeout(() => (status = ""), 2000);
+      if (denied) {
+        hapticImpact("light");
+        toast.show("Denied", "success");
+      } else {
+        toast.show("The request is no longer pending");
+      }
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
   }
 
@@ -111,7 +144,7 @@
       await invoke("unmute_user", { pubkey });
       await loadMuted();
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
   }
 
@@ -120,60 +153,98 @@
       await invoke("unblock_user", { pubkey });
       await loadBlocked();
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
   }
 
-  async function followUser() {
-    const nodeId = newPubkey.trim();
-    if (!nodeId) return;
+  /**
+   * Follow the user whose device has `nodeId`. With `expectedPubkey`, the
+   * command fails unless the node reports that master pubkey.
+   */
+  async function followNode(nodeId: string, expectedPubkey: string | null) {
+    if (addingFollow) return false;
     addingFollow = true;
-    status = "";
     try {
-      await invoke("follow_user", { nodeId });
-      newPubkey = "";
+      await invoke("follow_user", { nodeId, expectedPubkey });
       await loadFollows();
       hapticImpact("light");
-      status = "Followed!";
-      setTimeout(() => (status = ""), 2000);
+      toast.show("Followed", "success");
+      return true;
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
+      return false;
+    } finally {
+      addingFollow = false;
     }
-    addingFollow = false;
   }
 
-  function confirmUnfollow(pubkey: string) {
-    pendingUnfollowPubkey = pubkey;
+  async function followFromInput() {
+    const nodeId = newNodeId.trim().toLowerCase();
+    if (!nodeId) return;
+    if (!isPubkeyFormat(nodeId)) {
+      toast.show("A Node ID is 64 hex digits");
+      return;
+    }
+    if (await followNode(nodeId, null)) newNodeId = "";
+  }
+
+  /** Keep the scanned identity for the confirmation dialog; nothing is followed yet. */
+  async function handleScanned(result: {
+    pubkey: string;
+    transportNodeId?: string;
+  }) {
+    showScanner = false;
+    if (!isPubkeyFormat(result.pubkey)) {
+      toast.show("The code does not contain a valid public key");
+      return;
+    }
+    let nodeId = result.transportNodeId;
+    if (!nodeId) {
+      try {
+        const cached: string[] = await invoke("get_peer_node_ids", {
+          pubkey: result.pubkey,
+        });
+        nodeId = cached[0];
+      } catch {
+        // no cached Node ID
+      }
+    }
+    if (!nodeId || !isPubkeyFormat(nodeId)) {
+      toast.show("The code does not contain a Node ID for this user");
+      return;
+    }
+    scanned = { pubkey: result.pubkey, nodeId };
+  }
+
+  async function confirmScanned() {
+    if (!scanned) return;
+    const { pubkey, nodeId } = scanned;
+    scanned = null;
+    await followNode(nodeId, pubkey);
   }
 
   async function executeUnfollow() {
     if (!pendingUnfollowPubkey) return;
+    const pubkey = pendingUnfollowPubkey;
+    pendingUnfollowPubkey = null;
     try {
-      await invoke("unfollow_user", { pubkey: pendingUnfollowPubkey });
+      await invoke("unfollow_user", { pubkey });
       await loadFollows();
       hapticImpact("light");
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
-    pendingUnfollowPubkey = null;
-  }
-
-  function cancelUnfollow() {
-    pendingUnfollowPubkey = null;
   }
 
   function handleKey(e: KeyboardEvent) {
     if (e.key === "Enter") {
       e.preventDefault();
-      followUser();
+      followFromInput();
     }
   }
 
   function handleGlobalKey(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      if (pendingUnfollowPubkey) cancelUnfollow();
-      else if (showScanner) showScanner = false;
-    }
+    if (e.key === "Escape" && showScanner) showScanner = false;
   }
 
   onMount(() => {
@@ -203,6 +274,11 @@
     <div class="spinner"></div>
     <p>Loading...</p>
   </div>
+{:else if node.error}
+  <div class="empty">
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
+  </div>
 {:else}
   <div class="tabs">
     <button
@@ -225,8 +301,8 @@
       onclick={() => (activeTab = "requests")}
     >
       Requests
-      {#if pendingRequestCount > 0}
-        <span class="request-badge">{pendingRequestCount}</span>
+      {#if pendingRequests.length > 0}
+        <span class="request-badge">{pendingRequests.length}</span>
       {/if}
     </button>
   </div>
@@ -235,8 +311,12 @@
     <div class="add-follow">
       <input
         class="input-base"
-        bind:value={newPubkey}
+        bind:value={newNodeId}
         placeholder="Paste a Node ID to follow..."
+        aria-label="Node ID of the user to follow"
+        autocomplete="off"
+        autocapitalize="none"
+        spellcheck="false"
         onkeydown={handleKey}
       />
       {#if isMobile}
@@ -246,8 +326,8 @@
       {/if}
       <button
         class="follow-btn"
-        onclick={followUser}
-        disabled={!newPubkey.trim() || addingFollow}
+        onclick={followFromInput}
+        disabled={!newNodeId.trim() || addingFollow}
       >
         {#if addingFollow}
           <span class="btn-spinner"></span>
@@ -259,41 +339,9 @@
 
     {#if showScanner}
       <ScannerModal
-        onscanned={(result) => {
-          showScanner = false;
-          newPubkey = result.transportNodeId ?? result.pubkey;
-          followUser();
-        }}
+        onscanned={handleScanned}
         onclose={() => (showScanner = false)}
       />
-    {/if}
-
-    {#if status}
-      <p class="status">{status}</p>
-    {/if}
-
-    {#if pendingUnfollowPubkey}
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <div class="modal-overlay" onclick={cancelUnfollow} role="presentation">
-        <!-- svelte-ignore a11y_interactive_supports_focus -->
-        <div
-          class="modal"
-          onclick={(e) => e.stopPropagation()}
-          role="dialog"
-          aria-label="Confirm unfollow"
-        >
-          <p>
-            Unfollow this user? Their posts will be deleted from your device.
-          </p>
-          <div class="modal-actions">
-            <button class="modal-cancel" onclick={cancelUnfollow}>Cancel</button
-            >
-            <button class="modal-confirm" onclick={executeUnfollow}
-              >Unfollow</button
-            >
-          </div>
-        </div>
-      </div>
     {/if}
 
     <div class="follow-list">
@@ -302,13 +350,14 @@
           {#snippet actions()}
             <button
               class="btn-elevated"
+              title="Copy public key"
               onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
             >
-              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy"}
+              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy key"}
             </button>
             <button
               class="btn-moderation danger"
-              onclick={() => confirmUnfollow(f.pubkey)}
+              onclick={() => (pendingUnfollowPubkey = f.pubkey)}
             >
               Unfollow
             </button>
@@ -331,9 +380,10 @@
           {#snippet actions()}
             <button
               class="btn-elevated"
+              title="Copy public key"
               onclick={() => copyFb.copy(f.pubkey, f.pubkey)}
             >
-              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy"}
+              {copyFb.feedback === f.pubkey ? "Copied!" : "Copy key"}
             </button>
           {/snippet}
         </PersonItem>
@@ -344,12 +394,8 @@
       {/each}
     </div>
   {:else if activeTab === "requests"}
-    {#if status}
-      <p class="status">{status}</p>
-    {/if}
-
     <div class="follow-list">
-      {#each followRequests.filter((r) => r.status === "pending") as req (req.pubkey)}
+      {#each pendingRequests as req (req.pubkey)}
         <PersonItem pubkey={req.pubkey}>
           {#snippet actions()}
             <button
@@ -371,14 +417,13 @@
       {/each}
     </div>
 
-    {#if followRequests.some((r) => r.status !== "pending")}
+    {#if resolvedRequests.length > 0}
       <details class="moderation-section">
         <summary class="moderation-header resolved">
-          Resolved ({followRequests.filter((r) => r.status !== "pending")
-            .length})
+          Resolved ({resolvedRequests.length})
         </summary>
         <div class="follow-list">
-          {#each followRequests.filter((r) => r.status !== "pending") as req (req.pubkey)}
+          {#each resolvedRequests as req (req.pubkey)}
             <PersonItem pubkey={req.pubkey}>
               {#snippet actions()}
                 <span
@@ -439,6 +484,43 @@
       </div>
     </details>
   {/if}
+{/if}
+
+{#if pendingUnfollowPubkey}
+  <DeleteConfirmModal
+    message="Unfollow this user? Their posts will be deleted from your device."
+    confirmLabel="Unfollow"
+    onconfirm={executeUnfollow}
+    oncancel={() => (pendingUnfollowPubkey = null)}
+  />
+{/if}
+
+{#if scanned}
+  {@const knownName = getCachedDisplayName(scanned.pubkey)}
+  <ConfirmDialog
+    label="Confirm follow"
+    confirmLabel="Follow"
+    danger={false}
+    wide
+    onconfirm={confirmScanned}
+    oncancel={() => (scanned = null)}
+  >
+    <p>Follow the user with this public key?</p>
+    {#if knownName}
+      <p class="scanned-name">{knownName}</p>
+    {/if}
+    <code class="scanned-key">{scanned.pubkey}</code>
+    <p class="scanned-hint">
+      Compare it with the key the user shows on their profile. The follow is
+      rejected if the scanned device reports another key.
+    </p>
+  </ConfirmDialog>
+{/if}
+
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
+  </div>
 {/if}
 
 <style>
@@ -518,11 +600,24 @@
     background: var(--bg-elevated-hover);
   }
 
-  .status {
-    text-align: center;
+  .scanned-name {
+    font-weight: 600;
+  }
+
+  .scanned-key {
+    display: block;
+    margin: 0 0 1rem;
+    padding: 0.5rem;
+    background: var(--bg-elevated);
+    border-radius: var(--radius-md);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    word-break: break-all;
+  }
+
+  .scanned-hint {
     color: var(--text-secondary);
-    font-size: var(--text-base);
-    margin: 0.5rem 0;
+    font-size: var(--text-sm);
   }
 
   .moderation-section {

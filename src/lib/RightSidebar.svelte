@@ -13,7 +13,7 @@
   {#if liveStages.size > 0}
     <section class="panel">
       <h3 class="panel-title">Live Stages</h3>
-      {#each [...liveStages.values()] as ann (ann.stage_id)}
+      {#each [...liveStages] as [key, ann] (key)}
         <StageCard announcement={ann} />
       {/each}
     </section>

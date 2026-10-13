@@ -3,8 +3,9 @@
   import Avatar from "$lib/Avatar.svelte";
   import Timeago from "$lib/Timeago.svelte";
   import { useDisplayName } from "$lib/name.svelte";
+  import { postHref } from "$lib/profile/links";
   import type { Post } from "$lib/types";
-  import { shortId, getCachedAvatarTicket } from "$lib/utils";
+  import { shortId, getCachedAvatarTicket, truncate } from "$lib/utils";
 
   let {
     quoteOfId,
@@ -14,6 +15,8 @@
     pubkey: string;
   } = $props();
 
+  const PREVIEW_CHARS = 200;
+
   let quotedPost = $state<Post | null>(null);
 
   const author = useDisplayName(
@@ -21,17 +24,31 @@
     () => pubkey,
   );
 
+  let preview = $derived.by(() => {
+    const content = quotedPost?.content ?? "";
+    const cut = truncate(content, PREVIEW_CHARS);
+    return cut === content ? cut : cut + "...";
+  });
+
   $effect(() => {
-    invoke("get_post", { id: quoteOfId })
-      .then((qp) => {
-        quotedPost = qp as Post | null;
+    const id = quoteOfId;
+    quotedPost = null;
+    let stale = false;
+    invoke<Post | null>("get_post", { id })
+      .then((loaded) => {
+        if (!stale && loaded?.id === id) quotedPost = loaded;
       })
-      .catch(() => {});
+      .catch(() => {
+        // The quoted post is not stored locally.
+      });
+    return () => {
+      stale = true;
+    };
   });
 </script>
 
 {#if quotedPost}
-  <a href="/post/{quotedPost.id}" class="quoted-post">
+  <a href={postHref(quotedPost.id)} class="quoted-post">
     <div class="quoted-header">
       <Avatar
         pubkey={quotedPost.author}
@@ -45,16 +62,12 @@
       </span>
       <Timeago timestamp={quotedPost.timestamp} />
     </div>
-    {#if quotedPost.content}
-      <p class="quoted-content">
-        {quotedPost.content.length > 200
-          ? quotedPost.content.slice(0, 200) + "..."
-          : quotedPost.content}
-      </p>
+    {#if preview}
+      <p class="quoted-content">{preview}</p>
     {/if}
   </a>
 {:else}
-  <a href="/post/{quoteOfId}" class="quoted-post unavailable">
+  <a href={postHref(quoteOfId)} class="quoted-post unavailable">
     Quoted post unavailable
   </a>
 {/if}

@@ -1,19 +1,26 @@
 mod initiator;
 mod responder;
+mod session;
 mod state;
 mod termination;
 
-use crate::audio::{AudioCapture, EchoCanceller, android};
 use crate::dm::DmHandler;
 use crate::storage::Storage;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use proscenium_types::{CallEvent, CallState, short_id};
-use state::ActiveCall;
+use state::{
+    ActiveCall, CALL_PROOF_LEN, CONNECT_TIMEOUT, CallPhase, IO_TIMEOUT, ROLE_CALLEE, ROLE_CALLER,
+    call_proof, proofs_equal,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
+
+/// `CallReject` signals for offers received during a call that may be in transit at one
+/// time. Further offers are ignored without a reply.
+const MAX_PENDING_REJECTS: usize = 4;
 
 #[derive(Clone)]
 pub struct CallHandler {
@@ -22,6 +29,7 @@ pub struct CallHandler {
     pub(crate) dm: DmHandler,
     app_handle: AppHandle,
     pub(crate) active_call: Arc<Mutex<Option<ActiveCall>>>,
+    reject_permits: Arc<Semaphore>,
 }
 
 impl CallHandler {
@@ -37,6 +45,7 @@ impl CallHandler {
             dm,
             app_handle,
             active_call: Arc::new(Mutex::new(None)),
+            reject_permits: Arc::new(Semaphore::new(MAX_PENDING_REJECTS)),
         }
     }
 
@@ -58,134 +67,106 @@ impl std::fmt::Debug for CallHandler {
     }
 }
 
+fn reject(reason: &'static str) -> AcceptError {
+    AcceptError::from_err(std::io::Error::other(reason))
+}
+
 impl ProtocolHandler for CallHandler {
+    /// Accept the caller's audio connection for a call the local user answered.
+    ///
+    /// The connection is served only if all of these hold:
+    /// - the remote NodeId belongs to the peer of the active call,
+    /// - the call is incoming and in phase `Connecting` (`accept_call` was invoked),
+    /// - the first bytes of the stream are the caller's proof of the call id.
+    ///
+    /// Microphone capture starts after these checks.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        let remote = conn.remote_id();
-        let remote_str = remote.to_string();
+        let remote_str = conn.remote_id().to_string();
         log::info!(
             "[call] incoming audio connection from {}",
             short_id(&remote_str)
         );
 
         // Resolve transport NodeId to master pubkey
-        let peer_pubkey = self
+        let Some(peer_pubkey) = self
             .storage
             .get_master_pubkey_for_transport(&remote_str)
             .await
-            .unwrap_or_else(|| remote_str.clone());
+        else {
+            conn.close(1u32.into(), b"unknown peer");
+            return Err(reject("audio connection from an unknown node"));
+        };
 
-        // Check we have an active call with this peer
-        let (call_id, shared_capture, shared_playback) = {
+        let call_id = {
             let lock = self.active_call.lock().await;
-            match &*lock {
-                Some(call) if call.peer_pubkey == peer_pubkey => (
-                    call.call_id.clone(),
-                    call.capture.clone(),
-                    call.playback.clone(),
-                ),
+            match lock.as_ref() {
+                Some(call)
+                    if call.peer_pubkey == peer_pubkey
+                        && !call.outgoing
+                        && call.phase == CallPhase::Connecting =>
+                {
+                    call.call_id.clone()
+                }
                 _ => {
                     log::warn!(
                         "[call] rejecting unexpected audio connection from {}",
                         short_id(&peer_pubkey)
                     );
-                    return Err(AcceptError::from_err(std::io::Error::other(
-                        "no active call with this peer",
-                    )));
+                    conn.close(1u32.into(), b"no accepted call");
+                    return Err(reject("no accepted call with this peer"));
                 }
             }
         };
+
+        // The caller opens a bi-stream and sends its proof first.
+        let Ok(Ok((mut send, mut recv))) =
+            tokio::time::timeout(CONNECT_TIMEOUT, conn.accept_bi()).await
+        else {
+            conn.close(1u32.into(), b"no stream");
+            return Err(reject("audio stream was not opened"));
+        };
+        let mut proof = [0u8; CALL_PROOF_LEN];
+        let read = tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut proof)).await;
+        if !matches!(read, Ok(Ok(()))) || !proofs_equal(&proof, &call_proof(&call_id, ROLE_CALLER))
+        {
+            log::warn!(
+                "[call] rejecting audio connection from {}: invalid call proof",
+                short_id(&peer_pubkey)
+            );
+            conn.close(1u32.into(), b"invalid call proof");
+            return Err(reject("invalid call proof"));
+        }
+
+        // The call can end, or another connection can take it, while the proof is read.
+        let activated = {
+            let mut lock = self.active_call.lock().await;
+            match lock.as_mut() {
+                Some(call) if call.call_id == call_id && call.phase == CallPhase::Connecting => {
+                    call.enter_phase(CallPhase::Active);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !activated {
+            conn.close(1u32.into(), b"call ended");
+            return Err(reject("call ended before the audio stream opened"));
+        }
+
+        let reply = call_proof(&call_id, ROLE_CALLEE);
+        let written = tokio::time::timeout(IO_TIMEOUT, send.write_all(&reply)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            conn.close(1u32.into(), b"handshake failed");
+            self.end_call(&call_id, CallState::Failed, state::PeerNotice::Hangup)
+                .await;
+            return Err(reject("failed to send the call proof"));
+        }
 
         log::info!(
             "[call] accepting audio stream for call {}",
             short_id(&call_id)
         );
-
-        // The caller opened a bi-stream; accept it for audio data
-        let (send, recv) = conn.accept_bi().await?;
-
-        let (session_cancel, muted) = {
-            let lock = self.active_call.lock().await;
-            let call = lock.as_ref().unwrap();
-            (call.cancel.child_token(), call.muted.clone())
-        };
-
-        let (input_dev, output_dev) = self.audio_device_prefs().await;
-
-        // On Android, set MODE_IN_COMMUNICATION before opening audio streams
-        android::enter_communication_mode();
-
-        // AEC pipeline (same as run_audio_session)
-        let (raw_mic_tx, mut raw_mic_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
-        let (aec_out_tx, aec_out_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(32);
-        let (far_end_tx, mut far_end_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(20);
-
-        let capture = match AudioCapture::start(raw_mic_tx, input_dev.as_deref()) {
-            Ok(c) => c,
-            Err(e) => {
-                log::error!("[call] failed to start audio capture: {e}");
-                return Err(AcceptError::from_err(std::io::Error::other(format!(
-                    "failed to start audio capture: {e}"
-                ))));
-            }
-        };
-        *shared_capture.lock().unwrap() = Some(capture);
-
-        let aec_muted = muted.clone();
-        let aec_cancel = session_cancel.clone();
-        std::thread::spawn(move || {
-            let mut aec = EchoCanceller::new();
-            log::info!("[call] AEC thread started (accept)");
-            while let Some(raw) = raw_mic_rx.blocking_recv() {
-                if aec_cancel.is_cancelled() {
-                    break;
-                }
-                while let Ok(far) = far_end_rx.try_recv() {
-                    aec.render(&far);
-                }
-                let cleaned = aec.process_capture(&raw);
-                if cleaned.is_empty() {
-                    continue;
-                }
-                let out = if aec_muted.load(std::sync::atomic::Ordering::Relaxed) {
-                    vec![0.0f32; cleaned.len()]
-                } else {
-                    cleaned
-                };
-                if aec_out_tx.blocking_send(out).is_err() {
-                    break;
-                }
-            }
-            log::info!("[call] AEC thread ended (accept)");
-        });
-
-        let send_cancel = session_cancel.clone();
-        let recv_cancel = session_cancel.clone();
-
-        let send_task = tokio::spawn(Self::send_audio_loop(send, send_cancel, aec_out_rx));
-        let recv_task = tokio::spawn(Self::recv_audio_loop(
-            recv,
-            recv_cancel,
-            output_dev,
-            shared_playback,
-            far_end_tx,
-        ));
-
-        tokio::select! {
-            _ = session_cancel.cancelled() => {}
-            _ = send_task => {}
-            _ = recv_task => {}
-        }
-
-        // Clean up
-        let mut lock = self.active_call.lock().await;
-        if lock.as_ref().is_some_and(|c| c.call_id == call_id) {
-            let pk = lock.as_ref().unwrap().peer_pubkey.clone();
-            *lock = None;
-            drop(lock);
-            self.emit_call_event(&call_id, &pk, CallState::Ended);
-        }
-
-        conn.closed().await;
+        self.run_audio_session(conn, send, recv, &call_id).await;
         Ok(())
     }
 }

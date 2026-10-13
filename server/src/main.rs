@@ -1,15 +1,32 @@
 mod api;
-#[allow(dead_code)]
+#[cfg(test)]
+mod api_tests;
 mod config;
+mod content;
+mod http;
 mod ingestion;
 mod node;
+#[cfg(test)]
+mod peer_tests;
 mod storage;
+mod sync;
+#[cfg(test)]
+mod test_util;
 mod trending;
 mod web;
 
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Interval between two runs of `run_maintenance`.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
+/// Time an inactive registration row (its replay and downgrade floors) is kept after
+/// deactivation.
+const INACTIVE_REGISTRATION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Window of the request counter for `/api/v1/register`.
+const REGISTER_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "proscenium-server", about = "Proscenium discovery server")]
@@ -22,9 +39,59 @@ struct Cli {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Override listen port
+    /// Override the port of server.listen_addr
     #[arg(long)]
     port: Option<u16>,
+}
+
+/// Completes on SIGINT or SIGTERM.
+async fn shutdown_signal() {
+    let interrupt = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
+}
+
+/// Delete posts and interactions older than `retention_days` (if not 0) and inactive
+/// registration rows older than `INACTIVE_REGISTRATION_TTL`.
+async fn run_maintenance(storage: &storage::Storage, retention_days: u64) {
+    let now = proscenium_types::now_millis();
+    let cutoff = |age_ms: u64| i64::try_from(now.saturating_sub(age_ms)).unwrap_or(i64::MAX);
+
+    if retention_days > 0 {
+        let retention_ms = retention_days.saturating_mul(24 * 60 * 60 * 1000);
+        match storage.prune_older_than(cutoff(retention_ms)).await {
+            Ok((0, 0)) => {}
+            Ok((posts, interactions)) => tracing::info!(
+                "pruned {posts} posts and {interactions} interactions older than {retention_days} days"
+            ),
+            Err(e) => tracing::error!("retention pruning failed: {e}"),
+        }
+    }
+
+    let ttl_ms = u64::try_from(INACTIVE_REGISTRATION_TTL.as_millis()).unwrap_or(u64::MAX);
+    match storage.prune_inactive_registrations(cutoff(ttl_ms)).await {
+        Ok(0) => {}
+        Ok(rows) => tracing::info!("deleted {rows} inactive registration rows"),
+        Err(e) => tracing::error!("pruning of inactive registrations failed: {e}"),
+    }
 }
 
 #[tokio::main]
@@ -37,20 +104,21 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let config = if cli.config.exists() {
-        config::Config::load(&cli.config)?
-    } else {
-        tracing::warn!(
-            "config file {} not found, using defaults (you must set server.public_url)",
+    // The file is required: registration requests are verified against
+    // `server.public_url`, which has no usable default.
+    if !cli.config.exists() {
+        anyhow::bail!(
+            "config file {} not found; a config file that sets server.public_url is required",
             cli.config.display()
         );
-        toml::from_str(
-            r#"
-            [server]
-            public_url = "http://localhost:3000"
-            "#,
-        )?
-    };
+    }
+    let config = config::Config::load(&cli.config)
+        .map_err(|e| anyhow::anyhow!("invalid config file {}: {e}", cli.config.display()))?;
+    if config.server.public_url.starts_with("http://") {
+        tracing::warn!(
+            "server.public_url uses http: signed registration requests are sent unencrypted"
+        );
+    }
 
     let data_dir = cli
         .data_dir
@@ -65,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let node = node::Node::start(&data_dir).await?;
     tracing::info!("iroh node started");
 
-    let ingestion_mgr = ingestion::IngestionManager::new(&node, storage.clone());
+    let ingestion_mgr = ingestion::IngestionManager::new(&node, storage.clone(), &config);
     ingestion_mgr.start(config.sync.startup_sync).await;
     ingestion_mgr.start_periodic_sync(config.sync.interval_minutes);
     tracing::info!("ingestion manager started");
@@ -77,38 +145,33 @@ async fn main() -> anyhow::Result<()> {
     );
     tracing::info!("trending computation task started");
 
-    if config.limits.retention_days > 0 {
-        let retention_days = config.limits.retention_days;
-        let prune_storage = storage.clone();
-        tokio::spawn(async move {
-            let interval = tokio::time::Duration::from_secs(3600);
-            loop {
-                tokio::time::sleep(interval).await;
-                let cutoff_ms =
-                    proscenium_types::now_millis() - (retention_days * 24 * 60 * 60 * 1000);
-                match prune_storage.prune_old_posts(cutoff_ms as i64).await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!("pruned {n} posts older than {retention_days} days"),
-                    Err(e) => tracing::error!("post pruning failed: {e}"),
-                }
-            }
-        });
-        tracing::info!("post retention: {retention_days} days (pruning hourly)");
+    let retention_days = config.limits.retention_days;
+    if retention_days > 0 {
+        tracing::info!("retention: {retention_days} days (pruning hourly)");
     } else {
-        tracing::info!("post retention: unlimited");
+        tracing::info!("retention: unlimited");
     }
+    let maintenance_storage = storage.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+            run_maintenance(&maintenance_storage, retention_days).await;
+        }
+    });
 
-    let listen_addr = if let Some(port) = cli.port {
-        format!("0.0.0.0:{port}")
-    } else {
-        config.server.listen_addr.clone()
-    };
+    let listen_addr = config.listen_addr(cli.port)?;
+    let serve_limits = http::ServeLimits::new(config.limits.max_connections);
+    let register_limiter = Arc::new(http::RateLimiter::new(
+        config.limits.register_requests_per_minute,
+        REGISTER_RATE_WINDOW,
+    ));
 
     let app_state = api::AppState {
         storage,
         config: Arc::new(config),
-        ingestion: ingestion_mgr,
+        ingestion: ingestion_mgr.clone(),
         start_time: std::time::Instant::now(),
+        register_limiter,
     };
 
     let router = api::build_router(app_state);
@@ -116,7 +179,11 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     tracing::info!("HTTP server listening on {listen_addr}");
 
-    axum::serve(listener, router).await?;
+    http::serve(listener, router, serve_limits, shutdown_signal()).await;
+
+    tracing::info!("shutting down");
+    ingestion_mgr.shutdown().await;
+    node.shutdown().await;
 
     Ok(())
 }

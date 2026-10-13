@@ -1,11 +1,22 @@
 use crate::error::AppError;
 use proscenium_types::{
-    DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, RatchetSessionExport,
-    SigningKeyDelegation, now_millis,
+    DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, now_millis,
+    short_id, truncate_chars, validate_profile, verify_linked_devices_announcement,
 };
 use sqlx::Row;
+use std::collections::HashSet;
 
 use super::Storage;
+
+/// Return `name` cut to at most `MAX_DEVICE_NAME_LEN` bytes on a character boundary.
+/// `verify_linked_devices_announcement` rejects an announcement with a longer name.
+fn bounded_device_name(name: &str) -> &str {
+    if name.len() > MAX_DEVICE_NAME_LEN {
+        truncate_chars(name, MAX_DEVICE_NAME_LEN / 4)
+    } else {
+        name
+    }
+}
 
 impl Storage {
     pub async fn upsert_linked_device(
@@ -26,7 +37,7 @@ impl Storage {
                 last_seen_at = ?6",
         )
         .bind(node_id)
-        .bind(device_name)
+        .bind(bounded_device_name(device_name))
         .bind(is_primary as i32)
         .bind(is_self as i32)
         .bind(added_at as i64)
@@ -34,6 +45,34 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Insert the given devices with `is_self = 0`. A NodeId that is already stored keeps
+    /// its row. Returns the number of rows inserted.
+    ///
+    /// The caller passes only entries whose NodeId derives from the local master key.
+    pub async fn insert_missing_linked_devices(
+        &self,
+        devices: &[DeviceEntry],
+    ) -> Result<u32, AppError> {
+        let mut inserted = 0u32;
+        for device in devices {
+            let result = sqlx::query(
+                "INSERT INTO linked_devices (node_id, device_name, is_primary, is_self, added_at, last_seen_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, 0)
+                 ON CONFLICT(node_id) DO NOTHING",
+            )
+            .bind(&device.node_id)
+            .bind(bounded_device_name(&device.device_name))
+            .bind(device.is_primary as i32)
+            .bind(i64::try_from(device.added_at).unwrap_or(i64::MAX))
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() > 0 {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
     }
 
     pub async fn get_linked_devices(&self) -> Result<Vec<DeviceEntry>, AppError> {
@@ -54,160 +93,6 @@ impl Storage {
         Ok(devices)
     }
 
-    pub async fn cache_peer_device_announcement(
-        &self,
-        master_pubkey: &str,
-        announcement: &LinkedDevicesAnnouncement,
-    ) -> Result<(), AppError> {
-        let json = serde_json::to_string(announcement)?;
-        let now = now_millis() as i64;
-        sqlx::query(
-            "INSERT INTO peer_device_announcements (master_pubkey, announcement_json, version, cached_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(master_pubkey) DO UPDATE SET
-                announcement_json = ?2,
-                version = ?3,
-                cached_at = ?4",
-        )
-        .bind(master_pubkey)
-        .bind(&json)
-        .bind(announcement.version as i64)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-
-        // Also update transport_node_ids_json in peer_delegations
-        let transport_ids: Vec<&str> = announcement
-            .devices
-            .iter()
-            .map(|d| d.node_id.as_str())
-            .collect();
-        let transport_json = serde_json::to_string(&transport_ids)?;
-        sqlx::query(
-            "UPDATE peer_delegations SET transport_node_ids_json = ?2 WHERE master_pubkey = ?1",
-        )
-        .bind(master_pubkey)
-        .bind(&transport_json)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn get_peer_announcement_version(
-        &self,
-        master_pubkey: &str,
-    ) -> Result<Option<u64>, AppError> {
-        let result: Option<i64> = sqlx::query_scalar(
-            "SELECT version FROM peer_device_announcements WHERE master_pubkey = ?1",
-        )
-        .bind(master_pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(result.map(|v| v as u64))
-    }
-
-    pub async fn next_device_index(&self) -> Result<u32, AppError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM linked_devices")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count as u32)
-    }
-
-    pub async fn get_all_bookmark_ids(&self) -> Result<Vec<String>, AppError> {
-        let rows = sqlx::query("SELECT post_id FROM bookmarks ORDER BY created_at DESC")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(|r| r.get(0)).collect())
-    }
-
-    pub async fn export_ratchet_sessions(&self) -> Result<Vec<RatchetSessionExport>, AppError> {
-        let rows = sqlx::query(
-            "SELECT peer_pubkey, state_json, COALESCE(updated_at, 0) FROM dm_ratchet_sessions",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut sessions = Vec::new();
-        for row in &rows {
-            sessions.push(RatchetSessionExport {
-                peer_pubkey: row.get(0),
-                state_json: row.get(1),
-                updated_at: row.get::<i64, _>(2) as u64,
-            });
-        }
-        Ok(sessions)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn export_link_bundle(
-        &self,
-        master_pubkey: &str,
-        signing_secret_key_bytes: &[u8; 32],
-        dm_secret_key_bytes: &[u8; 32],
-        delegation: &SigningKeyDelegation,
-        transport_secret_key_bytes: &[u8; 32],
-        device_index: u32,
-        master_secret_key_bytes: Option<&[u8; 32]>,
-    ) -> Result<LinkBundleData, AppError> {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
-
-        let profile = self.get_profile(master_pubkey).await.ok().flatten();
-        let follows = self.get_follows(master_pubkey).await.unwrap_or_default();
-        let bookmarks = self.get_all_bookmark_ids().await.unwrap_or_default();
-        let blocked_users = self.get_blocked_pubkeys().await.unwrap_or_default();
-        let muted_users = self.get_muted_pubkeys().await.unwrap_or_default();
-        let ratchet_sessions = self.export_ratchet_sessions().await.unwrap_or_default();
-
-        Ok(LinkBundleData {
-            signing_secret_key: b64.encode(signing_secret_key_bytes),
-            dm_secret_key: b64.encode(dm_secret_key_bytes),
-            delegation: delegation.clone(),
-            transport_secret_key: b64.encode(transport_secret_key_bytes),
-            device_index,
-            master_secret_key: master_secret_key_bytes.map(|k| b64.encode(k)),
-            profile,
-            follows,
-            bookmarks,
-            blocked_users,
-            muted_users,
-            ratchet_sessions,
-        })
-    }
-
-    pub async fn import_link_bundle(
-        &self,
-        master_pubkey: &str,
-        bundle: &LinkBundleData,
-    ) -> Result<(), AppError> {
-        if let Some(ref profile) = bundle.profile {
-            self.save_profile(master_pubkey, profile).await?;
-        }
-
-        for follow in &bundle.follows {
-            self.follow(master_pubkey, follow).await?;
-        }
-
-        for post_id in &bundle.bookmarks {
-            let _ = self.toggle_bookmark(post_id).await;
-        }
-
-        for pubkey in &bundle.blocked_users {
-            self.block_user(pubkey).await?;
-        }
-
-        for pubkey in &bundle.muted_users {
-            self.mute_user(pubkey).await?;
-        }
-
-        for session in &bundle.ratchet_sessions {
-            self.save_ratchet_session(&session.peer_pubkey, &session.state_json, now_millis())
-                .await?;
-        }
-
-        Ok(())
-    }
-
     pub async fn get_other_device_node_ids(&self) -> Result<Vec<String>, AppError> {
         let rows = sqlx::query(
             "SELECT node_id FROM linked_devices WHERE is_self = 0 ORDER BY added_at ASC",
@@ -215,5 +100,101 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// True if the database holds rows written for an existing identity:
+    /// the row of the local device, or any profile.
+    pub async fn has_identity_data(&self) -> Result<bool, AppError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM linked_devices WHERE is_self = 1)
+                 OR EXISTS(SELECT 1 FROM profiles)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Cached signed device announcements of the users that `me` follows.
+    /// A stored announcement that does not parse is left out.
+    pub async fn get_followed_peer_announcements(
+        &self,
+        me: &str,
+    ) -> Result<Vec<LinkedDevicesAnnouncement>, AppError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT a.announcement_json FROM peer_device_announcements a
+             JOIN social_graph s ON s.followee = a.master_pubkey
+             WHERE s.follower = ?1 AND s.state = 'active' AND s.followed_at IS NOT NULL",
+        )
+        .bind(me)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .filter_map(|json| serde_json::from_str(json).ok())
+            .collect())
+    }
+
+    /// Store the content of a link bundle for the identity `master_pubkey`.
+    ///
+    /// `own_device` is the row of the local device. The caller has checked that every
+    /// NodeId in `bundle.devices` derives from the bundle's master key. The profile is
+    /// stored only if it passes `validate_profile`; a peer announcement is stored only
+    /// if it verifies and belongs to an actively followed user.
+    pub async fn import_link_bundle(
+        &self,
+        master_pubkey: &str,
+        own_device: &DeviceEntry,
+        bundle: &LinkBundleData,
+    ) -> Result<(), AppError> {
+        if let Some(profile) = &bundle.profile {
+            match validate_profile(profile) {
+                Ok(()) => {
+                    self.save_profile(master_pubkey, profile).await?;
+                }
+                Err(reason) => log::warn!("[link] profile in bundle not stored: {reason}"),
+            }
+        }
+
+        self.insert_missing_linked_devices(&bundle.devices).await?;
+        self.upsert_linked_device(
+            &own_device.node_id,
+            &own_device.device_name,
+            own_device.is_primary,
+            true,
+            own_device.added_at,
+        )
+        .await?;
+
+        self.merge_follows_lww(master_pubkey, &bundle.follows)
+            .await?;
+        self.merge_moderation_lww(&bundle.moderation).await?;
+        self.merge_bookmarks_lww(&bundle.bookmarks).await?;
+
+        let followed: HashSet<&str> = bundle
+            .follows
+            .iter()
+            .filter(|f| f.state == "active")
+            .map(|f| f.pubkey.as_str())
+            .collect();
+        for announcement in &bundle.peer_announcements {
+            if !followed.contains(announcement.master_pubkey.as_str()) {
+                continue;
+            }
+            if let Err(reason) = verify_linked_devices_announcement(announcement) {
+                log::warn!(
+                    "[link] announcement of {} in bundle not stored: {reason}",
+                    short_id(&announcement.master_pubkey)
+                );
+                continue;
+            }
+            if let Err(e) = self.cache_peer_announcement(announcement).await {
+                log::warn!(
+                    "[link] announcement of {} in bundle not stored: {e}",
+                    short_id(&announcement.master_pubkey)
+                );
+            }
+        }
+
+        Ok(())
     }
 }

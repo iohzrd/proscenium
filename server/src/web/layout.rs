@@ -1,4 +1,6 @@
+use crate::content::{Token, tokenize};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
+use proscenium_types::truncate_chars;
 
 pub fn page(title: &str, server_name: &str, content: Markup) -> Markup {
     html! {
@@ -37,12 +39,8 @@ pub fn page(title: &str, server_name: &str, content: Markup) -> Markup {
 }
 
 pub fn format_time(timestamp_ms: i64) -> String {
-    let secs = timestamp_ms / 1000;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let diff = now - secs;
+    let now_ms = i64::try_from(proscenium_types::now_millis()).unwrap_or(i64::MAX);
+    let diff = now_ms.saturating_sub(timestamp_ms) / 1000;
 
     if diff < 60 {
         "just now".to_string()
@@ -61,40 +59,57 @@ pub fn format_time(timestamp_ms: i64) -> String {
     }
 }
 
+/// First 6 and last 6 characters of `pubkey` joined by `...`; the whole string if it
+/// has at most 12 characters.
 pub fn short_pubkey(pubkey: &str) -> String {
-    if pubkey.len() > 12 {
-        format!("{}...{}", &pubkey[..6], &pubkey[pubkey.len() - 6..])
-    } else {
-        pubkey.to_string()
+    if pubkey.chars().count() <= 12 {
+        return pubkey.to_string();
+    }
+    let head = truncate_chars(pubkey, 6);
+    let tail_start = pubkey
+        .char_indices()
+        .rev()
+        .nth(5)
+        .map_or(0, |(index, _)| index);
+    let tail = pubkey.get(tail_start..).unwrap_or("");
+    format!("{head}...{tail}")
+}
+
+/// Render post text: each URL and hashtag token becomes a link, all other text is
+/// emitted as text. Every token is escaped by maud when it is written.
+pub fn render_content(content: &str) -> Markup {
+    html! {
+        @for token in tokenize(content) {
+            @match token {
+                Token::Text(text) => (text),
+                Token::Url(url) => {
+                    a href=(url) target="_blank" rel="noopener noreferrer" { (url) }
+                }
+                Token::Hashtag(tag) => {
+                    a href=(tag_href(tag)) { "#" (tag) }
+                }
+            }
+        }
     }
 }
 
-pub fn render_content(content: &str) -> Markup {
-    use regex::Regex;
-    use std::sync::LazyLock;
+/// Path of the page that lists posts with the hashtag `tag`.
+pub fn tag_href(tag: &str) -> String {
+    format!("/trending?tag={}", encode_query_value(tag))
+}
 
-    static URL_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"https?://[^\s<>"')\]]+"#).unwrap());
-    static HASHTAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"#(\w+)").unwrap());
-
-    let escaped = content
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-
-    let with_links = URL_RE.replace_all(&escaped, |caps: &regex::Captures| {
-        let url = &caps[0];
-        format!(r#"<a href="{url}" target="_blank" rel="noopener">{url}</a>"#)
-    });
-
-    let with_tags = HASHTAG_RE.replace_all(&with_links, |caps: &regex::Captures| {
-        let tag = &caps[1];
-        format!(r#"<a href="/trending?tag={tag}">#{tag}</a>"#)
-    });
-
-    let with_newlines = with_tags.replace('\n', "<br>");
-
-    html! { (PreEscaped(with_newlines)) }
+/// Percent-encode `value` for use as a URL query value: every byte except ASCII
+/// letters, digits, `-`, `.`, `_` and `~` is encoded.
+fn encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 const CSS: &str = r#"
@@ -336,3 +351,63 @@ footer {
     main { padding: 0 0.75rem; }
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(content: &str) -> String {
+        render_content(content).into_string()
+    }
+
+    #[test]
+    fn url_with_fragment_is_one_link() {
+        assert_eq!(
+            render("https://example.com/page#section"),
+            r#"<a href="https://example.com/page#section" target="_blank" rel="noopener noreferrer">https://example.com/page#section</a>"#
+        );
+    }
+
+    #[test]
+    fn text_is_escaped_and_entities_are_not_rewritten() {
+        assert_eq!(
+            render("<script>alert(1)</script> &#39; \"q\""),
+            "&lt;script&gt;alert(1)&lt;/script&gt; &amp;#39; &quot;q&quot;"
+        );
+        assert_eq!(render("a & b"), "a &amp; b");
+    }
+
+    #[test]
+    fn hashtag_links_are_percent_encoded() {
+        assert_eq!(
+            render("#rust and #\u{65e5}\u{672c}"),
+            "<a href=\"/trending?tag=rust\">#rust</a> and \
+             <a href=\"/trending?tag=%E6%97%A5%E6%9C%AC\">#\u{65e5}\u{672c}</a>"
+        );
+    }
+
+    #[test]
+    fn url_ends_before_quote_and_markup_characters() {
+        assert_eq!(
+            render("see http://a.test/x\"onmouseover=\"1"),
+            "see <a href=\"http://a.test/x\" target=\"_blank\" rel=\"noopener noreferrer\">http://a.test/x</a>&quot;onmouseover=&quot;1"
+        );
+    }
+
+    #[test]
+    fn newlines_are_kept_as_text() {
+        assert_eq!(render("a\nb"), "a\nb");
+    }
+
+    #[test]
+    fn short_pubkey_cuts_on_char_boundaries() {
+        assert_eq!(short_pubkey("abcdefghijkl"), "abcdefghijkl");
+        assert_eq!(short_pubkey("abcdefghijklmnop"), "abcdef...klmnop");
+        // 5 ASCII characters, one 4-byte character, 8 ASCII characters.
+        assert_eq!(
+            short_pubkey("aaaaa\u{10348}bbbbbbbb"),
+            "aaaaa\u{10348}...bbbbbb"
+        );
+        assert_eq!(short_pubkey(""), "");
+    }
+}

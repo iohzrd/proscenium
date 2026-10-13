@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import Modal from "$lib/Modal.svelte";
 
   let showWipeConfirm = $state(false);
   let wiping = $state(false);
@@ -9,12 +10,16 @@
     wiping = true;
     wipeStatus = "";
     try {
+      // `wipe_all_data` shows a native confirmation dialog, deletes the data,
+      // then restarts the app. The promise resolves only if the restart has
+      // not happened yet.
       await invoke("wipe_all_data");
-      wipeStatus = "All data deleted. Restart the app to start fresh.";
-      showWipeConfirm = false;
+      wipeStatus = "All data deleted. The app is restarting.";
     } catch (e) {
-      wipeStatus = `Error: ${e}`;
+      // "cancelled": the native dialog was declined. Nothing was deleted.
+      if (String(e) !== "cancelled") wipeStatus = `Error: ${e}`;
     }
+    showWipeConfirm = false;
     wiping = false;
   }
 </script>
@@ -22,12 +27,13 @@
 <section class="settings-section danger-section">
   <h3>Danger Zone</h3>
   <p class="section-desc">
-    Permanently delete all local data including posts, messages, follows,
-    notifications, and preferences. Your identity keys are preserved but all
-    content is gone forever.
+    Delete all posts, messages, follows, notifications, bookmarks, preferences
+    and downloaded media stored on this device, then restart the app. Your
+    identity keys are kept. Copies that other peers or servers already hold are
+    not deleted.
   </p>
   {#if wipeStatus}
-    <p class="wipe-status">{wipeStatus}</p>
+    <p class="wipe-status" role="status">{wipeStatus}</p>
   {/if}
   <button
     class="wipe-btn"
@@ -39,37 +45,30 @@
 </section>
 
 {#if showWipeConfirm}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="modal-overlay"
-    onclick={() => (showWipeConfirm = false)}
-    role="presentation"
+  <Modal
+    label="Confirm delete all data"
+    onclose={() => {
+      if (!wiping) showWipeConfirm = false;
+    }}
   >
-    <!-- svelte-ignore a11y_interactive_supports_focus -->
-    <div
-      class="modal"
-      onclick={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-label="Confirm delete all data"
-    >
-      <p>
-        Are you sure you want to delete all data? This will permanently remove
-        all posts, messages, follows, notifications, bookmarks, and preferences.
-        This cannot be undone.
-      </p>
-      <div class="modal-actions">
-        <button class="modal-cancel" onclick={() => (showWipeConfirm = false)}
-          >Cancel</button
-        >
-        <button
-          class="modal-confirm modal-confirm-danger"
-          onclick={wipeAllData}
-          disabled={wiping}
-          >{wiping ? "Deleting..." : "Delete everything"}</button
-        >
-      </div>
+    <p>
+      Delete all posts, messages, follows, notifications, bookmarks, preferences
+      and downloaded media on this device? This cannot be undone. A system
+      dialog asks once more, then the app restarts.
+    </p>
+    <div class="modal-actions">
+      <button
+        class="modal-cancel"
+        onclick={() => (showWipeConfirm = false)}
+        disabled={wiping}>Cancel</button
+      >
+      <button
+        class="modal-confirm modal-confirm-danger"
+        onclick={wipeAllData}
+        disabled={wiping}>{wiping ? "Deleting..." : "Delete everything"}</button
+      >
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>

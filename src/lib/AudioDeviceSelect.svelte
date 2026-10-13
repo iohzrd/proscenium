@@ -18,15 +18,29 @@
   /** When true, switching devices also hot-swaps the active call stream. */
   let { liveCall = false }: { liveCall?: boolean } = $props();
 
+  // Prefix of the element ids: this component can be mounted more than once.
+  const uid = $props.id();
+
   let isAndroid = $state(false);
   let inputDevices = $state<AudioDevice[]>([]);
   let outputDevices = $state<AudioDevice[]>([]);
   let commDevices = $state<CommAudioDevice[]>([]);
+  // The device in use. Assigned after the backend accepted a change.
   let selectedInput = $state("");
   let selectedOutput = $state("");
   let selectedCommId = $state<number | null>(null);
   let switching = $state(false);
   let loading = $state(true);
+  let errorMessage = $state("");
+
+  // A saved device that is not connected has no entry in the device list.
+  let inputMissing = $derived(
+    selectedInput !== "" && !inputDevices.some((d) => d.name === selectedInput),
+  );
+  let outputMissing = $derived(
+    selectedOutput !== "" &&
+      !outputDevices.some((d) => d.name === selectedOutput),
+  );
 
   function deviceIcon(deviceType: number): string {
     switch (deviceType) {
@@ -49,6 +63,7 @@
 
   async function load() {
     loading = true;
+    errorMessage = "";
     try {
       isAndroid = platform() === "android";
 
@@ -56,62 +71,66 @@
         commDevices = await invoke<CommAudioDevice[]>(
           "list_android_audio_devices",
         );
-        loading = false;
-        return;
+      } else {
+        const [inputs, outputs, savedInput, savedOutput] = await Promise.all([
+          invoke<AudioDevice[]>("list_audio_input_devices"),
+          invoke<AudioDevice[]>("list_audio_output_devices"),
+          invoke<string | null>("get_audio_input_device"),
+          invoke<string | null>("get_audio_output_device"),
+        ]);
+        inputDevices = inputs;
+        outputDevices = outputs;
+        selectedInput = savedInput || "";
+        selectedOutput = savedOutput || "";
       }
-
-      const [inputs, outputs, savedInput, savedOutput] = await Promise.all([
-        invoke<AudioDevice[]>("list_audio_input_devices"),
-        invoke<AudioDevice[]>("list_audio_output_devices"),
-        invoke<string | null>("get_audio_input_device"),
-        invoke<string | null>("get_audio_output_device"),
-      ]);
-      inputDevices = inputs;
-      outputDevices = outputs;
-      selectedInput = savedInput || "";
-      selectedOutput = savedOutput || "";
     } catch (e) {
-      console.error("Failed to load audio devices:", e);
+      errorMessage = `Failed to load audio devices: ${e}`;
     }
     loading = false;
   }
 
   async function setInput(e: Event) {
-    const name = (e.target as HTMLSelectElement).value;
-    selectedInput = name;
+    const select = e.currentTarget as HTMLSelectElement;
+    const name = select.value;
+    errorMessage = "";
     try {
-      if (liveCall) {
-        await invoke("switch_call_input_device", { name });
-      } else {
-        await invoke("set_audio_input_device", { name });
-      }
+      await invoke(
+        liveCall ? "switch_call_input_device" : "set_audio_input_device",
+        { name },
+      );
+      selectedInput = name;
     } catch (err) {
-      console.error("Failed to set input device:", err);
+      // The select returns to the device that is still in use.
+      select.value = selectedInput;
+      errorMessage = `Failed to set microphone: ${err}`;
     }
   }
 
   async function setOutput(e: Event) {
-    const name = (e.target as HTMLSelectElement).value;
-    selectedOutput = name;
+    const select = e.currentTarget as HTMLSelectElement;
+    const name = select.value;
+    errorMessage = "";
     try {
-      if (liveCall) {
-        await invoke("switch_call_output_device", { name });
-      } else {
-        await invoke("set_audio_output_device", { name });
-      }
+      await invoke(
+        liveCall ? "switch_call_output_device" : "set_audio_output_device",
+        { name },
+      );
+      selectedOutput = name;
     } catch (err) {
-      console.error("Failed to set output device:", err);
+      select.value = selectedOutput;
+      errorMessage = `Failed to set speaker: ${err}`;
     }
   }
 
   async function selectCommDevice(device: CommAudioDevice) {
     if (switching) return;
     switching = true;
-    selectedCommId = device.id;
+    errorMessage = "";
     try {
       await invoke("set_android_audio_device", { deviceId: device.id });
+      selectedCommId = device.id;
     } catch (err) {
-      console.error("Failed to set audio device:", err);
+      errorMessage = `Failed to set audio device: ${err}`;
     }
     switching = false;
   }
@@ -123,12 +142,14 @@
   <p class="audio-loading">Loading audio devices...</p>
 {:else if isAndroid}
   <div class="comm-heading">Audio output</div>
-  <div class="comm-device-list">
+  <div class="comm-device-list" role="radiogroup" aria-label="Audio output">
     {#each commDevices as device (device.id)}
       <button
         class="comm-device-row"
         class:active={selectedCommId === device.id}
         class:switching
+        role="radio"
+        aria-checked={selectedCommId === device.id}
         onclick={() => selectCommDevice(device)}
         disabled={switching}
       >
@@ -142,14 +163,17 @@
   </div>
 {:else}
   <div class="audio-device-row">
-    <label class="audio-label" for="audio-input">Microphone</label>
+    <label class="audio-label" for="{uid}-input">Microphone</label>
     <select
-      id="audio-input"
+      id="{uid}-input"
       class="audio-select"
       value={selectedInput}
       onchange={setInput}
     >
       <option value="">Default</option>
+      {#if inputMissing}
+        <option value={selectedInput}>{selectedInput} (not connected)</option>
+      {/if}
       {#each inputDevices as dev}
         <option value={dev.name}>
           {dev.name}{dev.is_default ? " (system default)" : ""}
@@ -158,14 +182,17 @@
     </select>
   </div>
   <div class="audio-device-row">
-    <label class="audio-label" for="audio-output">Speaker</label>
+    <label class="audio-label" for="{uid}-output">Speaker</label>
     <select
-      id="audio-output"
+      id="{uid}-output"
       class="audio-select"
       value={selectedOutput}
       onchange={setOutput}
     >
       <option value="">Default</option>
+      {#if outputMissing}
+        <option value={selectedOutput}>{selectedOutput} (not connected)</option>
+      {/if}
       {#each outputDevices as dev}
         <option value={dev.name}>
           {dev.name}{dev.is_default ? " (system default)" : ""}
@@ -175,12 +202,21 @@
   </div>
   <button class="audio-refresh-btn" onclick={load}>Refresh devices</button>
 {/if}
+{#if errorMessage}
+  <p class="audio-error" role="alert">{errorMessage}</p>
+{/if}
 
 <style>
   .audio-loading {
     color: var(--text-muted);
     font-size: var(--text-sm);
     margin: 0;
+  }
+
+  .audio-error {
+    color: var(--color-error-light);
+    font-size: var(--text-sm);
+    margin: 0.5rem 0 0;
   }
 
   /* Android communication device picker (Signal-style) */

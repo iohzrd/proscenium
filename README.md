@@ -4,6 +4,8 @@
 
 **Privacy notice:** Proscenium connects peers directly over QUIC. It is NOT an anonymity network. Peers you communicate with can see your IP address.
 
+**Protocol version 2:** Wire formats, signature formats and post ids changed after 0.2.31. A version 2 node does not connect to older nodes, and content signed by older versions does not verify. Discovery servers drop their version 1 tables on upgrade; users register again.
+
 A decentralized peer-to-peer social network built with [Iroh](https://iroh.computer/), [Tauri 2](https://tauri.app/), and [SvelteKit 5](https://svelte.dev/).
 
 Successor to [follow](https://github.com/iohzrd/follow) and [identia](https://github.com/iohzrd/identia), rebuilt on iroh's QUIC transport with end-to-end encrypted messaging.
@@ -18,27 +20,32 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 
 ### Identity and Key Architecture
 
-Each node has a three-tier key hierarchy:
+Each user has one master key and three kinds of derived keys:
 
-- **Master key** (Ed25519) -- The permanent, unforgeable identity. Stored in `master_key.key`. Your master public key is what others follow. The master key signs delegations and key rotations but never signs content directly. On first launch, a 24-word BIP39 recovery phrase is generated for backup.
-- **Transport key** (Ed25519) -- Derived from the master key via HKDF with a device-specific index. Unique per device. Used as iroh's QUIC endpoint identity (NodeId) for networking. Never used for signing content.
-- **Signing key** (Ed25519) -- Derived from the master key via HKDF-SHA256. Shared across all linked devices. Signs posts, interactions, profiles, and server registrations. Rotatable by the master key if a device is compromised.
-- **DM key** (X25519) -- Independently derived from the master key via HKDF with its own index. Used for Noise IK handshakes and Double Ratchet encryption. Rotatable independently of the signing key.
+- **Master key** (Ed25519) -- The permanent identity. Stored in `master_key.key` (mode 0600) on every device of the user. The master public key is what others follow. It signs delegations and key rotations, never content. A 24-word BIP39 recovery phrase encodes it.
+- **Transport key** (Ed25519) -- Derived from the master key with a per-device index (`device_index` file, 0 on the first device). It is the iroh NodeId of that device. Never signs content.
+- **Signing key** (Ed25519) -- Derived from the master key and a key index. The same on all devices of the user. Signs posts, interactions, profiles, deletions, device lists and server registrations. Rotation increments the index.
+- **DM key** (X25519) -- Derived from the master key with its own index. Used for the Noise IK handshake and as the first ratchet key of a DM session.
 
-The master key signs a `SigningKeyDelegation` binding the signing key to the identity. Peers cache this delegation and verify content signatures against the signing key. This separation means a compromised device's signing key can be rotated without losing the permanent identity.
+The master key signs a `SigningKeyDelegation` that names the current signing key and DM key. Peers accept a delegation only if the master signature verifies and its key indexes are not lower than the ones they already hold.
+
+A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the signing key. An identity response is accepted only if the delegation verifies, the device list verifies, and the device list contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
+
+Every signed byte string is a JSON array that starts with a type tag (`proscenium/<type>/2`), so a signature made for one message type does not verify as another. Post ids are a SHA-256 hash over the post's other fields, including the author. Profiles carry a signed `updated_at`; an older profile does not replace a newer one.
 
 ### Protocols
 
-**Six protocol layers handle all communication:**
+All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
 
-- **Gossip** -- Real-time pub/sub. When you post, it broadcasts instantly to anyone following you. Each user has a topic derived from their master public key.
-- **Sync** -- Historical pull. When you follow someone, their existing posts are fetched via a custom QUIC protocol with a three-tier streaming protocol (timestamp catch-up, ID diff, or up-to-date). On startup, all followed users are synced in parallel with bounded concurrency.
-- **Blobs** -- Content-addressed media storage. Images, videos, and files are stored locally and transferred peer-to-peer using iroh-blobs.
-- **DM** -- End-to-end encrypted direct messaging. A Noise IK handshake over QUIC establishes a shared secret between peers, which seeds a Double Ratchet providing per-message forward secrecy with ChaCha20-Poly1305 encryption. Messages are sent directly peer-to-peer with no intermediary, and queued locally for retry when the recipient is offline.
-- **Call** -- Peer-to-peer 1:1 voice calls over a dedicated QUIC protocol (`proscenium/call/1`). Audio is captured via cpal, encoded with Opus at 48kHz mono in 20ms frames, and streamed over bidirectional QUIC streams with length-prefixed framing. Call signaling (ring, accept, reject, end) is encrypted via the DM ratchet session.
-- **Stage** -- Multi-participant live audio rooms over a dedicated QUIC protocol (`proscenium/stage/1`). A host creates a room and speakers stream audio to the host via QUIC unidirectional streams. The host decodes all speaker streams, mixes them, re-encodes as a single Opus stream, and fans it out to listeners. Speakers receive individual forwarded streams from the host in an SFU model (no mesh). Volunteer relays extend capacity by forwarding the mixed stream to additional listeners. Stream authentication uses SHA256 hash chains with Ed25519 checkpoint signatures.
+- **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and key rotations. Every message is verified against the topic owner's cached signing key; a message without a resolvable signer is discarded.
+- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower that missed a key rotation can still verify content.
+- **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows.
+- **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is checked before download; blobs over 50 MiB are rejected. Media over 10 MiB is fetched only after a click.
+- **DM** -- End-to-end encrypted direct messages. See "Direct Messaging".
+- **Call** -- 1:1 voice calls. Opus at 48 kHz mono in 20 ms frames over a QUIC bi-stream. Signaling travels through the DM session. The audio connection is accepted only after the local user accepted the call, and both sides prove knowledge of the call id before audio starts.
+- **Stage** -- Live audio rooms. See "Stage (Live Audio Rooms)".
 
-When following a new user, an `IdentityRequest` is sent to their transport NodeId. The response contains their master pubkey, user key delegation, and profile. This is cached locally so subsequent connections can resolve the master pubkey to reachable transport NodeIds.
+When a user follows a NodeId, the node asks that NodeId for its identity, verifies the response as described above, and caches it. The caller can pass the expected master public key; a mismatch is an error.
 
 All data is persisted in a local SQLite database. The app works offline and syncs when peers are available.
 
@@ -46,7 +53,8 @@ All data is persisted in a local SQLite database. The app works offline and sync
 
 - Create and delete posts (text + media attachments)
 - Likes, reposts, and replies with real-time interaction counts
-- Follow/unfollow users by Node ID
+- Follow/unfollow users by Node ID, with the expected identity checked
+- Follow requests for Listed and Private profiles
 - View user profiles with their post history and media filters
 - Profile page with your own post history
 - Thread view with inline reply composer
@@ -62,7 +70,7 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Infinite scroll with cursor-based pagination
 - Real-time feed updates via gossip
 - Unread message badge in navigation
-- 60-second auto-sync (pauses when window is hidden)
+- Automatic sync request every 10 minutes while the window is visible, and when it becomes visible
 - Connection status indicator (relay + peer count)
 - Confirmation dialogs for destructive actions
 - Dark theme UI
@@ -77,7 +85,7 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Discovery server integration (find users, search posts, trending hashtags)
 - Server management in settings (add/remove servers, register with visibility levels)
 
-**Backend state model:** Services (`GossipService`, `DmHandler`, `CallHandler`, `StageHandler`, `PeerHandler`) are self-managing actors behind `Arc` with internal command channels. The Iroh endpoint, blob store, and database are accessed lock-free. A `TaskManager` tracks all background tasks for structured shutdown.
+**Backend state model:** Services (`GossipService`, `DmHandler`, `CallHandler`, `StageHandler`, `PeerHandler`) are cloneable handles. The network stack (endpoint, router, services) can be stopped and rebuilt in place when the identity changes (recovery, device linking). One cancellation token stops the background loops; the router is shut down on exit so peers receive a QUIC close.
 
 ## Prerequisites
 
@@ -175,146 +183,137 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 
 ## Discovery Server
 
-A self-hosted, headless server binary (`server/`) that adds opt-in aggregation, search, and trending to the P2P network. Users register with a server by signing a cryptographic proof of identity. The server subscribes to their gossip topics and indexes their posts in SQLite with FTS5, exposing an HTTP API for search, trending hashtags, user directory, and aggregated feeds.
+A self-hosted server binary (`server/`) that adds opt-in search, trending and a user directory. A user registers with a request signed by the signing key; the server verifies the master-signed delegation, the timestamp, and that the request names this server. The server then subscribes to the user's gossip topic, syncs the user's posts, and indexes them in SQLite with FTS5. It stores and serves content only for users whose registration and profile are both Public.
 
-The server is an overlay -- the P2P layer remains the foundation. Users who never connect to a server lose nothing.
+The server is an overlay. Users who never connect to a server lose nothing. Clients verify the signatures of posts a server returns and label posts they cannot verify.
 
 ### Running
 
 ```bash
 cargo build --release --manifest-path server/Cargo.toml
-./server/target/release/proscenium-server
+./server/target/release/proscenium-server --config config.toml
 ```
 
-The server listens on port 3000 by default. Configuration is via environment variables (`PROSCENIUM_PORT`, `PROSCENIUM_DB_PATH`).
+A `config.toml` is required; unknown keys are errors. `[server] public_url` is mandatory and must equal the URL users add in the client (compared without a trailing slash). Flags: `--config`, `--data-dir`, `--port`.
+
+| Section | Keys |
+| --- | --- |
+| `[server]` | `name`, `description`, `listen_addr`, `data_dir`, `public_url`, `registration_open`, `trust_forwarded_for` |
+| `[limits]` | `max_registered_users`, `max_posts_per_user`, `max_interactions_per_user`, `retention_days`, `max_connections`, `max_concurrent_requests`, `register_requests_per_minute` |
+| `[sync]` | `interval_minutes`, `startup_sync`, `max_concurrent_syncs` |
+| `[trending]` | `recompute_interval_minutes`, `window_hours` |
+
+The server speaks plain HTTP/1. Terminate TLS in a reverse proxy and set `trust_forwarded_for = true` so the per-address rate limit sees client addresses.
 
 ### Deploying
 
-A deploy script is provided for uploading to a remote server:
-
 ```bash
-scripts/deploy-server.sh
+DEPLOY_HOST=user@host DEPLOY_HEALTH_URL=https://example.org/api/v1/info scripts/deploy-server.sh
 ```
 
-This builds a static musl binary, uploads it via scp, and restarts the systemd service.
+Builds a static musl binary, uploads it to a temporary directory on the host, verifies its checksum, replaces the binary, restarts the systemd service, and restores the previous binary if the health check fails. Optional: `DEPLOY_SSH_KEY`, `DEPLOY_DIR`, `DEPLOY_SERVICE`.
 
 ### API
 
-- `GET /api/v1/info` -- Server info (name, version, user/post counts)
-- `POST /api/v1/register` -- Register with signed cryptographic proof
-- `DELETE /api/v1/register` -- Unregister
+- `GET /api/v1/info` -- Server info
+- `POST /api/v1/register` -- Register (signed)
+- `PUT /api/v1/register` -- Replace the stored profile (signed profile inside a signed request)
+- `DELETE /api/v1/register` -- Unregister (signed)
 - `GET /api/v1/feed` -- Aggregated post feed
 - `GET /api/v1/trending` -- Trending hashtags
 - `GET /api/v1/users` -- User directory
 - `GET /api/v1/users/search?q=` -- Search users
-- `GET /api/v1/users/{pubkey}/devices` -- Transport NodeIds for a user's devices
+- `GET /api/v1/users/{pubkey}` -- One user
+- `GET /api/v1/users/{pubkey}/posts` -- Posts of one user
+- `GET /api/v1/users/{pubkey}/devices` -- Transport NodeIds of a registered user (404 without an active registration)
 - `GET /api/v1/posts/search?q=` -- Full-text post search
+- `GET /api/v1/posts/{author}/{id}/interactions` -- Interactions of one post
+- HTML pages: `/`, `/users`, `/user/{pubkey}`, `/post/{author}/{id}`, `/trending`
+
+Signed requests are rejected if the timestamp is more than 5 minutes from the server clock, not greater than the last accepted timestamp of that user, or if the delegation is older than the stored one.
 
 ### Registration Visibility
 
-Users choose a visibility level when registering:
-
-- **Public** -- Profile and posts visible to all
-- **Listed** -- Profile visible in directory, posts only to followers
-- **Private** -- Registered but invisible on server
-
-See [todos/community-server.md](todos/community-server.md) for the full design document.
+- **Public** -- Profile and posts are stored and served.
+- **Listed** -- Profile is in the directory; posts are not stored.
+- **Private** -- Rejected. A Private profile received later removes the registration.
 
 ## Direct Messaging
 
-End-to-end encrypted direct messaging over a custom QUIC protocol (`proscenium/dm/1`). Messages are encrypted such that only the two participants can read them -- not relay servers, not discovery servers, not anyone.
+End-to-end encrypted direct messages over a QUIC protocol (`proscenium/dm/2`). Only the two participants can read them.
 
 ### Encryption Scheme
 
-Encryption is a two-phase process: a one-time session establishment, then per-message encryption with forward secrecy.
+**Phase 1: Noise IK handshake.** When Alice first messages Bob, a `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake runs over a QUIC bi-stream:
 
-**Phase 1: Noise IK Handshake (Session Establishment)**
+1. Alice takes Bob's X25519 DM public key from his cached, master-signed delegation.
+2. Alice sends the first Noise message and her DM public key.
+3. Bob processes it, checks that the key Noise authenticated equals the claimed sender key, and resolves that key to a master public key. If the key is unknown he asks the connecting NodeId for its identity and verifies it. A blocked user is rejected here.
+4. Both sides derive the ratchet seed: `HKDF-SHA256(ikm = k1 || k2, salt = handshake hash, info = "proscenium-dm-root-v2")`, where `k1` and `k2` are the two Noise transport keys. The handshake hash covers only transmitted bytes and serves as a public salt.
 
-Each user has an X25519 DM key derived from their master key via HKDF. When Alice first messages Bob, a `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake is performed over a dedicated QUIC bi-directional stream:
+**Phase 2: Double Ratchet.**
 
-1. Alice looks up Bob's X25519 DM public key from cached peer delegations
-2. Alice sends `DmHandshake::Init` containing the Noise message and her DM public key
-3. Bob processes the Noise message with his X25519 private key, verifies the Noise IK-authenticated initiator key matches the claimed sender (preventing impersonation), and responds with `DmHandshake::Response`
-4. Both sides extract the 32-byte handshake hash as a shared secret
+- **Root key ratchet**: `HKDF-SHA256(root_key, dh_output, info="proscenium-dm-rk")` yields a new root key and chain key.
+- **Chain key ratchet**: `HKDF-SHA256(chain_key, info="proscenium-dm-ck-msg")` yields a message key; `info="proscenium-dm-ck-chain"` yields the next chain key.
+- **Message encryption**: ChaCha20-Poly1305 with a zero nonce (each message key is used once). The associated data covers a domain tag, both parties' DM public keys and the ratchet header.
+- **DH ratchet step**: each direction change uses a new X25519 key pair.
 
-The "IK" pattern means the initiator knows the responder's long-term public key in advance, and the initiator's long-term key is encrypted and authenticated to the responder in the first message -- both sides are mutually authenticated.
+A received message changes the stored session only if its authentication tag verifies. Up to 100 messages per chain may arrive out of order; at most 1,000 skipped message keys are kept per session. One session is advanced by one operation at a time (a per-peer lock covers load, change and save).
 
-**Phase 2: Double Ratchet (Ongoing Messages)**
+Bob's first ratchet key is his long-term DM key. Messages Alice sends before Bob's first reply therefore depend on that key and on the handshake seed; see the doc comment of `RatchetState::init_bob` for the exact consequence.
 
-The Noise shared secret seeds a Double Ratchet (Signal Protocol pattern):
-
-- **Root key ratchet**: `HKDF-SHA256(root_key, dh_output, info="proscenium-dm-rk")` derives a new root key and chain key (64 bytes, split in half)
-- **Chain key ratchet**: `HKDF-SHA256(chain_key, info="proscenium-dm-ck-msg")` derives a one-time message key; `HKDF-SHA256(chain_key, info="proscenium-dm-ck-chain")` derives the next chain key
-- **Message encryption**: ChaCha20-Poly1305 with a zero nonce (safe because each message key is used exactly once)
-- **DH ratchet step**: Each direction change generates a fresh X25519 keypair and performs a new DH exchange, providing forward secrecy -- compromising current keys cannot decrypt past messages
-
-Each encrypted message carries a ratchet header: the sender's current DH public key, message number, and previous chain length. This allows the receiver to perform DH ratchet steps and handle out-of-order delivery (up to 100 skipped messages).
-
-**At-Rest Encryption**
-
-Ratchet session state is stored in SQLite encrypted with ChaCha20-Poly1305. The storage key is derived via `HKDF-SHA256(dm_secret_key, info="proscenium-ratchet-storage-v1")`. Format: `base64(12-byte random nonce || ciphertext)`.
-
-### Wire Format
-
-Messages are serialized as JSON over QUIC bi-directional streams. An encrypted envelope contains:
-
-```
-sender:          hex-encoded X25519 DM public key
-ratchet_header:  { dh_public, message_number, previous_chain_length }
-ciphertext:      ChaCha20-Poly1305 encrypted payload
-```
-
-The encrypted payload (`DmPayload`) can be: `Message` (text + media), `Delivered`, `Read`, `Typing`, `CallOffer`, `CallAnswer`, `CallReject`, or `CallHangup`. All payload types use the same ratchet channel, so call signaling is also end-to-end encrypted.
+**At rest.** Ratchet state is stored encrypted with ChaCha20-Poly1305 under a key derived from the DM secret. Message text is stored unencrypted in the local database. Key files are created with mode 0600 in a 0700 directory; there is no passphrase.
 
 ### Delivery and Queuing
 
-Messages are sent directly peer-to-peer with no intermediary. If the recipient is offline, the pre-encrypted envelope is queued to a local outbox. A background task retries delivery every 15 seconds, with an immediate retry on `Notify` when new messages are queued. Successfully delivered messages receive a `DmAck` response over the QUIC stream, triggering a `dm-delivered` event to the frontend.
+The receiver answers every envelope with an acknowledgement that carries the outcome. The sender marks a message delivered only on success. If the receiver has no session or cannot decrypt, the sender discards its session, runs a new handshake, encrypts again and sends once more.
+
+Undelivered messages are queued as plaintext payloads and encrypted at send time. Retries back off from 30 seconds to 15 minutes; entries older than 7 days are dropped. The message view can request an immediate retry.
 
 ### Features
 
-- Typing indicators (debounced, sent over the encrypted ratchet channel)
-- Read receipts (sent back to peer on conversation open)
-- Media attachments in DMs (images, videos, files)
-- Delivery acknowledgment over QUIC with real-time status updates
-- Conversation list with unread badges and message previews
-- Start conversations from any user's profile page
-- Blocked peers are rejected at the protocol handler level before any decryption occurs
-
-See [todos/direct-messaging.md](todos/direct-messaging.md) for the original design document.
+- Typing indicators and read receipts over the encrypted session
+- Media attachments (images, videos, files)
+- Delivery state from the acknowledgement
+- Conversation list with unread badges and previews
+- Blocked users are rejected by transport NodeId and again by identity after the sender key is resolved
 
 ## Voice Calls
 
-Peer-to-peer 1:1 voice calls over a dedicated QUIC protocol (`proscenium/call/1`). Call signaling (ring, accept, reject, end) is encrypted via the DM ratchet session.
+1:1 voice calls over a QUIC protocol (`proscenium/call/2`).
 
-- Opus audio codec at 48kHz mono, 20ms frames (960 samples)
-- Bidirectional QUIC streams with length-prefixed framing
-- Mute/unmute with real-time UI feedback
-- Call state machine: Idle, Ringing, InCall
-
-See [todos/voice-video-calling.md](todos/voice-video-calling.md) for the design document.
+- Signaling (offer, answer, reject, hangup) travels through the DM session.
+- Call phases: Ringing (caller), Incoming, Connecting, Active. The audio connection is served only for a call the local user accepted. Microphone capture starts in phase Active.
+- Each side sends a proof derived from the call id as the first bytes of the audio stream; audio starts only after the other side's proof verified.
+- Timeouts: 30 seconds ringing, 15 seconds for the audio connection after the answer.
+- Opus at 48 kHz mono, 20 ms frames, echo cancellation, mute.
 
 ## Stage (Live Audio Rooms)
 
-Multi-participant live audio rooms built on a dedicated QUIC protocol (`proscenium/stage/1`). Rooms support roles (Host, Co-host, Speaker, Listener) with a host-centric SFU audio architecture.
+Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with roles Host, Co-host, Speaker and Listener.
 
-- **Control plane**: iroh-gossip on a per-room TopicId, with Ed25519-signed control messages
-- **Audio plane**: Speakers stream Opus audio to the host via QUIC unidirectional streams. The host mixes all speaker streams into one Opus stream and fans it out to listeners.
-- **SFU model**: Speakers receive individual forwarded streams from the host (no peer-to-peer mesh), enabling efficient bandwidth usage
-- **Relay hierarchy**: Volunteer relays connect to the host (or upstream relay), receive the mixed stream, and fan it out to additional listeners. A TopologyManager assigns listeners to the host or a relay based on capacity.
-- **Stream authentication**: SHA256 hash chain with Ed25519 signature checkpoints every 50 frames (~1 second), ensuring listeners can verify the audio source
-- **Echo cancellation**: AEC applied to stage audio to prevent feedback loops
-- **Stage announcements**: Broadcast on the host's gossip topic so followers see active rooms in the live stages sidebar
-- Hand-raising, host muting, speaker promotion/demotion, co-host delegation, kick/ban, in-room chat
+- **Identity**: participants are identified by master public key. A participant proves the link between its signing key and its master key by sending its delegation in a signed presence message. A control message from a signer without verified presence is discarded.
+- **Roles**: only messages signed by the host (or, for promote, demote, mute and kick, by a co-host the host appointed) change roles. The host broadcasts a signed room-state snapshot periodically and on every change. A promotion starts the microphone only if the local user raised a hand.
+- **Control plane**: iroh-gossip on a per-room topic. Signatures cover the stage id and a timestamp that must increase per signer.
+- **Audio plane**: speakers stream Opus to the host. The host accepts a speaker connection only from the NodeId of a participant with a speaking role, mixes the streams and fans the mix out to listeners. Speakers receive individual forwarded streams.
+- **Relays**: a speaker or co-host can relay the mixed stream to additional listeners.
+- **Stream authentication**: a SHA-256 hash chain over frames with signed checkpoints that cover the stage id and a sequence number. A listener stops playback from a source that sends too many frames without a verifiable checkpoint, and does not return to a relay that failed verification.
+- **Moderation**: hand raising, promote and demote, host mute, kick, ban, in-room chat. Demotion stops the speaker's capture.
+- **Announcements**: signed by the host and broadcast on the host's feed topic.
 
-See [docs/spaces-design.md](docs/spaces-design.md) for the full design document.
+[docs/spaces-design.md](docs/spaces-design.md) is the original design document. Its control protocol section predates protocol version 2.
 
-## Linked Devices (In Progress)
+## Linked Devices
 
-Link multiple devices (phone, desktop, tablet) to a single identity. The three-tier key hierarchy (master / signing / transport) is implemented: a master key is the permanent identity, a derived signing key handles content signing and DM encryption across all devices, and per-device transport keys provide unique iroh NodeIds. The master key enables secure signing key rotation if a device is compromised without losing the identity.
+Several devices can share one identity.
 
-Key hierarchy, identity resolution, delegation, device pairing, and cross-device data sync are implemented. Remaining work covers key rotation and revocation.
+- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device runs a `Noise_IKpsk2` handshake with that secret, receives the link bundle, and confirms the keys before the existing device registers it.
+- **Bundle**: the master key, the new device's index, the key indexes, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
+- **Keys**: every device holds the master key and derives its own transport key from its device index.
+- **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins). A device serves device sync only to a NodeId that derives from its own master key.
+- **Not replicated**: DM ratchet sessions and post deletions. A DM is delivered to the first device that acknowledges it; another device establishes its own session when it sends.
 
-See [todos/linked-devices.md](todos/linked-devices.md) for the full design document.
+[docs/linked-devices.md](docs/linked-devices.md) is the original design document and describes an earlier design.
 
 ## Recommended IDE Setup
 

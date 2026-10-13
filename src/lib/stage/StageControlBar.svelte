@@ -5,6 +5,7 @@
     isSpeaker,
     isHost,
     selfMuted,
+    hostMuted = false,
     handRaised,
     quickReactions,
     ontoggleMute,
@@ -16,6 +17,8 @@
     isSpeaker: boolean;
     isHost: boolean;
     selfMuted: boolean;
+    /** True if a host or co-host muted the local microphone; the mute button is then disabled. */
+    hostMuted?: boolean;
     handRaised: boolean;
     quickReactions: string[];
     ontoggleMute: () => void;
@@ -29,15 +32,27 @@
 <div class="room-controls">
   <div class="controls-left">
     {#if isSpeaker}
-      <button
-        class="ctrl-btn"
-        class:ctrl-muted={selfMuted}
-        onclick={ontoggleMute}
-        title={selfMuted ? "Unmute" : "Mute"}
-      >
-        <Icon name={selfMuted ? "mic-off" : "mic"} size={18} />
-        <span>{selfMuted ? "Unmute" : "Mute"}</span>
-      </button>
+      {#if hostMuted}
+        <button
+          class="ctrl-btn ctrl-muted"
+          disabled
+          title="A host muted your microphone"
+        >
+          <Icon name="mic-off" size={18} />
+          <span>Muted by host</span>
+        </button>
+      {:else}
+        <button
+          class="ctrl-btn"
+          class:ctrl-muted={selfMuted}
+          onclick={ontoggleMute}
+          aria-pressed={selfMuted}
+          title={selfMuted ? "Unmute" : "Mute"}
+        >
+          <Icon name={selfMuted ? "mic-off" : "mic"} size={18} />
+          <span>{selfMuted ? "Unmute" : "Mute"}</span>
+        </button>
+      {/if}
     {:else}
       <button
         class="ctrl-btn"
@@ -133,8 +148,12 @@
     white-space: nowrap;
   }
 
-  .ctrl-btn:hover {
+  .ctrl-btn:hover:not(:disabled) {
     background: var(--bg-elevated-hover);
+  }
+
+  .ctrl-btn:disabled {
+    cursor: default;
   }
 
   .ctrl-btn.ctrl-muted {

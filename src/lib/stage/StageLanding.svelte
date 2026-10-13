@@ -30,7 +30,7 @@
   <p class="stage-subheading">Live audio rooms for your community</p>
 
   {#if errorMsg}
-    <div class="stage-error">{errorMsg}</div>
+    <div class="stage-error" role="alert">{errorMsg}</div>
   {/if}
 
   <div class="stage-cards">
@@ -42,7 +42,7 @@
         placeholder="Stage title"
         bind:value={createTitle}
         disabled={busy}
-        onkeydown={(e) => e.key === "Enter" && oncreate()}
+        onkeydown={(e) => e.key === "Enter" && !e.isComposing && oncreate()}
       />
       <button
         class="btn-primary"
@@ -63,7 +63,7 @@
         placeholder="Paste invite ticket"
         bind:value={joinTicket}
         disabled={busy}
-        onkeydown={(e) => e.key === "Enter" && onjoin()}
+        onkeydown={(e) => e.key === "Enter" && !e.isComposing && onjoin()}
       />
       <button
         class="btn-primary"
@@ -86,7 +86,12 @@
           value={createdTicket}
           onclick={(e) => (e.target as HTMLInputElement).select()}
         />
-        <button class="btn-icon" onclick={oncopyticket} title="Copy">
+        <button
+          class="btn-icon"
+          onclick={oncopyticket}
+          title="Copy"
+          aria-label="Copy invite ticket"
+        >
           <Icon name="copy" size={16} />
         </button>
       </div>

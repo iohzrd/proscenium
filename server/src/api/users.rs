@@ -1,9 +1,12 @@
-use super::AppState;
+use super::{AppState, clamp_limit, clamp_offset, internal_error};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+
+/// Maximum byte length of a user search query.
+const MAX_USER_QUERY_LEN: usize = 200;
 
 #[derive(Deserialize)]
 struct ListParams {
@@ -36,14 +39,14 @@ async fn list_users(
     State(state): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<UserListResponse>, StatusCode> {
-    let limit = params.limit.unwrap_or(20).min(100);
-    let offset = params.offset.unwrap_or(0);
+    let limit = clamp_limit(params.limit, 20, 100);
+    let offset = clamp_offset(params.offset);
 
     let (users, total) = state
         .storage
         .list_users(limit, offset)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     Ok(Json(UserListResponse {
         users,
@@ -57,13 +60,16 @@ async fn search_users(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<UserSearchResponse>, StatusCode> {
-    let limit = params.limit.unwrap_or(20).min(100);
+    let limit = clamp_limit(params.limit, 20, 100);
+    if params.q.len() > MAX_USER_QUERY_LEN {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let users = state
         .storage
         .search_users(&params.q, limit)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     let total = users.len();
     Ok(Json(UserSearchResponse {
@@ -81,7 +87,7 @@ async fn get_user(
         .storage
         .get_user_info(&pubkey)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(internal_error)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(user))
@@ -93,17 +99,18 @@ struct DevicesResponse {
     transport_node_ids: Vec<String>,
 }
 
+/// Transport NodeIds of a user's devices. Responds 404 unless the user has an active
+/// registration.
 async fn get_devices(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
 ) -> Result<Json<DevicesResponse>, StatusCode> {
-    let transport_node_id = state
+    let transport_node_ids = state
         .storage
-        .get_transport_node_id(&pubkey)
+        .get_device_node_ids(&pubkey)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let transport_node_ids = transport_node_id.into_iter().collect();
+        .map_err(internal_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(DevicesResponse {
         master_pubkey: pubkey,

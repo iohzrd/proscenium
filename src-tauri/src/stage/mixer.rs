@@ -1,10 +1,6 @@
 use super::auth::HostAuthState;
 use super::fanout::Fanout;
 use crate::audio::{FRAME_SIZE, OpusEncoder, SAMPLES_PER_FRAME, TAG_NORMAL};
-
-/// Per-speaker sample buffer cap: 5 frames (~100ms). Excess oldest samples
-/// are dropped to prevent a rogue or slow speaker from causing unbounded growth.
-const MAX_SPEAKER_BUFFER: usize = FRAME_SIZE * 5;
 use crate::error::AppError;
 use iroh::SecretKey;
 use proscenium_types::short_id;
@@ -13,18 +9,27 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Per-speaker sample buffer cap: 5 frames (~100ms). Excess oldest samples
+/// are dropped, so a speaker that sends faster than real time cannot grow the buffer.
+const MAX_SPEAKER_BUFFER: usize = FRAME_SIZE * 5;
+
 // ---- Command enum -------------------------------------------------------
 
 pub enum MixerCommand {
-    /// New speaker joined — register their decoded PCM channel with the mixer.
+    /// New speaker connection: register its decoded PCM channel with the mixer.
+    /// The mixer removes the input when the sending side of `pcm_rx` is dropped.
     AddSpeaker {
-        pubkey: String,
+        /// Identifier of the speaker connection. Unique per connection, so the inputs
+        /// of two connections from one node are separate.
+        id: u64,
+        /// Name used in log messages.
+        label: String,
         pcm_rx: mpsc::Receiver<Vec<f32>>,
     },
-    /// Mark a speaker as the local host and provide a direct PCM channel for
+    /// Mark an input as the local host and provide a direct PCM channel for
     /// mix-minus playback. The host receives all other speakers except themselves.
     SetHostSpeaker {
-        pubkey: String,
+        id: u64,
         pcm_tx: mpsc::Sender<Vec<f32>>,
     },
 }
@@ -40,22 +45,23 @@ pub struct MixerHandle {
 impl MixerHandle {
     pub async fn add_speaker(
         &self,
-        pubkey: String,
+        id: u64,
+        label: String,
         pcm_rx: mpsc::Receiver<Vec<f32>>,
     ) -> Result<(), AppError> {
         self.cmd_tx
-            .send(MixerCommand::AddSpeaker { pubkey, pcm_rx })
+            .send(MixerCommand::AddSpeaker { id, label, pcm_rx })
             .await
             .map_err(|_| AppError::Other("mixer actor closed".into()))
     }
 
     pub async fn set_host_speaker(
         &self,
-        pubkey: String,
+        id: u64,
         pcm_tx: mpsc::Sender<Vec<f32>>,
     ) -> Result<(), AppError> {
         self.cmd_tx
-            .send(MixerCommand::SetHostSpeaker { pubkey, pcm_tx })
+            .send(MixerCommand::SetHostSpeaker { id, pcm_tx })
             .await
             .map_err(|_| AppError::Other("mixer actor closed".into()))
     }
@@ -66,16 +72,19 @@ impl MixerHandle {
 /// Spawn the HostMixer Tokio actor.
 ///
 /// Returns `(MixerHandle, Arc<Fanout>)`:
-/// - `MixerHandle`: add/remove speakers, query RMS levels
-/// - `Arc<Fanout>`: the listener mix fanout — add QUIC-stream subscribers for listeners/relays
+/// - `MixerHandle`: add speaker inputs
+/// - `Arc<Fanout>`: the listener mix fanout; add QUIC-stream subscribers for listeners/relays
 ///
-/// `host_sfu_fanout`: the host's own voice SFU fanout — the mixer encodes the host's
+/// `host_sfu_fanout`: the host's own voice SFU fanout. The mixer encodes the host's
 /// contribution separately and sends to this fanout each tick so connected speakers
 /// can receive the host's voice via uni-streams.
+///
+/// `signing_key` and `stage_id` are used to sign the checkpoints of the listener mix.
 ///
 /// The actor owns the encoders, auth state, and all per-speaker buffers exclusively.
 pub fn spawn_mixer(
     signing_key: SecretKey,
+    stage_id: String,
     host_sfu_fanout: Arc<Fanout>,
     cancel: CancellationToken,
 ) -> Result<(MixerHandle, Arc<Fanout>), AppError> {
@@ -87,7 +96,7 @@ pub fn spawn_mixer(
         cmd_rx,
         actor_fanout,
         host_sfu_fanout,
-        signing_key,
+        HostAuthState::new(signing_key, stage_id),
         cancel,
     ));
 
@@ -99,7 +108,7 @@ async fn run_mixer(
     mut cmd_rx: mpsc::Receiver<MixerCommand>,
     listener_fanout: Arc<Fanout>,
     host_sfu_fanout: Arc<Fanout>,
-    signing_key: SecretKey,
+    mut auth: HostAuthState,
     cancel: CancellationToken,
 ) {
     let mut listener_encoder = match OpusEncoder::new() {
@@ -118,14 +127,12 @@ async fn run_mixer(
         }
     };
 
-    let mut auth = HostAuthState::new(signing_key);
-
-    // pubkey -> (sample buffer, most-recent RMS)
-    let mut buffers: HashMap<String, (Vec<f32>, f32)> = HashMap::new();
+    // Input id -> sample buffer
+    let mut buffers: HashMap<u64, Vec<f32>> = HashMap::new();
     // Separate vec for the PCM receivers so we can drain them each tick
-    let mut speaker_channels: Vec<(String, mpsc::Receiver<Vec<f32>>)> = Vec::new();
-    // Host speaker pubkey + direct PCM channel for mix-minus local playback
-    let mut host_speaker: Option<(String, mpsc::Sender<Vec<f32>>)> = None;
+    let mut speaker_channels: Vec<(u64, String, mpsc::Receiver<Vec<f32>>)> = Vec::new();
+    // Host input id + direct PCM channel for mix-minus local playback
+    let mut host_speaker: Option<(u64, mpsc::Sender<Vec<f32>>)> = None;
 
     let mut listener_seq: u32 = 0;
     let mut listener_ts: u32 = 0;
@@ -143,13 +150,13 @@ async fn run_mixer(
 
             cmd = cmd_rx.recv() => {
                 match cmd {
-                    Some(MixerCommand::AddSpeaker { pubkey, pcm_rx }) => {
-                        log::info!("[mixer] adding speaker {}", short_id(&pubkey));
-                        buffers.insert(pubkey.clone(), (Vec::new(), 0.0));
-                        speaker_channels.push((pubkey, pcm_rx));
+                    Some(MixerCommand::AddSpeaker { id, label, pcm_rx }) => {
+                        log::info!("[mixer] adding speaker {} (input {id})", short_id(&label));
+                        buffers.insert(id, Vec::new());
+                        speaker_channels.push((id, label, pcm_rx));
                     }
-                    Some(MixerCommand::SetHostSpeaker { pubkey, pcm_tx }) => {
-                        host_speaker = Some((pubkey, pcm_tx));
+                    Some(MixerCommand::SetHostSpeaker { id, pcm_tx }) => {
+                        host_speaker = Some((id, pcm_tx));
                     }
                     None => break,
                 }
@@ -157,18 +164,18 @@ async fn run_mixer(
 
             _ = mix_interval.tick() => {
                 // Drain all available PCM from each speaker's channel into their buffer.
-                let mut dead: Vec<String> = Vec::new();
-                for (pubkey, rx) in &mut speaker_channels {
+                let mut dead: Vec<u64> = Vec::new();
+                for (id, label, rx) in &mut speaker_channels {
                     loop {
                         match rx.try_recv() {
                             Ok(samples) => {
-                                if let Some((buf, _)) = buffers.get_mut(pubkey) {
+                                if let Some(buf) = buffers.get_mut(id) {
                                     buf.extend_from_slice(&samples);
                                     if buf.len() > MAX_SPEAKER_BUFFER {
                                         let excess = buf.len() - MAX_SPEAKER_BUFFER;
                                         log::warn!(
                                             "[mixer] speaker {} buffer overflow, dropping {excess} oldest samples",
-                                            short_id(pubkey)
+                                            short_id(label)
                                         );
                                         buf.drain(..excess);
                                     }
@@ -176,40 +183,43 @@ async fn run_mixer(
                             }
                             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                                log::debug!("[mixer] speaker {} channel closed, removing", short_id(pubkey));
-                                dead.push(pubkey.clone());
+                                log::debug!("[mixer] speaker {} channel closed, removing", short_id(label));
+                                dead.push(*id);
                                 break;
                             }
                         }
                     }
                 }
-                for pubkey in dead {
-                    buffers.remove(&pubkey);
-                    speaker_channels.retain(|(pk, _)| pk != &pubkey);
+                for id in dead {
+                    buffers.remove(&id);
+                    speaker_channels.retain(|(other, _, _)| *other != id);
                 }
 
-                // Collect per-speaker contributions (FRAME_SIZE samples each) and
-                // compute the unclamped total sum for mix-minus arithmetic.
-                let mut contributions: HashMap<String, Vec<f32>> = HashMap::new();
+                // Collect the host's contribution and compute the unclamped total sum
+                // for mix-minus arithmetic.
+                let host_id = host_speaker.as_ref().map(|(id, _)| *id);
+                let mut host_contrib = vec![0.0f32; FRAME_SIZE];
                 let mut total = vec![0.0f32; FRAME_SIZE];
-                for (pubkey, (buf, rms)) in buffers.iter_mut() {
+                for (id, buf) in buffers.iter_mut() {
                     let available = buf.len().min(FRAME_SIZE);
-                    let sum_sq: f32 = buf[..available].iter().map(|s| s * s).sum();
-                    *rms = (sum_sq / available.max(1) as f32).sqrt();
-
-                    let mut contrib = vec![0.0f32; FRAME_SIZE];
-                    for (i, s) in buf.drain(..available).enumerate() {
-                        contrib[i] = s;
-                        total[i] += s;
+                    let is_host = Some(*id) == host_id;
+                    for ((sample, sum), host) in buf
+                        .drain(..available)
+                        .zip(total.iter_mut())
+                        .zip(host_contrib.iter_mut())
+                    {
+                        *sum += sample;
+                        if is_host {
+                            *host = sample;
+                        }
                     }
-                    contributions.insert(pubkey.clone(), contrib);
                 }
 
-                // Full mix (clamped) → encode once → listener fanout.
+                // Full mix (clamped), encoded once, sent to the listener fanout.
                 let full_mix: Vec<f32> = total.iter().map(|s| s.clamp(-1.0, 1.0)).collect();
                 let packets = listener_encoder.push_samples(&full_mix);
                 for packet in &packets {
-                    let (tag, wire_payload) = auth.process(packet);
+                    let (tag, wire_payload) = auth.process(listener_seq, listener_ts, packet);
                     listener_fanout.send_frame(listener_seq, listener_ts, tag, wire_payload);
                     listener_seq = listener_seq.wrapping_add(1);
                     listener_ts = listener_ts.wrapping_add(SAMPLES_PER_FRAME as u32);
@@ -217,15 +227,6 @@ async fn run_mixer(
                 }
 
                 // Mix-minus for host local playback: PCM of all speakers except the host.
-                let host_contrib = if let Some((ref host_pk, _)) = host_speaker {
-                    contributions
-                        .get(host_pk.as_str())
-                        .cloned()
-                        .unwrap_or_else(|| vec![0.0; FRAME_SIZE])
-                } else {
-                    vec![0.0; FRAME_SIZE]
-                };
-
                 if let Some((_, ref pcm_tx)) = host_speaker {
                     let minus_host: Vec<f32> = total
                         .iter()

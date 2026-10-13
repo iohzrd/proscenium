@@ -1,21 +1,28 @@
 use super::client::sync_from_peer;
-use super::processing::process_sync_result;
-use crate::constants::SYNC_TIMEOUT;
+use crate::constants::{MAX_NODE_IDS_TRIED, SYNC_PEER_TIMEOUT};
 use crate::error::AppError;
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointId};
-use proscenium_types::{Post, short_id};
-use tauri::{AppHandle, Emitter};
+use proscenium_types::{Post, is_valid_pubkey, short_id};
+use tauri::AppHandle;
+use tokio::time::Instant;
 
 /// Stats returned from `sync_one_peer`.
 pub struct SyncOneResult {
+    /// Number of new post rows inserted.
     pub stored: usize,
+    /// The newest newly stored posts (at most `SYNC_RETURNED_POSTS_MAX`, newest first).
     pub posts: Vec<Post>,
+    /// Number of posts the responder reported for the author.
     pub remote_post_count: u64,
 }
 
-/// Sync from a single peer: resolve transport NodeIds, try each, run sync protocol,
-/// process and store results. Returns `SyncOneResult` on first successful NodeId.
+/// Sync the content of the user `pubkey` from one of its cached transport NodeIds.
+///
+/// Connects to at most `MAX_NODE_IDS_TRIED` NodeIds in order and runs for at most
+/// `SYNC_PEER_TIMEOUT` in total (plus one frame timeout). Returns the result of the
+/// first NodeId that answered with a usable summary. Nothing is requested for a muted
+/// or blocked user.
 pub async fn sync_one_peer(
     endpoint: &Endpoint,
     storage: &Storage,
@@ -24,6 +31,20 @@ pub async fn sync_one_peer(
     app_handle: &AppHandle,
     label: &str,
 ) -> Result<SyncOneResult, AppError> {
+    if !is_valid_pubkey(pubkey) {
+        return Err(AppError::Other("invalid pubkey".into()));
+    }
+    if pubkey == my_id {
+        return Err(AppError::Other("cannot sync the local user".into()));
+    }
+    if storage.is_hidden(pubkey).await? {
+        return Ok(SyncOneResult {
+            stored: 0,
+            posts: Vec::new(),
+            remote_post_count: 0,
+        });
+    }
+
     let node_ids = storage.get_peer_transport_node_ids(pubkey).await?;
     if node_ids.is_empty() {
         return Err(AppError::Other(format!(
@@ -32,8 +53,14 @@ pub async fn sync_one_peer(
         )));
     }
 
-    let mut last_err = String::new();
-    for node_id in &node_ids {
+    let deadline = Instant::now() + SYNC_PEER_TIMEOUT;
+    let mut last_err = String::from("no usable transport NodeId");
+    let mut tried = 0usize;
+    for node_id in node_ids.iter().take(MAX_NODE_IDS_TRIED) {
+        if Instant::now() >= deadline {
+            last_err = "time limit reached".to_string();
+            break;
+        }
         let target: EndpointId = match node_id.parse() {
             Ok(t) => t,
             Err(e) => {
@@ -41,65 +68,22 @@ pub async fn sync_one_peer(
                 continue;
             }
         };
-
-        let result = tokio::time::timeout(
-            SYNC_TIMEOUT,
-            sync_from_peer(endpoint, storage, target, pubkey),
+        tried += 1;
+        match sync_from_peer(
+            endpoint, storage, target, pubkey, my_id, app_handle, label, deadline,
         )
-        .await;
-
-        match result {
-            Ok(Ok(sync_result)) => {
-                let stored =
-                    process_sync_result(storage, pubkey, &sync_result, label, my_id, app_handle)
-                        .await;
-
-                // Emit stage announcement if the peer is hosting a live stage.
-                if let Some(stage) = &sync_result.active_stage {
-                    log::info!(
-                        "[{label}] discovered live stage \"{}\" from {}",
-                        stage.title,
-                        short_id(pubkey),
-                    );
-                    let _ = app_handle.emit(
-                        "stage-announced",
-                        serde_json::json!({
-                            "stage_id": stage.stage_id,
-                            "title": stage.title,
-                            "ticket": stage.ticket.to_string(),
-                            "host_pubkey": stage.host_pubkey,
-                            "started_at": stage.started_at,
-                        }),
-                    );
-                }
-
-                log::info!(
-                    "[{label}] stored {stored}/{} posts from {} via {} (mode={:?})",
-                    sync_result.posts.len(),
-                    short_id(pubkey),
-                    short_id(node_id),
-                    sync_result.mode,
-                );
-                return Ok(SyncOneResult {
-                    stored,
-                    posts: sync_result.posts,
-                    remote_post_count: sync_result.remote_post_count,
-                });
-            }
-            Ok(Err(e)) => {
-                log::warn!("[{label}] failed via {}: {e}", short_id(node_id));
+        .await
+        {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                log::debug!("[{label}] sync via {} failed: {e}", short_id(node_id));
                 last_err = e.to_string();
-            }
-            Err(_) => {
-                log::warn!("[{label}] timed out via {}", short_id(node_id));
-                last_err = "timeout".to_string();
             }
         }
     }
 
     Err(AppError::Other(format!(
-        "sync failed for {} (tried {} node(s)): {last_err}",
+        "sync failed for {} (tried {tried} node(s)): {last_err}",
         short_id(pubkey),
-        node_ids.len(),
     )))
 }

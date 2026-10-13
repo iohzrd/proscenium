@@ -4,111 +4,350 @@ use crate::error::AppError;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
 use crate::stage::StageHandler;
-use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand};
+use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand, device_node_id};
 use crate::storage::Storage;
-use iroh::{Endpoint, SecretKey, protocol::Router};
+use iroh::{
+    Endpoint, SecretKey,
+    endpoint::Connection,
+    protocol::{AcceptError, ProtocolHandler, Router},
+};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use proscenium_types::{
-    CALL_ALPN, DM_ALPN, DeviceEntry, LinkedDevicesAnnouncement, PEER_ALPN, STAGE_ALPN,
-    derive_dm_key, derive_signing_key, derive_transport_key, now_millis, sign_delegation,
-    sign_linked_devices_announcement,
+    CALL_ALPN, DM_ALPN, DeviceEntry, LinkBundleData, MAX_LINKED_DEVICES, PEER_ALPN, STAGE_ALPN,
+    SigningKeyDelegation, now_millis,
 };
+use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tauri::Manager;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
-/// Load raw key bytes from a file, or generate new ones.
-fn load_or_create_key_bytes(path: &std::path::Path) -> [u8; 32] {
-    if path.exists() {
-        let bytes = std::fs::read(path).expect("failed to read key file");
-        bytes.try_into().expect("invalid key length")
-    } else {
-        let mut key_bytes = [0u8; 32];
-        getrandom::fill(&mut key_bytes).expect("failed to generate random key");
-        std::fs::write(path, key_bytes).expect("failed to write key file");
-        key_bytes
+const MASTER_KEY_FILE: &str = "master_key.key";
+const DEVICE_INDEX_FILE: &str = "device_index";
+const SIGNING_KEY_INDEX_FILE: &str = "signing_key_index";
+const DM_KEY_INDEX_FILE: &str = "dm_key_index";
+/// Marker file. While it exists, `get_seed_phrase` asks for native confirmation.
+pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
+/// Suffix of the temporary files created by `write_secret_file`.
+const TEMP_FILE_SUFFIX: &str = ".tmp";
+
+/// Time limit for the network shutdown when the application exits.
+const EXIT_SHUTDOWN_LIMIT: Duration = Duration::from_secs(3);
+/// Time limit for the network shutdown before the local identity is replaced.
+const REPLACE_SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
+
+/// The master key and derivation indexes that define the identity of a device.
+/// The master key bytes are overwritten with zeros when the value is dropped.
+pub struct IdentityKeys {
+    pub master_secret_key: [u8; 32],
+    pub device_index: u32,
+    pub signing_key_index: u32,
+    pub dm_key_index: u32,
+}
+
+impl Drop for IdentityKeys {
+    fn drop(&mut self) {
+        self.master_secret_key.zeroize();
     }
 }
 
-/// Load the persisted signing key index (returns 0 if not yet saved).
-fn load_signing_key_index(data_dir: &std::path::Path) -> u32 {
-    let path = data_dir.join("signing_key_index");
+/// Write `bytes` to `path` so that `path` holds either its previous content or all of
+/// `bytes`.
+///
+/// Creates a temporary file in the same directory (mode 0600 on Unix), writes it, calls
+/// fsync, renames it over `path`, then calls fsync on the directory (Unix).
+pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".{}{TEMP_FILE_SUFFIX}", hex::encode(random)));
+    let tmp_path = dir.join(tmp_name);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let written = (|| {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return written;
+    }
+
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Delete temporary files that `write_secret_file` left behind when the process ended
+/// between creating the file and renaming it. Such a file can hold key material.
+fn remove_stale_temp_files(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_temp = name.ends_with(TEMP_FILE_SUFFIX)
+            && [
+                MASTER_KEY_FILE,
+                DEVICE_INDEX_FILE,
+                SIGNING_KEY_INDEX_FILE,
+                DM_KEY_INDEX_FILE,
+                SEED_BACKED_UP_FILE,
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(&format!("{prefix}.")));
+        if is_temp && let Err(e) = std::fs::remove_file(entry.path()) {
+            log::warn!("[setup] failed to delete temporary file {name}: {e}");
+        }
+    }
+}
+
+/// Remove the permission bits of `path` that are not in `mode`.
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if current & !mode != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(current & mode))?;
+    }
+    Ok(())
+}
+
+/// Create the data directory. On Unix a new directory gets mode 0700, and an existing
+/// directory loses its group and other permission bits.
+fn create_data_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)?;
+
+    #[cfg(unix)]
+    if let Err(e) = restrict_permissions(path, 0o700) {
+        log::warn!(
+            "[setup] failed to restrict permissions of {}: {e}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Read the master key file. Returns `Ok(None)` if the file does not exist, and an error
+/// if it cannot be read or does not hold exactly 32 bytes.
+fn read_master_key(path: &Path) -> Result<Option<[u8; 32]>, AppError> {
+    let mut bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AppError::Other(format!(
+                "failed to read {}: {e}",
+                path.display()
+            )));
+        }
+    };
+    let key: Result<[u8; 32], _> = bytes.as_slice().try_into();
+    let len = bytes.len();
+    bytes.zeroize();
+    let key = key.map_err(|_| {
+        AppError::Other(format!(
+            "{} holds {len} bytes, expected 32. Restore the file from a backup.",
+            path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    if let Err(e) = restrict_permissions(path, 0o600) {
+        log::warn!(
+            "[setup] failed to restrict permissions of {}: {e}",
+            path.display()
+        );
+    }
+    Ok(Some(key))
+}
+
+/// Make sure the master key file exists.
+///
+/// A new random key is generated only if the file is missing and the database holds no
+/// rows of an existing identity. A missing key file next to such a database is an error:
+/// generating a key would start a different identity on top of the stored data.
+async fn ensure_master_key(data_dir: &Path, storage: &Storage) -> Result<(), AppError> {
+    let path = data_dir.join(MASTER_KEY_FILE);
+    if read_master_key(&path)?.is_some() {
+        return Ok(());
+    }
+    if storage.has_identity_data().await? {
+        return Err(AppError::Other(format!(
+            "{} is missing but the database holds data of an existing identity. \
+             Restore the key file, or remove social.db to start with a new identity.",
+            path.display()
+        )));
+    }
+
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key)?;
+    let written = write_secret_file(&path, &key);
+    key.zeroize();
+    written.map_err(|e| AppError::Other(format!("failed to write {}: {e}", path.display())))?;
+    log::info!("[setup] generated a new master key");
+    Ok(())
+}
+
+/// Read a derivation index file. A missing file means index 0.
+/// Returns an error if the file exists and does not hold a decimal `u32`.
+fn read_index_file(data_dir: &Path, name: &str) -> Result<u32, AppError> {
+    let path = data_dir.join(name);
     match std::fs::read_to_string(&path) {
-        Ok(s) => s.trim().parse().unwrap_or(0),
-        Err(_) => 0,
+        Ok(content) => content.trim().parse().map_err(|_| {
+            AppError::Other(format!(
+                "{} does not hold a derivation index",
+                path.display()
+            ))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(AppError::Other(format!(
+            "failed to read {}: {e}",
+            path.display()
+        ))),
     }
 }
 
-/// Load the persisted DM key index (returns 0 if not yet saved).
-fn load_dm_key_index(data_dir: &std::path::Path) -> u32 {
-    let path = data_dir.join("dm_key_index");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => s.trim().parse().unwrap_or(0),
-        Err(_) => 0,
+/// Read the master key and the derivation index files in `data_dir` and derive the identity.
+fn load_identity(data_dir: &Path) -> Result<Identity, AppError> {
+    let path = data_dir.join(MASTER_KEY_FILE);
+    let master_secret_key_bytes = read_master_key(&path)?
+        .ok_or_else(|| AppError::Other(format!("{} is missing", path.display())))?;
+    let device_index = read_index_file(data_dir, DEVICE_INDEX_FILE)?;
+    if device_index as usize >= MAX_LINKED_DEVICES {
+        return Err(AppError::Other(format!(
+            "device index {device_index} is out of range (0..{MAX_LINKED_DEVICES})"
+        )));
     }
-}
-
-/// Derive all key material from the master key and build an Identity struct.
-fn build_identity(data_dir: &std::path::Path) -> Identity {
-    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
-    let transport_key_bytes = derive_transport_key(&master_secret_key_bytes, 0);
-    let transport_node_id = SecretKey::from_bytes(&transport_key_bytes)
-        .public()
-        .to_string();
-    let master_secret = SecretKey::from_bytes(&master_secret_key_bytes);
-    let signing_key_index = load_signing_key_index(data_dir);
-    let signing_secret_key_bytes = derive_signing_key(&master_secret_key_bytes, signing_key_index);
-    let signing_key = SecretKey::from_bytes(&signing_secret_key_bytes);
-    let dm_key_index = load_dm_key_index(data_dir);
-    let dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes, dm_key_index);
-    let (dm_x25519_private, dm_x25519_public) =
-        crate::crypto::x25519_keypair_from_raw(&dm_secret_key_bytes);
-
-    let delegation = sign_delegation(
-        &master_secret,
-        &signing_key.public(),
-        signing_key_index,
-        &hex::encode(dm_x25519_public),
-        dm_key_index,
-        now_millis(),
-    );
-
-    let ratchet_storage_key = crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes);
-
-    Identity {
+    let signing_key_index = read_index_file(data_dir, SIGNING_KEY_INDEX_FILE)?;
+    let dm_key_index = read_index_file(data_dir, DM_KEY_INDEX_FILE)?;
+    Ok(Identity::derive(
         master_secret_key_bytes,
-        master_pubkey: master_secret.public().to_string(),
-        signing_secret_key_bytes,
-        signing_key,
+        device_index,
         signing_key_index,
-        dm_secret_key_bytes,
-        dm_pubkey: hex::encode(dm_x25519_public),
         dm_key_index,
-        dm_x25519_private,
-        dm_x25519_public,
-        ratchet_storage_key,
-        transport_node_id,
-        delegation,
+    ))
+}
+
+/// Write the three index files, then the master key file.
+///
+/// The master key is written last: if a step fails, the previous master key is still on
+/// disk and the new key is never combined with the previous device index.
+fn write_identity_files(data_dir: &Path, keys: &IdentityKeys) -> std::io::Result<()> {
+    write_secret_file(
+        &data_dir.join(DEVICE_INDEX_FILE),
+        keys.device_index.to_string().as_bytes(),
+    )?;
+    write_secret_file(
+        &data_dir.join(SIGNING_KEY_INDEX_FILE),
+        keys.signing_key_index.to_string().as_bytes(),
+    )?;
+    write_secret_file(
+        &data_dir.join(DM_KEY_INDEX_FILE),
+        keys.dm_key_index.to_string().as_bytes(),
+    )?;
+    write_secret_file(&data_dir.join(MASTER_KEY_FILE), &keys.master_secret_key)
+}
+
+/// Run `write` on the blocking thread pool and flatten the join error into `AppError`.
+async fn run_blocking_io<F>(write: F) -> Result<(), AppError>
+where
+    F: FnOnce() -> std::io::Result<()> + Send + 'static,
+{
+    tokio::task::spawn_blocking(write)
+        .await
+        .map_err(|e| AppError::Other(format!("file write task failed: {e}")))?
+        .map_err(AppError::from)
+}
+
+/// Raise the signing key index to `new_index`: write the index file, then replace the
+/// in-memory identity with one derived for that index. Returns the new delegation.
+///
+/// Returns an error if `new_index` is not greater than the current index. The identity
+/// write lock is held from the comparison to the update, so concurrent calls are applied
+/// one after the other.
+pub async fn raise_signing_key_index(
+    app: &tauri::AppHandle,
+    identity: &SharedIdentity,
+    new_index: u32,
+) -> Result<SigningKeyDelegation, AppError> {
+    let path = app.path().app_data_dir()?.join(SIGNING_KEY_INDEX_FILE);
+    let mut id = identity.write().await;
+    if new_index <= id.signing_key_index {
+        return Err(AppError::Other(format!(
+            "signing key index is already {}",
+            id.signing_key_index
+        )));
+    }
+    run_blocking_io(move || write_secret_file(&path, new_index.to_string().as_bytes())).await?;
+    *id = Identity::derive(
+        id.master_secret_key_bytes,
+        id.device_index,
+        new_index,
+        id.dm_key_index,
+    );
+    Ok(id.delegation.clone())
+}
+
+/// Serves the blobs ALPN from the blob store that every network stack shares.
+///
+/// `BlobsProtocol::shutdown` closes the store. This wrapper keeps the default
+/// `ProtocolHandler::shutdown`, which does nothing, so `Router::shutdown` leaves the store
+/// open and a rebuilt network stack can serve from it. `shutdown_for_exit` closes the store.
+#[derive(Debug, Clone)]
+struct SharedStoreBlobs(BlobsProtocol);
+
+impl ProtocolHandler for SharedStoreBlobs {
+    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
+        self.0.accept(conn).await
     }
 }
 
 /// Build the networking stack: endpoint, gossip, handlers, router.
+/// The endpoint key is the transport key of `identity`.
 /// Returns the stack plus channel receivers needed by background tasks.
 async fn build_network_stack(
     handle: &tauri::AppHandle,
     identity: SharedIdentity,
     storage: Arc<Storage>,
     blob_store: &FsStore,
-    master_secret_key_bytes: &[u8; 32],
 ) -> Result<
     (
         NetworkStack,
         mpsc::Receiver<SyncCommand>,
         mpsc::UnboundedReceiver<crate::dm::CallSignal>,
     ),
-    Box<dyn std::error::Error>,
+    AppError,
 > {
     let mdns_enabled = crate::preferences::get_mdns_discovery(&storage).await;
     let dht_enabled = crate::preferences::get_dht_discovery(&storage).await;
@@ -118,10 +357,10 @@ async fn build_network_stack(
         if dht_enabled { "enabled" } else { "disabled" },
     );
 
-    let transport_key_bytes = derive_transport_key(master_secret_key_bytes, 0);
+    let transport_secret_key = identity.read().await.transport_secret_key();
     log::info!("[setup] binding iroh endpoint...");
     let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(SecretKey::from_bytes(&transport_key_bytes))
+        .secret_key(transport_secret_key)
         .alpns(vec![
             iroh_blobs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
@@ -138,15 +377,15 @@ async fn build_network_stack(
         builder = builder.address_lookup(iroh_mainline_address_lookup::DhtAddressLookup::builder());
     }
 
-    let endpoint = builder.bind().await.expect("failed to bind iroh endpoint");
+    let endpoint = builder
+        .bind()
+        .await
+        .map_err(|e| AppError::Other(format!("failed to bind iroh endpoint: {e}")))?;
 
-    let blobs_dir = handle
-        .path()
-        .app_data_dir()
-        .expect("failed to resolve app data dir")
-        .join("blobs");
     let blobs = BlobsProtocol::new(blob_store, None);
-    let gossip = Gossip::builder().spawn(endpoint.clone());
+    let gossip = Gossip::builder()
+        .max_message_size(crate::constants::GOSSIP_MAX_MESSAGE_SIZE)
+        .spawn(endpoint.clone());
     log::info!("[setup] gossip started");
 
     let gossip_service = GossipService::new(
@@ -192,7 +431,7 @@ async fn build_network_stack(
     );
 
     let router = Router::builder(endpoint.clone())
-        .accept(iroh_blobs::ALPN, blobs.clone())
+        .accept(iroh_blobs::ALPN, SharedStoreBlobs(blobs.clone()))
         .accept(iroh_gossip::ALPN, gossip)
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
@@ -204,8 +443,6 @@ async fn build_network_stack(
     let shutdown = CancellationToken::new();
     let (sync_tx, sync_rx) = mpsc::channel::<SyncCommand>(64);
 
-    let _ = blobs_dir; // used for logging context only in original code
-
     let net = NetworkStack {
         endpoint,
         gossip: gossip_service,
@@ -216,7 +453,7 @@ async fn build_network_stack(
         blobs,
         sync_tx,
         shutdown,
-        _router: router,
+        router,
     };
 
     Ok((net, sync_rx, call_signal_rx))
@@ -236,9 +473,20 @@ async fn start_services(
     state.dm().start_background(shutdown.child_token());
     crate::tasks::spawn_all(state.clone(), sync_rx);
 
+    // Forwards call signals from the DM handler to the call handler. The task holds a
+    // `CallHandler`, which holds a sender of this channel, so `recv` never yields `None`;
+    // the task ends when the shutdown token of this stack is cancelled.
     let call = state.call();
+    let token = shutdown.child_token();
     tokio::spawn(async move {
-        while let Some(signal) = call_signal_rx.recv().await {
+        loop {
+            let signal = tokio::select! {
+                _ = token.cancelled() => break,
+                signal = call_signal_rx.recv() => match signal {
+                    Some(signal) => signal,
+                    None => break,
+                },
+            };
             match signal.payload {
                 proscenium_types::DmPayload::CallOffer { call_id, .. } => {
                     call.on_call_offer(&call_id, &signal.peer_pubkey).await;
@@ -248,7 +496,7 @@ async fn start_services(
                 }
                 proscenium_types::DmPayload::CallReject { call_id }
                 | proscenium_types::DmPayload::CallHangup { call_id } => {
-                    call.on_call_ended(&call_id).await;
+                    call.on_call_ended(&call_id, &signal.peer_pubkey).await;
                 }
                 _ => {}
             }
@@ -266,105 +514,247 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         log::info!("[setup] own gossip feed started");
     }
 
-    {
+    let (transport_node_id, master_pubkey, device_index) = {
         let id = state.identity.read().await;
-        let master_pubkey = id.master_pubkey.clone();
-        drop(id);
-        if let Ok(Some(profile)) = state.storage.get_profile(&master_pubkey).await {
-            if let Err(e) = gossip.broadcast_profile(&profile).await {
-                log::error!("[setup] failed to broadcast profile: {e}");
-            } else {
-                log::info!("[setup] broadcast profile: {}", profile.display_name);
-            }
-        }
+        (
+            id.transport_node_id.clone(),
+            id.master_pubkey.clone(),
+            id.device_index,
+        )
+    };
+
+    // Only the device with derivation index 0 is stored as the primary device.
+    if let Err(e) = state
+        .storage
+        .upsert_linked_device(
+            &transport_node_id,
+            &crate::announcement::default_device_name(device_index),
+            device_index == 0,
+            true,
+            now_millis(),
+        )
+        .await
+    {
+        log::error!("[setup] failed to register own device: {e}");
     }
 
-    {
-        let id = state.identity.read().await;
-        let now = now_millis();
-        if let Err(e) = state
-            .storage
-            .upsert_linked_device(&id.transport_node_id, "Primary Device", true, true, now)
-            .await
-        {
-            log::error!("[setup] failed to register own device: {e}");
+    // Signs the stored profile again if its signature does not match the current
+    // signing key, then broadcasts the profile and the device list.
+    match crate::announcement::build_own_identity_response(&state.storage, &state.identity).await {
+        Ok(identity) => {
+            if let Some(profile) = &identity.profile {
+                if let Err(e) = gossip.broadcast_profile(profile).await {
+                    log::error!("[setup] failed to broadcast profile: {e}");
+                } else {
+                    log::info!("[setup] broadcast profile: {}", profile.display_name);
+                }
+            }
+            if let Err(e) = gossip
+                .broadcast_linked_devices(&identity.announcement)
+                .await
+            {
+                log::error!("[setup] failed to broadcast device announcement: {e}");
+            } else {
+                log::info!(
+                    "[setup] broadcast device announcement for {} ({} devices)",
+                    proscenium_types::short_id(&master_pubkey),
+                    identity.announcement.devices.len()
+                );
+            }
         }
-
-        let mut announcement = LinkedDevicesAnnouncement {
-            master_pubkey: id.master_pubkey.clone(),
-            delegation: id.delegation.clone(),
-            devices: vec![DeviceEntry {
-                node_id: id.transport_node_id.clone(),
-                device_name: "Primary Device".to_string(),
-                is_primary: true,
-                added_at: now,
-            }],
-            version: 1,
-            timestamp: now,
-            signature: String::new(),
-        };
-        sign_linked_devices_announcement(&mut announcement, &id.signing_key);
-        drop(id);
-
-        if let Err(e) = gossip.broadcast_linked_devices(&announcement).await {
-            log::error!("[setup] failed to broadcast device announcement: {e}");
-        } else {
-            log::info!("[setup] broadcast single-device announcement");
-        }
+        Err(e) => log::error!("[setup] failed to build device announcement: {e}"),
     }
 }
 
-/// Rebuild the networking stack after identity recovery.
-/// Cancels all background tasks, updates identity from disk, builds fresh
-/// networking, and restarts all services.
-pub async fn rebuild_for_recovery(state: &Arc<AppState>) -> Result<(), AppError> {
-    log::info!("[recovery] starting network rebuild...");
+/// Stop the current network stack.
+///
+/// Cancels the shutdown token (background loops), aborts the gossip listener tasks, then
+/// awaits `Router::shutdown`, which stops the protocol handlers, aborts the running
+/// `accept` futures and closes the endpoint. Returns at once if the stack is already
+/// stopped.
+pub(crate) async fn stop_network(state: &AppState) {
+    let token = state.shutdown();
+    let router = state.router();
+    if token.is_cancelled() && router.is_shutdown() {
+        return;
+    }
+    token.cancel();
 
-    // 1. Cancel all background tasks.
-    state.shutdown().cancel();
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // The listener tasks store received gossip messages. They are aborted here so that
+    // a message buffered in a topic receiver is not stored after this function returns.
+    let gossip = state.gossip();
+    gossip.stop_own_feed().await;
+    let my_id = state.identity.read().await.master_pubkey.clone();
+    match state.storage.get_follows(&my_id).await {
+        Ok(follows) => {
+            for follow in &follows {
+                gossip.unfollow_user(&follow.pubkey).await;
+            }
+        }
+        Err(e) => log::warn!("[net] failed to load follows for gossip unsubscribe: {e}"),
+    }
 
-    // 2. Reload key material from disk.
-    let data_dir = state.app_handle.path().app_data_dir()?;
-    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
+    if let Err(e) = router.shutdown().await {
+        log::warn!("[net] router task ended with an error: {e}");
+    }
+    log::info!("[net] network stack stopped");
+}
 
-    // 3. Build new networking stack.
+/// Derive the identity from the files in `data_dir`, build a network stack for it, store
+/// both in `state`, start the background services and broadcast the initial state.
+async fn start_network(state: &Arc<AppState>, data_dir: &Path) -> Result<(), AppError> {
+    let identity = load_identity(data_dir)?;
+    log::info!("[identity] master pubkey: {}", identity.master_pubkey);
+    log::info!(
+        "[identity] transport NodeId: {} (device index {})",
+        identity.transport_node_id,
+        identity.device_index
+    );
+    *state.identity.write().await = identity;
+
     let (net, sync_rx, call_signal_rx) = build_network_stack(
         &state.app_handle,
         state.identity.clone(),
         state.storage.clone(),
         &state.blob_store,
-        &master_secret_key_bytes,
     )
-    .await
-    .map_err(|e| AppError::Other(e.to_string()))?;
-
-    // 4. Update identity with new key material.
-    let new_identity = build_identity(&data_dir);
-
-    log::info!(
-        "[recovery] new master pubkey: {}",
-        &new_identity.master_pubkey
-    );
-    log::info!(
-        "[recovery] new transport NodeId: {}",
-        &new_identity.transport_node_id
-    );
-
-    {
-        let mut id = state.identity.write().await;
-        *id = new_identity;
-    }
-
-    // 5. Swap networking stack.
+    .await?;
     state.replace_net(net);
 
-    // 6. Start services and broadcast initial state.
     start_services(state, sync_rx, call_signal_rx).await;
     broadcast_initial_state(state).await;
-
-    log::info!("[recovery] network rebuild complete");
     Ok(())
+}
+
+/// Delete all rows, write the identity files, import `bundle`, and start a network stack
+/// for the new identity. The previous network stack must already be stopped.
+async fn install_identity(
+    state: &Arc<AppState>,
+    keys: IdentityKeys,
+    bundle: Option<&LinkBundleData>,
+) -> Result<(), AppError> {
+    let data_dir = state.app_handle.path().app_data_dir()?;
+    let master_pubkey = SecretKey::from_bytes(&keys.master_secret_key)
+        .public()
+        .to_string();
+    let own_device = DeviceEntry {
+        node_id: device_node_id(&keys.master_secret_key, keys.device_index),
+        device_name: crate::announcement::default_device_name(keys.device_index),
+        is_primary: keys.device_index == 0,
+        added_at: now_millis(),
+    };
+
+    state.storage.wipe_all_data().await?;
+
+    let dir = data_dir.clone();
+    run_blocking_io(move || {
+        write_identity_files(&dir, &keys)?;
+        // The identity exists outside this device (on the linking device, or as the
+        // recovery phrase the user entered). With the marker present, `get_seed_phrase`
+        // returns the phrase only after native confirmation.
+        write_secret_file(&dir.join(SEED_BACKED_UP_FILE), b"1")
+    })
+    .await?;
+
+    if let Some(bundle) = bundle {
+        state
+            .storage
+            .import_link_bundle(&master_pubkey, &own_device, bundle)
+            .await?;
+    }
+
+    start_network(state, &data_dir).await
+}
+
+/// Sets `AppState::replacing_identity` for its lifetime and clears it when dropped.
+struct ReplacementInProgress<'a>(&'a AppState);
+
+impl<'a> ReplacementInProgress<'a> {
+    /// Returns `None` if the flag is already set.
+    fn begin(state: &'a AppState) -> Option<Self> {
+        state
+            .replacing_identity
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self(state))
+    }
+}
+
+impl Drop for ReplacementInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.replacing_identity.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Replace the local identity with the one defined by `keys` and rebuild the network
+/// stack in place. Used by seed phrase recovery (`bundle` is `None`) and device linking.
+///
+/// Order: stop the network stack, delete all rows, write the index files and then the
+/// master key file, import `bundle`, derive the identity from disk, build and start a
+/// new network stack. The returned error of any step after the network stop states that
+/// a restart is required. Returns an error at once if another call is in progress.
+pub async fn replace_identity(
+    state: &Arc<AppState>,
+    keys: IdentityKeys,
+    bundle: Option<&LinkBundleData>,
+) -> Result<(), AppError> {
+    let Some(_replacement) = ReplacementInProgress::begin(state) else {
+        return Err("another identity replacement is in progress".into());
+    };
+    log::info!("[identity] replacing the local identity...");
+
+    if tokio::time::timeout(REPLACE_SHUTDOWN_LIMIT, stop_network(state))
+        .await
+        .is_err()
+    {
+        log::warn!(
+            "[identity] network stack did not stop within {}s",
+            REPLACE_SHUTDOWN_LIMIT.as_secs()
+        );
+    }
+
+    install_identity(state, keys, bundle).await.map_err(|e| {
+        log::error!("[identity] replacement failed: {e}");
+        AppError::Other(format!(
+            "Replacing the identity failed after the network was stopped: {e}. Restart the app."
+        ))
+    })?;
+
+    log::info!("[identity] identity replaced, network stack rebuilt");
+    Ok(())
+}
+
+/// Stop the network stack and close the blob store before the process exits, waiting at
+/// most `EXIT_SHUTDOWN_LIMIT`. Peers then receive a QUIC close instead of running into
+/// their idle timeout. Only the first call does anything.
+///
+/// Blocks the calling thread. Must not be called from a Tokio worker thread.
+pub fn shutdown_for_exit(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<Arc<AppState>>() else {
+        return;
+    };
+    let state = Arc::clone(state.inner());
+    if state.exit_started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tauri::async_runtime::block_on(async move {
+        let stop = async {
+            stop_network(&state).await;
+            if let Err(e) = state.blob_store.shutdown().await {
+                log::warn!("[exit] failed to close blob store: {e}");
+            }
+        };
+        if tokio::time::timeout(EXIT_SHUTDOWN_LIMIT, stop)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[exit] network shutdown did not finish within {}s",
+                EXIT_SHUTDOWN_LIMIT.as_secs()
+            );
+        }
+    });
 }
 
 pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -381,63 +771,63 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 }
 
 async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = handle
-        .path()
-        .app_data_dir()
-        .expect("failed to resolve app data dir");
-    std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
+    let data_dir = handle.path().app_data_dir()?;
+    create_data_dir(&data_dir).map_err(|e| {
+        format!(
+            "failed to create data directory {}: {e}",
+            data_dir.display()
+        )
+    })?;
     log::info!("[setup] data dir: {}", data_dir.display());
+    remove_stale_temp_files(&data_dir);
 
-    let master_secret_key_bytes = load_or_create_key_bytes(&data_dir.join("master_key.key"));
-
-    // Open the database early so we can read preferences before binding the endpoint.
+    // The database is opened before the key is loaded: `ensure_master_key` reads it to
+    // tell a first start from a missing key file, and the endpoint builder reads
+    // preferences from it.
     let storage = Arc::new(
         Storage::open(&data_dir.join("social.db"))
             .await
-            .expect("failed to open database"),
+            .map_err(|e| format!("failed to open database: {e}"))?,
     );
     log::info!("[setup] database opened");
+
+    ensure_master_key(&data_dir, &storage).await?;
+    let identity_data = load_identity(&data_dir)?;
 
     let blobs_dir = data_dir.join("blobs");
     let blob_store = FsStore::load(&blobs_dir)
         .await
-        .expect("failed to open blob store");
+        .map_err(|e| format!("failed to open blob store: {e}"))?;
     log::info!("[setup] blob store opened at {}", blobs_dir.display());
 
-    // Build a placeholder identity (transport_node_id filled in after endpoint bind).
-    // We need SharedIdentity before building the network stack because handlers hold it.
-    let identity_data = build_identity(&data_dir);
-
-    log::info!("[setup] master pubkey: {}", &identity_data.master_pubkey);
+    log::info!("[setup] master pubkey: {}", identity_data.master_pubkey);
     log::info!(
         "[setup] signing pubkey: {}",
-        &identity_data.signing_key.public().to_string()
+        identity_data.signing_key.public()
     );
-    log::info!("[setup] DM pubkey: {}", &identity_data.dm_pubkey);
+    log::info!("[setup] DM pubkey: {}", identity_data.dm_pubkey);
     log::info!(
-        "[setup] Transport NodeId: {}",
-        &identity_data.transport_node_id
+        "[setup] Transport NodeId: {} (device index {})",
+        identity_data.transport_node_id,
+        identity_data.device_index
     );
 
+    // The handlers of the network stack hold the shared identity, so it is created first.
     let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(identity_data));
 
-    let (net, sync_rx, call_signal_rx) = build_network_stack(
-        &handle,
-        identity.clone(),
-        storage.clone(),
-        &blob_store,
-        &master_secret_key_bytes,
-    )
-    .await?;
+    let (net, sync_rx, call_signal_rx) =
+        build_network_stack(&handle, identity.clone(), storage.clone(), &blob_store).await?;
 
     log::info!("[setup] addr (immediate): {:?}", net.endpoint.addr());
 
+    // Redirects are not followed: a discovery server must not be able to forward a
+    // signed request to another host.
     let http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent("proscenium/1.0")
         .build()
-        .expect("failed to build HTTP client");
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
     let state = Arc::new(AppState::new(
         handle.clone(),
@@ -454,4 +844,178 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     handle.manage(state);
     log::info!("[setup] app state ready");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A new empty directory under the system temp directory, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).unwrap();
+            let path =
+                std::env::temp_dir().join(format!("proscenium-test-{}", hex::encode(random)));
+            create_data_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn write_secret_file_replaces_content_and_leaves_no_temp_file() {
+        let dir = TempDir::new();
+        let path = dir.0.join(MASTER_KEY_FILE);
+        write_secret_file(&path, &[1u8; 32]).unwrap();
+        write_secret_file(&path, &[2u8; 32]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vec![2u8; 32]);
+        let names: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(MASTER_KEY_FILE)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_file_and_data_dir_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new();
+        let path = dir.0.join(MASTER_KEY_FILE);
+        write_secret_file(&path, &[1u8; 32]).unwrap();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode & 0o077, 0);
+        let dir_mode = std::fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode & 0o077, 0);
+
+        // An existing file with wider permissions is narrowed when it is read.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        read_master_key(&path).unwrap();
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[test]
+    fn master_key_with_wrong_length_is_an_error() {
+        let dir = TempDir::new();
+        let path = dir.0.join(MASTER_KEY_FILE);
+        assert!(read_master_key(&path).unwrap().is_none());
+        std::fs::write(&path, [7u8; 31]).unwrap();
+        let err = read_master_key(&path).unwrap_err().to_string();
+        assert!(err.contains("31 bytes"), "{err}");
+        assert!(load_identity(&dir.0).is_err());
+    }
+
+    #[test]
+    fn index_files_default_to_zero_and_reject_other_content() {
+        let dir = TempDir::new();
+        assert_eq!(read_index_file(&dir.0, DEVICE_INDEX_FILE).unwrap(), 0);
+        std::fs::write(dir.0.join(DEVICE_INDEX_FILE), "3\n").unwrap();
+        assert_eq!(read_index_file(&dir.0, DEVICE_INDEX_FILE).unwrap(), 3);
+        std::fs::write(dir.0.join(DEVICE_INDEX_FILE), "three").unwrap();
+        assert!(read_index_file(&dir.0, DEVICE_INDEX_FILE).is_err());
+    }
+
+    #[test]
+    fn identity_files_select_the_transport_key() {
+        let dir = TempDir::new();
+        let master = [9u8; 32];
+        write_identity_files(
+            &dir.0,
+            &IdentityKeys {
+                master_secret_key: master,
+                device_index: 2,
+                signing_key_index: 4,
+                dm_key_index: 1,
+            },
+        )
+        .unwrap();
+        let identity = load_identity(&dir.0).unwrap();
+        assert_eq!(identity.device_index, 2);
+        assert_eq!(identity.signing_key_index, 4);
+        assert_eq!(identity.dm_key_index, 1);
+        assert_eq!(identity.transport_node_id, device_node_id(&master, 2));
+        assert_ne!(identity.transport_node_id, device_node_id(&master, 0));
+        assert_eq!(
+            identity.transport_secret_key().public().to_string(),
+            identity.transport_node_id
+        );
+
+        // An index outside 0..MAX_LINKED_DEVICES is rejected.
+        std::fs::write(
+            dir.0.join(DEVICE_INDEX_FILE),
+            MAX_LINKED_DEVICES.to_string(),
+        )
+        .unwrap();
+        assert!(load_identity(&dir.0).is_err());
+    }
+
+    #[test]
+    fn stale_temp_files_are_removed() {
+        let dir = TempDir::new();
+        let stale = dir
+            .0
+            .join(format!("{MASTER_KEY_FILE}.0011223344556677.tmp"));
+        std::fs::write(&stale, [1u8; 32]).unwrap();
+        let other = dir.0.join("notes.tmp");
+        std::fs::write(&other, b"x").unwrap();
+        remove_stale_temp_files(&dir.0);
+        assert!(!stale.exists());
+        assert!(other.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_key_with_identity_rows_is_an_error() {
+        let dir = TempDir::new();
+        let storage = Storage::open_in_memory().await.unwrap();
+
+        // Empty database: a key is generated.
+        ensure_master_key(&dir.0, &storage).await.unwrap();
+        let first = read_master_key(&dir.0.join(MASTER_KEY_FILE))
+            .unwrap()
+            .unwrap();
+
+        // Existing key: kept.
+        ensure_master_key(&dir.0, &storage).await.unwrap();
+        let second = read_master_key(&dir.0.join(MASTER_KEY_FILE))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+
+        // Key file removed while the database holds the local device row: error, no new key.
+        storage
+            .upsert_linked_device(&device_node_id(&first, 0), "Primary Device", true, true, 1)
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.0.join(MASTER_KEY_FILE)).unwrap();
+        assert!(ensure_master_key(&dir.0, &storage).await.is_err());
+        assert!(!dir.0.join(MASTER_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn identity_debug_output_holds_no_secret_bytes() {
+        let master = [0xABu8; 32];
+        let identity = Identity::derive(master, 0, 0, 0);
+        let debug = format!("{identity:?}");
+        assert!(debug.contains(&identity.master_pubkey));
+        for secret in [
+            identity.master_secret_key_bytes,
+            identity.signing_secret_key_bytes,
+            identity.dm_secret_key_bytes,
+            identity.dm_x25519_private,
+            identity.ratchet_storage_key,
+        ] {
+            assert!(!debug.contains(&hex::encode(secret)));
+            assert!(!debug.contains(&format!("{secret:?}")));
+        }
+    }
 }

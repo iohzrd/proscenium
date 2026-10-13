@@ -26,7 +26,7 @@ async fn info(State(state): State<AppState>) -> Json<ServerInfo> {
         name: state.config.server.name.clone(),
         description: state.config.server.description.clone(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        node_id: state.ingestion.endpoint.id().to_string(),
+        node_id: state.ingestion.node_id(),
         registered_users,
         total_posts,
         uptime_seconds: uptime,

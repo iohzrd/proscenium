@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { messagesHref } from "$lib/profile/links";
+
   let {
     pubkey,
     isFollowing,
@@ -37,7 +39,7 @@
         ? "Unfollow"
         : "Follow"}{/if}
   </button>
-  <a href="/messages/{pubkey}" class="message-btn">Message</a>
+  <a href={messagesHref(pubkey)} class="message-btn">Message</a>
   <button class="call-btn" onclick={onStartCall} disabled={isBlocked}>
     Call
   </button>

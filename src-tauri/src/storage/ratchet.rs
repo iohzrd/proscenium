@@ -29,4 +29,12 @@ impl Storage {
                 .await?;
         Ok(result)
     }
+
+    pub async fn delete_ratchet_session(&self, peer_pubkey: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM dm_ratchet_sessions WHERE peer_pubkey=?1")
+            .bind(peer_pubkey)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }

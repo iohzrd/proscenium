@@ -1,7 +1,8 @@
 #!/bin/bash
+set -euo pipefail
 
-# Auto-bump patch version across all version files in sync.
-# Triggers on any staged source file change (excludes version-only files to avoid loops).
+# Bump the patch version in package.json, src-tauri/tauri.conf.json and the workspace
+# Cargo.toml when a commit stages any other file. The three files always hold the same version.
 
 bump_patch() {
     local version="$1"
@@ -10,27 +11,37 @@ bump_patch() {
     echo "${major}.${minor}.$((patch + 1))"
 }
 
+# Replace the first occurrence of $2 with $3 in file $1, without GNU-only sed flags.
+replace_first() {
+    FROM="$2" TO="$3" perl -0pi -e 's/\Q$ENV{FROM}\E/$ENV{TO}/' "$1"
+}
+
 STAGED=$(git diff --cached --name-only)
 
-# Skip if only version files are staged
-VERSION_FILES="package.json\nsrc-tauri/tauri.conf.json\nCargo.toml"
-NON_VERSION=$(echo "$STAGED" | grep -vxF -e "package.json" -e "src-tauri/tauri.conf.json" -e "Cargo.toml" -e "Cargo.lock")
+# Exit if only version files and lockfiles are staged.
+NON_VERSION=$(echo "$STAGED" | grep -vxF \
+    -e "package.json" \
+    -e "src-tauri/tauri.conf.json" \
+    -e "Cargo.toml" \
+    -e "Cargo.lock" \
+    -e "server/Cargo.lock" || true)
 
 if [ -z "$NON_VERSION" ]; then
     exit 0
 fi
 
-# Read current version from tauri.conf.json (single source of truth)
+# src-tauri/tauri.conf.json is the source of the current version.
 current=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*"\([0-9]*\.[0-9]*\.[0-9]*\)".*/\1/')
 new=$(bump_patch "$current")
 
-# Update all version files
-sed -i "s/\"version\": \"$current\"/\"version\": \"$new\"/" package.json
-sed -i "s/\"version\": \"$current\"/\"version\": \"$new\"/" src-tauri/tauri.conf.json
-sed -i "s/^version = \"$current\"/version = \"$new\"/" Cargo.toml
+replace_first package.json "\"version\": \"$current\"" "\"version\": \"$new\""
+replace_first src-tauri/tauri.conf.json "\"version\": \"$current\"" "\"version\": \"$new\""
+replace_first Cargo.toml "version = \"$current\"" "version = \"$new\""
 
-# Regenerate Cargo.lock to reflect the new workspace version
-cargo generate-lockfile --manifest-path Cargo.toml 2>/dev/null
+# Write the new version of the workspace members into both lockfiles.
+# `--workspace` leaves every third-party dependency at its locked version.
+cargo update --workspace --offline --quiet
+cargo update --manifest-path server/Cargo.toml --package proscenium-types --offline --quiet
 
-git add package.json src-tauri/tauri.conf.json Cargo.toml Cargo.lock
+git add package.json src-tauri/tauri.conf.json Cargo.toml Cargo.lock server/Cargo.lock
 echo "version: $current -> $new"

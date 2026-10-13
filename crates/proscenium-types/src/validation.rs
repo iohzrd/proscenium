@@ -1,5 +1,7 @@
-use crate::types::{Interaction, Post, Profile};
+use crate::signing::compute_post_id;
+use crate::types::{Interaction, MediaAttachment, Post, Profile};
 use iroh::PublicKey;
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_POST_CONTENT_LEN: usize = 10_000;
@@ -8,17 +10,105 @@ pub const MAX_TIMESTAMP_DRIFT_MS: u64 = 5 * 60 * 1000;
 pub const MAX_BLOB_SIZE: usize = 50 * 1024 * 1024;
 pub const MAX_DISPLAY_NAME_LEN: usize = 200;
 pub const MAX_BIO_LEN: usize = 2_000;
+/// Length of post, interaction and message ids (lowercase hex digits).
+pub const ID_HEX_LEN: usize = 32;
+pub const MAX_BLOB_HASH_LEN: usize = 128;
+pub const MAX_BLOB_TICKET_LEN: usize = 2_048;
+pub const MAX_MIME_TYPE_LEN: usize = 127;
+pub const MAX_FILENAME_LEN: usize = 255;
+
+/// Return the longest prefix of `s` holding at most `max_chars` characters.
+pub fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
+    }
+}
 
 /// Return the first 8 characters of an ID string, or the whole string if shorter.
 pub fn short_id(id: &str) -> &str {
-    &id[..id.len().min(8)]
+    truncate_chars(id, 8)
 }
 
+/// Milliseconds since the Unix epoch; 0 if the system clock is before the epoch.
 pub fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// True if `s` is exactly `ID_HEX_LEN` lowercase hex digits.
+pub fn is_valid_id(s: &str) -> bool {
+    s.len() == ID_HEX_LEN && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// True if `s` is the canonical string form of an Ed25519 public key.
+/// Rejects alternate encodings of the same key, so string equality equals key equality.
+pub fn is_valid_pubkey(s: &str) -> bool {
+    s.parse::<PublicKey>().is_ok_and(|key| key.to_string() == s)
+}
+
+/// True if `s` is 64 lowercase hex digits (an X25519 public key).
+pub fn is_valid_dm_pubkey(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// True if `timestamp` is at most `MAX_TIMESTAMP_DRIFT_MS` away from the local clock.
+pub fn is_recent_timestamp(timestamp: u64) -> bool {
+    timestamp.abs_diff(now_millis()) <= MAX_TIMESTAMP_DRIFT_MS
+}
+
+pub fn validate_media_attachment(media: &MediaAttachment) -> Result<(), String> {
+    if media.hash.is_empty() || media.hash.len() > MAX_BLOB_HASH_LEN {
+        return Err(format!(
+            "media hash length {} out of range (1..={MAX_BLOB_HASH_LEN})",
+            media.hash.len()
+        ));
+    }
+    if media.ticket.is_empty() || media.ticket.len() > MAX_BLOB_TICKET_LEN {
+        return Err(format!(
+            "media ticket length {} out of range (1..={MAX_BLOB_TICKET_LEN})",
+            media.ticket.len()
+        ));
+    }
+    if media.mime_type.len() > MAX_MIME_TYPE_LEN {
+        return Err(format!(
+            "media mime type too long: {} bytes (max {MAX_MIME_TYPE_LEN})",
+            media.mime_type.len()
+        ));
+    }
+    if media.filename.len() > MAX_FILENAME_LEN {
+        return Err(format!(
+            "media filename too long: {} bytes (max {MAX_FILENAME_LEN})",
+            media.filename.len()
+        ));
+    }
+    if media.size > MAX_BLOB_SIZE as u64 {
+        return Err(format!(
+            "media size {} exceeds {MAX_BLOB_SIZE} bytes",
+            media.size
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a list of attachments: count, per-item bounds, no repeated hash.
+pub fn validate_media_list(media: &[MediaAttachment]) -> Result<(), String> {
+    if media.len() > MAX_MEDIA_COUNT {
+        return Err(format!(
+            "too many media attachments: {} (max {MAX_MEDIA_COUNT})",
+            media.len()
+        ));
+    }
+    let mut seen = HashSet::with_capacity(media.len());
+    for item in media {
+        validate_media_attachment(item)?;
+        if !seen.insert(item.hash.as_str()) {
+            return Err(format!("duplicate media hash {}", short_id(&item.hash)));
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_profile(profile: &Profile) -> Result<(), String> {
@@ -36,10 +126,43 @@ pub fn validate_profile(profile: &Profile) -> Result<(), String> {
             MAX_BIO_LEN
         ));
     }
+    if profile
+        .avatar_hash
+        .as_ref()
+        .is_some_and(|h| h.len() > MAX_BLOB_HASH_LEN)
+    {
+        return Err(format!(
+            "avatar hash too long (max {MAX_BLOB_HASH_LEN} bytes)"
+        ));
+    }
+    if profile
+        .avatar_ticket
+        .as_ref()
+        .is_some_and(|t| t.len() > MAX_BLOB_TICKET_LEN)
+    {
+        return Err(format!(
+            "avatar ticket too long (max {MAX_BLOB_TICKET_LEN} bytes)"
+        ));
+    }
+    if profile.updated_at > now_millis() + MAX_TIMESTAMP_DRIFT_MS {
+        return Err("profile updated_at is too far in the future".to_string());
+    }
     Ok(())
 }
 
 pub fn validate_interaction(interaction: &Interaction) -> Result<(), String> {
+    if !is_valid_id(&interaction.id) {
+        return Err("invalid interaction id".to_string());
+    }
+    if !is_valid_pubkey(&interaction.author) {
+        return Err("invalid interaction author".to_string());
+    }
+    if !is_valid_id(&interaction.target_post_id) {
+        return Err("invalid interaction target post id".to_string());
+    }
+    if !is_valid_pubkey(&interaction.target_author) {
+        return Err("invalid interaction target author".to_string());
+    }
     let now = now_millis();
     if interaction.timestamp > now + MAX_TIMESTAMP_DRIFT_MS {
         return Err(format!(
@@ -51,6 +174,9 @@ pub fn validate_interaction(interaction: &Interaction) -> Result<(), String> {
 }
 
 pub fn validate_post(post: &Post) -> Result<(), String> {
+    if !is_valid_pubkey(&post.author) {
+        return Err("invalid post author".to_string());
+    }
     if post.content.len() > MAX_POST_CONTENT_LEN {
         return Err(format!(
             "post content too long: {} bytes (max {})",
@@ -58,12 +184,26 @@ pub fn validate_post(post: &Post) -> Result<(), String> {
             MAX_POST_CONTENT_LEN
         ));
     }
-    if post.media.len() > MAX_MEDIA_COUNT {
-        return Err(format!(
-            "too many media attachments: {} (max {})",
-            post.media.len(),
-            MAX_MEDIA_COUNT
-        ));
+    validate_media_list(&post.media)?;
+    if post.reply_to.as_deref().is_some_and(|id| !is_valid_id(id)) {
+        return Err("invalid reply_to id".to_string());
+    }
+    if post
+        .reply_to_author
+        .as_deref()
+        .is_some_and(|pk| !is_valid_pubkey(pk))
+    {
+        return Err("invalid reply_to_author".to_string());
+    }
+    if post.quote_of.as_deref().is_some_and(|id| !is_valid_id(id)) {
+        return Err("invalid quote_of id".to_string());
+    }
+    if post
+        .quote_of_author
+        .as_deref()
+        .is_some_and(|pk| !is_valid_pubkey(pk))
+    {
+        return Err("invalid quote_of_author".to_string());
     }
     let now = now_millis();
     if post.timestamp > now + MAX_TIMESTAMP_DRIFT_MS {
@@ -71,6 +211,10 @@ pub fn validate_post(post: &Post) -> Result<(), String> {
             "post timestamp {} is too far in the future (now: {})",
             post.timestamp, now
         ));
+    }
+    // The id is a hash of the other fields, so two authors cannot hold the same id.
+    if post.id != compute_post_id(post) {
+        return Err("post id does not match post content".to_string());
     }
     Ok(())
 }
@@ -101,4 +245,31 @@ pub fn parse_mentions(content: &str) -> Vec<String> {
         }
     }
     mentions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_stops_on_char_boundary() {
+        assert_eq!(short_id("aaaaaaa\u{20ac}bcd"), "aaaaaaa\u{20ac}");
+        assert_eq!(short_id("abc"), "abc");
+        assert_eq!(short_id(""), "");
+        let cjk = "\u{65e5}".repeat(30);
+        assert_eq!(truncate_chars(&cjk, 77), cjk);
+        assert_eq!(truncate_chars(&cjk, 2).chars().count(), 2);
+    }
+
+    #[test]
+    fn id_and_pubkey_format_checks() {
+        assert!(is_valid_id(&"0".repeat(32)));
+        assert!(!is_valid_id(&"0".repeat(31)));
+        assert!(!is_valid_id(&"G".repeat(32)));
+        assert!(!is_valid_id(&"A".repeat(32)));
+        let key = iroh::SecretKey::from_bytes(&[7u8; 32]).public().to_string();
+        assert!(is_valid_pubkey(&key));
+        assert!(!is_valid_pubkey(&key.to_uppercase()));
+        assert!(!is_valid_pubkey("aaaaaaa\u{20ac}"));
+    }
 }

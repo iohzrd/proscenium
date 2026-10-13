@@ -1,53 +1,84 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import Icon from "$lib/Icon.svelte";
+  import Modal from "$lib/Modal.svelte";
   import type { ServerEntry } from "$lib/types";
 
   let servers = $state<ServerEntry[]>([]);
   let newServerUrl = $state("");
   let adding = $state(false);
   let serverStatus = $state("");
+  let statusTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingRemoveUrl = $state<string | null>(null);
+
+  /** Parses `input` as an absolute http or https URL; null otherwise. */
+  function parseServerUrl(input: string): URL | null {
+    try {
+      const url = new URL(input);
+      const isHttp = url.protocol === "https:" || url.protocol === "http:";
+      return isHttp && url.hostname ? url : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isUnencrypted(url: string): boolean {
+    return parseServerUrl(url)?.protocol === "http:";
+  }
+
+  let newUrlUnencrypted = $derived(isUnencrypted(newServerUrl.trim()));
+
+  function setStatus(message: string, clearAfterMs?: number) {
+    clearTimeout(statusTimer);
+    serverStatus = message;
+    if (clearAfterMs !== undefined) {
+      statusTimer = setTimeout(() => (serverStatus = ""), clearAfterMs);
+    }
+  }
 
   async function loadServers() {
     try {
       servers = await invoke("list_servers");
     } catch (e) {
-      console.error("Failed to load servers:", e);
+      setStatus(`Error: ${e}`);
     }
   }
 
   async function addServer() {
     const url = newServerUrl.trim();
-    if (!url) return;
+    if (!url || adding) return;
+    if (!parseServerUrl(url)) {
+      setStatus("Enter a URL that starts with https:// or http://.");
+      return;
+    }
     adding = true;
-    serverStatus = "";
+    setStatus("");
     try {
       const entry: ServerEntry = await invoke("add_server", { url });
       newServerUrl = "";
       await loadServers();
-      serverStatus = `Added ${entry.name || entry.url}`;
-      setTimeout(() => (serverStatus = ""), 3000);
+      setStatus(`Added ${entry.name || entry.url}`, 3000);
     } catch (e) {
-      serverStatus = `Error: ${e}`;
+      setStatus(`Error: ${e}`);
     }
     adding = false;
   }
 
   async function removeServer() {
-    if (!pendingRemoveUrl) return;
+    const url = pendingRemoveUrl;
+    if (!url) return;
+    pendingRemoveUrl = null;
     try {
-      await invoke("remove_server", { url: pendingRemoveUrl });
+      await invoke("remove_server", { url });
       await loadServers();
     } catch (e) {
-      serverStatus = `Error: ${e}`;
+      setStatus(`Error: ${e}`);
     }
-    pendingRemoveUrl = null;
   }
 
   function handleServerKey(e: KeyboardEvent) {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       addServer();
     }
@@ -56,6 +87,8 @@
   onMount(() => {
     loadServers();
   });
+
+  onDestroy(() => clearTimeout(statusTimer));
 </script>
 
 <section class="settings-section">
@@ -64,7 +97,11 @@
     <input
       class="input-base server-input"
       bind:value={newServerUrl}
-      placeholder="Server URL (e.g. http://54.201.25.68:3000)"
+      placeholder="Server URL (e.g. https://discovery.example.org)"
+      aria-label="Server URL"
+      autocapitalize="none"
+      autocomplete="off"
+      spellcheck="false"
       onkeydown={handleServerKey}
     />
     <button
@@ -75,8 +112,14 @@
       {adding ? "..." : "Add"}
     </button>
   </div>
+  {#if newUrlUnencrypted}
+    <p class="server-warning">
+      http:// is not encrypted. Registration, searches and results sent to this
+      server can be read and changed in transit.
+    </p>
+  {/if}
   {#if serverStatus}
-    <p class="server-status">{serverStatus}</p>
+    <p class="server-status" role="status">{serverStatus}</p>
   {/if}
   {#if servers.length > 0}
     <div class="server-list">
@@ -89,6 +132,12 @@
               <span class="server-row-url">{server.url}</span>
             {/if}
           </div>
+          {#if isUnencrypted(server.url)}
+            <span
+              class="server-badge unencrypted"
+              title="Traffic to this server is not encrypted">Unencrypted</span
+            >
+          {/if}
           {#if server.registered_at}
             <span class="server-badge">Registered</span>
           {/if}
@@ -109,28 +158,18 @@
 </section>
 
 {#if pendingRemoveUrl}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div
-    class="modal-overlay"
-    onclick={() => (pendingRemoveUrl = null)}
-    role="presentation"
+  <Modal
+    label="Confirm remove server"
+    onclose={() => (pendingRemoveUrl = null)}
   >
-    <!-- svelte-ignore a11y_interactive_supports_focus -->
-    <div
-      class="modal"
-      onclick={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-label="Confirm remove server"
-    >
-      <p>Remove this server? This will not unregister you from it.</p>
-      <div class="modal-actions">
-        <button class="modal-cancel" onclick={() => (pendingRemoveUrl = null)}
-          >Cancel</button
-        >
-        <button class="modal-confirm" onclick={removeServer}>Remove</button>
-      </div>
+    <p>Remove this server? This will not unregister you from it.</p>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick={() => (pendingRemoveUrl = null)}
+        >Cancel</button
+      >
+      <button class="modal-confirm" onclick={removeServer}>Remove</button>
     </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
@@ -230,6 +269,17 @@
     font-weight: 600;
     color: var(--color-success, #22c55e);
     flex-shrink: 0;
+  }
+
+  .server-badge.unencrypted {
+    color: var(--color-warning);
+  }
+
+  .server-warning {
+    font-size: var(--text-sm);
+    color: var(--color-warning);
+    margin: 0 0 0.5rem;
+    line-height: 1.4;
   }
 
   .server-remove-btn {

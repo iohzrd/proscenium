@@ -17,8 +17,9 @@
     <div class="spinner small"></div>
   </div>
 {:else if trending.length > 0}
+  <!-- Not keyed: the server can return the same tag twice. -->
   <div class="trending-list">
-    {#each trending as t, i (t.tag)}
+    {#each trending as t, i}
       <button class="trending-item" onclick={() => onsearchtag(t.tag)}>
         <span class="trending-rank">{i + 1}</span>
         <div class="trending-info">

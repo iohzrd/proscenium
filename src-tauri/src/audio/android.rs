@@ -5,9 +5,15 @@
 //! the necessary JNI calls.
 
 #[cfg(target_os = "android")]
-use jni::JNIEnv;
+use jni::errors::Error as JniError;
 #[cfg(target_os = "android")]
-use jni::objects::{JObject, JValueGen};
+use jni::objects::{JObject, JString};
+#[cfg(target_os = "android")]
+use jni::signature::MethodSignature;
+#[cfg(target_os = "android")]
+use jni::strings::JNIStr;
+#[cfg(target_os = "android")]
+use jni::{Env, JValue, JValueOwned, JavaVM, jni_sig, jni_str};
 
 use serde::Serialize;
 
@@ -90,267 +96,342 @@ fn type_label(device_type: i32, product_name: &str) -> String {
     }
 }
 
-/// Helper: get AudioManager from the Android context.
+/// First API level with `AudioManager.getAvailableCommunicationDevices`,
+/// `setCommunicationDevice` and `clearCommunicationDevice` (Android 12).
 #[cfg(target_os = "android")]
-fn get_audio_manager<'a>(env: &mut JNIEnv<'a>) -> Result<JObject<'a>, String> {
-    let ctx = ndk_context::android_context();
-    let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let audio_service = env
-        .new_string("audio")
-        .map_err(|e| format!("JNI string error: {e}"))?;
-    env.call_method(
-        &activity,
-        "getSystemService",
-        "(Ljava/lang/String;)Ljava/lang/Object;",
-        &[JValueGen::Object(&audio_service.into())],
-    )
-    .map_err(|e| format!("getSystemService failed: {e}"))?
-    .l()
-    .map_err(|e| format!("getSystemService return type error: {e}"))
+const API_LEVEL_COMMUNICATION_DEVICE: i32 = 31;
+/// `AudioManager.MODE_NORMAL`.
+#[cfg(target_os = "android")]
+const MODE_NORMAL: i32 = 0;
+/// `AudioManager.MODE_IN_COMMUNICATION`.
+#[cfg(target_os = "android")]
+const MODE_IN_COMMUNICATION: i32 = 3;
+/// `AudioDeviceInfo.TYPE_BUILTIN_SPEAKER`.
+#[cfg(target_os = "android")]
+const TYPE_BUILTIN_SPEAKER: i32 = 2;
+
+/// Error of an audio routing operation.
+#[cfg(target_os = "android")]
+enum RouteError {
+    Jni(JniError),
+    Other(String),
 }
 
-/// List available communication audio devices (API 31+).
 #[cfg(target_os = "android")]
-pub fn list_communication_devices() -> Result<Vec<CommAudioDevice>, String> {
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
-        .map_err(|e| format!("failed to get JavaVM: {e}"))?;
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|e| format!("failed to attach JNI thread: {e}"))?;
-
-    let audio_manager = get_audio_manager(&mut env)?;
-
-    let devices_list = match env.call_method(
-        &audio_manager,
-        "getAvailableCommunicationDevices",
-        "()Ljava/util/List;",
-        &[],
-    ) {
-        Ok(result) => result
-            .l()
-            .map_err(|e| format!("getAvailableCommunicationDevices type error: {e}"))?,
-        Err(_) => return Ok(Vec::new()),
-    };
-
-    let size = env
-        .call_method(&devices_list, "size", "()I", &[])
-        .map_err(|e| format!("List.size failed: {e}"))?
-        .i()
-        .map_err(|e| format!("List.size type error: {e}"))?;
-
-    let mut devices = Vec::new();
-    for i in 0..size {
-        let device = env
-            .call_method(
-                &devices_list,
-                "get",
-                "(I)Ljava/lang/Object;",
-                &[JValueGen::Int(i)],
-            )
-            .map_err(|e| format!("List.get failed: {e}"))?
-            .l()
-            .map_err(|e| format!("List.get type error: {e}"))?;
-
-        let device_type = env
-            .call_method(&device, "getType", "()I", &[])
-            .map_err(|e| format!("getType failed: {e}"))?
-            .i()
-            .map_err(|e| format!("getType type error: {e}"))?;
-
-        let id = env
-            .call_method(&device, "getId", "()I", &[])
-            .map_err(|e| format!("getId failed: {e}"))?
-            .i()
-            .map_err(|e| format!("getId type error: {e}"))?;
-
-        let product_name_obj = env
-            .call_method(&device, "getProductName", "()Ljava/lang/CharSequence;", &[])
-            .map_err(|e| format!("getProductName failed: {e}"))?
-            .l()
-            .map_err(|e| format!("getProductName type error: {e}"))?;
-
-        let product_name: String = if product_name_obj.is_null() {
-            String::new()
-        } else {
-            // CharSequence.toString() -> String
-            let name_jstr = env
-                .call_method(&product_name_obj, "toString", "()Ljava/lang/String;", &[])
-                .and_then(|v| v.l());
-            match name_jstr {
-                Ok(obj) => {
-                    let jstr = env.get_string((&obj).into());
-                    match jstr {
-                        Ok(s) => String::from(s),
-                        Err(_) => String::new(),
-                    }
-                }
-                Err(_) => String::new(),
-            }
-        };
-
-        let label = type_label(device_type, &product_name);
-
-        devices.push(CommAudioDevice {
-            id,
-            name: product_name,
-            device_type,
-            label,
-        });
+impl From<JniError> for RouteError {
+    fn from(e: JniError) -> Self {
+        Self::Jni(e)
     }
+}
 
+#[cfg(target_os = "android")]
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jni(e) => write!(f, "JNI error: {e}"),
+            Self::Other(msg) => f.write_str(msg),
+        }
+    }
+}
+
+/// Call a Java method. If the call fails, clear the pending Java exception so that
+/// later JNI calls on this thread are valid.
+#[cfg(target_os = "android")]
+fn call<'local, 'sig, 'sig_args>(
+    env: &mut Env<'local>,
+    obj: &JObject<'_>,
+    name: &JNIStr,
+    sig: &MethodSignature<'sig, 'sig_args>,
+    args: &[JValue],
+) -> Result<JValueOwned<'local>, JniError> {
+    let result = env.call_method(obj, name, sig, args);
+    if result.is_err() && env.exception_check() {
+        env.exception_clear();
+    }
+    result
+}
+
+/// Attach the current thread to the JVM, fetch the `AudioManager` system service and
+/// run `f` with it.
+#[cfg(target_os = "android")]
+fn with_audio_manager<T>(
+    f: impl FnOnce(&mut Env<'_>, &JObject<'_>) -> Result<T, RouteError>,
+) -> Result<T, String> {
+    let ctx = ndk_context::android_context();
+    let vm_ptr = ctx.vm();
+    let context_ptr = ctx.context();
+    if vm_ptr.is_null() || context_ptr.is_null() {
+        return Err("Android context is not initialized".to_string());
+    }
+    // SAFETY: `vm_ptr` is the non-null JavaVM pointer the Android runtime registered
+    // with ndk_context; it stays valid for the lifetime of the process.
+    let vm = unsafe { JavaVM::from_raw(vm_ptr.cast()) };
+    vm.attach_current_thread(|env: &mut Env<'_>| -> Result<T, RouteError> {
+        // SAFETY: `context_ptr` is a global reference to the application Context held
+        // by ndk_context for the lifetime of the process. `JObject` does not delete the
+        // reference when dropped.
+        let context = unsafe { JObject::from_raw(env, context_ptr.cast()) };
+        let service_name = env.new_string("audio")?;
+        let audio_manager = call(
+            env,
+            &context,
+            jni_str!("getSystemService"),
+            &jni_sig!("(Ljava/lang/String;)Ljava/lang/Object;"),
+            &[(&service_name).into()],
+        )?
+        .l()?;
+        if audio_manager.is_null() {
+            return Err(RouteError::Other("AudioManager is not available".into()));
+        }
+        f(env, &audio_manager)
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Read `android.os.Build.VERSION.SDK_INT`.
+#[cfg(target_os = "android")]
+fn sdk_level(env: &mut Env<'_>) -> Result<i32, JniError> {
+    env.get_static_field(
+        jni_str!("android/os/Build$VERSION"),
+        jni_str!("SDK_INT"),
+        jni_sig!("I"),
+    )?
+    .i()
+}
+
+/// Call `AudioManager.getAvailableCommunicationDevices()` (API 31+) and return the
+/// elements of the list.
+#[cfg(target_os = "android")]
+fn communication_devices<'local>(
+    env: &mut Env<'local>,
+    audio_manager: &JObject<'_>,
+) -> Result<Vec<JObject<'local>>, JniError> {
+    let list = call(
+        env,
+        audio_manager,
+        jni_str!("getAvailableCommunicationDevices"),
+        &jni_sig!("()Ljava/util/List;"),
+        &[],
+    )?
+    .l()?;
+    let size = call(env, &list, jni_str!("size"), &jni_sig!("()I"), &[])?.i()?;
+    let mut devices = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    for i in 0..size {
+        let device = call(
+            env,
+            &list,
+            jni_str!("get"),
+            &jni_sig!("(I)Ljava/lang/Object;"),
+            &[JValue::Int(i)],
+        )?
+        .l()?;
+        devices.push(device);
+    }
     Ok(devices)
 }
 
-/// Set a specific communication device by ID (API 31+).
+/// Read the product name of an `AudioDeviceInfo`. Empty if it has none.
+#[cfg(target_os = "android")]
+fn product_name(env: &mut Env<'_>, device: &JObject<'_>) -> String {
+    let read = |env: &mut Env<'_>| -> Result<String, JniError> {
+        let chars = call(
+            env,
+            device,
+            jni_str!("getProductName"),
+            &jni_sig!("()Ljava/lang/CharSequence;"),
+            &[],
+        )?
+        .l()?;
+        if chars.is_null() {
+            return Ok(String::new());
+        }
+        let text = call(
+            env,
+            &chars,
+            jni_str!("toString"),
+            &jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )?
+        .l()?;
+        if text.is_null() {
+            return Ok(String::new());
+        }
+        let text = env.cast_local::<JString>(text)?;
+        text.try_to_string(env)
+    };
+    read(env).unwrap_or_default()
+}
+
+/// List available communication audio devices. Empty below API 31.
+#[cfg(target_os = "android")]
+pub fn list_communication_devices() -> Result<Vec<CommAudioDevice>, String> {
+    with_audio_manager(|env, audio_manager| {
+        if sdk_level(env)? < API_LEVEL_COMMUNICATION_DEVICE {
+            return Ok(Vec::new());
+        }
+        let mut devices = Vec::new();
+        for device in communication_devices(env, audio_manager)? {
+            let device_type =
+                call(env, &device, jni_str!("getType"), &jni_sig!("()I"), &[])?.i()?;
+            let id = call(env, &device, jni_str!("getId"), &jni_sig!("()I"), &[])?.i()?;
+            let name = product_name(env, &device);
+            let label = type_label(device_type, &name);
+            devices.push(CommAudioDevice {
+                id,
+                name,
+                device_type,
+                label,
+            });
+        }
+        Ok(devices)
+    })
+}
+
+/// Route call audio to the communication device with the given id (API 31+).
+/// `MODE_IN_COMMUNICATION` is set only after the route change succeeded.
 #[cfg(target_os = "android")]
 pub fn set_communication_device_by_id(device_id: i32) -> Result<(), String> {
-    let ctx = ndk_context::android_context();
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }
-        .map_err(|e| format!("failed to get JavaVM: {e}"))?;
-    let mut env = vm
-        .attach_current_thread()
-        .map_err(|e| format!("failed to attach JNI thread: {e}"))?;
+    with_audio_manager(|env, audio_manager| {
+        if sdk_level(env)? < API_LEVEL_COMMUNICATION_DEVICE {
+            return Err(RouteError::Other(
+                "selecting a communication device requires Android 12".into(),
+            ));
+        }
 
-    let audio_manager = get_audio_manager(&mut env)?;
-
-    // Set MODE_IN_COMMUNICATION
-    env.call_method(&audio_manager, "setMode", "(I)V", &[JValueGen::Int(3)])
-        .map_err(|e| format!("setMode failed: {e}"))?;
-
-    // For speaker (type 2), use setSpeakerphoneOn instead of setCommunicationDevice
-    // because setCommunicationDevice with the built-in speaker may not work on all devices.
-    // First, find the device to check its type.
-    let devices_list = env
-        .call_method(
-            &audio_manager,
-            "getAvailableCommunicationDevices",
-            "()Ljava/util/List;",
-            &[],
-        )
-        .map_err(|e| format!("getAvailableCommunicationDevices failed: {e}"))?
-        .l()
-        .map_err(|e| format!("getAvailableCommunicationDevices type error: {e}"))?;
-
-    let size = env
-        .call_method(&devices_list, "size", "()I", &[])
-        .map_err(|e| format!("List.size failed: {e}"))?
-        .i()
-        .map_err(|e| format!("List.size type error: {e}"))?;
-
-    for i in 0..size {
-        let device = env
-            .call_method(
-                &devices_list,
-                "get",
-                "(I)Ljava/lang/Object;",
-                &[JValueGen::Int(i)],
-            )
-            .map_err(|e| format!("List.get failed: {e}"))?
-            .l()
-            .map_err(|e| format!("List.get type error: {e}"))?;
-
-        let id = env
-            .call_method(&device, "getId", "()I", &[])
-            .map_err(|e| format!("getId failed: {e}"))?
-            .i()
-            .map_err(|e| format!("getId type error: {e}"))?;
-
-        if id == device_id {
-            let device_type = env
-                .call_method(&device, "getType", "()I", &[])
-                .map_err(|e| format!("getType failed: {e}"))?
-                .i()
-                .map_err(|e| format!("getType type error: {e}"))?;
-
-            // TYPE_BUILTIN_SPEAKER = 2: use setSpeakerphoneOn
-            if device_type == 2 {
-                let _ = env.call_method(&audio_manager, "clearCommunicationDevice", "()V", &[]);
-                env.call_method(
-                    &audio_manager,
-                    "setSpeakerphoneOn",
-                    "(Z)V",
-                    &[JValueGen::Bool(1)],
-                )
-                .map_err(|e| format!("setSpeakerphoneOn failed: {e}"))?;
-                log::info!("[audio-android] set route to speaker via setSpeakerphoneOn");
-                return Ok(());
-            }
-
-            // For earpiece / bluetooth / anything else: use setCommunicationDevice
-            env.call_method(
-                &audio_manager,
-                "setSpeakerphoneOn",
-                "(Z)V",
-                &[JValueGen::Bool(0)],
-            )
-            .map_err(|e| format!("setSpeakerphoneOn(false) failed: {e}"))?;
-
-            let result = env
-                .call_method(
-                    &audio_manager,
-                    "setCommunicationDevice",
-                    "(Landroid/media/AudioDeviceInfo;)Z",
-                    &[JValueGen::Object(&device)],
-                )
-                .map_err(|e| format!("setCommunicationDevice failed: {e}"))?
-                .z()
-                .map_err(|e| format!("setCommunicationDevice type error: {e}"))?;
-
-            if result {
-                log::info!(
-                    "[audio-android] setCommunicationDevice to id={device_id} type={device_type}"
-                );
-                return Ok(());
-            } else {
-                return Err(format!(
-                    "setCommunicationDevice returned false for id={device_id}"
-                ));
+        let mut selected = None;
+        for device in communication_devices(env, audio_manager)? {
+            let id = call(env, &device, jni_str!("getId"), &jni_sig!("()I"), &[])?.i()?;
+            if id == device_id {
+                selected = Some(device);
+                break;
             }
         }
-    }
+        let Some(device) = selected else {
+            return Err(RouteError::Other(format!(
+                "device id {device_id} not found"
+            )));
+        };
+        let device_type = call(env, &device, jni_str!("getType"), &jni_sig!("()I"), &[])?.i()?;
 
-    Err(format!("device id {device_id} not found"))
+        // The built-in speaker is selected with setSpeakerphoneOn:
+        // setCommunicationDevice does not accept it on all devices.
+        if device_type == TYPE_BUILTIN_SPEAKER {
+            call(
+                env,
+                audio_manager,
+                jni_str!("clearCommunicationDevice"),
+                &jni_sig!("()V"),
+                &[],
+            )?;
+            call(
+                env,
+                audio_manager,
+                jni_str!("setSpeakerphoneOn"),
+                &jni_sig!("(Z)V"),
+                &[JValue::Bool(true)],
+            )?;
+        } else {
+            call(
+                env,
+                audio_manager,
+                jni_str!("setSpeakerphoneOn"),
+                &jni_sig!("(Z)V"),
+                &[JValue::Bool(false)],
+            )?;
+            let accepted = call(
+                env,
+                audio_manager,
+                jni_str!("setCommunicationDevice"),
+                &jni_sig!("(Landroid/media/AudioDeviceInfo;)Z"),
+                &[(&device).into()],
+            )?
+            .z()?;
+            if !accepted {
+                return Err(RouteError::Other(format!(
+                    "setCommunicationDevice returned false for id={device_id}"
+                )));
+            }
+        }
+
+        call(
+            env,
+            audio_manager,
+            jni_str!("setMode"),
+            &jni_sig!("(I)V"),
+            &[JValue::Int(MODE_IN_COMMUNICATION)],
+        )?;
+        log::info!("[audio-android] routed call audio to id={device_id} type={device_type}");
+        Ok(())
+    })
 }
 
 /// Restore default audio routing (call this when a call ends).
 #[cfg(target_os = "android")]
 pub fn restore_default_routing() {
-    let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }) else {
-        return;
-    };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return;
-    };
-    let Ok(am) = get_audio_manager(&mut env) else {
-        return;
-    };
-
-    let _ = env.call_method(&am, "setSpeakerphoneOn", "(Z)V", &[JValueGen::Bool(0)]);
-    let _ = env.call_method(&am, "setBluetoothScoOn", "(Z)V", &[JValueGen::Bool(0)]);
-    let _ = env.call_method(&am, "stopBluetoothSco", "()V", &[]);
-    let _ = env.call_method(&am, "clearCommunicationDevice", "()V", &[]);
-    // MODE_NORMAL = 0
-    let _ = env.call_method(&am, "setMode", "(I)V", &[JValueGen::Int(0)]);
-    log::info!("[audio-android] restored default routing");
+    let result = with_audio_manager(|env, audio_manager| {
+        // Each step is independent; a failed step does not skip the following ones.
+        let _ = call(
+            env,
+            audio_manager,
+            jni_str!("setSpeakerphoneOn"),
+            &jni_sig!("(Z)V"),
+            &[JValue::Bool(false)],
+        );
+        let _ = call(
+            env,
+            audio_manager,
+            jni_str!("setBluetoothScoOn"),
+            &jni_sig!("(Z)V"),
+            &[JValue::Bool(false)],
+        );
+        let _ = call(
+            env,
+            audio_manager,
+            jni_str!("stopBluetoothSco"),
+            &jni_sig!("()V"),
+            &[],
+        );
+        if sdk_level(env)? >= API_LEVEL_COMMUNICATION_DEVICE {
+            let _ = call(
+                env,
+                audio_manager,
+                jni_str!("clearCommunicationDevice"),
+                &jni_sig!("()V"),
+                &[],
+            );
+        }
+        call(
+            env,
+            audio_manager,
+            jni_str!("setMode"),
+            &jni_sig!("(I)V"),
+            &[JValue::Int(MODE_NORMAL)],
+        )?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => log::info!("[audio-android] restored default routing"),
+        Err(e) => log::warn!("[audio-android] failed to restore default routing: {e}"),
+    }
 }
 
 /// Set MODE_IN_COMMUNICATION before opening audio streams.
 #[cfg(target_os = "android")]
 pub fn enter_communication_mode() {
-    let ctx = ndk_context::android_context();
-    let Ok(vm) = (unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }) else {
-        return;
-    };
-    let Ok(mut env) = vm.attach_current_thread() else {
-        return;
-    };
-    let Ok(am) = get_audio_manager(&mut env) else {
-        return;
-    };
-    let _ = env.call_method(&am, "setMode", "(I)V", &[JValueGen::Int(3)]);
-    log::info!("[audio-android] set MODE_IN_COMMUNICATION");
+    let result = with_audio_manager(|env, audio_manager| {
+        call(
+            env,
+            audio_manager,
+            jni_str!("setMode"),
+            &jni_sig!("(I)V"),
+            &[JValue::Int(MODE_IN_COMMUNICATION)],
+        )?;
+        Ok(())
+    });
+    match result {
+        Ok(()) => log::info!("[audio-android] set MODE_IN_COMMUNICATION"),
+        Err(e) => log::warn!("[audio-android] failed to set MODE_IN_COMMUNICATION: {e}"),
+    }
 }
 
 // Stubs for non-Android platforms

@@ -1,6 +1,8 @@
 use crate::error::AppError;
+use crate::stage::control::VerifiedControl;
+use crate::stage::pipeline::IncomingAudio;
 use iroh::endpoint::Connection;
-use proscenium_types::{SignedStageControl, StageState, StageTicket};
+use proscenium_types::{StageState, StageTicket};
 use tokio::sync::{mpsc, oneshot};
 
 // ---- Command enum -------------------------------------------------------
@@ -25,18 +27,55 @@ pub(crate) enum StageCommand {
     // Incoming transport connection from a remote peer
     IncomingConnection(Connection),
 
-    // Incoming control message from the gossip receive task
-    ControlReceived(SignedStageControl),
+    // Incoming audio connection whose hello was verified
+    AudioConnection(IncomingAudio),
+
+    // The task serving a listener connection ended
+    ListenerConnClosed {
+        node_id: String,
+        conn_id: u64,
+    },
+
+    // The receive loop of a speaker connection ended (host only)
+    SpeakerConnClosed {
+        node_id: String,
+        conn_id: u64,
+    },
+
+    // The listener pipeline stopped using a relay and returned to the host
+    UpstreamFailed {
+        stage_id: String,
+        node_id: String,
+    },
+
+    // Verified control message from the gossip receive task
+    ControlReceived(VerifiedControl),
 
     // Periodic presence expiry sweep (sent by a background timer task)
     SweepPresence,
 
-    // Host moderation
+    // One-second timer of the host: broadcasts a pending or periodic RoomState
+    HostTick,
+
+    // Moderation (host or co-host)
     PromoteSpeaker {
         pubkey: String,
         reply: oneshot::Sender<Result<(), AppError>>,
     },
     DemoteSpeaker {
+        pubkey: String,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
+    MuteSpeaker {
+        pubkey: String,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
+    Kick {
+        pubkey: String,
+        reply: oneshot::Sender<Result<(), AppError>>,
+    },
+    // Host only
+    Ban {
         pubkey: String,
         reply: oneshot::Sender<Result<(), AppError>>,
     },
@@ -69,10 +108,31 @@ pub(crate) enum StageCommand {
     GetState {
         reply: oneshot::Sender<Option<StageState>>,
     },
-    /// Query the active stage announcement (if hosting). Used by sync handler.
+    /// Query the signed announcement of the hosted stage. Used by sync handler.
     GetActiveAnnouncement {
         reply: oneshot::Sender<Option<proscenium_types::StageAnnouncement>>,
     },
+}
+
+// ---- Sender for background tasks ----------------------------------------
+
+/// Command sender handed to the background tasks of a stage. It holds a weak reference,
+/// so the actor's channel closes once every `StageActorHandle` is dropped.
+#[derive(Clone)]
+pub(crate) struct ActorSender(mpsc::WeakSender<StageCommand>);
+
+impl ActorSender {
+    pub(crate) fn new(cmd_tx: &mpsc::Sender<StageCommand>) -> Self {
+        Self(cmd_tx.downgrade())
+    }
+
+    /// Send a command to the actor. Returns false if the actor is gone.
+    pub(crate) async fn send(&self, cmd: StageCommand) -> bool {
+        match self.0.upgrade() {
+            Some(cmd_tx) => cmd_tx.send(cmd).await.is_ok(),
+            None => false,
+        }
+    }
 }
 
 // ---- Actor handle -------------------------------------------------------
@@ -88,64 +148,62 @@ impl StageActorHandle {
         Self { cmd_tx }
     }
 
-    pub async fn create_stage(&self, title: String) -> Result<StageTicket, AppError> {
+    /// Send a command built from a reply sender and wait for the actor's reply.
+    async fn request<T>(
+        &self,
+        build: impl FnOnce(oneshot::Sender<Result<T, AppError>>) -> StageCommand,
+    ) -> Result<T, AppError> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(StageCommand::CreateStage { title, reply: tx })
+            .send(build(tx))
             .await
             .map_err(|_| AppError::Other("stage actor closed".into()))?;
         rx.await
             .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
+    }
+
+    pub async fn create_stage(&self, title: String) -> Result<StageTicket, AppError> {
+        self.request(|reply| StageCommand::CreateStage { title, reply })
+            .await
     }
 
     pub async fn join_stage(&self, ticket: StageTicket) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::JoinStage { ticket, reply: tx })
+        self.request(|reply| StageCommand::JoinStage { ticket, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn leave_stage(&self) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::LeaveStage { reply: tx })
+        self.request(|reply| StageCommand::LeaveStage { reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn end_stage(&self) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::EndStage { reply: tx })
-            .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
+        self.request(|reply| StageCommand::EndStage { reply }).await
     }
 
     pub async fn promote_speaker(&self, pubkey: String) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::PromoteSpeaker { pubkey, reply: tx })
+        self.request(|reply| StageCommand::PromoteSpeaker { pubkey, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn demote_speaker(&self, pubkey: String) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::DemoteSpeaker { pubkey, reply: tx })
+        self.request(|reply| StageCommand::DemoteSpeaker { pubkey, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
+    }
+
+    pub async fn mute_speaker(&self, pubkey: String) -> Result<(), AppError> {
+        self.request(|reply| StageCommand::MuteSpeaker { pubkey, reply })
+            .await
+    }
+
+    pub async fn kick(&self, pubkey: String) -> Result<(), AppError> {
+        self.request(|reply| StageCommand::Kick { pubkey, reply })
+            .await
+    }
+
+    pub async fn ban(&self, pubkey: String) -> Result<(), AppError> {
+        self.request(|reply| StageCommand::Ban { pubkey, reply })
+            .await
     }
 
     pub async fn get_state(&self) -> Option<StageState> {
@@ -161,7 +219,7 @@ impl StageActorHandle {
         rx.await.unwrap_or(None)
     }
 
-    /// Query the active stage announcement if this node is currently hosting a stage.
+    /// Query the signed announcement of the stage this node is currently hosting.
     pub async fn get_active_announcement(&self) -> Option<proscenium_types::StageAnnouncement> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -176,66 +234,33 @@ impl StageActorHandle {
     }
 
     pub async fn toggle_self_mute(&self) -> Result<bool, AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::ToggleSelfMute { reply: tx })
+        self.request(|reply| StageCommand::ToggleSelfMute { reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn raise_hand(&self) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::RaiseHand { reply: tx })
+        self.request(|reply| StageCommand::RaiseHand { reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn lower_hand(&self) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::LowerHand { reply: tx })
+        self.request(|reply| StageCommand::LowerHand { reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn send_reaction(&self, emoji: String) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::SendReaction { emoji, reply: tx })
+        self.request(|reply| StageCommand::SendReaction { emoji, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn send_chat(&self, text: String) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::SendChat { text, reply: tx })
+        self.request(|reply| StageCommand::SendChat { text, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub async fn volunteer_as_relay(&self, capacity: u32) -> Result<(), AppError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(StageCommand::VolunteerAsRelay {
-                capacity,
-                reply: tx,
-            })
+        self.request(|reply| StageCommand::VolunteerAsRelay { capacity, reply })
             .await
-            .map_err(|_| AppError::Other("stage actor closed".into()))?;
-        rx.await
-            .map_err(|_| AppError::Other("stage actor dropped reply".into()))?
     }
 
     pub(crate) async fn incoming_connection(&self, conn: Connection) {

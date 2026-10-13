@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { profileHref } from "$lib/profile/links";
   import type { ServerSearchPost } from "$lib/types";
+  import { shortId } from "$lib/utils";
 
   let {
     posts,
@@ -11,23 +13,29 @@
     userNames: Map<string, string>;
   } = $props();
 
-  function shortId(id: string): string {
-    return id.length > 12 ? id.slice(0, 6) + ".." + id.slice(-4) : id;
-  }
-
   function formatTime(ts: number): string {
     return new Date(ts).toLocaleDateString();
   }
 </script>
 
 {#if posts.length > 0}
+  <!-- Not keyed: the server can return the same id twice. -->
   <div class="post-list">
-    {#each posts as post (post.id)}
+    {#each posts as post}
       <div class="feed-post">
         <div class="post-meta">
-          <a href="/profile/{post.author}" class="post-author">
-            {userNames.get(post.author) || shortId(post.author)}
-          </a>
+          <span class="post-byline">
+            <a href={profileHref(post.author)} class="post-author">
+              {userNames.get(post.author) || shortId(post.author)}
+            </a>
+            {#if !post.verified}
+              <span
+                class="unverified-badge"
+                title="The signature of this post was not verified against a known key of this author. The server chose the author shown here."
+                >Unverified</span
+              >
+            {/if}
+          </span>
           <span class="post-time">{formatTime(post.timestamp)}</span>
         </div>
         <p class="post-content">{post.content}</p>
@@ -54,6 +62,7 @@
   .post-meta {
     display: flex;
     justify-content: space-between;
+    gap: 0.5rem;
     margin-bottom: 0.35rem;
     font-size: var(--text-sm);
   }
@@ -69,6 +78,23 @@
 
   .post-author:hover {
     text-decoration: underline;
+  }
+
+  .post-byline {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .unverified-badge {
+    color: var(--color-warning);
+    border: 1px solid var(--color-warning-border);
+    border-radius: var(--radius-sm);
+    padding: 0 0.35rem;
+    font-size: var(--text-xs);
+    font-weight: 600;
+    flex-shrink: 0;
   }
 
   .post-time {

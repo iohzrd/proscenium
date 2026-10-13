@@ -1,5 +1,12 @@
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroizing;
+
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const NOISE_PSK_PATTERN: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+
+/// HKDF info string for the Double Ratchet seed derived from a DM handshake.
+const RATCHET_SEED_INFO: &[u8] = b"proscenium-dm-root-v2";
 
 /// Perform the initiator side of Noise IK handshake.
 /// Returns the handshake state and the first message to send.
@@ -38,41 +45,61 @@ pub fn noise_respond(
 }
 
 /// Complete the handshake on the initiator side.
-/// Returns the handshake hash (shared secret for ratchet seeding).
+/// Returns the seed for the Double Ratchet root key (`derive_ratchet_seed`).
 pub fn noise_complete_initiator(
     mut initiator: snow::HandshakeState,
     response: &[u8],
-) -> Result<[u8; 32], snow::Error> {
+) -> Result<Zeroizing<[u8; 32]>, snow::Error> {
     let mut payload = vec![0u8; 65535];
     initiator.read_message(response, &mut payload)?;
-    let hash = extract_handshake_hash(&initiator);
-    // Transition to transport mode to complete the handshake properly
-    let _transport = initiator.into_transport_mode()?;
-    Ok(hash)
+    derive_ratchet_seed(&mut initiator)
 }
 
 /// Complete the handshake on the responder side.
-/// Returns `(handshake_hash, initiator_dm_pubkey)`.
-/// The initiator's long-term X25519 key, authenticated by the Noise IK handshake.
+/// Returns `(ratchet_seed, initiator_dm_pubkey)`: the seed for the Double Ratchet root key
+/// (`derive_ratchet_seed`) and the initiator's long-term X25519 key, which the handshake
+/// authenticated.
 pub fn noise_complete_responder(
-    responder: snow::HandshakeState,
-) -> Result<([u8; 32], Option<[u8; 32]>), snow::Error> {
-    let hash = extract_handshake_hash(&responder);
-    let initiator_dm_pubkey = responder.get_remote_static().and_then(|s| {
-        let arr: [u8; 32] = s.try_into().ok()?;
-        Some(arr)
-    });
-    let _transport = responder.into_transport_mode()?;
-    Ok((hash, initiator_dm_pubkey))
+    mut responder: snow::HandshakeState,
+) -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), snow::Error> {
+    let initiator_dm_pubkey: [u8; 32] = responder
+        .get_remote_static()
+        .and_then(|s| s.try_into().ok())
+        .ok_or(snow::Error::Prereq(
+            snow::error::Prerequisite::RemotePublicKey,
+        ))?;
+    let seed = derive_ratchet_seed(&mut responder)?;
+    Ok((seed, initiator_dm_pubkey))
 }
 
-/// Extract the handshake hash from a Noise handshake state.
-fn extract_handshake_hash(hs: &snow::HandshakeState) -> [u8; 32] {
-    let hash = hs.get_handshake_hash();
-    let mut result = [0u8; 32];
-    let len = hash.len().min(32);
-    result[..len].copy_from_slice(&hash[..len]);
-    result
+/// Derive the Double Ratchet seed from a finished handshake:
+/// `HKDF-SHA256(ikm = k1 || k2, salt = handshake hash, info = RATCHET_SEED_INFO)`.
+///
+/// `k1` and `k2` are the two transport cipher keys of the Noise `Split()` step. They are
+/// derived from the final chaining key, which mixes the four DH outputs of the IK pattern
+/// (es, ss, ee, se), so they cannot be computed from the handshake messages. The handshake
+/// hash covers only transmitted bytes and is used as a public salt.
+///
+/// Returns `HandshakeNotFinished` before the last handshake message was processed, because
+/// the chaining key does not include every DH output until then.
+fn derive_ratchet_seed(hs: &mut snow::HandshakeState) -> Result<Zeroizing<[u8; 32]>, snow::Error> {
+    if !hs.is_handshake_finished() {
+        return Err(snow::Error::State(
+            snow::error::StateProblem::HandshakeNotFinished,
+        ));
+    }
+    let (k1, k2) = hs.dangerously_get_raw_split();
+    let (k1, k2) = (Zeroizing::new(k1), Zeroizing::new(k2));
+    let mut ikm = Zeroizing::new([0u8; 64]);
+    let (first, second) = ikm.split_at_mut(32);
+    first.copy_from_slice(k1.as_slice());
+    second.copy_from_slice(k2.as_slice());
+
+    let hk = Hkdf::<Sha256>::new(Some(hs.get_handshake_hash()), ikm.as_slice());
+    let mut seed = Zeroizing::new([0u8; 32]);
+    hk.expand(RATCHET_SEED_INFO, seed.as_mut_slice())
+        .map_err(|_| snow::Error::Input)?;
+    Ok(seed)
 }
 
 /// Initiator side of Noise IK+PSK handshake for device pairing.

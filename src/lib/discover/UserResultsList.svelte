@@ -1,6 +1,8 @@
 <script lang="ts">
   import Icon from "$lib/Icon.svelte";
+  import { profileHref } from "$lib/profile/links";
   import type { ServerUser } from "$lib/types";
+  import { shortId } from "$lib/utils";
 
   let {
     users,
@@ -15,17 +17,14 @@
     togglingFollow: string | null;
     ontogglefollow: (pubkey: string) => void;
   } = $props();
-
-  function shortId(id: string): string {
-    return id.length > 12 ? id.slice(0, 6) + ".." + id.slice(-4) : id;
-  }
 </script>
 
 {#if users.length > 0}
+  <!-- Not keyed: the server can return the same pubkey twice. -->
   <div class="user-list">
-    {#each users as user (user.pubkey)}
+    {#each users as user}
       <div class="user-card">
-        <a href="/profile/{user.pubkey}" class="user-card-link">
+        <a href={profileHref(user.pubkey)} class="user-card-link">
           <div class="user-avatar">
             <Icon name="user" size={24} />
           </div>

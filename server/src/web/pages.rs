@@ -1,5 +1,6 @@
 use super::layout;
-use crate::api::AppState;
+use crate::api::{AppState, clamp_offset, internal_error};
+use crate::content::{extract_hashtags, fts_query, normalize_hashtag};
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -7,19 +8,27 @@ use axum::response::Html;
 use axum::routing::get;
 use maud::html;
 use serde::Deserialize;
+use std::collections::HashMap;
 
-use crate::storage::{PostStats, StoredPost, UserInfo};
+use crate::storage::{PostStats, StoredPost};
+
+/// Posts per page on the feed, profile and hashtag pages.
+const PAGE_POSTS: i64 = 50;
+/// Users per page on the user list.
+const PAGE_USERS: i64 = 50;
+/// Full-text matches read for one hashtag page before posts without the hashtag are
+/// filtered out.
+const HASHTAG_CANDIDATES: i64 = 200;
+
+type StatsMap = HashMap<(String, String), PostStats>;
 
 // --- Helpers ---
 
 fn render_post(
     post: &StoredPost,
-    author_info: Option<&UserInfo>,
+    display_name: Option<&str>,
     stats: Option<&PostStats>,
 ) -> maud::Markup {
-    let display_name = author_info
-        .and_then(|u| u.display_name.as_deref())
-        .filter(|n| !n.is_empty());
     let short_key = layout::short_pubkey(&post.author);
 
     html! {
@@ -39,22 +48,22 @@ fn render_post(
                     (layout::format_time(post.timestamp))
                 }
             }
-            @if let Some(ref reply_to) = post.reply_to {
+            @if let (Some(reply_to), Some(reply_to_author)) = (&post.reply_to, &post.reply_to_author) {
                 p.post-reply-context {
                     "Replying to "
-                    a href=(format!("/post/{}/{}", post.reply_to_author.as_deref().unwrap_or(""), reply_to)) {
+                    a href=(format!("/post/{reply_to_author}/{reply_to}")) {
                         "a post"
                     }
                 }
             }
-            @if let Some(ref quote_of) = post.quote_of {
+            @if let (Some(quote_of), Some(quote_of_author)) = (&post.quote_of, &post.quote_of_author) {
                 p.post-reply-context {
                     @if post.content.is_empty() {
                         "Reposted "
                     } @else {
                         "Quoting "
                     }
-                    a href=(format!("/post/{}/{}", post.quote_of_author.as_deref().unwrap_or(""), quote_of)) {
+                    a href=(format!("/post/{quote_of_author}/{quote_of}")) {
                         "a post"
                     }
                 }
@@ -63,7 +72,7 @@ fn render_post(
                 p.post-content { (layout::render_content(&post.content)) }
             }
             @if let Some(s) = stats {
-                @if s.likes > 0 || s.reposts > 0 || s.replies > 0 || s.quotes > 0 {
+                @if !s.is_empty() {
                     div.post-stats {
                         @if s.replies > 0 {
                             span.stat { (s.replies) " replies" }
@@ -84,6 +93,50 @@ fn render_post(
     }
 }
 
+fn render_posts(
+    posts: &[StoredPost],
+    names: &HashMap<String, String>,
+    stats: &StatsMap,
+) -> maud::Markup {
+    html! {
+        @for post in posts {
+            (render_post(
+                post,
+                names.get(&post.author).map(String::as_str),
+                stats.get(&(post.author.clone(), post.id.clone())),
+            ))
+        }
+    }
+}
+
+/// Display names of the authors of `posts`, in one query.
+async fn load_display_names(
+    state: &AppState,
+    posts: &[StoredPost],
+) -> Result<HashMap<String, String>, StatusCode> {
+    let mut authors: Vec<&str> = posts.iter().map(|p| p.author.as_str()).collect();
+    authors.sort_unstable();
+    authors.dedup();
+    state
+        .storage
+        .get_display_names(&authors)
+        .await
+        .map_err(internal_error)
+}
+
+/// Like, repost, reply and quote counts of `posts`, in one query.
+async fn load_stats(state: &AppState, posts: &[StoredPost]) -> Result<StatsMap, StatusCode> {
+    let keys: Vec<(&str, &str)> = posts
+        .iter()
+        .map(|p| (p.author.as_str(), p.id.as_str()))
+        .collect();
+    state
+        .storage
+        .get_post_stats_batch(&keys)
+        .await
+        .map_err(internal_error)
+}
+
 // --- Feed page ---
 
 #[derive(Deserialize)]
@@ -97,12 +150,12 @@ async fn feed_page(
 ) -> Result<Html<String>, StatusCode> {
     let posts = state
         .storage
-        .get_feed(50, params.before, None)
+        .get_feed(PAGE_POSTS, params.before, None)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
-    let author_map = build_author_map(&state, &posts).await;
-    let stats_map = build_stats_map(&state, &posts).await;
+    let names = load_display_names(&state, &posts).await?;
+    let stats = load_stats(&state, &posts).await?;
     let server_name = &state.config.server.name;
     let oldest_ts = posts.last().map(|p| p.timestamp);
 
@@ -111,9 +164,7 @@ async fn feed_page(
         @if posts.is_empty() {
             p.empty { "No posts yet. Be the first!" }
         } @else {
-            @for post in &posts {
-                (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref()), stats_map.get(&post.id)))
-            }
+            (render_posts(&posts, &names, &stats))
             @if let Some(ts) = oldest_ts {
                 a.load-more href=(format!("/?before={ts}")) { "Load older posts" }
             }
@@ -136,54 +187,51 @@ async fn user_page(
         .storage
         .get_user_info(&pubkey)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(internal_error)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let posts = if user.visibility == "public" {
-        state
-            .storage
-            .get_user_posts(&pubkey, 50, params.before)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    } else {
-        vec![]
-    };
+    // Empty unless the registration is public.
+    let posts = state
+        .storage
+        .get_user_posts(&user.pubkey, PAGE_POSTS, params.before)
+        .await
+        .map_err(internal_error)?;
 
-    let stats_map = build_stats_map(&state, &posts).await;
+    let stats = load_stats(&state, &posts).await?;
     let oldest_ts = posts.last().map(|p| p.timestamp);
     let server_name = &state.config.server.name;
-    let display = user
-        .display_name
-        .as_deref()
-        .filter(|n| !n.is_empty())
-        .unwrap_or("Anonymous");
+    let display_name = user.display_name.as_deref().filter(|n| !n.is_empty());
+    let display = display_name.unwrap_or("Anonymous");
+    let is_public = user.visibility == "public";
 
     let content = html! {
         div.profile-header {
             h1.profile-name { (display) }
-            p.profile-pubkey { (pubkey) }
-            @if let Some(ref bio) = user.bio {
-                @if !bio.is_empty() {
-                    p.profile-bio { (bio) }
-                }
+            p.profile-pubkey { (user.pubkey) }
+            @if let Some(bio) = user.bio.as_deref().filter(|b| !b.is_empty()) {
+                p.profile-bio { (bio) }
             }
             div.profile-stats {
-                @if user.visibility == "public" {
+                @if is_public {
                     span { strong { (user.post_count) } " posts" }
                 }
                 span { "Joined " (layout::format_time(user.registered_at)) }
             }
         }
-        @if user.visibility != "public" {
+        @if !is_public {
             p.empty { "This user's posts are not publicly visible." }
         } @else if posts.is_empty() {
             p.empty { "No posts yet." }
         } @else {
             @for post in &posts {
-                (render_post(post, Some(&user), stats_map.get(&post.id)))
+                (render_post(
+                    post,
+                    display_name,
+                    stats.get(&(post.author.clone(), post.id.clone())),
+                ))
             }
             @if let Some(ts) = oldest_ts {
-                a.load-more href=(format!("/user/{}?before={ts}", pubkey)) { "Load older posts" }
+                a.load-more href=(format!("/user/{}?before={ts}", user.pubkey)) { "Load older posts" }
             }
         }
     };
@@ -195,6 +243,8 @@ async fn user_page(
 
 // --- Single post ---
 
+/// One post. Responds 404 unless the post is stored and its author has an active
+/// public registration.
 async fn post_page(
     State(state): State<AppState>,
     Path((author, post_id)): Path<(String, String)>,
@@ -203,26 +253,17 @@ async fn post_page(
         .storage
         .get_post(&author, &post_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(internal_error)?
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let user = state
-        .storage
-        .get_user_info(&author)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
+    let posts = std::slice::from_ref(&post);
+    let names = load_display_names(&state, posts).await?;
+    let stats = load_stats(&state, posts).await?;
     let server_name = &state.config.server.name;
-    let display_name = user
-        .as_ref()
-        .and_then(|u| u.display_name.as_deref())
-        .filter(|n| !n.is_empty())
-        .unwrap_or("Anonymous");
-
-    let post_stats = build_stats_map(&state, std::slice::from_ref(&post)).await;
+    let display_name = names.get(&post.author).map_or("Anonymous", String::as_str);
 
     let content = html! {
-        (render_post(&post, user.as_ref(), post_stats.get(&post.id)))
+        (render_posts(posts, &names, &stats))
         div.post-meta {
             span { "Posted " (layout::format_time(post.timestamp)) }
         }
@@ -240,44 +281,53 @@ struct TrendingParams {
     tag: Option<String>,
 }
 
+/// Posts that contain the hashtag `tag`. The full-text index is queried for the tag
+/// name as a phrase; matches that contain the words but not the hashtag are removed.
+/// Responds 400 if `tag` is not a hashtag name.
+async fn tag_page(state: &AppState, tag: &str) -> Result<Html<String>, StatusCode> {
+    let tag = normalize_hashtag(tag).ok_or(StatusCode::BAD_REQUEST)?;
+    let query = fts_query(&tag).ok_or(StatusCode::BAD_REQUEST)?;
+    let (candidates, _total) = state
+        .storage
+        .search_posts(&query, HASHTAG_CANDIDATES, 0)
+        .await
+        .map_err(internal_error)?;
+    let posts: Vec<StoredPost> = candidates
+        .into_iter()
+        .filter(|post| extract_hashtags(&post.content).contains(&tag))
+        .take(PAGE_POSTS as usize)
+        .collect();
+
+    let names = load_display_names(state, &posts).await?;
+    let stats = load_stats(state, &posts).await?;
+
+    let content = html! {
+        h1.section-title { "#" (tag) }
+        @if posts.is_empty() {
+            p.empty { "No posts found with this tag." }
+        } @else {
+            (render_posts(&posts, &names, &stats))
+        }
+    };
+
+    Ok(Html(
+        layout::page(&format!("#{tag}"), &state.config.server.name, content).into_string(),
+    ))
+}
+
 async fn trending_page(
     State(state): State<AppState>,
     Query(params): Query<TrendingParams>,
 ) -> Result<Html<String>, StatusCode> {
-    let server_name = &state.config.server.name;
-
-    if let Some(ref tag) = params.tag {
-        let query = format!("#{tag}");
-        let (posts, _total) = state
-            .storage
-            .search_posts(&query, 50, 0)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        let author_map = build_author_map(&state, &posts).await;
-        let stats_map = build_stats_map(&state, &posts).await;
-
-        let content = html! {
-            h1.section-title { "#" (tag) }
-            @if posts.is_empty() {
-                p.empty { "No posts found with this tag." }
-            } @else {
-                @for post in &posts {
-                    (render_post(post, author_map.get(post.author.as_str()).and_then(|o| o.as_ref()), stats_map.get(&post.id)))
-                }
-            }
-        };
-
-        return Ok(Html(
-            layout::page(&format!("#{tag}"), server_name, content).into_string(),
-        ));
+    if let Some(tag) = &params.tag {
+        return tag_page(&state, tag).await;
     }
 
     let tags = state
         .storage
         .get_trending_hashtags(30)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     let content = html! {
         h1.section-title { "Trending" }
@@ -287,7 +337,7 @@ async fn trending_page(
             ul.tag-list {
                 @for tag in &tags {
                     li.tag-item {
-                        a.tag-name href=(format!("/trending?tag={}", tag.tag)) {
+                        a.tag-name href=(layout::tag_href(&tag.tag)) {
                             "#" (tag.tag)
                         }
                         span.tag-stats {
@@ -300,7 +350,7 @@ async fn trending_page(
     };
 
     Ok(Html(
-        layout::page("Trending", server_name, content).into_string(),
+        layout::page("Trending", &state.config.server.name, content).into_string(),
     ))
 }
 
@@ -315,16 +365,15 @@ async fn users_page(
     State(state): State<AppState>,
     Query(params): Query<UsersParams>,
 ) -> Result<Html<String>, StatusCode> {
-    let offset = params.offset.unwrap_or(0);
-    let limit = 50;
+    let offset = clamp_offset(params.offset);
     let (users, total) = state
         .storage
-        .list_users(limit, offset)
+        .list_users(PAGE_USERS, offset)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     let server_name = &state.config.server.name;
-    let next_offset = offset + limit;
+    let next_offset = offset.saturating_add(PAGE_USERS);
     let has_more = next_offset < total;
 
     let content = html! {
@@ -335,20 +384,14 @@ async fn users_page(
             @for user in &users {
                 a.user-card href=(format!("/user/{}", user.pubkey)) {
                     div.user-name {
-                        @if let Some(ref name) = user.display_name {
-                            @if !name.is_empty() {
-                                (name)
-                            } @else {
-                                (layout::short_pubkey(&user.pubkey))
-                            }
+                        @if let Some(name) = user.display_name.as_deref().filter(|n| !n.is_empty()) {
+                            (name)
                         } @else {
                             (layout::short_pubkey(&user.pubkey))
                         }
                     }
-                    @if let Some(ref bio) = user.bio {
-                        @if !bio.is_empty() {
-                            p.user-bio { (bio) }
-                        }
+                    @if let Some(bio) = user.bio.as_deref().filter(|b| !b.is_empty()) {
+                        p.user-bio { (bio) }
                     }
                     p.user-meta {
                         @if user.visibility == "public" {
@@ -379,41 +422,4 @@ pub fn routes() -> Router<AppState> {
         .route("/post/{author}/{id}", get(post_page))
         .route("/trending", get(trending_page))
         .route("/users", get(users_page))
-}
-
-// --- Utilities ---
-
-async fn build_author_map(
-    state: &AppState,
-    posts: &[StoredPost],
-) -> std::collections::HashMap<String, Option<UserInfo>> {
-    let mut map = std::collections::HashMap::new();
-    for post in posts {
-        if map.contains_key(&post.author) {
-            continue;
-        }
-        let info = state
-            .storage
-            .get_user_info(&post.author)
-            .await
-            .ok()
-            .flatten();
-        map.insert(post.author.clone(), info);
-    }
-    map
-}
-
-async fn build_stats_map(
-    state: &AppState,
-    posts: &[StoredPost],
-) -> std::collections::HashMap<String, PostStats> {
-    let post_ids: Vec<(String, String)> = posts
-        .iter()
-        .map(|p| (p.author.clone(), p.id.clone()))
-        .collect();
-    state
-        .storage
-        .get_post_stats_batch(&post_ids)
-        .await
-        .unwrap_or_default()
 }

@@ -1,239 +1,128 @@
 <script lang="ts">
-  import { onMount } from "svelte";
   import { hapticNotification } from "$lib/haptics";
+  import Modal from "$lib/Modal.svelte";
+  import QrScanner from "$lib/QrScanner.svelte";
   import type { LinkQrPayload } from "$lib/types";
+  import { isPubkeyFormat } from "$lib/utils";
 
   interface Props {
+    /** Called with a payload whose shape and expiry were checked. Nothing is invoked here. */
     onscanned: (payload: LinkQrPayload) => void;
     onclose: () => void;
   }
 
   let { onscanned, onclose }: Props = $props();
 
+  const uid = $props.id();
+
+  // 32 bytes in base64: 43 characters, with or without one padding character.
+  const SECRET = /^[A-Za-z0-9+/_-]{43}=?$/;
+  const MAX_RELAY_URL_LENGTH = 2048;
+
   let error = $state<string | null>(null);
-  let scanning = $state(true);
   let manualInput = $state("");
   let showManual = $state(false);
-  let cancelFn: (() => Promise<void>) | null = null;
 
-  function parsePayload(text: string): LinkQrPayload | null {
+  function isRelayUrl(value: unknown): value is string {
+    if (typeof value !== "string" || value.length > MAX_RELAY_URL_LENGTH) {
+      return false;
+    }
     try {
-      const parsed = JSON.parse(text);
-      if (
-        typeof parsed.node_id === "string" &&
-        typeof parsed.secret === "string"
-      ) {
-        return {
-          node_id: parsed.node_id,
-          secret: parsed.secret,
-          relay_url: parsed.relay_url ?? null,
-        };
-      }
-      return null;
+      const protocol = new URL(value).protocol;
+      return protocol === "https:" || protocol === "http:";
     } catch {
-      return null;
+      return false;
     }
   }
 
-  function handleScanResult(text: string) {
+  /** Returns the payload, or the reason `text` is not accepted. */
+  function parsePayload(text: string): LinkQrPayload | string {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return "Not a device link code.";
+    }
+    if (typeof parsed !== "object" || parsed === null) {
+      return "Not a device link code.";
+    }
+    const { node_id, secret, relay_url, expires_at } = parsed as Record<
+      string,
+      unknown
+    >;
+    if (
+      typeof node_id !== "string" ||
+      !isPubkeyFormat(node_id) ||
+      typeof secret !== "string" ||
+      !SECRET.test(secret) ||
+      !(
+        relay_url === null ||
+        relay_url === undefined ||
+        isRelayUrl(relay_url)
+      ) ||
+      typeof expires_at !== "number" ||
+      !Number.isSafeInteger(expires_at)
+    ) {
+      return "Not a device link code.";
+    }
+    if (expires_at <= Date.now()) {
+      return "This link code has expired. Generate a new code on the other device.";
+    }
+    return { node_id, secret, relay_url: relay_url ?? null, expires_at };
+  }
+
+  function submit(text: string, scanned: boolean) {
     const payload = parsePayload(text);
-    if (payload) {
-      hapticNotification("success");
-      onscanned(payload);
-    } else {
-      error = "Not a valid device link QR code";
+    if (typeof payload === "string") {
+      error = payload;
+      showManual = true;
+      return;
     }
+    if (scanned) hapticNotification("success");
+    onscanned(payload);
   }
-
-  function submitManual() {
-    const payload = parsePayload(manualInput.trim());
-    if (payload) {
-      onscanned(payload);
-    } else {
-      error = "Invalid payload. Paste the JSON from the existing device.";
-    }
-  }
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") onclose();
-  }
-
-  async function stopScanning() {
-    if (cancelFn) {
-      try {
-        await cancelFn();
-      } catch {
-        // ignore cancel errors
-      }
-      cancelFn = null;
-    }
-    document.documentElement.style.background = "";
-    document.body.style.background = "";
-  }
-
-  onMount(() => {
-    (async () => {
-      try {
-        const { scan, cancel, Format, checkPermissions, requestPermissions } =
-          await import("@tauri-apps/plugin-barcode-scanner");
-
-        cancelFn = cancel;
-
-        let perms = await checkPermissions();
-        if (perms !== "granted") {
-          perms = await requestPermissions();
-        }
-        if (perms !== "granted") {
-          // No camera -- fall back to manual input
-          scanning = false;
-          showManual = true;
-          return;
-        }
-
-        document.documentElement.style.background = "transparent";
-        document.body.style.background = "transparent";
-
-        const result = await scan({
-          formats: [Format.QRCode],
-          windowed: true,
-        });
-        scanning = false;
-        await stopScanning();
-        handleScanResult(result.content);
-      } catch {
-        // Scanner not available (desktop) -- fall back to manual input
-        scanning = false;
-        showManual = true;
-        await stopScanning();
-      }
-    })();
-
-    return () => {
-      stopScanning();
-    };
-  });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<QrScanner
+  hint="Scan device link QR code"
+  onresult={(text) => submit(text, true)}
+  onunavailable={() => (showManual = true)}
+  oncancel={onclose}
+/>
 
-{#if scanning}
-  <div class="scanner-overlay">
-    <div class="scanner-top"></div>
-    <div class="scanner-middle">
-      <div class="scanner-side"></div>
-      <div class="scanner-viewfinder"></div>
-      <div class="scanner-side"></div>
+{#if showManual}
+  <Modal label="Link with device" {onclose} maxWidth="380px">
+    {#if error}
+      <p class="scanner-error" role="alert">{error}</p>
+    {/if}
+    <label class="scanner-label" for="{uid}-payload">
+      Paste the link code from your other device:
+    </label>
+    <textarea
+      id="{uid}-payload"
+      class="textarea-base manual-input"
+      bind:value={manualInput}
+      placeholder="JSON with node_id, secret, relay_url, expires_at"
+      rows="4"
+      spellcheck="false"
+      autocomplete="off"
+      autocapitalize="none"></textarea>
+    <div class="modal-actions">
+      <button class="modal-cancel" onclick={onclose}>Cancel</button>
+      <button
+        class="modal-confirm save"
+        onclick={() => submit(manualInput.trim(), false)}
+        disabled={!manualInput.trim()}
+      >
+        Continue
+      </button>
     </div>
-    <div class="scanner-bottom">
-      <p class="scanner-hint">Scan device link QR code</p>
-      <button class="scanner-close" onclick={onclose}>Cancel</button>
-    </div>
-  </div>
-{/if}
-
-{#if showManual || error}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="modal-overlay" onclick={onclose} role="presentation">
-    <!-- svelte-ignore a11y_interactive_supports_focus -->
-    <div
-      class="modal link-scanner-modal"
-      onclick={(e) => e.stopPropagation()}
-      role="dialog"
-      aria-label="Link with device"
-    >
-      {#if error}
-        <p class="scanner-error">{error}</p>
-      {/if}
-      <p class="scanner-label">
-        Paste the link payload from your other device:
-      </p>
-      <textarea
-        class="textarea-base manual-input"
-        bind:value={manualInput}
-        placeholder="node_id, secret, relay_url (JSON)"
-        rows="4"></textarea>
-      <div class="modal-actions">
-        <button class="modal-cancel" onclick={onclose}>Cancel</button>
-        <button
-          class="modal-confirm"
-          onclick={submitManual}
-          disabled={!manualInput.trim()}
-        >
-          Link
-        </button>
-      </div>
-    </div>
-  </div>
+  </Modal>
 {/if}
 
 <style>
-  .scanner-overlay {
-    position: fixed;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-    z-index: var(--z-scanner);
-  }
-
-  .scanner-top {
-    flex: 1;
-    background: var(--overlay-medium);
-  }
-
-  .scanner-middle {
-    display: flex;
-  }
-
-  .scanner-side {
-    flex: 1;
-    background: var(--overlay-medium);
-  }
-
-  .scanner-viewfinder {
-    width: 250px;
-    height: 250px;
-    border: 3px solid var(--accent-medium);
-    border-radius: var(--radius-2xl);
-    flex-shrink: 0;
-  }
-
-  .scanner-bottom {
-    flex: 1;
-    background: var(--overlay-medium);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding-top: 1rem;
-  }
-
-  .scanner-hint {
-    color: var(--text-on-accent);
-    font-size: var(--text-base);
-    margin: 0;
-    text-shadow: 0 1px 4px rgba(0, 0, 0, 0.8);
-  }
-
-  .scanner-close {
-    margin-top: 1.5rem;
-    background: var(--overlay-light);
-    color: var(--text-on-accent);
-    border: 1px solid var(--overlay-white-faint);
-    border-radius: var(--radius-lg);
-    padding: 0.6rem 2rem;
-    font-size: var(--text-icon);
-    cursor: pointer;
-    transition: background var(--transition-fast);
-  }
-
-  .scanner-close:hover {
-    background: var(--overlay-medium);
-  }
-
-  .link-scanner-modal {
-    max-width: 380px;
-  }
-
   .scanner-label {
+    display: block;
     margin: 0 0 0.75rem;
     color: var(--text-secondary);
     font-size: var(--text-sm);
@@ -241,7 +130,7 @@
 
   .scanner-error {
     margin: 0 0 0.75rem;
-    color: var(--color-error, #ef4444);
+    color: var(--color-error);
     font-size: var(--text-sm);
   }
 

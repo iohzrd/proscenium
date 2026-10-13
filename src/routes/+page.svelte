@@ -9,8 +9,9 @@
   import PostComposer from "$lib/PostComposer.svelte";
   import { createBlobCache, setBlobContext } from "$lib/blobs";
   import { hapticImpact } from "$lib/haptics";
-  import type { Post, StageAnnouncement } from "$lib/types";
-  import { shortId, seedOwnProfile, evictDisplayName } from "$lib/utils";
+  import { liveStages } from "$lib/stage.svelte";
+  import type { Post } from "$lib/types";
+  import { coalesce, dedupeById, mergeFirstPage, shortId } from "$lib/utils";
   import {
     useToast,
     useCopyFeedback,
@@ -22,24 +23,32 @@
     usePullToRefresh,
   } from "$lib/composables";
 
+  const PAGE_SIZE = 20;
+  // Largest number of rows one feed refresh reads again.
+  const REFRESH_MAX = 100;
+  // Interval between automatic sync requests while the window is visible: 10 minutes.
+  const AUTO_SYNC_INTERVAL_MS = 600_000;
+  // A change to visible requests a sync only if the last request is at least this old.
+  const VISIBILITY_SYNC_MIN_INTERVAL_MS = 60_000;
+  // Shortest time between two sync requests from any trigger.
+  const SYNC_REQUEST_MIN_INTERVAL_MS = 10_000;
+
   let syncing = $state(false);
+  let lastSyncRequestedAt = 0;
   let posts = $state<Post[]>([]);
-  let liveStages = $state<Map<string, StageAnnouncement>>(new Map());
   let showScrollTop = $state(false);
   let sentinel = $state<HTMLDivElement>(null!);
-  let syncFailures = $state<string[]>([]);
-  let showSyncDetails = $state(false);
-
-  const blobs = createBlobCache();
-  setBlobContext(blobs);
 
   const toast = useToast();
+  const blobs = createBlobCache({ onError: toast.show });
+  setBlobContext(blobs);
+
   const copyFb = useCopyFeedback();
   const lightbox = useLightbox();
   const del = useDeleteConfirm(async (id) => {
     try {
       await invoke("delete_post", { id });
-      await loadFeed();
+      await refreshFeed();
     } catch (e) {
       toast.show("Failed to delete post");
       console.error("Failed to delete post:", e);
@@ -52,78 +61,86 @@
       goto("/welcome");
       return;
     }
-    await seedOwnProfile(node.pubkey);
-    await loadFeed();
+    await refreshFeed();
   });
 
-  async function loadFeed() {
+  /**
+   * Read the first rows of the feed again and merge them into `posts` by id.
+   * Rows loaded by pagination beyond the refreshed range are kept.
+   */
+  const refreshFeed = coalesce(async () => {
+    const limit = Math.min(Math.max(PAGE_SIZE, posts.length), REFRESH_MAX);
     try {
-      const newPosts: Post[] = await invoke("get_feed", { limit: 20 });
-      posts = newPosts;
-      scroll.setHasMore(newPosts.length);
+      const fresh: Post[] = await invoke("get_feed", { limit });
+      const merged = mergeFirstPage(posts, fresh, limit, "desc");
+      posts = merged.items;
+      if (merged.exhausted) scroll.setNoMore();
+      else if (!merged.keptExisting) scroll.reset();
     } catch (e) {
       toast.show("Failed to load feed");
       console.error("Failed to load feed:", e);
     }
-  }
+  });
 
   const scroll = useInfiniteScroll(
     () => sentinel,
     async () => {
+      const last = posts[posts.length - 1];
+      if (!last) return false;
       try {
-        const oldest = posts[posts.length - 1];
-        const olderPosts: Post[] = await invoke("get_feed", {
-          limit: 20,
-          before: oldest.timestamp,
+        const older: Post[] = await invoke("get_feed", {
+          limit: PAGE_SIZE,
+          before: last.timestamp,
+          beforeId: last.id,
         });
-        if (olderPosts.length === 0) {
+        // The cursor row is no longer the last row: this page is outdated.
+        if (posts[posts.length - 1]?.id !== last.id) return;
+        const known = new Set(posts.map((p) => p.id));
+        const added = dedupeById(older).filter((p) => !known.has(p.id));
+        if (added.length === 0) {
           scroll.setNoMore();
-        } else {
-          posts = [...posts, ...olderPosts];
-          scroll.setHasMore(olderPosts.length);
+          return;
         }
+        posts = [...posts, ...added];
+        scroll.setHasMore(older.length);
       } catch (e) {
         toast.show("Failed to load more posts");
         console.error("Failed to load more:", e);
+        return false;
       }
     },
-    20,
+    PAGE_SIZE,
   );
 
-  async function syncAll() {
+  /**
+   * Ask the backend to sync every followed peer, then read the feed again.
+   * `sync_all_peers` returns when the request is queued, so the backend can
+   * still be syncing afterwards; posts it stores later reach the list through
+   * `feed-updated`. A call made while a request is pending, or less than
+   * `SYNC_REQUEST_MIN_INTERVAL_MS` after the last one, only reads the feed.
+   */
+  async function requestSync() {
+    if (syncing) return;
+    if (Date.now() - lastSyncRequestedAt < SYNC_REQUEST_MIN_INTERVAL_MS) {
+      await refreshFeed();
+      return;
+    }
     syncing = true;
-    syncFailures = [];
+    lastSyncRequestedAt = Date.now();
     try {
-      const follows: { pubkey: string }[] = await invoke("get_follows");
-      const results = await Promise.allSettled(
-        follows.map(async (f) => {
-          await invoke("sync_posts", { pubkey: f.pubkey });
-          return f.pubkey;
-        }),
-      );
-      const failed: string[] = [];
-      for (let i = 0; i < results.length; i++) {
-        if (results[i].status === "rejected") {
-          failed.push(follows[i].pubkey);
-        }
-      }
-      syncFailures = failed;
-      if (failed.length > 0 && failed.length < follows.length) {
-        toast.show(`Synced, but ${failed.length} peer(s) unreachable`);
-      } else if (failed.length > 0 && failed.length === follows.length) {
-        toast.show("Could not reach any peers");
-      }
-      await loadFeed();
+      await invoke("sync_all_peers");
+      await refreshFeed();
     } catch (e) {
       toast.show("Sync failed");
       console.error("Failed to sync:", e);
+    } finally {
+      syncing = false;
     }
-    syncing = false;
   }
 
   const pull = usePullToRefresh(async () => {
     hapticImpact("medium");
-    await syncAll();
+    await requestSync();
   });
 
   function handleGlobalKey(e: KeyboardEvent) {
@@ -145,7 +162,7 @@
 
   function startAutoSync() {
     if (syncInterval) return;
-    syncInterval = setInterval(() => syncAll(), 600000);
+    syncInterval = setInterval(requestSync, AUTO_SYNC_INTERVAL_MS);
   }
 
   function stopAutoSync() {
@@ -158,9 +175,11 @@
   function handleVisibility() {
     if (document.hidden) {
       stopAutoSync();
-    } else {
-      syncAll();
-      startAutoSync();
+      return;
+    }
+    startAutoSync();
+    if (Date.now() - lastSyncRequestedAt >= VISIBILITY_SYNC_MIN_INTERVAL_MS) {
+      requestSync();
     }
   }
 
@@ -172,22 +191,7 @@
     node.init();
     const cleanupListeners = useEventListeners({
       "feed-updated": () => {
-        loadFeed();
-      },
-      "profile-updated": (payload) => {
-        const pubkey = payload as string;
-        evictDisplayName(pubkey);
-        loadFeed();
-      },
-      "stage-announced": (payload) => {
-        const ann = payload as StageAnnouncement;
-        liveStages = new Map(liveStages).set(ann.stage_id, ann);
-      },
-      "stage-ended-remote": (payload) => {
-        const stageId = payload as string;
-        const next = new Map(liveStages);
-        next.delete(stageId);
-        liveStages = next;
+        refreshFeed();
       },
     });
     window.addEventListener("scroll", handleScroll);
@@ -218,6 +222,11 @@
   <div class="loading">
     <div class="spinner"></div>
     <p>Starting node...</p>
+  </div>
+{:else if node.error}
+  <div class="empty">
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
   </div>
 {:else}
   <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -256,7 +265,7 @@
       </div>
     </div>
 
-    <PostComposer pubkey={node.pubkey} onsubmitted={loadFeed} />
+    <PostComposer pubkey={node.pubkey} onsubmitted={refreshFeed} />
 
     <hr class="divider" />
 
@@ -273,7 +282,7 @@
       pubkey={node.pubkey}
       showDelete={true}
       emptyMessage="No posts yet. Write something or follow someone!"
-      onreload={loadFeed}
+      onreload={refreshFeed}
       ondelete={del.confirm}
       onlightbox={lightbox.open}
     />
@@ -286,32 +295,13 @@
       </div>
     {/if}
 
-    <button class="refresh" onclick={syncAll} disabled={syncing}>
+    <button class="refresh" onclick={requestSync} disabled={syncing}>
       {#if syncing}
         <span class="btn-spinner"></span> Syncing...
       {:else}
         Refresh
       {/if}
     </button>
-
-    {#if syncFailures.length > 0}
-      <div class="sync-failures">
-        <button
-          class="sync-failures-toggle"
-          onclick={() => (showSyncDetails = !showSyncDetails)}
-        >
-          {syncFailures.length} peer(s) unreachable
-          <span class="toggle-arrow">{showSyncDetails ? "v" : ">"}</span>
-        </button>
-        {#if showSyncDetails}
-          <ul class="sync-failures-list">
-            {#each syncFailures as peer}
-              <li><code>{shortId(peer)}</code></li>
-            {/each}
-          </ul>
-        {/if}
-      </div>
-    {/if}
   </div>
 {/if}
 
@@ -436,52 +426,6 @@
     .scroll-top {
       bottom: 1.5rem;
     }
-  }
-
-  .sync-failures {
-    margin: 0.5rem 0;
-    border: 1px solid var(--danger-bg);
-    border-radius: var(--radius-lg);
-    background: var(--danger-bg-subtle);
-    overflow: hidden;
-  }
-
-  .sync-failures-toggle {
-    width: 100%;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: none;
-    border: none;
-    color: var(--danger-text);
-    padding: 0.5rem 0.75rem;
-    font-size: var(--text-base);
-    cursor: pointer;
-  }
-
-  .sync-failures-toggle:hover {
-    background: var(--danger-bg-subtle-hover);
-  }
-
-  .toggle-arrow {
-    font-size: var(--text-sm);
-    color: var(--text-secondary);
-  }
-
-  .sync-failures-list {
-    list-style: none;
-    padding: 0 0.75rem 0.5rem;
-    margin: 0;
-  }
-
-  .sync-failures-list li {
-    font-size: var(--text-sm);
-    color: var(--text-secondary);
-    padding: 0.15rem 0;
-  }
-
-  .sync-failures-list code {
-    color: var(--color-error-light);
   }
 
   .pull-indicator {

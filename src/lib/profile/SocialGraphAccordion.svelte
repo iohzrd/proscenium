@@ -1,5 +1,6 @@
 <script lang="ts">
   import Avatar from "$lib/Avatar.svelte";
+  import { profileHref } from "$lib/profile/links";
   import type { RemoteSocialResult, RemoteFollowersResult } from "$lib/types";
   import { shortId } from "$lib/utils";
 
@@ -14,6 +15,8 @@
   let showFollowsList = $state(false);
   let showFollowersList = $state(false);
 </script>
+
+<!-- The lists below are not keyed: a peer can send the same pubkey twice. -->
 
 {#if remoteFollows || remoteFollowers}
   <div class="social-graph">
@@ -33,9 +36,9 @@
       </button>
       {#if showFollowsList && !remoteFollows.hidden}
         <ul class="social-list">
-          {#each remoteFollows.follows as f (f.pubkey)}
+          {#each remoteFollows.follows as f}
             <li>
-              <a href="/profile/{f.pubkey}" class="social-link">
+              <a href={profileHref(f.pubkey)} class="social-link">
                 <Avatar pubkey={f.pubkey} name={shortId(f.pubkey)} size={28} />
                 <span class="social-name">{shortId(f.pubkey)}</span>
               </a>
@@ -62,9 +65,9 @@
       </button>
       {#if showFollowersList && !remoteFollowers.hidden}
         <ul class="social-list">
-          {#each remoteFollowers.followers as f (f.pubkey)}
+          {#each remoteFollowers.followers as f}
             <li>
-              <a href="/profile/{f.pubkey}" class="social-link">
+              <a href={profileHref(f.pubkey)} class="social-link">
                 <Avatar pubkey={f.pubkey} name={shortId(f.pubkey)} size={28} />
                 <span class="social-name">{shortId(f.pubkey)}</span>
               </a>

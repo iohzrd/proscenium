@@ -1,20 +1,22 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import Icon from "$lib/Icon.svelte";
+  import type { StageAnnouncement } from "$lib/types";
   import { shortId } from "$lib/utils";
 
-  export interface StageAnnouncement {
-    stage_id: string;
-    title: string;
-    ticket: string;
-    host_pubkey: string;
-    started_at: number;
-  }
+  const ELAPSED_REFRESH_MS = 30_000;
 
   let { announcement }: { announcement: StageAnnouncement } = $props();
 
-  function elapsedLabel(startedAt: number): string {
-    const secs = Math.floor((Date.now() - startedAt) / 1000);
+  let now = $state(Date.now());
+
+  $effect(() => {
+    const timer = setInterval(() => (now = Date.now()), ELAPSED_REFRESH_MS);
+    return () => clearInterval(timer);
+  });
+
+  function elapsedLabel(startedAt: number, now: number): string {
+    const secs = Math.floor((now - startedAt) / 1000);
     if (secs < 60) return "just started";
     const mins = Math.floor(secs / 60);
     if (mins < 60) return `${mins}m`;
@@ -38,6 +40,7 @@
       <span class="stage-meta">
         {shortId(announcement.host_pubkey)} &middot; {elapsedLabel(
           announcement.started_at,
+          now,
         )}
       </span>
     </div>

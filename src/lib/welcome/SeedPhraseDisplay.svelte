@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { copyToClipboard } from "$lib/utils";
+  import SeedWordGrid from "./SeedWordGrid.svelte";
 
   let {
     seedPhrase,
@@ -14,40 +14,27 @@
   } = $props();
 
   let seedRevealed = $state(false);
-  let seedCopyFeedback = $state(false);
 
   let seedWords = $derived(seedPhrase ? seedPhrase.split(" ") : []);
-
-  async function copySeedPhrase() {
-    await copyToClipboard(seedPhrase);
-    seedCopyFeedback = true;
-    setTimeout(() => (seedCopyFeedback = false), 1500);
-  }
 </script>
 
 <div class="step">
   <h2>Back Up Your Recovery Phrase</h2>
   <p class="desc">
     This 24-word phrase is the only way to recover your identity. Write it down
-    and store it somewhere safe. If you lose it, your identity cannot be
-    recovered.
+    on paper and store it somewhere safe. If you lose it, your identity cannot
+    be recovered. Do not copy it to the clipboard, a screenshot or a file: other
+    applications can read those.
   </p>
 
-  {#if seedRevealed}
-    <div class="seed-grid">
-      {#each seedWords as word, i}
-        <div class="seed-word">
-          <span class="seed-num">{i + 1}</span>
-          <span class="seed-text">{word}</span>
-        </div>
-      {/each}
+  {#if seedWords.length === 0}
+    <div class="seed-hidden">
+      <p class="seed-warning">
+        The recovery phrase is not loaded. Go back and continue again.
+      </p>
     </div>
-
-    <div class="seed-actions">
-      <button class="secondary-btn" onclick={copySeedPhrase}>
-        {seedCopyFeedback ? "Copied!" : "Copy to Clipboard"}
-      </button>
-    </div>
+  {:else if seedRevealed}
+    <SeedWordGrid words={seedWords} />
   {:else}
     <div class="seed-hidden">
       <p class="seed-warning">
@@ -64,7 +51,7 @@
 
   <div class="actions">
     <button class="secondary-btn" onclick={onback}>Back</button>
-    {#if seedRevealed}
+    {#if seedRevealed && seedWords.length > 0}
       <button class="btn-accent primary-btn" onclick={onverify}>
         I've Written It Down
       </button>
@@ -94,40 +81,6 @@
     font-size: var(--text-base);
     line-height: 1.6;
     margin: 0 0 1.5rem;
-  }
-
-  .seed-grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 0.5rem;
-    margin-bottom: 1rem;
-    text-align: left;
-  }
-
-  .seed-word {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    padding: 0.4rem 0.6rem;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-  }
-
-  .seed-num {
-    color: var(--text-tertiary);
-    font-size: var(--text-xs);
-    min-width: 1.2rem;
-  }
-
-  .seed-text {
-    color: var(--text-primary);
-  }
-
-  .seed-actions {
-    margin-bottom: 1.5rem;
   }
 
   .seed-hidden {

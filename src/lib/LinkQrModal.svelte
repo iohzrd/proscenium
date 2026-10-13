@@ -1,7 +1,8 @@
 <script lang="ts">
-  import QR from "@svelte-put/qr/svg/QR.svelte";
-  import { copyToClipboard } from "$lib/utils";
+  import { invoke } from "@tauri-apps/api/core";
+  import QrCodeDialog from "$lib/QrCodeDialog.svelte";
   import type { LinkQrPayload } from "$lib/types";
+  import { copyToClipboard } from "$lib/utils";
 
   interface Props {
     payload: LinkQrPayload;
@@ -9,92 +10,90 @@
   }
 
   let { payload, onclose }: Props = $props();
-  let copyFeedback = $state(false);
 
   let qrData = $derived(JSON.stringify(payload));
+  let expiresAt = $derived(payload.expires_at);
+  let now = $state(Date.now());
+  let secondsLeft = $derived(Math.max(0, Math.ceil((expiresAt - now) / 1000)));
+
+  // A device without a camera cannot scan the code, so the payload text can
+  // be copied and pasted on the other device. The clipboard is overwritten
+  // when this dialog is destroyed (closed or expired).
+  let copied = $state(false);
+  let copyError = $state("");
 
   async function copyPayload() {
-    await copyToClipboard(qrData);
-    copyFeedback = true;
-    setTimeout(() => (copyFeedback = false), 1500);
+    copyError = "";
+    try {
+      await copyToClipboard(qrData);
+      copied = true;
+    } catch {
+      copyError = "Copy failed";
+    }
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") onclose();
-  }
+  $effect(() => {
+    return () => {
+      if (copied) copyToClipboard("").catch(() => {});
+    };
+  });
+
+  // Counts down to `expires_at`. At expiry the link session is cancelled in
+  // the backend and the dialog closes, so no expired code stays on screen.
+  $effect(() => {
+    const deadline = expiresAt;
+    const timer = setInterval(() => {
+      const current = Date.now();
+      now = current;
+      if (current < deadline) return;
+      clearInterval(timer);
+      invoke("cancel_device_link").catch((e) =>
+        console.error("Failed to cancel device link:", e),
+      );
+      onclose();
+    }, 250);
+    return () => clearInterval(timer);
+  });
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="modal-overlay" onclick={onclose} role="presentation">
-  <!-- svelte-ignore a11y_interactive_supports_focus -->
-  <div
-    class="modal link-qr-modal"
-    onclick={(e) => e.stopPropagation()}
-    role="dialog"
-    aria-label="Device link QR code"
-  >
-    <p class="qr-label">Scan with new device to pair</p>
-    <div class="qr-wrapper">
-      <QR
-        data={qrData}
-        moduleFill="#000000"
-        anchorOuterFill="#000000"
-        anchorInnerFill="#000000"
-      />
-    </div>
-    <p class="qr-hint">This code expires in 60 seconds</p>
-    <div class="qr-actions">
-      <button class="btn-elevated copy-btn" onclick={copyPayload}>
-        {copyFeedback ? "Copied!" : "Copy payload"}
-      </button>
-    </div>
-    <div class="modal-actions">
-      <button class="modal-cancel" onclick={onclose}>Cancel</button>
-    </div>
-  </div>
-</div>
+<QrCodeDialog
+  label="Device link QR code"
+  caption="Scan with new device to pair"
+  data={qrData}
+  closeLabel="Cancel"
+  {onclose}
+>
+  <p class="qr-hint">
+    This code expires in {secondsLeft}
+    {secondsLeft === 1 ? "second" : "seconds"}. Show it only to your own device:
+    it transfers your identity keys.
+  </p>
+  <button class="copy-btn" onclick={copyPayload}>
+    {copied ? "Copied" : "Copy code as text"}
+  </button>
+  <p class="qr-hint">
+    For a device without a camera: paste the text there. The clipboard is
+    cleared when this dialog closes.
+  </p>
+  {#if copyError}
+    <p class="qr-error" role="alert">{copyError}</p>
+  {/if}
+</QrCodeDialog>
 
 <style>
-  .link-qr-modal {
-    max-width: 300px;
-    text-align: center;
-  }
-
-  .qr-label {
-    color: var(--text-secondary);
-    font-size: var(--text-base);
-    margin: 0 0 1rem;
-  }
-
-  .qr-wrapper {
-    background: #ffffff;
-    border-radius: var(--radius-lg);
-    padding: 0.75rem;
-    display: inline-block;
-    margin-bottom: 0.75rem;
-    line-height: 0;
-  }
-
-  .qr-wrapper :global(svg) {
-    width: 200px;
-    height: 200px;
-  }
-
   .qr-hint {
     color: var(--text-muted);
     font-size: var(--text-sm);
     margin: 0 0 0.75rem;
   }
 
-  .qr-actions {
-    margin-bottom: 0.75rem;
+  .copy-btn {
+    margin: 0 0 0.5rem;
   }
 
-  .copy-btn {
-    border-radius: var(--radius-sm);
-    padding: 0.4rem 0.8rem;
+  .qr-error {
+    color: var(--danger-text);
     font-size: var(--text-sm);
+    margin: 0 0 0.75rem;
   }
 </style>

@@ -10,20 +10,41 @@ mod peer_delegations;
 mod posts;
 mod preferences;
 mod profiles;
-mod push;
 mod ratchet;
 mod servers;
 mod social;
+mod sync;
 #[cfg(test)]
 mod tests;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+pub use follow_requests::FollowRequestOutcome;
+pub use peer_delegations::AnnouncementOutcome;
+pub use social::RemoteListKind;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
-use std::str::FromStr;
+use std::time::Duration;
+pub use sync::TombstoneOutcome;
 
-pub struct FeedQuery {
-    pub limit: usize,
-    pub before: Option<u64>,
+/// Largest number of rows one paged query returns.
+pub const MAX_PAGE_SIZE: usize = 200;
+
+/// Keyset pagination position: `(timestamp, id)` of the last row of the previous page.
+pub type Cursor<'a> = (u64, &'a str);
+
+/// `limit` capped at `MAX_PAGE_SIZE`, as a value for a SQL `LIMIT` parameter.
+/// SQLite treats a negative `LIMIT` as no limit, so the cap also keeps the value non-negative.
+fn page_limit(limit: usize) -> i64 {
+    limit.min(MAX_PAGE_SIZE) as i64
+}
+
+/// `offset` as a value for a SQL `OFFSET` parameter.
+fn page_offset(offset: usize) -> i64 {
+    i64::try_from(offset).unwrap_or(i64::MAX)
+}
+
+/// A `u64` timestamp as a SQL integer parameter. Values above `i64::MAX` become `i64::MAX`.
+fn sql_timestamp(timestamp: u64) -> i64 {
+    i64::try_from(timestamp).unwrap_or(i64::MAX)
 }
 
 pub struct Storage {
@@ -82,14 +103,35 @@ impl Storage {
             "011_preferences",
             include_str!("../../migrations/011_preferences.sql"),
         ),
+        (
+            "012_profile_version",
+            include_str!("../../migrations/012_profile_version.sql"),
+        ),
+        (
+            "013_messaging",
+            include_str!("../../migrations/013_messaging.sql"),
+        ),
+        (
+            "014_social",
+            include_str!("../../migrations/014_social.sql"),
+        ),
+        (
+            "015_content",
+            include_str!("../../migrations/015_content.sql"),
+        ),
+        (
+            "016_devices",
+            include_str!("../../migrations/016_devices.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
-        let url = format!("sqlite:{}?mode=rwc", path.as_ref().display());
-        let opts = SqliteConnectOptions::from_str(&url)?
-            .pragma("journal_mode", "WAL")
-            .pragma("foreign_keys", "ON")
-            .pragma("busy_timeout", "5000");
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -103,7 +145,8 @@ impl Storage {
     /// Create an in-memory storage instance for testing.
     #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self, AppError> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.pragma("foreign_keys", "ON");
+        use std::str::FromStr;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -112,35 +155,32 @@ impl Storage {
         Ok(Self { pool })
     }
 
-    /// Delete all user data from every table (except schema_migrations).
+    /// Delete every row of every table except `schema_migrations`, in one transaction.
     pub async fn wipe_all_data(&self) -> Result<(), AppError> {
-        let tables = [
-            "push_outbox",
-            "dm_outbox",
-            "dm_ratchet_sessions",
-            "dm_messages",
-            "dm_conversations",
-            "notifications",
-            "interactions",
-            "posts",
-            "bookmarks",
-            "follow_requests",
-            "moderation",
-            "remote_social_meta",
-            "social_graph",
-            "peer_device_announcements",
-            "linked_devices",
-            "peer_delegations",
-            "profiles",
-            "servers",
-            "preferences",
-        ];
+        // Read before the transaction starts: its first statement must be a write, because
+        // a transaction that starts with a read fails with SQLITE_BUSY when it needs the
+        // write lock after another connection has committed.
+        let tables: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_schema
+             WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != 'schema_migrations'",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tx = self.pool.begin().await?;
+        // Foreign keys are checked at commit, when every table is empty, so the order of
+        // the deletes does not matter.
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await?;
         for table in tables {
-            let sql = format!("DELETE FROM {table}");
-            sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                .execute(&self.pool)
+            // Table names come from `sqlite_schema`, which only migrations write.
+            let sql = format!("DELETE FROM \"{}\"", table.replace('"', "\"\""));
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
                 .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -148,6 +188,7 @@ impl Storage {
         sqlx::raw_sql(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,
+                -- Unix ms
                 applied_at INTEGER NOT NULL
             )",
         )
@@ -161,16 +202,19 @@ impl Storage {
                     .fetch_one(pool)
                     .await?;
             if !already_applied {
-                println!("[storage] applying migration: {name}");
+                log::info!("[storage] applying migration: {name}");
+                // One transaction per migration: the statements and the bookkeeping row
+                // are applied together or not at all.
+                let mut tx = pool.begin().await?;
                 sqlx::raw_sql(sqlx::AssertSqlSafe(*sql))
-                    .execute(pool)
+                    .execute(&mut *tx)
                     .await?;
-                sqlx::query(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, strftime('%s', 'now'))",
-                )
-                .bind(name)
-                .execute(pool)
-                .await?;
+                sqlx::query("INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)")
+                    .bind(name)
+                    .bind(proscenium_types::now_millis() as i64)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
             }
         }
         Ok(())

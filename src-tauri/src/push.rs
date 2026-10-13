@@ -1,214 +1,234 @@
+use crate::constants::{
+    MAX_PUSH_TOMBSTONES, PEER_CLOSE_WAIT, PEER_RESPONSE_WRITE_TIMEOUT, PUSH_ACK_TIMEOUT,
+    PUSH_CONNECT_TIMEOUT,
+};
 use crate::error::AppError;
-use crate::ingest::{process_incoming_interaction, process_incoming_post};
+use crate::framing::{read_to_end_timeout, wait_closed, write_all_timeout};
+use crate::ingest::{
+    InteractionOutcome, resolve_signer, verify_and_apply_post_tombstones,
+    verify_and_store_interaction, verify_and_store_post, verify_and_store_profile,
+};
 use crate::storage::Storage;
-use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::Connection, protocol::AcceptError};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId,
+    endpoint::{Connection, SendStream},
+    protocol::AcceptError,
+};
 use proscenium_types::{
     MAX_PUSH_INTERACTIONS, MAX_PUSH_POSTS, PEER_ALPN, PeerRequest, PushAck, PushMessage,
-    Visibility, short_id, validate_profile, verify_profile_signature,
+    Visibility, is_valid_pubkey, short_id, verify_linked_devices_announcement,
 };
 use tauri::{AppHandle, Emitter};
 
-/// Connect to a peer and deliver a `PushMessage`. Returns the peer's `PushAck`.
-/// Caller should treat errors as "peer offline" and not retry — sync is the reliable path.
+/// Largest `PushAck` a sender accepts: the ids of `MAX_PUSH_POSTS` posts and
+/// `MAX_PUSH_INTERACTIONS` interactions.
+const MAX_PUSH_ACK_BYTES: usize = 16 * 1024;
+
+fn reject(reason: &'static str) -> AcceptError {
+    AcceptError::from_err(std::io::Error::other(reason))
+}
+
+/// Connect to the NodeId `target` and deliver `msg`. Returns the peer's `PushAck`.
+///
+/// Connect, request write and ack read each have a timeout. An error means the message
+/// was not acknowledged; the recipient obtains the content at its next sync.
 pub async fn push_to_peer(
     endpoint: &Endpoint,
     target: EndpointId,
     msg: &PushMessage,
 ) -> Result<PushAck, AppError> {
-    let addr = EndpointAddr::from(target);
     let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        endpoint.connect(addr, PEER_ALPN),
+        PUSH_CONNECT_TIMEOUT,
+        endpoint.connect(EndpointAddr::from(target), PEER_ALPN),
     )
     .await
     .map_err(|_| AppError::Other("push connect timeout".into()))??;
 
-    let (mut send, mut recv) = conn.open_bi().await?;
+    let (mut send, mut recv) = tokio::time::timeout(PUSH_CONNECT_TIMEOUT, conn.open_bi())
+        .await
+        .map_err(|_| AppError::Other("push stream open timeout".into()))??;
 
-    let req_bytes = serde_json::to_vec(&PeerRequest::Push(msg.clone()))?;
-    send.write_all(&req_bytes).await?;
-    send.finish()?;
+    let req_bytes = serde_json::to_vec(&PeerRequest::Push(Box::new(msg.clone())))?;
+    write_all_timeout(&mut send, &req_bytes, PUSH_ACK_TIMEOUT).await?;
 
-    let ack_bytes =
-        tokio::time::timeout(std::time::Duration::from_secs(10), recv.read_to_end(65536))
-            .await
-            .map_err(|_| AppError::Other("push ack timeout".into()))??;
+    let ack_bytes = read_to_end_timeout(&mut recv, MAX_PUSH_ACK_BYTES, PUSH_ACK_TIMEOUT).await?;
     let ack: PushAck = serde_json::from_slice(&ack_bytes)?;
 
     conn.close(0u32.into(), b"done");
     Ok(ack)
 }
 
-/// Server-side push handler, dispatched from the unified PeerHandler.
-/// The initial PeerRequest::Push has already been read and parsed.
+/// Accept side of a push, dispatched from `PeerHandler::accept` after the
+/// `PeerRequest::Push` request was read and parsed.
+///
+/// Content is accepted only if the local user follows `msg.author` (and, with Private
+/// visibility, `msg.author` is also an approved follower), the sending NodeId is in the
+/// author's stored device list, and a signing key is cached for the author.
 pub async fn handle_push(
     storage: &Storage,
-    node_id: &str,
+    my_pubkey: &str,
     remote_str: &str,
     app_handle: &AppHandle,
-    mut send: iroh::endpoint::SendStream,
+    mut send: SendStream,
     msg: PushMessage,
     conn: &Connection,
 ) -> Result<(), AcceptError> {
-    // Resolve transport NodeId to master pubkey for access control
-    let remote_pubkey = storage
-        .get_master_pubkey_for_transport(remote_str)
-        .await
-        .unwrap_or_else(|| remote_str.to_string());
-
-    // Validate author matches the resolved master pubkey
-    if msg.author != remote_pubkey {
-        log::warn!(
-            "[push-rx] author mismatch: msg.author={}, remote={}",
-            short_id(&msg.author),
-            short_id(&remote_pubkey)
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "author mismatch",
-        )));
+    if !is_valid_pubkey(&msg.author) || msg.author == my_pubkey {
+        return Err(reject("invalid push author"));
     }
+    if msg.posts.len() > MAX_PUSH_POSTS
+        || msg.interactions.len() > MAX_PUSH_INTERACTIONS
+        || msg.tombstones.len() > MAX_PUSH_TOMBSTONES
+    {
+        log::warn!(
+            "[push-rx] oversized push from {}: {} posts, {} interactions, {} tombstones",
+            short_id(remote_str),
+            msg.posts.len(),
+            msg.interactions.len(),
+            msg.tombstones.len(),
+        );
+        return Err(reject("too many items"));
+    }
+    let author = msg.author.as_str();
 
-    // Verify the sender is someone we expect content from
-    let my_visibility = storage
-        .get_visibility(node_id)
+    // Content is accepted only from a user the local user follows.
+    let visibility = storage
+        .get_visibility(my_pubkey)
         .await
-        .unwrap_or(Visibility::Public);
-
-    let allowed = match my_visibility {
-        Visibility::Public | Visibility::Listed => {
-            storage
-                .is_follower(node_id, &remote_pubkey)
-                .await
-                .unwrap_or(false)
-                || storage
-                    .get_follows(node_id)
-                    .await
-                    .map(|f| f.iter().any(|e| e.pubkey == remote_pubkey))
-                    .unwrap_or(false)
-        }
-        Visibility::Private => storage
-            .is_mutual(node_id, &remote_pubkey)
-            .await
-            .unwrap_or(false),
-    };
-
+        .map_err(AcceptError::from_err)?;
+    let allowed = match visibility {
+        Visibility::Public | Visibility::Listed => storage.is_following(my_pubkey, author).await,
+        Visibility::Private => storage.is_mutual(my_pubkey, author).await,
+    }
+    .map_err(AcceptError::from_err)?;
     if !allowed {
         log::warn!(
-            "[push-rx] rejecting push from {} (not authorized)",
-            short_id(&remote_pubkey)
+            "[push-rx] rejecting push for {} from {} (not authorized)",
+            short_id(author),
+            short_id(remote_str)
         );
-        return Err(AcceptError::from_err(std::io::Error::other("unauthorized")));
+        return Err(reject("unauthorized"));
     }
 
-    // Enforce batch size limits
-    if msg.posts.len() > MAX_PUSH_POSTS {
-        log::warn!(
-            "[push-rx] too many posts: {} (max {})",
-            msg.posts.len(),
-            MAX_PUSH_POSTS
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "too many posts",
-        )));
-    }
-    if msg.interactions.len() > MAX_PUSH_INTERACTIONS {
-        log::warn!(
-            "[push-rx] too many interactions: {} (max {})",
-            msg.interactions.len(),
-            MAX_PUSH_INTERACTIONS
-        );
-        return Err(AcceptError::from_err(std::io::Error::other(
-            "too many interactions",
-        )));
-    }
-
-    let mut received_post_ids = Vec::new();
-    let mut received_interaction_ids = Vec::new();
-
-    // Process posts
-    for post in &msg.posts {
-        if post.author != remote_pubkey {
-            continue;
+    // The author's signed device list carries its current delegation and device NodeIds.
+    // It is stored before the sender and the content are checked, so a push sent after a
+    // signing key rotation or from a newly linked device verifies.
+    if let Some(announcement) = &msg.announcement {
+        if announcement.master_pubkey != author {
+            return Err(reject("announcement of another user"));
         }
-        if storage.is_hidden(&remote_pubkey).await.unwrap_or(false) {
-            continue;
-        }
-        if process_incoming_post(storage, post, "push-rx", node_id, app_handle).await {
-            received_post_ids.push(post.id.clone());
-        }
-    }
-
-    // Process interactions
-    for interaction in &msg.interactions {
-        if interaction.author != remote_pubkey {
-            continue;
-        }
-        if storage.is_hidden(&remote_pubkey).await.unwrap_or(false) {
-            continue;
-        }
-        process_incoming_interaction(
-            storage,
-            interaction,
-            &remote_pubkey,
-            "push-rx",
-            node_id,
-            app_handle,
-        )
-        .await;
-        received_interaction_ids.push(interaction.id.clone());
-    }
-
-    // Process profile update
-    if let Some(profile) = &msg.profile {
-        if let Err(reason) = validate_profile(profile) {
-            log::error!(
-                "[push-rx] rejected profile from {}: {reason}",
-                short_id(&remote_pubkey)
-            );
-        } else {
-            // Verify profile signature if we have a cached signing key
-            let signer_ok = match storage.get_peer_signing_pubkey(&remote_pubkey).await {
-                Ok(Some(signing_pubkey)) => match signing_pubkey.parse::<iroh::PublicKey>() {
-                    Ok(pk) => verify_profile_signature(profile, &pk).is_ok(),
-                    Err(_) => true, // bad cached key, allow through
-                },
-                _ => true, // no delegation cached, allow through (backward compat)
-            };
-            if !signer_ok {
+        match verify_linked_devices_announcement(announcement) {
+            Ok(()) => {
+                if let Err(e) = storage.cache_peer_announcement(announcement).await {
+                    log::warn!(
+                        "[push-rx] rejected device announcement of {}: {e}",
+                        short_id(author)
+                    );
+                }
+            }
+            Err(reason) => {
                 log::warn!(
-                    "[push-rx] bad profile signature from {}",
-                    short_id(&remote_pubkey)
+                    "[push-rx] invalid device announcement of {}: {reason}",
+                    short_id(author)
                 );
-            } else if let Err(e) = storage.save_profile(&remote_pubkey, profile).await {
-                log::error!("[push-rx] failed to store profile: {e}");
-            } else {
-                let _ = app_handle.emit("profile-updated", remote_pubkey.as_str());
+                return Err(reject("invalid announcement"));
             }
         }
     }
 
-    if !received_post_ids.is_empty() || !received_interaction_ids.is_empty() {
-        let _ = app_handle.emit("feed-updated", ());
+    // The sending NodeId must be one of the author's devices.
+    let sender = storage
+        .try_get_master_pubkey_for_transport(remote_str)
+        .await
+        .map_err(AcceptError::from_err)?;
+    if sender.as_deref() != Some(author) {
+        log::warn!(
+            "[push-rx] NodeId {} is not a device of {}",
+            short_id(remote_str),
+            short_id(author)
+        );
+        return Err(reject("author mismatch"));
+    }
+
+    let mut ack = PushAck {
+        received_post_ids: Vec::new(),
+        received_interaction_ids: Vec::new(),
+    };
+
+    // A muted author is still followed; its content is not stored.
+    let hidden = storage
+        .is_hidden(author)
+        .await
+        .map_err(AcceptError::from_err)?;
+    let signer = resolve_signer(storage, author).await;
+    if signer.is_none() {
+        log::warn!(
+            "[push-rx] no cached signing key for {}, content not stored",
+            short_id(author)
+        );
+    }
+
+    if !hidden && let Some(signer) = signer {
+        let removed =
+            verify_and_apply_post_tombstones(storage, author, &msg.tombstones, &signer, "push-rx")
+                .await
+                .posts_removed;
+
+        for post in &msg.posts {
+            if post.author == author
+                && verify_and_store_post(storage, post, &signer, "push-rx", my_pubkey, app_handle)
+                    .await
+            {
+                ack.received_post_ids.push(post.id.clone());
+            }
+        }
+
+        for interaction in &msg.interactions {
+            let outcome = verify_and_store_interaction(
+                storage,
+                interaction,
+                author,
+                &signer,
+                "push-rx",
+                my_pubkey,
+                app_handle,
+            )
+            .await;
+            if outcome == InteractionOutcome::Stored {
+                ack.received_interaction_ids.push(interaction.id.clone());
+            }
+        }
+
+        if let Some(profile) = &msg.profile {
+            match verify_and_store_profile(storage, author, profile, &signer).await {
+                Ok(true) => {
+                    let _ = app_handle.emit("profile-updated", author);
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("[push-rx] rejected profile from {}: {e}", short_id(author)),
+            }
+        }
+
+        if removed > 0
+            || !ack.received_post_ids.is_empty()
+            || !ack.received_interaction_ids.is_empty()
+        {
+            let _ = app_handle.emit("feed-updated", ());
+        }
     }
 
     log::info!(
-        "[push-rx] processed {} posts, {} interactions from {}",
-        received_post_ids.len(),
-        received_interaction_ids.len(),
-        short_id(&remote_pubkey)
+        "[push-rx] stored {} posts, {} interactions from {}",
+        ack.received_post_ids.len(),
+        ack.received_interaction_ids.len(),
+        short_id(author)
     );
 
-    // Send ack
-    let ack = PushAck {
-        received_post_ids,
-        received_interaction_ids,
-    };
     let ack_bytes = serde_json::to_vec(&ack).map_err(AcceptError::from_err)?;
-    send.write_all(&ack_bytes)
+    write_all_timeout(&mut send, &ack_bytes, PEER_RESPONSE_WRITE_TIMEOUT)
         .await
         .map_err(AcceptError::from_err)?;
-    send.finish().map_err(AcceptError::from_err)?;
 
-    conn.closed().await;
+    wait_closed(conn, PEER_CLOSE_WAIT).await;
     Ok(())
 }

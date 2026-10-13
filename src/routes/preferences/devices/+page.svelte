@@ -1,11 +1,13 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import LinkQrModal from "$lib/LinkQrModal.svelte";
   import LinkScannerModal from "$lib/LinkScannerModal.svelte";
   import Timeago from "$lib/Timeago.svelte";
+  import { useEventListeners } from "$lib/composables";
   import type { DeviceEntry, LinkQrPayload } from "$lib/types";
+  import { shortId } from "$lib/utils";
+  import ConfirmDialog from "../../ConfirmDialog.svelte";
 
   let devices = $state<DeviceEntry[]>([]);
   let loading = $state(true);
@@ -16,22 +18,28 @@
   let linkPayload = $state<LinkQrPayload | null>(null);
   let showScanner = $state(false);
   let linking = $state(false);
+  // Link code read by the scanner, waiting for confirmation.
+  let pendingLink = $state<LinkQrPayload | null>(null);
+  // True if linking would discard an identity that has a profile and whose
+  // recovery phrase is not marked as backed up. Then the dialog requires
+  // `lossAcknowledged`.
+  let unrecoverable = $state(true);
+  let lossAcknowledged = $state(false);
 
   async function loadDevices() {
     try {
       devices = await invoke<DeviceEntry[]>("get_linked_devices");
     } catch (e) {
+      error = `Failed to load devices: ${e}`;
       console.error("Failed to load devices:", e);
     }
     loading = false;
   }
 
-  async function startLink(transferMasterKey: boolean) {
+  async function startLink() {
     error = null;
     try {
-      linkPayload = await invoke<LinkQrPayload>("start_device_link", {
-        transferMasterKey,
-      });
+      linkPayload = await invoke<LinkQrPayload>("start_device_link");
       showLinkQr = true;
     } catch (e) {
       error = `Failed to start link: ${e}`;
@@ -48,50 +56,72 @@
     }
   }
 
+  /** Keep the scanned code for the confirmation dialog; nothing is linked yet. */
   async function handleScanned(payload: LinkQrPayload) {
     showScanner = false;
+    error = null;
+    lossAcknowledged = false;
+    try {
+      const [backedUp, profile] = await Promise.all([
+        invoke<boolean>("is_seed_phrase_backed_up"),
+        invoke<unknown>("get_my_profile"),
+      ]);
+      unrecoverable = !backedUp && profile !== null;
+    } catch {
+      unrecoverable = true;
+    }
+    pendingLink = payload;
+  }
+
+  async function confirmLink() {
+    const payload = pendingLink;
+    if (!payload || linking) return;
+    pendingLink = null;
+    if (payload.expires_at <= Date.now()) {
+      error = "The link code expired. Generate a new code on the other device.";
+      return;
+    }
     linking = true;
     error = null;
     linkStatus = "Connecting to device...";
     try {
       await invoke("link_with_device", { qrPayload: payload });
-      linkStatus =
-        "Device linked successfully! Restart the app to use the new identity.";
-      await loadDevices();
     } catch (e) {
-      error = `Link failed: ${e}`;
       linkStatus = null;
+      linking = false;
+      // "cancelled": the native confirmation was declined. Nothing was replaced.
+      if (String(e) !== "cancelled") error = `Link failed: ${e}`;
+      return;
     }
-    linking = false;
+    // The backend replaced the local identity. The layout and every page hold
+    // the previous pubkey and Node ID, so load the webview again.
+    location.reload();
   }
 
   onMount(() => {
     loadDevices();
 
-    const unlisten = listen("device-link-progress", (event) => {
-      const stage = event.payload as string;
-      if (stage === "bundle_sent") {
-        showLinkQr = false;
-        linkPayload = null;
-        linkStatus = "Link bundle sent to new device.";
-        loadDevices();
-      }
+    return useEventListeners({
+      "device-link-progress": (payload) => {
+        if (payload === "bundle_sent") {
+          showLinkQr = false;
+          linkPayload = null;
+          linkStatus = "Link bundle sent to new device.";
+          loadDevices();
+        }
+      },
     });
-
-    return () => {
-      unlisten.then((fn) => fn());
-    };
   });
 </script>
 
 <h2>Linked Devices</h2>
 
 {#if error}
-  <p class="error-msg">{error}</p>
+  <p class="error-msg" role="alert">{error}</p>
 {/if}
 
 {#if linkStatus}
-  <p class="status-msg">{linkStatus}</p>
+  <p class="status-msg" role="status">{linkStatus}</p>
 {/if}
 
 <section class="devices-section">
@@ -114,6 +144,7 @@
               stroke-width="2"
               stroke-linecap="round"
               stroke-linejoin="round"
+              aria-hidden="true"
             >
               <rect x="5" y="2" width="14" height="20" rx="2" ry="2" />
               <line x1="12" y1="18" x2="12.01" y2="18" />
@@ -152,35 +183,20 @@
       <h4>Enroll a new device</h4>
       <p class="link-card-desc">
         Generate a QR code on this device, then scan it on the new device. The
-        new device will be able to post, interact, and message as you.
+        new device receives the master key of this identity and can post,
+        interact, message, and enroll further devices as you. Show the code only
+        to a device you control.
       </p>
-      <button
-        class="btn-accent"
-        onclick={() => startLink(false)}
-        disabled={linking}
-      >
+      <button class="btn-accent" onclick={startLink} disabled={linking}>
         Generate link code
       </button>
-      <details class="master-key-details">
-        <summary>Advanced: transfer master key</summary>
-        <p class="link-card-hint">
-          The master key controls identity management (enrolling more devices,
-          key rotation). Only transfer it to a device you fully trust.
-        </p>
-        <button
-          class="btn-elevated"
-          onclick={() => startLink(true)}
-          disabled={linking}
-        >
-          Generate link code (with master key)
-        </button>
-      </details>
     </div>
 
     <div class="link-card">
       <h4>Join from another device</h4>
       <p class="link-card-desc">
-        Scan or paste the link code shown on your existing device.
+        Scan or paste the link code shown on your existing device. The identity
+        and all data stored on this device are replaced.
       </p>
       <button
         class="btn-accent"
@@ -202,6 +218,35 @@
     onscanned={handleScanned}
     onclose={() => (showScanner = false)}
   />
+{/if}
+
+{#if pendingLink}
+  <ConfirmDialog
+    label="Replace the identity on this device"
+    confirmLabel="Replace identity"
+    wide
+    confirmDisabled={unrecoverable && !lossAcknowledged}
+    onconfirm={confirmLink}
+    oncancel={() => (pendingLink = null)}
+  >
+    <p>
+      Linking replaces the identity on this device with the identity of the
+      device with Node ID <code>{shortId(pendingLink.node_id)}</code>.
+    </p>
+    <p>
+      The keys, posts, messages and follows stored on this device are deleted.
+    </p>
+    {#if unrecoverable}
+      <p class="link-warning">
+        The recovery phrase of the current identity is not marked as backed up.
+        Without it, the current identity cannot be restored after linking.
+      </p>
+      <label class="link-ack">
+        <input type="checkbox" bind:checked={lossAcknowledged} />
+        I understand that the current identity will be lost.
+      </label>
+    {/if}
+  </ConfirmDialog>
 {/if}
 
 <style>
@@ -350,28 +395,16 @@
     margin: 0 0 0.75rem;
   }
 
-  .link-card-buttons {
+  .link-warning {
+    color: var(--color-warning);
+  }
+
+  .link-ack {
     display: flex;
+    align-items: flex-start;
     gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-
-  .link-card-hint {
-    color: var(--text-muted);
-    font-size: var(--text-xs);
-    margin: 0.5rem 0 0.75rem;
-    line-height: 1.4;
-  }
-
-  .master-key-details {
-    margin-top: 0.75rem;
+    margin: 0 0 1rem;
     font-size: var(--text-sm);
-    color: var(--text-secondary);
-  }
-
-  .master-key-details summary {
     cursor: pointer;
-    color: var(--text-muted);
-    font-size: var(--text-xs);
   }
 </style>

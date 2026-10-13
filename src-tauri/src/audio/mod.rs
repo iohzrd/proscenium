@@ -2,14 +2,17 @@ pub mod aec;
 pub mod android;
 pub mod capture;
 pub mod codec;
+mod device;
+pub mod mic;
 pub mod playback;
 pub mod transport;
 
-pub use aec::EchoCanceller;
-pub use capture::{AudioCapture, SharedCapture};
+pub use capture::SharedCapture;
 pub use codec::{FRAME_SIZE, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME};
+pub use device::lock;
+pub use mic::{MicConfig, PCM_CHANNEL_CAPACITY, spawn_mic_thread};
 pub use playback::{AudioPlayback, SharedPlayback};
-pub use transport::{TAG_NORMAL, read_audio_frame, write_audio_frame};
+pub use transport::{TAG_CHECKPOINT, TAG_NORMAL, WireFrame, read_audio_frame, write_audio_frame};
 
 use capture::device_name;
 use cpal::traits::HostTrait;

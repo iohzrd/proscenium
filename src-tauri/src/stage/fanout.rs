@@ -1,7 +1,12 @@
 use crate::audio::write_audio_frame;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+/// A subscriber whose stream accepts no frame for this long is removed.
+const SUBSCRIBER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A single Opus audio frame forwarded to all subscribers.
 #[derive(Clone, Debug)]
@@ -15,27 +20,31 @@ pub struct AudioFrame {
     pub payload: Arc<Vec<u8>>,
 }
 
-/// Fan-out: distributes a mixed audio stream to an arbitrary number of
-/// downstream listeners via `tokio::sync::broadcast`.
+/// Fan-out: distributes one audio stream to its subscribers via `tokio::sync::broadcast`.
 ///
-/// Not an actor — `broadcast::Sender` is already non-blocking and lock-free.
+/// Not an actor: `broadcast::Sender::send` neither blocks nor locks across an await.
 /// Each subscriber gets its own task that writes frames to a QUIC send stream.
 pub struct Fanout {
     tx: broadcast::Sender<AudioFrame>,
 }
 
+impl Default for Fanout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Fanout {
     /// Create a new Fanout with a 50-frame buffer (~1 second of audio at 20ms/frame).
-    /// Lagging subscribers skip to the latest frame, which is correct for
-    /// real-time audio (old frames are useless).
+    /// A subscriber that falls more than 50 frames behind skips to the oldest buffered
+    /// frame; its receiver sees a gap in the frame sequence.
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(50);
         Self { tx }
     }
 
-    /// Send an authenticated frame to all active subscribers.
-    /// Non-blocking — never fails even if there are no subscribers or a
-    /// subscriber's buffer is full (laggards are silently dropped).
+    /// Send a frame to all active subscribers. Returns at once; a frame sent while
+    /// there is no subscriber is discarded.
     pub fn send_frame(&self, seq: u32, timestamp: u32, tag: u8, payload: Vec<u8>) {
         let frame = AudioFrame {
             seq,
@@ -43,58 +52,52 @@ impl Fanout {
             tag,
             payload: Arc::new(payload),
         };
-        // Ignore SendError (no subscribers) — normal at start/end of room.
+        // SendError means there is no subscriber, which is normal at start/end of room.
         let _ = self.tx.send(frame);
     }
 
     /// Subscribe a downstream QUIC send stream to this fanout.
     ///
-    /// Spawns a task that writes frames to `stream` until the stream closes,
-    /// the returned token is cancelled (evict one subscriber), or `stage_cancel`
-    /// fires (shut down all subscribers with the stage). Always pass the stage's
-    /// `CancellationToken` as `stage_cancel` so all subscribers are cleaned up
-    /// together on stage teardown.
+    /// Spawns a task that writes frames to `stream` until a write fails or takes longer
+    /// than `SUBSCRIBER_WRITE_TIMEOUT`, `cancel` is cancelled, or the fanout is dropped.
+    /// The returned handle completes when that task ends.
     pub fn add_subscriber(
         &self,
         mut stream: iroh::endpoint::SendStream,
-        stage_cancel: &CancellationToken,
-    ) -> CancellationToken {
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
         let mut rx = self.tx.subscribe();
-        let cancel = stage_cancel.child_token();
-        let token = cancel.clone();
 
         tokio::spawn(async move {
             loop {
+                let frame = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    result = rx.recv() => match result {
+                        Ok(frame) => frame,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            log::debug!("[fanout] subscriber lagged, skipped {n} frames");
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                };
+                let write = write_audio_frame(
+                    &mut stream,
+                    frame.seq,
+                    frame.timestamp,
+                    frame.tag,
+                    &frame.payload,
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    result = rx.recv() => {
-                        match result {
-                            Ok(frame) => {
-                                if write_audio_frame(
-                                    &mut stream,
-                                    frame.seq,
-                                    frame.timestamp,
-                                    frame.tag,
-                                    &frame.payload,
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    break; // stream dead
-                                }
-                            }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                log::debug!("[fanout] subscriber lagged {n} frames — skipping");
-                                // Skip to latest — correct for real-time audio
-                            }
-                            Err(broadcast::error::RecvError::Closed) => break,
+                    result = tokio::time::timeout(SUBSCRIBER_WRITE_TIMEOUT, write) => {
+                        if !matches!(result, Ok(Ok(()))) {
+                            break; // stream closed or stalled
                         }
                     }
                 }
             }
             let _ = stream.finish();
-        });
-
-        token
+        })
     }
 }

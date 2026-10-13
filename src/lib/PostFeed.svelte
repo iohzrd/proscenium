@@ -26,51 +26,70 @@
     onlightbox: (src: string, alt: string, att: MediaAttachment) => void;
   } = $props();
 
-  let replyingTo = $state<Post | null>(null);
-  let quotingPost = $state<Post | null>(null);
+  // The open inline composer: `cardId` is the feed entry it is shown under,
+  // `target` the post it replies to or quotes (the quoted post for a
+  // repost-only entry).
+  type Composing = { kind: "reply" | "quote"; cardId: string; target: Post };
+  let composing = $state.raw<Composing | null>(null);
+
+  function toggleComposer(
+    kind: Composing["kind"],
+    cardId: string,
+    target: Post,
+  ) {
+    composing =
+      composing?.kind === kind && composing.cardId === cardId
+        ? null
+        : { kind, cardId, target };
+  }
+
+  // Rendering a list with a repeated key throws; keep the first of each id.
+  let uniquePosts = $derived.by(() => {
+    const seen = new Set<string>();
+    return posts.filter((p) => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return true;
+    });
+  });
 </script>
 
 <div class="feed">
-  {#each posts as post (post.id)}
+  {#each uniquePosts as post (post.id)}
     <PostCard
       {post}
       {pubkey}
       {showAuthor}
       {showDelete}
       {showReplyContext}
-      onreply={(p) => {
-        replyingTo = replyingTo?.id === p.id ? null : p;
-        quotingPost = null;
-      }}
+      onreply={(target) => toggleComposer("reply", post.id, target)}
       {ondelete}
-      onquote={(p) => {
-        quotingPost = quotingPost?.id === p.id ? null : p;
-        replyingTo = null;
-      }}
+      onquote={(target) => toggleComposer("quote", post.id, target)}
       {onlightbox}
     />
-    {#if replyingTo?.id === post.id}
-      <ReplyComposer
-        replyToId={post.id}
-        replyToAuthor={post.author}
-        {pubkey}
-        onsubmitted={() => {
-          replyingTo = null;
-          onreload?.();
-        }}
-        oncancel={() => (replyingTo = null)}
-      />
-    {/if}
-    {#if quotingPost?.id === post.id}
-      <QuoteComposer
-        quotedPost={post}
-        {pubkey}
-        onsubmitted={() => {
-          quotingPost = null;
-          onreload?.();
-        }}
-        oncancel={() => (quotingPost = null)}
-      />
+    {#if composing?.cardId === post.id}
+      {#if composing.kind === "reply"}
+        <ReplyComposer
+          replyToId={composing.target.id}
+          replyToAuthor={composing.target.author}
+          {pubkey}
+          onsubmitted={() => {
+            composing = null;
+            onreload?.();
+          }}
+          oncancel={() => (composing = null)}
+        />
+      {:else}
+        <QuoteComposer
+          quotedPost={composing.target}
+          {pubkey}
+          onsubmitted={() => {
+            composing = null;
+            onreload?.();
+          }}
+          oncancel={() => (composing = null)}
+        />
+      {/if}
     {/if}
   {:else}
     <p class="empty">{emptyMessage}</p>

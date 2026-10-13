@@ -21,9 +21,13 @@ export function useMentionAutocomplete(
   }
 
   function insertMention(pubkey: string) {
-    const textarea = document.querySelector(
-      textareaSelector,
-    ) as HTMLTextAreaElement;
+    const textarea =
+      document.querySelector<HTMLTextAreaElement>(textareaSelector);
+    if (!textarea) {
+      active = false;
+      query = "";
+      return;
+    }
     const cursorPos = textarea.selectionStart;
     const content = getContent();
     const textBeforeCursor = content.slice(0, cursorPos);

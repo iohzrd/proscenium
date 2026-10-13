@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { MediaAttachment } from "$lib/types";
   import { getBlobContext } from "$lib/blobs";
+  import { focusTrap } from "$lib/composables";
   import { showContextMenu } from "$lib/context-menu";
 
   interface Props {
@@ -17,28 +18,39 @@
     if (e.key === "Escape") onclose();
   }
 
+  function handleOverlayClick(e: MouseEvent) {
+    if (e.target === e.currentTarget) onclose();
+  }
+
   function handleContextMenu(e: MouseEvent) {
-    if (!attachment) return;
+    const att = attachment;
+    if (!att) return;
     showContextMenu(e, [
-      { text: "Save Image As...", action: () => saveFileAs(attachment!) },
-    ]);
+      { text: "Save Image As...", action: () => saveFileAs(att) },
+    ]).catch((err) => console.error("Failed to show context menu:", err));
   }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
-<!-- svelte-ignore a11y_click_events_have_key_events -->
-<div class="lightbox-overlay" onclick={onclose} role="presentation">
-  <button class="lightbox-close" onclick={onclose} aria-label="Close lightbox">
-    &times;
-  </button>
-  <img
-    {src}
-    {alt}
-    class="lightbox-img"
-    onclick={(e) => e.stopPropagation()}
-    oncontextmenu={handleContextMenu}
-  />
+<div class="lightbox-overlay" onclick={handleOverlayClick} role="presentation">
+  <div
+    class="lightbox-dialog"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Image viewer"
+    tabindex="-1"
+    use:focusTrap
+  >
+    <button
+      class="lightbox-close"
+      onclick={onclose}
+      aria-label="Close lightbox"
+    >
+      &times;
+    </button>
+    <img {src} {alt} class="lightbox-img" oncontextmenu={handleContextMenu} />
+  </div>
 </div>
 
 <style>
@@ -51,6 +63,17 @@
     justify-content: center;
     z-index: var(--z-lightbox);
     cursor: pointer;
+  }
+
+  /* Not positioned: the close button is placed relative to the overlay, and
+     the box is as large as the image, so a click beside it reaches the overlay. */
+  .lightbox-dialog {
+    display: flex;
+    cursor: default;
+  }
+
+  .lightbox-dialog:focus {
+    outline: none;
   }
 
   .lightbox-close {

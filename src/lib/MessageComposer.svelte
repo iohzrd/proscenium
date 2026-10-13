@@ -1,8 +1,15 @@
 <script lang="ts">
-  import { platform } from "@tauri-apps/plugin-os";
-  import type { PendingAttachment, MediaAttachment } from "$lib/types";
-  import { isImage, uploadFiles } from "$lib/utils";
-  import { autogrow } from "$lib/composables";
+  import { onDestroy } from "svelte";
+  import type { MediaAttachment } from "$lib/types";
+  import { MAX_ATTACHMENTS, isImage } from "$lib/utils";
+  import { autogrow, useFileUpload } from "$lib/composables";
+  import {
+    MAX_CONTENT_BYTES,
+    isMobilePlatform,
+    isSubmitEnter,
+    toMediaAttachments,
+    utf8Length,
+  } from "$lib/messages/compose";
 
   let {
     onsubmit,
@@ -12,78 +19,67 @@
     oninput?: () => void;
   } = $props();
 
-  const isMobile = platform() === "android" || platform() === "ios";
+  const isMobile = isMobilePlatform();
+  const upload = useFileUpload();
+
   let messageText = $state("");
   let sending = $state(false);
   let sendError = $state("");
-  let attachments = $state<PendingAttachment[]>([]);
-  let uploading = $state(false);
+  let sendErrorTimer: ReturnType<typeof setTimeout> | undefined;
   let fileInput = $state<HTMLInputElement>(null!);
   let cameraInput = $state<HTMLInputElement>(null!);
 
-  async function handleFiles(e: Event) {
-    const input = e.target as HTMLInputElement;
-    const files = input.files;
-    if (!files || files.length === 0) return;
-    uploading = true;
-    try {
-      const uploaded = await uploadFiles(files);
-      attachments = [...attachments, ...uploaded];
-    } catch (e) {
-      console.error("Failed to upload files:", e);
-    }
-    uploading = false;
-    input.value = "";
-  }
-
-  function removeAttachment(index: number) {
-    const removed = attachments[index];
-    if (removed) URL.revokeObjectURL(removed.previewUrl);
-    attachments = attachments.filter((_, i) => i !== index);
-  }
+  let trimmed = $derived(messageText.trim());
+  let contentBytes = $derived(utf8Length(trimmed));
+  let overLimit = $derived(contentBytes > MAX_CONTENT_BYTES);
+  let tooManyAttachments = $derived(
+    upload.attachments.length > MAX_ATTACHMENTS,
+  );
+  // No attachment is added while a message is being sent: `upload.clear()`
+  // runs when it succeeds, and an upload that completes later would be
+  // appended to the emptied composer.
+  let canAttach = $derived(
+    !sending &&
+      !upload.uploading &&
+      upload.attachments.length < MAX_ATTACHMENTS,
+  );
+  let canSend = $derived(
+    !sending &&
+      !upload.uploading &&
+      !overLimit &&
+      !tooManyAttachments &&
+      (trimmed.length > 0 || upload.attachments.length > 0),
+  );
 
   async function send() {
-    const text = messageText.trim();
-    if ((!text && attachments.length === 0) || sending) return;
+    if (!canSend) return;
     sending = true;
     sendError = "";
+    clearTimeout(sendErrorTimer);
     try {
-      const media =
-        attachments.length > 0
-          ? attachments.map(({ hash, ticket, mime_type, filename, size }) => ({
-              hash,
-              ticket,
-              mime_type,
-              filename,
-              size,
-            }))
-          : null;
-      await onsubmit(text, media);
+      const media = toMediaAttachments(upload.attachments);
+      await onsubmit(trimmed, media.length > 0 ? media : null);
       messageText = "";
-      for (const a of attachments) URL.revokeObjectURL(a.previewUrl);
-      attachments = [];
+      upload.clear();
     } catch (e) {
-      console.error("Failed to send message:", e);
       sendError = String(e);
-      setTimeout(() => (sendError = ""), 5000);
+      sendErrorTimer = setTimeout(() => (sendError = ""), 5000);
     }
     sending = false;
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (isSubmitEnter(e, isMobile)) {
       e.preventDefault();
       send();
     }
   }
 
-  function handleInput() {
-    oninput?.();
+  export function revokeAttachments() {
+    upload.revokeAll();
   }
 
-  export function revokeAttachments() {
-    for (const a of attachments) URL.revokeObjectURL(a.previewUrl);
-  }
+  onDestroy(() => clearTimeout(sendErrorTimer));
 </script>
 
 <input
@@ -91,7 +87,7 @@
   multiple
   class="hidden-input"
   bind:this={fileInput}
-  onchange={handleFiles}
+  onchange={upload.handleFiles}
 />
 <input
   type="file"
@@ -99,16 +95,29 @@
   capture="environment"
   class="hidden-input"
   bind:this={cameraInput}
-  onchange={handleFiles}
+  onchange={upload.handleFiles}
 />
 
+{#if overLimit}
+  <div class="send-error">
+    {contentBytes}/{MAX_CONTENT_BYTES} bytes
+  </div>
+{/if}
+{#if tooManyAttachments}
+  <div class="send-error">
+    {upload.attachments.length} attachments; the limit is {MAX_ATTACHMENTS}.
+  </div>
+{/if}
+{#if upload.errorMessage}
+  <div class="send-error" role="alert">{upload.errorMessage}</div>
+{/if}
 {#if sendError}
-  <div class="send-error">{sendError}</div>
+  <div class="send-error" role="alert">{sendError}</div>
 {/if}
 
-{#if attachments.length > 0}
+{#if upload.attachments.length > 0}
   <div class="attachment-preview">
-    {#each attachments as att, i}
+    {#each upload.attachments as att, i}
       <div class="attachment-item">
         {#if isImage(att.mime_type)}
           <img src={att.previewUrl} alt={att.filename} />
@@ -117,7 +126,8 @@
         {/if}
         <button
           class="att-remove"
-          onclick={() => removeAttachment(i)}
+          onclick={() => upload.removeAttachment(i)}
+          disabled={sending}
           aria-label="Remove attachment">x</button
         >
       </div>
@@ -130,33 +140,31 @@
     <button
       class="attach-btn"
       onclick={() => cameraInput?.click()}
-      disabled={uploading}
+      disabled={!canAttach}
       title="Take photo"
     >
-      {uploading ? "..." : "Cam"}
+      {upload.uploading ? "..." : "Cam"}
     </button>
   {/if}
   <button
     class="attach-btn"
     onclick={() => fileInput?.click()}
-    disabled={uploading}
+    disabled={!canAttach}
     title="Attach file"
+    aria-label="Attach file"
   >
-    {uploading ? "..." : "+"}
+    {upload.uploading ? "..." : "+"}
   </button>
   <textarea
     class="input-base compose-input"
     placeholder="Type a message..."
     bind:value={messageText}
     onkeydown={handleKeydown}
-    oninput={handleInput}
+    oninput={() => oninput?.()}
+    maxlength={MAX_CONTENT_BYTES}
     rows="1"
     use:autogrow></textarea>
-  <button
-    class="btn-accent send-btn"
-    onclick={send}
-    disabled={(!messageText.trim() && attachments.length === 0) || sending}
-  >
+  <button class="btn-accent send-btn" onclick={send} disabled={!canSend}>
     {sending ? "..." : "Send"}
   </button>
 </div>

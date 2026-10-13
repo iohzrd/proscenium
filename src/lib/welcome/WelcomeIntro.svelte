@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { copyToClipboard } from "$lib/utils";
+  import { useCopyFeedback } from "$lib/composables";
 
   let {
     nodeId,
@@ -13,19 +13,7 @@
     onrecover: () => void;
   } = $props();
 
-  let copyFeedback = $state(false);
-
-  async function copyNodeId() {
-    await copyToClipboard(nodeId);
-    copyFeedback = true;
-    setTimeout(() => (copyFeedback = false), 1500);
-  }
-
-  async function copyPubkey() {
-    await copyToClipboard(masterPubkey);
-    copyFeedback = true;
-    setTimeout(() => (copyFeedback = false), 1500);
-  }
+  const copier = useCopyFeedback();
 </script>
 
 <div class="step">
@@ -40,10 +28,14 @@
   {#if nodeId}
     <div class="node-id-section">
       <p class="label">Your Node ID (transport address)</p>
-      <button class="node-id" onclick={copyNodeId} title="Copy Node ID">
+      <button
+        class="node-id"
+        onclick={() => copier.copy(nodeId, "node")}
+        title="Copy Node ID"
+      >
         {nodeId.slice(0, 16)}...{nodeId.slice(-8)}
       </button>
-      {#if copyFeedback}
+      {#if copier.feedback === "node"}
         <span class="copied">Copied!</span>
       {/if}
     </div>
@@ -51,9 +43,16 @@
   {#if masterPubkey}
     <div class="node-id-section">
       <p class="label">Your Public Key (permanent identity)</p>
-      <button class="node-id" onclick={copyPubkey} title="Copy Public Key">
+      <button
+        class="node-id"
+        onclick={() => copier.copy(masterPubkey, "pubkey")}
+        title="Copy Public Key"
+      >
         {masterPubkey.slice(0, 16)}...{masterPubkey.slice(-8)}
       </button>
+      {#if copier.feedback === "pubkey"}
+        <span class="copied">Copied!</span>
+      {/if}
     </div>
   {/if}
   <button class="btn-accent primary-btn" onclick={oncontinue}>

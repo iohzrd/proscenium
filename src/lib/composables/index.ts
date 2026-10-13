@@ -9,3 +9,4 @@ export { useDeleteConfirm } from "./useDeleteConfirm.svelte";
 export { usePullToRefresh } from "./usePullToRefresh.svelte";
 export { useLightbox } from "./useLightbox.svelte";
 export { autogrow } from "./autogrow.svelte";
+export { focusTrap } from "./focusTrap";

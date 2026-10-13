@@ -4,6 +4,11 @@
   import { getDisplayName, getCachedAvatarTicket, shortId } from "$lib/utils";
   import type { SocialGraphEntry } from "$lib/types";
 
+  const DEBOUNCE_MS = 150;
+  const MAX_RESULTS = 8;
+  /** Number of display-name lookups that run at the same time. */
+  const LOOKUP_BATCH = 16;
+
   let {
     query,
     selfId,
@@ -19,60 +24,67 @@
   let results = $state<{ pubkey: string; name: string }[]>([]);
   let selectedIndex = $state(0);
 
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+  // Incremented whenever the query changes; a search assigns its results only
+  // while its own value is still the latest.
+  let searchSeq = 0;
 
   $effect(() => {
-    if (!visible || !query) {
+    const q = visible ? query : "";
+    const seq = ++searchSeq;
+    if (!q) {
       results = [];
       return;
     }
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => searchUsers(query), 150);
+    const timer = setTimeout(() => searchUsers(q, seq), DEBOUNCE_MS);
+    return () => clearTimeout(timer);
   });
 
-  async function searchUsers(q: string) {
+  async function searchUsers(q: string, seq: number) {
     const lowerQ = q.toLowerCase();
     try {
-      const follows: SocialGraphEntry[] = await invoke("get_follows");
-      const followers: SocialGraphEntry[] = await invoke("get_followers");
-      const seen = new Set<string>();
-      const items: { pubkey: string; name: string }[] = [];
+      const [follows, followers] = await Promise.all([
+        invoke<SocialGraphEntry[]>("get_follows"),
+        invoke<SocialGraphEntry[]>("get_followers"),
+      ]);
+      if (seq !== searchSeq) return;
+      const pubkeys = [
+        ...new Set([...follows, ...followers].map((entry) => entry.pubkey)),
+      ].filter((pubkey) => pubkey !== selfId);
 
-      for (const f of follows) {
-        if (seen.has(f.pubkey) || f.pubkey === selfId) continue;
-        seen.add(f.pubkey);
-        const name = await getDisplayName(f.pubkey, selfId);
-        if (
-          name.toLowerCase().includes(lowerQ) ||
-          f.pubkey.toLowerCase().startsWith(lowerQ)
-        ) {
-          items.push({ pubkey: f.pubkey, name });
-        }
-        if (items.length >= 8) break;
-      }
-      if (items.length < 8) {
-        for (const f of followers) {
-          if (seen.has(f.pubkey) || f.pubkey === selfId) continue;
-          seen.add(f.pubkey);
-          const name = await getDisplayName(f.pubkey, selfId);
+      const items: { pubkey: string; name: string }[] = [];
+      for (
+        let start = 0;
+        start < pubkeys.length && items.length < MAX_RESULTS;
+        start += LOOKUP_BATCH
+      ) {
+        const batch = pubkeys.slice(start, start + LOOKUP_BATCH);
+        const names = await Promise.all(
+          batch.map((pubkey) => getDisplayName(pubkey, selfId)),
+        );
+        if (seq !== searchSeq) return;
+        for (const [i, pubkey] of batch.entries()) {
+          const name = names[i];
           if (
-            name.toLowerCase().includes(lowerQ) ||
-            f.pubkey.toLowerCase().startsWith(lowerQ)
+            items.length < MAX_RESULTS &&
+            (name.toLowerCase().includes(lowerQ) ||
+              pubkey.toLowerCase().startsWith(lowerQ))
           ) {
-            items.push({ pubkey: f.pubkey, name });
+            items.push({ pubkey, name });
           }
-          if (items.length >= 8) break;
         }
       }
       results = items;
       selectedIndex = 0;
-    } catch {
-      results = [];
+    } catch (e) {
+      console.error("Mention search failed:", e);
+      if (seq === searchSeq) results = [];
     }
   }
 
   export function handleKey(e: KeyboardEvent): boolean {
     if (!visible || results.length === 0) return false;
+    // A key press that belongs to an IME composition selects nothing.
+    if (e.isComposing || e.keyCode === 229) return false;
     if (e.key === "ArrowDown") {
       e.preventDefault();
       selectedIndex = (selectedIndex + 1) % results.length;
@@ -84,8 +96,10 @@
       return true;
     }
     if (e.key === "Enter" || e.key === "Tab") {
+      const selected = results[selectedIndex];
+      if (!selected) return false;
       e.preventDefault();
-      onselect(results[selectedIndex].pubkey);
+      onselect(selected.pubkey);
       return true;
     }
     if (e.key === "Escape") {

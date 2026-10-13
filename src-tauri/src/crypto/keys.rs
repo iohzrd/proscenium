@@ -1,7 +1,9 @@
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256, Sha512};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
+
+use super::ratchet::CryptoError;
 
 /// Derive the ratchet state storage encryption key from a DM secret key.
 /// Used to encrypt ratchet sessions at rest.
@@ -56,17 +58,17 @@ pub fn x25519_keypair_from_raw(secret: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 }
 
 /// Perform X25519 Diffie-Hellman key agreement.
-pub(super) fn x25519_dh(my_private: &[u8; 32], their_public: &[u8; 32]) -> [u8; 32] {
+pub(super) fn x25519_dh(my_private: &[u8; 32], their_public: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     let secret = StaticSecret::from(*my_private);
     let public = X25519Public::from(*their_public);
     let shared = secret.diffie_hellman(&public);
-    shared.to_bytes()
+    Zeroizing::new(shared.to_bytes())
 }
 
-/// Generate a new X25519 keypair for ratchet steps.
-pub(super) fn generate_x25519_keypair() -> ([u8; 32], [u8; 32]) {
-    let mut private_bytes = [0u8; 32];
-    getrandom::fill(&mut private_bytes).expect("failed to generate random key");
+/// Generate a new X25519 keypair for ratchet steps. Returns `(private, public)`.
+pub(super) fn generate_x25519_keypair() -> Result<(Zeroizing<[u8; 32]>, [u8; 32]), CryptoError> {
+    let mut private_bytes = Zeroizing::new([0u8; 32]);
+    getrandom::fill(private_bytes.as_mut_slice()).map_err(|_| CryptoError::Rng)?;
     let public_bytes = x25519_public_from_private(&private_bytes);
-    (private_bytes, public_bytes)
+    Ok((private_bytes, public_bytes))
 }

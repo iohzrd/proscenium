@@ -1,8 +1,69 @@
+<script lang="ts" module>
+  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+  import type { Interaction } from "$lib/types";
+
+  /** Delay between an event that names no post and the counts reload. */
+  const RELOAD_DEBOUNCE_MS = 500;
+
+  interface Card {
+    postId: () => string;
+    reload: () => Promise<void>;
+  }
+
+  // One set of event listeners serves every mounted instance.
+  const cards = new Set<Card>();
+  let unlisteners: Promise<UnlistenFn>[] = [];
+  let reloadAllTimer: ReturnType<typeof setTimeout> | undefined;
+
+  /** Reloads the counts of every mounted card that shows `postId`. */
+  async function reloadPost(postId: string): Promise<void> {
+    await Promise.all(
+      [...cards]
+        .filter((card) => card.postId() === postId)
+        .map((card) => card.reload()),
+    );
+  }
+
+  function reloadAllDebounced() {
+    clearTimeout(reloadAllTimer);
+    reloadAllTimer = setTimeout(() => {
+      for (const card of cards) card.reload();
+    }, RELOAD_DEBOUNCE_MS);
+  }
+
+  function register(card: Card): () => void {
+    cards.add(card);
+    if (cards.size === 1) {
+      unlisteners = [
+        listen<Interaction>("interaction-received", (event) => {
+          reloadPost(event.payload.target_post_id);
+        }),
+        listen<{ id: string; author: string; target_post_id?: string }>(
+          "interaction-deleted",
+          (event) => {
+            const target = event.payload.target_post_id;
+            if (target) reloadPost(target);
+            else reloadAllDebounced();
+          },
+        ),
+        listen("feed-updated", reloadAllDebounced),
+      ];
+    }
+    return () => {
+      cards.delete(card);
+      if (cards.size === 0) {
+        clearTimeout(reloadAllTimer);
+        for (const unlisten of unlisteners) unlisten.then((fn) => fn());
+        unlisteners = [];
+      }
+    };
+  }
+</script>
+
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
-  import type { PostCounts, Interaction } from "$lib/types";
+  import type { PostCounts } from "$lib/types";
 
   let {
     postId,
@@ -16,115 +77,121 @@
     onquote?: () => void;
   } = $props();
 
-  let counts = $state<PostCounts>({
+  const NO_COUNTS: PostCounts = {
     likes: 0,
     replies: 0,
     reposts: 0,
     liked_by_me: false,
     reposted_by_me: false,
-  });
+  };
+
+  let counts = $state.raw<PostCounts>(NO_COUNTS);
   let liking = $state(false);
   let reposting = $state(false);
   let bookmarked = $state(false);
   let bookmarking = $state(false);
+  let errorMessage = $state("");
+  let errorTimer: ReturnType<typeof setTimeout> | undefined;
 
-  async function loadCounts() {
+  // Derived: the effect below reruns when the id string changes, not when the
+  // parent passes an equal post object.
+  const currentId = $derived(postId);
+
+  function showError(action: string, e: unknown) {
+    errorMessage = `${action} failed: ${e}`;
+    clearTimeout(errorTimer);
+    errorTimer = setTimeout(() => (errorMessage = ""), 4000);
+  }
+
+  async function loadCounts(id: string) {
     try {
-      counts = await invoke("get_post_counts", { targetPostId: postId });
-    } catch {
-      // counts are best-effort
+      const loaded = await invoke<PostCounts>("get_post_counts", {
+        targetPostId: id,
+      });
+      if (id === currentId) counts = loaded;
+    } catch (e) {
+      console.error("Failed to load post counts:", e);
     }
   }
 
-  async function loadBookmark() {
+  async function loadBookmark(id: string) {
     try {
-      bookmarked = await invoke("is_bookmarked", { postId });
-    } catch {
-      // best-effort
+      const loaded = await invoke<boolean>("is_bookmarked", { postId: id });
+      if (id === currentId) bookmarked = loaded;
+    } catch (e) {
+      console.error("Failed to load bookmark state:", e);
     }
   }
 
   $effect(() => {
-    postId;
-    loadCounts();
-    loadBookmark();
+    const id = currentId;
+    counts = NO_COUNTS;
+    bookmarked = false;
+    loadCounts(id);
+    loadBookmark(id);
   });
 
   onMount(() => {
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen<Interaction>("interaction-received", (event) => {
-        if (event.payload.target_post_id === postId) {
-          loadCounts();
-        }
-      }),
-    );
-    unlisteners.push(
-      listen<{ id: string; author: string }>("interaction-deleted", () => {
-        loadCounts();
-      }),
-    );
-    unlisteners.push(
-      listen("feed-updated", () => {
-        loadCounts();
-      }),
-    );
+    const unregister = register({
+      postId: () => currentId,
+      reload: () => loadCounts(currentId),
+    });
     return () => {
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      unregister();
+      clearTimeout(errorTimer);
     };
   });
 
   async function toggleLike() {
     if (liking) return;
     liking = true;
+    const id = currentId;
     try {
       if (counts.liked_by_me) {
-        await invoke("unlike_post", { targetPostId: postId });
-        counts.liked_by_me = false;
-        counts.likes = Math.max(0, counts.likes - 1);
+        await invoke("unlike_post", { targetPostId: id });
       } else {
         await invoke("like_post", {
-          targetPostId: postId,
+          targetPostId: id,
           targetAuthor: postAuthor,
         });
-        counts.liked_by_me = true;
-        counts.likes += 1;
       }
     } catch (e) {
-      console.error("Failed to toggle like:", e);
+      showError(counts.liked_by_me ? "Unlike" : "Like", e);
     }
+    // The counts come from storage again; no local arithmetic.
+    await reloadPost(id);
     liking = false;
   }
 
   async function toggleRepost() {
     if (reposting) return;
     reposting = true;
+    const id = currentId;
     try {
       if (counts.reposted_by_me) {
-        await invoke("unrepost", { targetPostId: postId });
-        counts.reposted_by_me = false;
-        counts.reposts = Math.max(0, counts.reposts - 1);
+        await invoke("unrepost", { targetPostId: id });
       } else {
         await invoke("repost", {
-          targetPostId: postId,
+          targetPostId: id,
           targetAuthor: postAuthor,
         });
-        counts.reposted_by_me = true;
-        counts.reposts += 1;
       }
     } catch (e) {
-      console.error("Failed to toggle repost:", e);
+      showError(counts.reposted_by_me ? "Undo repost" : "Repost", e);
     }
+    await reloadPost(id);
     reposting = false;
   }
 
   async function toggleBookmark() {
     if (bookmarking) return;
     bookmarking = true;
+    const id = currentId;
     try {
-      bookmarked = await invoke("toggle_bookmark", { postId });
+      const next = await invoke<boolean>("toggle_bookmark", { postId: id });
+      if (id === currentId) bookmarked = next;
     } catch (e) {
-      console.error("Failed to toggle bookmark:", e);
+      showError("Bookmark", e);
     }
     bookmarking = false;
   }
@@ -142,10 +209,17 @@
     {#if counts.likes > 0}<span class="count">{counts.likes}</span>{/if}
   </button>
 
-  <button class="action-btn" onclick={onreply} aria-label="Reply">
-    <span class="icon">{"\u21A9"}</span>
-    {#if counts.replies > 0}<span class="count">{counts.replies}</span>{/if}
-  </button>
+  {#if onreply}
+    <button class="action-btn" onclick={onreply} aria-label="Reply">
+      <span class="icon">{"\u21A9"}</span>
+      {#if counts.replies > 0}<span class="count">{counts.replies}</span>{/if}
+    </button>
+  {:else if counts.replies > 0}
+    <span class="action-btn static" title="Replies">
+      <span class="icon">{"\u21A9"}</span>
+      <span class="count">{counts.replies}</span>
+    </span>
+  {/if}
 
   <button
     class="action-btn"
@@ -159,9 +233,16 @@
     {#if counts.reposts > 0}<span class="count">{counts.reposts}</span>{/if}
   </button>
 
-  <button class="action-btn" onclick={onquote} title="Quote" aria-label="Quote">
-    <span class="icon">{"\u275D"}</span>
-  </button>
+  {#if onquote}
+    <button
+      class="action-btn"
+      onclick={onquote}
+      title="Quote"
+      aria-label="Quote"
+    >
+      <span class="icon">{"\u275D"}</span>
+    </button>
+  {/if}
 
   <button
     class="action-btn bookmark"
@@ -174,6 +255,9 @@
     <span class="icon">{bookmarked ? "\u2605" : "\u2606"}</span>
   </button>
 </div>
+{#if errorMessage}
+  <p class="action-error" role="alert">{errorMessage}</p>
+{/if}
 
 <style>
   .post-actions {
@@ -206,6 +290,13 @@
     background: var(--accent-light-hover-bg);
   }
 
+  .action-btn.static,
+  .action-btn.static:hover {
+    cursor: default;
+    color: var(--text-muted);
+    background: none;
+  }
+
   .action-btn.active {
     color: var(--color-error-light);
   }
@@ -235,5 +326,11 @@
 
   .count {
     font-size: var(--text-sm);
+  }
+
+  .action-error {
+    color: var(--color-error-light);
+    font-size: var(--text-sm);
+    margin: 0.25rem 0 0;
   }
 </style>

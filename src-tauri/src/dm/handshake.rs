@@ -2,209 +2,165 @@ use crate::crypto::{
     RatchetState, noise_complete_initiator, noise_complete_responder, noise_initiate, noise_respond,
 };
 use crate::error::AppError;
-use iroh::{EndpointAddr, EndpointId};
-use proscenium_types::{DM_ALPN, DmHandshake, DmMessage, now_millis, short_id};
+use iroh::EndpointId;
+use proscenium_types::{DmHandshake, DmMessage, is_valid_dm_pubkey, short_id};
 
-use super::DmHandler;
-use super::crypto::{dm_pubkey_to_x25519, open_ratchet_state, seal_ratchet_state};
+use super::crypto::dm_pubkey_to_x25519;
+use super::{DmHandler, DmKeys, HANDSHAKE_RESPONSE_TIMEOUT, PeerRoute, SESSION_LOCK_TIMEOUT};
 
-/// Get or establish a ratchet session with a peer.
-/// Returns `(RatchetState, peer_dm_pubkey)` -- callers must use `peer_dm_pubkey`
-/// as the key for any subsequent `save_ratchet_session` calls.
-pub(super) async fn get_or_establish_session(
+/// Byte length of Noise IK message 1 with an empty payload: the ephemeral key (32), the
+/// encrypted static key (32 + 16) and the payload tag (16).
+const NOISE_INIT_LEN: usize = 96;
+
+/// Run the Noise IK handshake as initiator with the NodeIds of `peer`, in order, until
+/// one answers, and store the resulting session. The caller holds the session lock of
+/// the peer. The NodeId that answered is moved to the front of `peer.node_ids`.
+pub(super) async fn establish_session(
     handler: &DmHandler,
-    peer_master_pubkey: &str,
-) -> Result<(RatchetState, String), AppError> {
-    log::info!(
-        "[dm] get_or_establish_session: peer={}",
-        short_id(peer_master_pubkey)
-    );
-
-    // Resolve the peer's DM pubkey from cached delegation.
-    let peer_dm_pubkey = handler
-        .storage
-        .get_peer_dm_pubkey(peer_master_pubkey)
-        .await?
-        .ok_or_else(|| {
-            AppError::Other(format!(
-                "no DM pubkey cached for {}",
-                short_id(peer_master_pubkey)
-            ))
-        })?;
-
-    // Read all identity fields needed before any await points.
-    let (my_x25519_private, my_dm_pubkey, ratchet_storage_key) = {
-        let id = handler.identity.read().await;
-        (
-            id.dm_x25519_private,
-            id.dm_pubkey.clone(),
-            id.ratchet_storage_key,
-        )
-    };
-
-    // Try loading existing session (keyed by DM pubkey)
-    if let Some(stored) = handler.storage.get_ratchet_session(&peer_dm_pubkey).await? {
-        log::info!(
-            "[dm] loaded existing ratchet session for {}",
-            short_id(peer_master_pubkey),
-        );
-        let json = open_ratchet_state(&ratchet_storage_key, &stored)?;
-        let state: RatchetState = serde_json::from_str(&json)?;
-        return Ok((state, peer_dm_pubkey));
+    keys: &DmKeys,
+    peer: &mut PeerRoute,
+) -> Result<RatchetState, AppError> {
+    let mut last_error = AppError::Other(format!(
+        "no transport NodeId for {}",
+        short_id(&peer.master_pubkey)
+    ));
+    for (index, node) in peer.node_ids.clone().into_iter().enumerate() {
+        match handshake_with_node(handler, keys, peer, node).await {
+            Ok(ratchet) => {
+                handler
+                    .save_session(keys, &peer.dm_pubkey, &ratchet)
+                    .await?;
+                peer.node_ids.swap(0, index);
+                log::info!(
+                    "[dm] established session with {}",
+                    short_id(&peer.master_pubkey)
+                );
+                return Ok(ratchet);
+            }
+            Err(e) => {
+                log::debug!(
+                    "[dm] handshake with {} at node {} failed: {e}",
+                    short_id(&peer.master_pubkey),
+                    short_id(&node.to_string())
+                );
+                last_error = e;
+            }
+        }
     }
-
-    // No session -- need to handshake
-    log::info!(
-        "[dm] no existing session, initiating Noise IK handshake with {}",
-        short_id(peer_master_pubkey)
-    );
-
-    // Fail fast: resolve transport NodeId before doing any crypto work
-    let node_ids = handler
-        .storage
-        .get_peer_transport_node_ids(peer_master_pubkey)
-        .await?;
-    let transport_id_str = node_ids.into_iter().next().ok_or_else(|| {
-        AppError::Other(format!(
-            "no transport NodeId for {}",
-            short_id(peer_master_pubkey)
-        ))
-    })?;
-    let transport_id: EndpointId = transport_id_str.parse()?;
-    let addr = EndpointAddr::from(transport_id);
-
-    // Peer's DM pubkey IS already X25519 -- just hex-decode it
-    let peer_x25519_public = dm_pubkey_to_x25519(&peer_dm_pubkey)?;
-    log::info!("[dm] resolved peer DM X25519 key");
-
-    // Noise IK handshake: initiator
-    let (initiator_hs, msg1) = noise_initiate(&my_x25519_private, &peer_x25519_public)?;
-    log::info!("[dm] noise init message created ({} bytes)", msg1.len());
-
-    log::info!(
-        "[dm] connecting to {} on DM_ALPN...",
-        short_id(peer_master_pubkey)
-    );
-    let conn = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        handler.endpoint.connect(addr, DM_ALPN),
-    )
-    .await
-    .map_err(|_| {
-        AppError::Other(format!(
-            "handshake connect timeout to {}",
-            short_id(peer_master_pubkey)
-        ))
-    })?
-    .inspect_err(|e| {
-        log::error!(
-            "[dm] QUIC connect failed to {}: {e}",
-            short_id(peer_master_pubkey)
-        );
-    })?;
-    log::info!("[dm] QUIC connected, opening bi-stream...");
-    let (mut send, mut recv) = conn.open_bi().await?;
-
-    // Send handshake init -- sender is our DM pubkey
-    let handshake = DmHandshake::Init {
-        noise_message: msg1,
-        sender: my_dm_pubkey,
-    };
-    let bytes = serde_json::to_vec(&DmMessage::Handshake(handshake))?;
-    log::info!("[dm] sending handshake init ({} bytes)...", bytes.len());
-    send.write_all(&bytes).await?;
-    send.finish()?;
-
-    // Read handshake response (acceptor sends DmHandshake::Response directly)
-    log::info!("[dm] waiting for handshake response...");
-    let resp_bytes = recv.read_to_end(65536).await?;
-    log::info!(
-        "[dm] received handshake response ({} bytes)",
-        resp_bytes.len()
-    );
-    let resp: DmHandshake = serde_json::from_slice(&resp_bytes)?;
-
-    let noise_response = match resp {
-        DmHandshake::Response { noise_message } => noise_message,
-        _ => return Err(AppError::Other("unexpected handshake response".into())),
-    };
-
-    // Complete handshake
-    let shared_secret = noise_complete_initiator(initiator_hs, &noise_response)?;
-    log::info!("[dm] noise handshake completed successfully");
-
-    conn.close(0u32.into(), b"done");
-
-    // Initialize Double Ratchet as Alice (initiator)
-    let ratchet = RatchetState::init_alice(&shared_secret, &peer_x25519_public);
-
-    // Encrypt and save session keyed by peer's DM pubkey
-    let json = serde_json::to_string(&ratchet)?;
-    let sealed = seal_ratchet_state(&ratchet_storage_key, &json)?;
-    handler
-        .storage
-        .save_ratchet_session(&peer_dm_pubkey, &sealed, now_millis())
-        .await?;
-
-    log::info!(
-        "[dm] established and saved ratchet session with {}",
-        short_id(peer_master_pubkey)
-    );
-    Ok((ratchet, peer_dm_pubkey))
+    Err(last_error)
 }
 
-/// Handle an incoming handshake (Noise IK responder side).
-/// `peer_dm_pubkey` is taken from `DmHandshake::Init.sender`.
-pub(super) async fn handle_handshake(
+/// Send `DmHandshake::Init` to `node`, read the response and derive the initiator
+/// ratchet state. Nothing is stored.
+async fn handshake_with_node(
     handler: &DmHandler,
-    peer_dm_pubkey: &str,
-    noise_message: Vec<u8>,
-) -> Result<Vec<u8>, AppError> {
-    log::info!("[dm] handling handshake from {}", short_id(peer_dm_pubkey));
+    keys: &DmKeys,
+    peer: &PeerRoute,
+    node: EndpointId,
+) -> Result<RatchetState, AppError> {
+    let (initiator, noise_message) = noise_initiate(&keys.x25519_private, &peer.x25519_public)?;
+    let frame = serde_json::to_vec(&DmMessage::Handshake(DmHandshake::Init {
+        noise_message,
+        sender: keys.dm_pubkey.clone(),
+    }))?;
 
-    let (my_x25519_private, my_x25519_public, ratchet_storage_key) = {
-        let id = handler.identity.read().await;
-        (
-            id.dm_x25519_private,
-            id.dm_x25519_public,
-            id.ratchet_storage_key,
-        )
+    let answer = handler
+        .exchange(node, &frame, HANDSHAKE_RESPONSE_TIMEOUT)
+        .await?;
+    let DmHandshake::Response { noise_message } = serde_json::from_slice(&answer)? else {
+        return Err(AppError::Other("unexpected handshake response".into()));
     };
 
-    // Noise IK responder
-    let (responder_hs, response_msg) = noise_respond(&my_x25519_private, &noise_message)?;
+    let seed = noise_complete_initiator(initiator, &noise_message)?;
+    Ok(RatchetState::init_alice(&seed, &peer.x25519_public)?)
+}
 
-    let (shared_secret, initiator_dm_pubkey) = noise_complete_responder(responder_hs)?;
+/// Handle `DmHandshake::Init` (Noise IK responder side) received from NodeId `remote`.
+/// Returns the serialized `DmHandshake::Response`.
+///
+/// A session is stored only if all of these hold: `sender` is the static key the Noise
+/// handshake authenticated; `sender` is the DM pubkey of a cached delegation, or of the
+/// verified identity that `remote` returns; that user is not blocked.
+pub(super) async fn handle_handshake(
+    handler: &DmHandler,
+    remote: EndpointId,
+    sender: &str,
+    noise_message: &[u8],
+) -> Result<Vec<u8>, AppError> {
+    if !is_valid_dm_pubkey(sender) {
+        return Err(AppError::Other(
+            "handshake sender is not a DM pubkey".into(),
+        ));
+    }
+    if noise_message.len() != NOISE_INIT_LEN {
+        return Err(AppError::Other(format!(
+            "handshake message has {} bytes, expected {NOISE_INIT_LEN}",
+            noise_message.len()
+        )));
+    }
+    let keys = handler.dm_keys().await;
+    if sender == keys.dm_pubkey {
+        return Err(AppError::Other(
+            "handshake sender is the local DM pubkey".into(),
+        ));
+    }
+    let claimed_key = dm_pubkey_to_x25519(sender)?;
 
-    // Verify the Noise IK-authenticated initiator DM key matches the claimed sender.
-    let claimed_key = dm_pubkey_to_x25519(peer_dm_pubkey)?;
-    match initiator_dm_pubkey {
-        Some(actual) if actual == claimed_key => {}
-        Some(_) => {
-            return Err(AppError::Other(
-                "DmHandshake::Init sender mismatch: claimed key does not match authenticated key"
-                    .into(),
-            ));
-        }
-        None => {
-            return Err(AppError::Other(
-                "Noise IK handshake did not reveal initiator key".into(),
-            ));
-        }
+    // Noise IK responder. No state is written before the initiator's key is authenticated.
+    let (responder, response_msg) = noise_respond(&keys.x25519_private, noise_message)?;
+    let (seed, authenticated_key) = noise_complete_responder(responder)?;
+    if authenticated_key != claimed_key {
+        return Err(AppError::Other(
+            "DmHandshake::Init sender mismatch: claimed key does not match authenticated key"
+                .into(),
+        ));
     }
 
-    // Initialize Double Ratchet as Bob (responder)
-    let ratchet = RatchetState::init_bob(&shared_secret, (my_x25519_private, my_x25519_public));
-
-    // Save session keyed by peer's DM pubkey
-    let json = serde_json::to_string(&ratchet)?;
-    let sealed = seal_ratchet_state(&ratchet_storage_key, &json)?;
-    handler
+    let peer_master_pubkey = match handler
         .storage
-        .save_ratchet_session(peer_dm_pubkey, &sealed, now_millis())
-        .await?;
+        .get_master_pubkey_for_dm_pubkey(sender)
+        .await
+    {
+        Some(master_pubkey) => {
+            if handler.storage.is_blocked(&master_pubkey).await? {
+                return Err(AppError::Other("peer is blocked".into()));
+            }
+            master_pubkey
+        }
+        None => {
+            // Unknown DM key: ask the connecting node for its signed identity.
+            let identity = crate::peer::query_identity(&handler.endpoint, remote).await?;
+            if identity.delegation().dm_pubkey != sender {
+                return Err(AppError::Other(
+                    "handshake sender is not the DM pubkey of the node's identity".into(),
+                ));
+            }
+            if identity.master_pubkey == keys.master_pubkey {
+                return Err(AppError::Other("handshake from the local identity".into()));
+            }
+            if handler.storage.is_blocked(&identity.master_pubkey).await? {
+                return Err(AppError::Other("peer is blocked".into()));
+            }
+            handler.storage.cache_peer_identity(&identity).await?;
+            identity.master_pubkey
+        }
+    };
 
-    log::info!("[dm] session established with {}", short_id(peer_dm_pubkey));
+    // Initialize Double Ratchet as Bob (responder). This replaces any stored session
+    // with the peer.
+    let ratchet = RatchetState::init_bob(&seed, (*keys.x25519_private, keys.x25519_public));
+    {
+        let _session_guard =
+            tokio::time::timeout(SESSION_LOCK_TIMEOUT, handler.session_locks.lock(sender))
+                .await
+                .map_err(|_| AppError::Other("session is in use".into()))?;
+        handler.save_session(&keys, sender, &ratchet).await?;
+    }
+
+    log::info!(
+        "[dm] session established by {}",
+        short_id(&peer_master_pubkey)
+    );
 
     let resp = DmHandshake::Response {
         noise_message: response_msg,

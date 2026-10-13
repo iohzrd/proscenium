@@ -1,10 +1,14 @@
 use crate::audio::AudioPlayback;
+use proscenium_types::MAX_STAGE_SPEAKERS;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 /// Per-stream buffer cap: 5 frames (~100ms).
 pub(super) const MAX_STREAM_BUFFER: usize = crate::audio::FRAME_SIZE * 5;
+
+/// Largest number of mixed input streams: one per other speaker plus the host.
+const MAX_STREAMS: usize = MAX_STAGE_SPEAKERS + 1;
 
 enum SpeakerMixerCmd {
     AddStream {
@@ -51,7 +55,7 @@ pub(super) fn spawn_speaker_mixer(cancel: CancellationToken) -> SpeakerMixerHand
 }
 
 async fn run_speaker_mixer(mut cmd_rx: mpsc::Receiver<SpeakerMixerCmd>, cancel: CancellationToken) {
-    let (mut prod, _playback) = match AudioPlayback::start(None) {
+    let (mut prod, _playback) = match AudioPlayback::start_blocking(None).await {
         Ok(p) => p,
         Err(e) => {
             log::error!("[stage-speaker-mixer] failed to start playback: {e}");
@@ -74,8 +78,12 @@ async fn run_speaker_mixer(mut cmd_rx: mpsc::Receiver<SpeakerMixerCmd>, cancel: 
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(SpeakerMixerCmd::AddStream { id, rx }) => {
-                        buffers.insert(id, Vec::new());
-                        streams.push((id, rx));
+                        if streams.len() >= MAX_STREAMS {
+                            log::warn!("[stage-speaker-mixer] stream limit reached, ignoring stream {id}");
+                        } else {
+                            buffers.insert(id, Vec::new());
+                            streams.push((id, rx));
+                        }
                     }
                     Some(SpeakerMixerCmd::RemoveStream(id)) => {
                         buffers.remove(&id);
@@ -120,8 +128,8 @@ async fn run_speaker_mixer(mut cmd_rx: mpsc::Receiver<SpeakerMixerCmd>, cancel: 
                 let mut mix = vec![0.0f32; crate::audio::FRAME_SIZE];
                 for buf in buffers.values_mut() {
                     let available = buf.len().min(crate::audio::FRAME_SIZE);
-                    for (i, s) in buf.drain(..available).enumerate() {
-                        mix[i] += s;
+                    for (sample, sum) in buf.drain(..available).zip(mix.iter_mut()) {
+                        *sum += sample;
                     }
                 }
                 let mix: Vec<f32> = mix.iter().map(|s| s.clamp(-1.0, 1.0)).collect();

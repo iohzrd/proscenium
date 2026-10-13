@@ -1,14 +1,23 @@
-use crate::ingest::{process_incoming_interaction, process_incoming_post};
+use crate::ingest::{
+    process_incoming_interaction, process_incoming_post, resolve_signer,
+    verify_and_apply_post_tombstones, verify_and_store_profile,
+};
 use crate::storage::Storage;
 use bytes::Bytes;
 use proscenium_types::{
-    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, SigningKeyRotation,
-    short_id, validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
-    verify_linked_devices_announcement, verify_profile_signature, verify_rotation,
+    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
+    SigningKeyRotation, StageTicket, is_valid_id, now_millis, short_id,
+    verify_delete_interaction_signature, verify_linked_devices_announcement, verify_rotation,
+    verify_stage_announcement, verify_stage_ended,
 };
 use tauri::{AppHandle, Emitter};
 
 impl super::GossipService {
+    /// Handle one message received on the feed topic of the followed user `pk`.
+    ///
+    /// Every message type must carry `pk` as its author and, except the two types signed by
+    /// the master key, must verify against the signing key cached for `pk`. A message for
+    /// which no signing key is cached is discarded.
     pub(super) async fn handle_follow_message(
         storage: &Storage,
         pk: &str,
@@ -16,7 +25,7 @@ impl super::GossipService {
         app_handle: &AppHandle,
         content: &Bytes,
     ) {
-        log::info!(
+        log::debug!(
             "[gossip-rx] received {} bytes from {}",
             content.len(),
             short_id(pk)
@@ -30,7 +39,7 @@ impl super::GossipService {
                 author,
                 signature,
             }) => {
-                Self::handle_delete_post(storage, pk, app_handle, &id, &author, &signature).await;
+                Self::handle_delete_post(storage, pk, app_handle, id, author, signature).await;
             }
             Ok(GossipMessage::ProfileUpdate(profile)) => {
                 Self::handle_profile_update(storage, pk, app_handle, profile).await;
@@ -52,6 +61,7 @@ impl super::GossipService {
             Ok(GossipMessage::SigningKeyRotation(rotation)) => {
                 Self::handle_signing_key_rotation(storage, pk, rotation).await;
             }
+            // Not sent by this version; ignored when received.
             Ok(GossipMessage::Heartbeat) => {}
             Ok(GossipMessage::StageAnnouncement {
                 stage_id,
@@ -59,29 +69,108 @@ impl super::GossipService {
                 ticket,
                 host_pubkey,
                 started_at,
+                signature,
             }) => {
-                log::info!(
-                    "[gossip-rx] stage announcement: {} ({})",
-                    title,
-                    short_id(&stage_id)
-                );
-                let _ = app_handle.emit(
-                    "stage-announced",
-                    serde_json::json!({
-                        "stage_id": stage_id,
-                        "title": title,
-                        "ticket": ticket.to_string(),
-                        "host_pubkey": host_pubkey,
-                        "started_at": started_at,
-                    }),
-                );
+                Self::handle_stage_announcement(
+                    storage,
+                    pk,
+                    app_handle,
+                    &stage_id,
+                    &title,
+                    &ticket,
+                    &host_pubkey,
+                    started_at,
+                    &signature,
+                )
+                .await;
             }
-            Ok(GossipMessage::StageEnded { stage_id }) => {
+            Ok(GossipMessage::StageEnded {
+                stage_id,
+                host_pubkey,
+                signature,
+            }) => {
+                if host_pubkey != pk {
+                    return;
+                }
+                let Some(signer) = resolve_signer(storage, pk).await else {
+                    return;
+                };
+                if let Err(reason) =
+                    verify_stage_ended(&stage_id, &host_pubkey, &signature, &signer)
+                {
+                    log::warn!(
+                        "[gossip-rx] bad stage-ended from {}: {reason}",
+                        short_id(pk)
+                    );
+                    return;
+                }
                 log::info!("[gossip-rx] stage ended: {}", short_id(&stage_id));
                 let _ = app_handle.emit("stage-ended-remote", &stage_id);
             }
             Err(e) => {
-                log::error!("[gossip-rx] failed to parse message: {e}");
+                log::warn!(
+                    "[gossip-rx] message from {} does not parse: {e}",
+                    short_id(pk)
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_stage_announcement(
+        storage: &Storage,
+        pk: &str,
+        app_handle: &AppHandle,
+        stage_id: &str,
+        title: &str,
+        ticket: &StageTicket,
+        host_pubkey: &str,
+        started_at: u64,
+        signature: &str,
+    ) {
+        // Only the topic owner can announce a stage on this topic.
+        if host_pubkey != pk {
+            return;
+        }
+        let Some(signer) = resolve_signer(storage, pk).await else {
+            return;
+        };
+        if let Err(reason) = verify_stage_announcement(
+            stage_id,
+            title,
+            ticket,
+            host_pubkey,
+            started_at,
+            signature,
+            &signer,
+        ) {
+            log::warn!(
+                "[gossip-rx] bad stage announcement from {}: {reason}",
+                short_id(pk)
+            );
+            return;
+        }
+        log::info!("[gossip-rx] stage announcement: {}", short_id(stage_id));
+        let _ = app_handle.emit(
+            "stage-announced",
+            serde_json::json!({
+                "stage_id": stage_id,
+                "title": title,
+                "ticket": ticket.to_string(),
+                "host_pubkey": host_pubkey,
+                "started_at": started_at,
+            }),
+        );
+    }
+
+    /// True if content of `pk` must not be stored: `pk` is muted or blocked, or the
+    /// moderation lookup failed.
+    async fn is_hidden_or_unknown(storage: &Storage, pk: &str) -> bool {
+        match storage.is_hidden(pk).await {
+            Ok(hidden) => hidden,
+            Err(e) => {
+                log::error!("[gossip-rx] moderation lookup failed: {e}");
+                true
             }
         }
     }
@@ -93,18 +182,10 @@ impl super::GossipService {
         app_handle: &AppHandle,
         post: Post,
     ) {
-        if post.author != pk {
-            log::info!(
-                "[gossip-rx] ignored post from {} (expected {})",
-                short_id(&post.author),
-                short_id(pk)
-            );
-        } else if storage.is_hidden(pk).await.unwrap_or(false) {
-            log::info!(
-                "[gossip-rx] skipping post from muted/blocked {}",
-                short_id(pk)
-            );
-        } else if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle).await {
+        if post.author != pk || Self::is_hidden_or_unknown(storage, pk).await {
+            return;
+        }
+        if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle).await {
             let _ = app_handle.emit("feed-updated", ());
         }
     }
@@ -113,37 +194,40 @@ impl super::GossipService {
         storage: &Storage,
         pk: &str,
         app_handle: &AppHandle,
-        id: &str,
-        author: &str,
-        signature: &str,
+        id: String,
+        author: String,
+        signature: String,
     ) {
         if author != pk {
             return;
         }
-        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-            && let Err(reason) = verify_delete_post_signature(id, author, signature, &signer)
-        {
-            log::warn!(
-                "[gossip-rx] bad delete-post signature from {}: {reason}",
+        let Some(signer) = resolve_signer(storage, pk).await else {
+            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
+            return;
+        };
+        let tombstone = PostTombstone {
+            id,
+            author,
+            signature,
+        };
+        // Verifies the signature, stores the tombstone and deletes the post row of this
+        // author with this id.
+        let removed = verify_and_apply_post_tombstones(
+            storage,
+            pk,
+            std::slice::from_ref(&tombstone),
+            &signer,
+            "gossip-rx",
+        )
+        .await
+        .posts_removed;
+        if removed > 0 {
+            log::info!(
+                "[gossip-rx] deleted post {} of {}",
+                short_id(&tombstone.id),
                 short_id(pk)
             );
-            return;
-        }
-        match storage.get_post_by_id(id).await {
-            Ok(Some(post)) if post.author == pk => {
-                log::info!("[gossip-rx] delete post {id} from {}", short_id(pk));
-                if let Err(e) = storage.delete_post(id).await {
-                    log::error!("[gossip-rx] failed to delete post: {e}");
-                }
-                let _ = app_handle.emit("feed-updated", ());
-            }
-            Ok(Some(_)) => {
-                log::error!("[gossip-rx] rejected delete for {id}: author mismatch");
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::error!("[gossip-rx] failed to look up post {id}: {e}");
-            }
+            let _ = app_handle.emit("feed-updated", ());
         }
     }
 
@@ -153,31 +237,18 @@ impl super::GossipService {
         app_handle: &AppHandle,
         profile: Profile,
     ) {
-        if let Err(reason) = validate_profile(&profile) {
-            log::error!(
-                "[gossip-rx] rejected profile from {}: {reason}",
-                short_id(pk)
-            );
+        let Some(signer) = resolve_signer(storage, pk).await else {
+            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
             return;
+        };
+        match verify_and_store_profile(storage, pk, &profile, &signer).await {
+            Ok(true) => {
+                log::info!("[gossip-rx] stored profile of {}", short_id(pk));
+                let _ = app_handle.emit("profile-updated", pk);
+            }
+            Ok(false) => {}
+            Err(e) => log::warn!("[gossip-rx] rejected profile from {}: {e}", short_id(pk)),
         }
-        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-            && let Err(reason) = verify_profile_signature(&profile, &signer)
-        {
-            log::warn!(
-                "[gossip-rx] bad profile signature from {}: {reason}",
-                short_id(pk)
-            );
-            return;
-        }
-        log::info!(
-            "[gossip-rx] profile update from {}: {}",
-            short_id(pk),
-            profile.display_name
-        );
-        if let Err(e) = storage.save_profile(pk, &profile).await {
-            log::error!("[gossip-rx] failed to store profile: {e}");
-        }
-        let _ = app_handle.emit("profile-updated", pk);
     }
 
     async fn handle_new_interaction(
@@ -187,19 +258,14 @@ impl super::GossipService {
         app_handle: &AppHandle,
         interaction: Interaction,
     ) {
-        if interaction.author != pk {
+        if interaction.author != pk || Self::is_hidden_or_unknown(storage, pk).await {
             return;
         }
-        if storage.is_hidden(pk).await.unwrap_or(false) {
-            log::info!(
-                "[gossip-rx] skipping interaction from muted/blocked {}",
-                short_id(pk)
-            );
-            return;
+        if process_incoming_interaction(storage, &interaction, pk, "gossip-rx", my_id, app_handle)
+            .await
+        {
+            let _ = app_handle.emit("interaction-received", &interaction);
         }
-        process_incoming_interaction(storage, &interaction, pk, "gossip-rx", my_id, app_handle)
-            .await;
-        let _ = app_handle.emit("interaction-received", &interaction);
     }
 
     async fn handle_delete_interaction(
@@ -210,26 +276,43 @@ impl super::GossipService {
         author: &str,
         signature: &str,
     ) {
-        if author != pk {
+        if author != pk || !is_valid_id(id) {
             return;
         }
-        if let Some(signer) = crate::ingest::resolve_signer(storage, pk).await
-            && let Err(reason) = verify_delete_interaction_signature(id, author, signature, &signer)
-        {
+        let Some(signer) = resolve_signer(storage, pk).await else {
+            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
+            return;
+        };
+        if let Err(reason) = verify_delete_interaction_signature(id, author, signature, &signer) {
             log::warn!(
                 "[gossip-rx] bad delete-interaction signature from {}: {reason}",
                 short_id(pk)
             );
             return;
         }
-        log::info!("[gossip-rx] delete interaction {id} from {}", short_id(pk));
-        if let Err(e) = storage.delete_interaction(id, author).await {
-            log::error!("[gossip-rx] failed to delete interaction: {e}");
+        // The tombstone is stored first: from then on the interaction is not stored again.
+        if let Err(e) = storage
+            .record_interaction_tombstone(author, id, now_millis())
+            .await
+        {
+            log::error!("[gossip-rx] failed to store interaction deletion: {e}");
+            return;
         }
-        let _ = app_handle.emit(
-            "interaction-deleted",
-            serde_json::json!({ "id": id, "author": author }),
-        );
+        match storage.delete_interaction(id, author).await {
+            Ok(true) => {
+                log::info!(
+                    "[gossip-rx] deleted interaction {} of {}",
+                    short_id(id),
+                    short_id(pk)
+                );
+                let _ = app_handle.emit(
+                    "interaction-deleted",
+                    serde_json::json!({ "id": id, "author": author }),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => log::error!("[gossip-rx] failed to delete interaction: {e}"),
+        }
     }
 
     async fn handle_linked_devices(
@@ -252,25 +335,22 @@ impl super::GossipService {
             );
             return;
         }
-        let cached_version = storage
-            .get_peer_announcement_version(pk)
-            .await
-            .unwrap_or(None)
-            .unwrap_or(0);
-        if announcement.version <= cached_version {
-            return;
-        }
-        log::info!(
-            "[gossip-rx] device announcement from {} v{} ({} devices)",
-            short_id(pk),
-            announcement.version,
-            announcement.devices.len()
-        );
-        if let Err(e) = storage
-            .cache_peer_device_announcement(pk, &announcement)
-            .await
-        {
-            log::error!("[gossip-rx] failed to cache device announcement: {e}");
+        match storage.cache_peer_announcement(&announcement).await {
+            Ok(crate::storage::AnnouncementOutcome::Stored) => {
+                log::info!(
+                    "[gossip-rx] device announcement from {} v{} ({} devices)",
+                    short_id(pk),
+                    announcement.version,
+                    announcement.devices.len()
+                );
+            }
+            Ok(crate::storage::AnnouncementOutcome::NotNewer) => {}
+            Err(e) => {
+                log::warn!(
+                    "[gossip-rx] rejected device announcement from {}: {e}",
+                    short_id(pk)
+                );
+            }
         }
     }
 
@@ -294,33 +374,20 @@ impl super::GossipService {
             );
             return;
         }
-        if let Ok(Some(cached_delegation)) = storage.get_peer_delegation(pk).await
-            && rotation.new_key_index <= cached_delegation.key_index
+        // `cache_peer_delegation` rejects a delegation older than the cached one.
+        match storage
+            .cache_peer_delegation(&rotation.new_delegation)
+            .await
         {
-            log::warn!(
-                "[gossip-rx] stale key rotation from {} (index {} <= cached {})",
+            Ok(()) => log::info!(
+                "[gossip-rx] signing key rotation from {} to index {}",
                 short_id(pk),
-                rotation.new_key_index,
-                cached_delegation.key_index
-            );
-            return;
-        }
-        log::info!(
-            "[gossip-rx] signing key rotation from {} to index {}",
-            short_id(pk),
-            rotation.new_key_index
-        );
-        let response = proscenium_types::IdentityResponse {
-            master_pubkey: rotation.master_pubkey.clone(),
-            delegation: rotation.new_delegation.clone(),
-            transport_node_ids: storage
-                .get_peer_transport_node_ids(pk)
-                .await
-                .unwrap_or_default(),
-            profile: None,
-        };
-        if let Err(e) = storage.cache_peer_identity(&response).await {
-            log::error!("[gossip-rx] failed to cache rotated delegation: {e}");
+                rotation.new_key_index
+            ),
+            Err(e) => log::warn!(
+                "[gossip-rx] rejected key rotation from {}: {e}",
+                short_id(pk)
+            ),
         }
     }
 }

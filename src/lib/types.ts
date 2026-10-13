@@ -36,6 +36,8 @@ export interface Profile {
   avatar_hash: string | null;
   avatar_ticket: string | null;
   visibility: Visibility;
+  /** Unix ms of the owner's last change; signed. */
+  updated_at: number;
 }
 
 export interface SocialGraphEntry {
@@ -86,7 +88,7 @@ export interface PostCounts {
 
 export interface AppNotification {
   id: string;
-  kind: "mention" | "like" | "reply" | "quote" | "follower";
+  kind: "mention" | "like" | "reply" | "quote" | "follower" | "follow_request";
   actor: string;
   target_post_id: string | null;
   post_id: string | null;
@@ -101,6 +103,9 @@ export interface FollowRequestEntry {
   created_at: number;
   expires_at: number;
 }
+
+/** Result of `send_follow_request_to_peer`. */
+export type FollowRequestOutcome = "approved" | "denied" | "pending";
 
 export interface SyncResult {
   posts: Post[];
@@ -126,7 +131,6 @@ export interface ServerEntry {
   registered_at: number | null;
   visibility: string;
   added_at: number;
-  last_synced_at: number | null;
 }
 
 export interface ServerInfo {
@@ -146,9 +150,15 @@ export interface ServerFeedPost {
   author: string;
   content: string;
   timestamp: number;
+  media_json: string | null;
   reply_to: string | null;
-  media_hashes: string | null;
-  signature: string | null;
+  reply_to_author: string | null;
+  quote_of: string | null;
+  quote_of_author: string | null;
+  signature: string;
+  indexed_at: number;
+  /** True if the client verified the post signature against a cached delegation of the author. */
+  verified: boolean;
 }
 
 export interface TrendingHashtag {
@@ -187,6 +197,8 @@ export interface ServerSearchPost {
   quote_of_author: string | null;
   signature: string;
   indexed_at: number;
+  /** True if the client verified the post signature against a cached delegation of the author. */
+  verified: boolean;
 }
 
 export interface PostSearchResponse {
@@ -206,6 +218,8 @@ export interface LinkQrPayload {
   node_id: string;
   secret: string;
   relay_url: string | null;
+  /** Unix ms after which the existing device rejects this payload. */
+  expires_at: number;
 }
 
 export type CallState = "ringing" | "incoming" | "active" | "ended" | "failed";
@@ -231,6 +245,10 @@ export interface StageState {
   participants: StageParticipant[];
   started_at: number;
   ticket: string | null;
+  /** Local microphone mute state held by the backend. */
+  self_muted: boolean;
+  /** Local raised-hand state held by the backend. */
+  hand_raised: boolean;
 }
 
 export type StageEvent =

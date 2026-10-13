@@ -1,7 +1,9 @@
 <script lang="ts">
   import type { MediaAttachment } from "$lib/types";
   import type { BlobCache } from "$lib/blobs";
-  import { isImage, isVideo, isAudio, formatSize } from "$lib/utils";
+  import { showContextMenu } from "$lib/context-menu";
+  import MediaLoader, { mediaKind } from "$lib/MediaLoader.svelte";
+  import { formatSize } from "$lib/utils";
 
   let {
     media,
@@ -10,35 +12,66 @@
     media: MediaAttachment[];
     blobs: BlobCache;
   } = $props();
+
+  // Replaces the webview's default menu, which offers to open the blob URL.
+  function handleContextMenu(
+    e: MouseEvent,
+    att: MediaAttachment,
+    label: string,
+  ) {
+    showContextMenu(e, [
+      { text: label, action: () => blobs.saveFileAs(att) },
+    ]).catch((err) => console.error("Failed to show context menu:", err));
+  }
 </script>
 
 <div class="message-media">
   {#each media as att}
-    {#if isImage(att.mime_type)}
-      {#await blobs.getBlobUrl(att) then url}
-        <img src={url} alt={att.filename} class="media-img" />
-      {/await}
+    {@const kind = mediaKind(att.mime_type)}
+    {#if kind === "image"}
+      <MediaLoader {att} {blobs}>
+        {#snippet ready(url)}
+          <img
+            src={url}
+            alt={att.filename}
+            class="media-img"
+            oncontextmenu={(e) => handleContextMenu(e, att, "Save Image As...")}
+          />
+        {/snippet}
+      </MediaLoader>
       <button class="dm-save-as-btn" onclick={() => blobs.saveFileAs(att)}
         >Save As</button
       >
-    {:else if isVideo(att.mime_type)}
-      {#await blobs.getBlobUrl(att) then url}
-        <video src={url} controls class="media-video" preload="metadata"
-        ></video>
-      {/await}
-      <button class="dm-save-as-btn" onclick={() => blobs.saveFileAs(att)}
-        >Save As</button
-      >
-    {:else if isAudio(att.mime_type)}
-      {#await blobs.getBlobUrl(att) then url}
-        <div class="audio-attachment">
-          <span class="audio-filename">{att.filename}</span>
-          <audio src={url} controls preload="metadata"></audio>
-          <button class="dm-save-as-btn" onclick={() => blobs.saveFileAs(att)}
-            >Save As</button
+    {:else if kind === "video"}
+      <MediaLoader {att} {blobs}>
+        {#snippet ready(url)}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <video
+            src={url}
+            controls
+            class="media-video"
+            preload="metadata"
+            oncontextmenu={(e) => handleContextMenu(e, att, "Save Video As...")}
           >
-        </div>
-      {/await}
+            <track kind="captions" />
+          </video>
+        {/snippet}
+      </MediaLoader>
+      <button class="dm-save-as-btn" onclick={() => blobs.saveFileAs(att)}
+        >Save As</button
+      >
+    {:else if kind === "audio"}
+      <div class="audio-attachment">
+        <span class="audio-filename">{att.filename}</span>
+        <MediaLoader {att} {blobs}>
+          {#snippet ready(url)}
+            <audio src={url} controls preload="metadata"></audio>
+          {/snippet}
+        </MediaLoader>
+        <button class="dm-save-as-btn" onclick={() => blobs.saveFileAs(att)}
+          >Save As</button
+        >
+      </div>
     {:else}
       <button class="file-attachment" onclick={() => blobs.saveFileAs(att)}>
         <span class="file-icon">&#128196;</span>
@@ -62,7 +95,6 @@
     max-height: 300px;
     border-radius: var(--radius-lg);
     object-fit: contain;
-    cursor: pointer;
   }
 
   .media-video {

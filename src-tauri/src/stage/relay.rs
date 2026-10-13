@@ -1,144 +1,102 @@
-use crate::audio::{read_audio_frame, write_audio_frame};
-use crate::error::AppError;
-use iroh::endpoint::{RecvStream, SendStream};
+use super::control::ControlSigner;
+use super::fanout::Fanout;
+use super::pipeline::{BACKOFF_INITIAL, BACKOFF_MAX, STREAM_IDLE_TIMEOUT, open_audio_connection};
+use super::{CLOSE_NORMAL, CONN_TYPE_LISTENER};
+use crate::audio::read_audio_frame;
+use iroh::{Endpoint, EndpointId};
+use proscenium_types::short_id;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-/// A single Opus audio frame forwarded to all relay subscribers.
-#[derive(Clone, Debug)]
-pub struct RelayFrame {
-    pub seq: u32,
-    pub timestamp: u32,
-    /// Wire tag byte (TAG_NORMAL or TAG_CHECKPOINT) — preserved for auth forwarding.
-    pub tag: u8,
-    pub payload: Arc<Vec<u8>>,
+/// Parameters of the relay upstream task.
+pub(super) struct RelayConfig {
+    pub(super) endpoint: Endpoint,
+    /// The host's transport NodeId. A relay always reads the mixed stream from the host.
+    pub(super) host_node_id: String,
+    pub(super) signer: Arc<ControlSigner>,
+    /// Downstream listeners subscribe to this fanout.
+    pub(super) fanout: Arc<Fanout>,
+    pub(super) cancel: CancellationToken,
 }
 
-// ---- Command enum -------------------------------------------------------
-
-pub enum RelayCommand {
-    /// New downstream listener connected — add their send stream to the relay fanout.
-    AddDownstream(SendStream),
-}
-
-// ---- Handle -------------------------------------------------------------
-
-/// Cheap-to-clone handle to the RelayActor.
-#[derive(Clone)]
-pub struct RelayHandle {
-    cmd_tx: mpsc::Sender<RelayCommand>,
-}
-
-impl RelayHandle {
-    pub async fn add_downstream(&self, stream: SendStream) -> Result<(), AppError> {
-        self.cmd_tx
-            .send(RelayCommand::AddDownstream(stream))
-            .await
-            .map_err(|_| AppError::Other("relay actor closed".into()))
-    }
-}
-
-// ---- Actor --------------------------------------------------------------
-
-/// Spawn the RelayActor.
+/// Relay upstream task: connect to the host as a listener and forward every received
+/// frame, unmodified, to `config.fanout`. Reconnects with exponential backoff when the
+/// stream ends; the delay returns to `BACKOFF_INITIAL` after a session that delivered
+/// frames. Runs until `config.cancel` is cancelled.
 ///
-/// The relay reads frames from `upstream` (a `RecvStream` from the host or
-/// an upstream relay) and fans them out to all downstream subscribers.
-/// Call `handle.add_downstream(send_stream)` whenever a new listener connects.
-pub fn spawn_relay(
-    upstream: RecvStream,
-    cancel: CancellationToken,
-) -> Result<RelayHandle, AppError> {
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    tokio::spawn(run_relay(upstream, cmd_rx, cancel));
-    Ok(RelayHandle { cmd_tx })
-}
-
-async fn run_relay(
-    mut upstream: RecvStream,
-    mut cmd_rx: mpsc::Receiver<RelayCommand>,
-    cancel: CancellationToken,
-) {
-    // Relay-local broadcast channel: same 50-frame buffer, laggards skip.
-    let (frame_tx, _) = broadcast::channel::<RelayFrame>(50);
+/// The frames keep the host's header and checkpoint data, so downstream listeners verify
+/// the stream against the host key.
+pub(super) async fn run_relay_upstream(config: RelayConfig) {
+    let Ok(host_id) = config.host_node_id.parse::<EndpointId>() else {
+        log::error!("[stage-relay] invalid host node id");
+        return;
+    };
+    let mut backoff = BACKOFF_INITIAL;
 
     loop {
+        let forwarded = forward_once(&config, host_id).await;
+        if config.cancel.is_cancelled() {
+            break;
+        }
+        if forwarded > 0 {
+            backoff = BACKOFF_INITIAL;
+        }
+        log::info!(
+            "[stage-relay] upstream ended after {forwarded} frames, reconnecting in {backoff:?}"
+        );
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            _ = config.cancel.cancelled() => break,
+            _ = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(BACKOFF_MAX);
+    }
+    log::info!("[stage-relay] upstream task stopped");
+}
 
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    Some(RelayCommand::AddDownstream(stream)) => {
-                        let mut rx = frame_tx.subscribe();
-                        let sub_cancel = cancel.child_token();
-                        tokio::spawn(async move {
-                            run_downstream_subscriber(stream, &mut rx, sub_cancel).await;
-                        });
-                    }
-                    None => break,
-                }
-            }
+/// One upstream session. Returns the number of frames forwarded.
+///
+/// The frame read is the only branch besides cancellation, so a partially read frame is
+/// discarded only when the session ends.
+async fn forward_once(config: &RelayConfig, host_id: EndpointId) -> u64 {
+    let opened = tokio::select! {
+        _ = config.cancel.cancelled() => return 0,
+        opened = open_audio_connection(&config.endpoint, host_id, CONN_TYPE_LISTENER, &config.signer) => opened,
+    };
+    let (conn, _send, mut recv) = match opened {
+        Ok(streams) => streams,
+        Err(e) => {
+            log::warn!("[stage-relay] connection to host failed: {e}");
+            return 0;
+        }
+    };
+    log::info!(
+        "[stage-relay] connected to host {}",
+        short_id(&config.host_node_id)
+    );
 
-            result = read_audio_frame(&mut upstream) => {
+    let mut forwarded: u64 = 0;
+    loop {
+        tokio::select! {
+            _ = config.cancel.cancelled() => break,
+            result = tokio::time::timeout(STREAM_IDLE_TIMEOUT, read_audio_frame(&mut recv)) => {
                 match result {
-                    Ok(Some((seq, timestamp, tag, payload))) => {
-                        let frame = RelayFrame {
-                            seq,
-                            timestamp,
-                            tag,
-                            payload: Arc::new(payload),
-                        };
-                        // Non-blocking send — lagging subscribers are skipped
-                        let _ = frame_tx.send(frame);
+                    Ok(Ok(Some(frame))) => {
+                        config.fanout.send_frame(frame.seq, frame.timestamp, frame.tag, frame.payload);
+                        forwarded += 1;
                     }
-                    Ok(None) => {
-                        log::info!("[relay] upstream stream ended");
+                    Ok(Ok(None)) => break,
+                    Ok(Err(e)) => {
+                        log::info!("[stage-relay] upstream read error: {e}");
                         break;
                     }
-                    Err(e) => {
-                        log::warn!("[relay] upstream read error: {e}");
+                    Err(_) => {
+                        log::warn!("[stage-relay] no frame from host within {STREAM_IDLE_TIMEOUT:?}");
                         break;
                     }
                 }
             }
         }
     }
-
-    log::info!("[relay] actor stopped");
-}
-
-async fn run_downstream_subscriber(
-    mut stream: SendStream,
-    rx: &mut broadcast::Receiver<RelayFrame>,
-    cancel: CancellationToken,
-) {
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => break,
-            result = rx.recv() => {
-                match result {
-                    Ok(frame) => {
-                        if write_audio_frame(
-                            &mut stream,
-                            frame.seq,
-                            frame.timestamp,
-                            frame.tag,
-                            &frame.payload,
-                        )
-                        .await
-                        .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::debug!("[relay] subscriber lagged {n} frames — skipping");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-    let _ = stream.finish();
+    conn.close(CLOSE_NORMAL.into(), b"relay stopped");
+    forwarded
 }

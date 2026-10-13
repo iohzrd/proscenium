@@ -1,9 +1,13 @@
-use super::AppState;
+use super::{AppState, clamp_limit, clamp_offset, internal_error};
+use crate::content::fts_query;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+
+/// Maximum number of interactions returned for one post.
+const MAX_INTERACTIONS: i64 = 500;
 
 #[derive(Deserialize)]
 struct UserPostsParams {
@@ -36,40 +40,37 @@ struct InteractionsResponse {
     like_count: i64,
 }
 
+/// Posts of one user. Empty unless the user has an active public registration.
 async fn get_user_posts(
     State(state): State<AppState>,
     Path(pubkey): Path<String>,
     Query(params): Query<UserPostsParams>,
 ) -> Result<Json<PostsResponse>, StatusCode> {
-    // Check if user is Listed (no posts stored)
-    if let Ok(Some(reg)) = state.storage.get_registration(&pubkey).await
-        && reg.visibility == "listed"
-    {
-        return Ok(Json(PostsResponse { posts: vec![] }));
-    }
-
-    let limit = params.limit.unwrap_or(50).min(200);
+    let limit = clamp_limit(params.limit, 50, 200);
     let posts = state
         .storage
         .get_user_posts(&pubkey, limit, params.before)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     Ok(Json(PostsResponse { posts }))
 }
 
+/// Full-text search. Responds 400 if `q` has no searchable term or exceeds the limits
+/// of `content::fts_query`.
 async fn search_posts(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
 ) -> Result<Json<PostSearchResponse>, StatusCode> {
-    let limit = params.limit.unwrap_or(20).min(100);
-    let offset = params.offset.unwrap_or(0);
+    let limit = clamp_limit(params.limit, 20, 100);
+    let offset = clamp_offset(params.offset);
+    let query = fts_query(&params.q).ok_or(StatusCode::BAD_REQUEST)?;
 
     let (posts, total) = state
         .storage
-        .search_posts(&params.q, limit, offset)
+        .search_posts(&query, limit, offset)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     Ok(Json(PostSearchResponse {
         posts,
@@ -78,21 +79,18 @@ async fn search_posts(
     }))
 }
 
+/// Interactions on one post. Responds 404 unless the post is stored and its author has
+/// an active public registration.
 async fn get_post_interactions(
     State(state): State<AppState>,
     Path((author, post_id)): Path<(String, String)>,
 ) -> Result<Json<InteractionsResponse>, StatusCode> {
-    let interactions = state
+    let (interactions, like_count) = state
         .storage
-        .get_post_interactions(&author, &post_id)
+        .get_post_interactions(&author, &post_id, MAX_INTERACTIONS)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let like_count = state
-        .storage
-        .get_post_like_count(&author, &post_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(InteractionsResponse {
         interactions,

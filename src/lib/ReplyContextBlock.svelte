@@ -1,7 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { postHref } from "$lib/profile/links";
   import type { Post } from "$lib/types";
-  import { getDisplayName } from "$lib/utils";
+  import { getDisplayName, truncate } from "$lib/utils";
 
   let {
     replyToId,
@@ -11,31 +12,36 @@
     pubkey: string;
   } = $props();
 
+  const PREVIEW_CHARS = 100;
+
   let context = $state<{ author: string; preview: string } | null>(null);
 
   $effect(() => {
-    loadReplyContext(replyToId);
-  });
-
-  async function loadReplyContext(parentId: string) {
-    try {
-      const parent: Post | null = await invoke("get_post", { id: parentId });
-      if (parent) {
-        const name = await getDisplayName(parent.author, pubkey);
-        const preview =
-          parent.content.length > 100
-            ? parent.content.slice(0, 100) + "..."
-            : parent.content;
-        context = { author: name, preview };
+    const parentId = replyToId;
+    const selfId = pubkey;
+    context = null;
+    let stale = false;
+    (async () => {
+      try {
+        const parent = await invoke<Post | null>("get_post", { id: parentId });
+        if (!parent || stale) return;
+        const author = await getDisplayName(parent.author, selfId);
+        if (stale) return;
+        const cut = truncate(parent.content, PREVIEW_CHARS);
+        const preview = cut === parent.content ? cut : cut + "...";
+        context = { author, preview };
+      } catch {
+        // The parent post is not stored locally.
       }
-    } catch {
-      // parent not available locally
-    }
-  }
+    })();
+    return () => {
+      stale = true;
+    };
+  });
 </script>
 
 {#if context}
-  <a href="/post/{replyToId}" class="reply-context-block">
+  <a href={postHref(replyToId)} class="reply-context-block">
     <span class="reply-icon">{"\u21A9"}</span>
     <span class="reply-author">{context.author}</span>
     {#if context.preview}
@@ -43,7 +49,7 @@
     {/if}
   </a>
 {:else}
-  <a href="/post/{replyToId}" class="reply-context">
+  <a href={postHref(replyToId)} class="reply-context">
     {"\u21A9"} in reply to a post
   </a>
 {/if}

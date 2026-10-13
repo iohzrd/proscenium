@@ -1,4 +1,4 @@
-use super::AppState;
+use super::{AppState, clamp_limit, internal_error};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -20,13 +20,13 @@ async fn get_trending(
     State(state): State<AppState>,
     Query(params): Query<TrendingParams>,
 ) -> Result<Json<TrendingResponse>, StatusCode> {
-    let limit = params.limit.unwrap_or(10).min(50);
+    let limit = clamp_limit(params.limit, 10, 50);
 
     let hashtags = state
         .storage
         .get_trending_hashtags(limit)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(internal_error)?;
 
     let computed_at = hashtags.first().map(|t| t.computed_at);
 

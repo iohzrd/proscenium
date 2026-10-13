@@ -1,5 +1,7 @@
 # Stage: Live Audio Rooms
 
+> **Status:** original design document. The control protocol described here predates protocol version 2: participants are now identified by master public key with a delegation in signed presence, roles come only from host-signed room state, and relays are speakers or co-hosts. See "Stage (Live Audio Rooms)" in the README.
+
 Design document for implementing live, multi-participant audio rooms
 in iroh-social.
 

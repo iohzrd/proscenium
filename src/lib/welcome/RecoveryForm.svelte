@@ -1,22 +1,22 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { PHRASE_INPUT_ATTRS } from "./phrase-input";
 
   let {
     onback,
     onprofile,
   }: {
     onback: () => void;
-    onprofile: () => void;
+    /** Called after a successful recovery, before the webview reloads. */
+    onprofile?: () => void;
   } = $props();
 
   let recoveryPhrase = $state("");
   let recovering = $state(false);
   let recoveryError = $state("");
-  let recoveryComplete = $state(false);
 
   async function recoverFromPhrase() {
-    const trimmed = recoveryPhrase.trim();
-    const words = trimmed.split(/\s+/);
+    const words = recoveryPhrase.trim().toLowerCase().split(/\s+/);
     if (words.length !== 24) {
       recoveryError = "Recovery phrase must be exactly 24 words.";
       return;
@@ -24,58 +24,56 @@
     recovering = true;
     recoveryError = "";
     try {
-      await invoke("recover_from_seed_phrase", { phrase: trimmed });
-      recoveryComplete = true;
+      // `recover_from_seed_phrase` shows a native confirmation dialog, then
+      // replaces the identity.
+      await invoke("recover_from_seed_phrase", { phrase: words.join(" ") });
     } catch (e) {
-      recoveryError = `Recovery failed: ${e}`;
+      // "cancelled": the native dialog was declined. Nothing was replaced.
+      if (String(e) !== "cancelled") recoveryError = `Recovery failed: ${e}`;
+      recovering = false;
+      return;
     }
-    recovering = false;
+    recoveryPhrase = "";
+    onprofile?.();
+    // The layout and every page hold the previous pubkey and node id.
+    location.reload();
   }
 </script>
 
 <div class="step">
-  {#if recoveryComplete}
-    <h2>Identity Recovered</h2>
-    <p class="desc">
-      Your identity has been restored. Set up your profile to get started.
-    </p>
-    <button class="btn-accent primary-btn" onclick={onprofile}>
-      Create Profile
-    </button>
-  {:else}
-    <h2>Recover Your Identity</h2>
-    <p class="desc">
-      Enter your 24-word recovery phrase to restore your identity on this
-      device. This will replace any existing identity.
-    </p>
+  <h2>Recover Your Identity</h2>
+  <p class="desc">
+    Enter your 24-word recovery phrase to restore your identity on this device.
+    This replaces the identity and deletes all data stored on this device.
+  </p>
 
-    <label class="field">
-      <span class="field-label">Recovery Phrase</span>
-      <textarea
-        class="input-base recovery-textarea"
-        bind:value={recoveryPhrase}
-        placeholder="Enter your 24 words separated by spaces"
-        rows="4"
-        autocapitalize="none"
-        autocomplete="off"
-        spellcheck="false"></textarea>
-    </label>
+  <label class="field">
+    <span class="field-label">Recovery Phrase</span>
+    <textarea
+      class="input-base recovery-textarea"
+      bind:value={recoveryPhrase}
+      placeholder="Enter your 24 words separated by spaces"
+      rows="4"
+      {...PHRASE_INPUT_ATTRS}
+      disabled={recovering}></textarea>
+  </label>
 
-    {#if recoveryError}
-      <p class="error">{recoveryError}</p>
-    {/if}
-
-    <div class="actions">
-      <button class="secondary-btn" onclick={onback}>Back</button>
-      <button
-        class="btn-accent primary-btn"
-        onclick={recoverFromPhrase}
-        disabled={!recoveryPhrase.trim() || recovering}
-      >
-        {recovering ? "Recovering..." : "Recover Identity"}
-      </button>
-    </div>
+  {#if recoveryError}
+    <p class="error" role="alert">{recoveryError}</p>
   {/if}
+
+  <div class="actions">
+    <button class="secondary-btn" onclick={onback} disabled={recovering}
+      >Back</button
+    >
+    <button
+      class="btn-accent primary-btn"
+      onclick={recoverFromPhrase}
+      disabled={!recoveryPhrase.trim() || recovering}
+    >
+      {recovering ? "Recovering..." : "Recover Identity"}
+    </button>
+  </div>
 </div>
 
 <style>
@@ -111,7 +109,7 @@
   }
 
   .error {
-    color: var(--color-danger);
+    color: var(--color-error);
     font-size: var(--text-sm);
     margin: 0 0 1rem;
   }

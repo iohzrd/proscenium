@@ -1,8 +1,9 @@
 <script lang="ts">
   import { getBlobContext } from "$lib/blobs";
   import { showContextMenu } from "$lib/context-menu";
+  import MediaLoader, { mediaKind } from "$lib/MediaLoader.svelte";
   import type { MediaAttachment } from "$lib/types";
-  import { isImage, isVideo, isAudio, formatSize } from "$lib/utils";
+  import { formatSize } from "$lib/utils";
 
   let {
     media,
@@ -12,109 +13,82 @@
     onlightbox?: (src: string, alt: string, att: MediaAttachment) => void;
   } = $props();
 
-  const { getBlobUrl, refetchBlobUrl, saveFileAs } = getBlobContext();
+  const blobs = getBlobContext();
 
-  let refetching = $state<Record<string, Promise<string> | undefined>>({});
-
-  function handleContextMenu(e: MouseEvent, att: MediaAttachment) {
+  function handleContextMenu(
+    e: MouseEvent,
+    att: MediaAttachment,
+    label: string,
+  ) {
     showContextMenu(e, [
-      { text: "Save Image As...", action: () => saveFileAs(att) },
-    ]);
+      { text: label, action: () => blobs.saveFileAs(att) },
+    ]).catch((err) => console.error("Failed to show context menu:", err));
   }
 </script>
 
 {#if media.length > 0}
+  <!-- Not keyed: two attachments of one post can carry the same hash. -->
   <div class="media-grid" class:grid={media.length > 1}>
-    {#each media as att (att.hash)}
-      {#if isImage(att.mime_type)}
+    {#each media as att}
+      {@const kind = mediaKind(att.mime_type)}
+      {#if kind === "image"}
         <div class="media-item">
-          {#await refetching[att.hash] ?? getBlobUrl(att)}
-            <div class="media-placeholder">Loading...</div>
-          {:then url}
-            <button
-              class="media-img-btn"
-              onclick={() => onlightbox?.(url, att.filename, att)}
-              oncontextmenu={(e) => handleContextMenu(e, att)}
-            >
-              <img src={url} alt={att.filename} class="media-img" />
-            </button>
-            <button class="save-as-overlay" onclick={() => saveFileAs(att)}
-              >Save As</button
-            >
-          {:catch}
-            <div class="media-placeholder">
-              Failed to load
+          <MediaLoader {att} {blobs}>
+            {#snippet ready(url)}
               <button
-                class="retry-btn"
-                onclick={() => {
-                  refetching[att.hash] = refetchBlobUrl(att);
-                }}>Re-download</button
+                class="media-img-btn"
+                onclick={() => onlightbox?.(url, att.filename, att)}
+                oncontextmenu={(e) =>
+                  handleContextMenu(e, att, "Save Image As...")}
               >
-            </div>
-          {/await}
+                <img src={url} alt={att.filename} class="media-img" />
+              </button>
+              <button
+                class="save-as-overlay"
+                onclick={() => blobs.saveFileAs(att)}>Save As</button
+              >
+            {/snippet}
+          </MediaLoader>
         </div>
-      {:else if isVideo(att.mime_type)}
+      {:else if kind === "video"}
         <div class="media-item">
-          {#await refetching[att.hash] ?? getBlobUrl(att)}
-            <div class="media-placeholder">Loading...</div>
-          {:then url}
-            <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <video
-              src={url}
-              controls
-              class="media-video"
-              oncontextmenu={(e) => handleContextMenu(e, att)}
-            >
-              <track kind="captions" />
-            </video>
-            <div class="media-actions">
-              <button
-                class="retry-btn retry-btn-inline"
-                onclick={() => {
-                  refetching[att.hash] = refetchBlobUrl(att);
-                }}>Re-download</button
+          <MediaLoader {att} {blobs}>
+            {#snippet ready(url, refetch)}
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <video
+                src={url}
+                controls
+                class="media-video"
+                oncontextmenu={(e) =>
+                  handleContextMenu(e, att, "Save Video As...")}
               >
-              <button class="save-as-btn" onclick={() => saveFileAs(att)}
+                <track kind="captions" />
+              </video>
+              <div class="media-actions">
+                <button class="retry-btn" onclick={refetch}>Re-download</button>
+                <button
+                  class="save-as-btn"
+                  onclick={() => blobs.saveFileAs(att)}>Save As</button
+                >
+              </div>
+            {/snippet}
+          </MediaLoader>
+        </div>
+      {:else if kind === "audio"}
+        <MediaLoader {att} {blobs}>
+          {#snippet ready(url)}
+            <div class="media-audio">
+              <span class="audio-filename">{att.filename}</span>
+              <audio src={url} controls preload="metadata"></audio>
+              <button class="save-as-btn" onclick={() => blobs.saveFileAs(att)}
                 >Save As</button
               >
             </div>
-          {:catch}
-            <div class="media-placeholder">
-              Failed to load
-              <button
-                class="retry-btn"
-                onclick={() => {
-                  refetching[att.hash] = refetchBlobUrl(att);
-                }}>Re-download</button
-              >
-            </div>
-          {/await}
-        </div>
-      {:else if isAudio(att.mime_type)}
-        {#await refetching[att.hash] ?? getBlobUrl(att)}
-          <div class="media-placeholder">Loading...</div>
-        {:then url}
-          <div class="media-audio">
-            <span class="audio-filename">{att.filename}</span>
-            <audio src={url} controls preload="metadata"></audio>
-            <button class="save-as-btn" onclick={() => saveFileAs(att)}
-              >Save As</button
-            >
-          </div>
-        {:catch}
-          <div class="media-placeholder">
-            Failed to load
-            <button
-              class="retry-btn"
-              onclick={() => {
-                refetching[att.hash] = refetchBlobUrl(att);
-              }}>Re-download</button
-            >
-          </div>
-        {/await}
+          {/snippet}
+        </MediaLoader>
       {:else}
-        <button class="media-file" onclick={() => saveFileAs(att)}>
-          <span>{att.filename}</span>
+        <button class="media-file" onclick={() => blobs.saveFileAs(att)}>
+          <span class="file-name">{att.filename}</span>
           <span class="file-size">{formatSize(att.size)}</span>
           <span class="download-label">Save As</span>
         </button>
@@ -231,15 +205,6 @@
     border-radius: var(--radius-sm);
   }
 
-  .media-placeholder {
-    background: var(--bg-deep);
-    border-radius: var(--radius-lg);
-    padding: 2rem;
-    text-align: center;
-    color: var(--text-tertiary);
-    font-size: var(--text-base);
-  }
-
   .media-file {
     background: var(--bg-deep);
     border: 1px solid var(--border);
@@ -252,6 +217,7 @@
     font-size: var(--text-base);
     cursor: pointer;
     flex: 1;
+    gap: 0.5rem;
     min-width: 0;
     transition: border-color var(--transition-normal);
   }
@@ -260,14 +226,23 @@
     border-color: var(--accent-medium);
   }
 
+  .file-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .file-size {
     color: var(--text-tertiary);
     font-size: var(--text-sm);
+    flex-shrink: 0;
   }
 
   .download-label {
     color: var(--color-link);
     font-size: var(--text-sm);
+    flex-shrink: 0;
   }
 
   .retry-btn {
@@ -275,22 +250,15 @@
     color: var(--text-primary);
     border: none;
     border-radius: var(--radius-sm);
-    padding: 0.3rem 0.75rem;
-    font-size: var(--text-sm);
+    padding: 0.15rem 0.5rem;
+    font-size: var(--text-xs, 0.7rem);
     cursor: pointer;
-    margin-top: 0.5rem;
+    opacity: 0.6;
     transition: opacity var(--transition-fast);
   }
 
   .retry-btn:hover {
     opacity: 0.8;
-  }
-
-  .retry-btn-inline {
-    margin-top: 0;
-    font-size: var(--text-xs, 0.7rem);
-    padding: 0.15rem 0.5rem;
-    opacity: 0.6;
   }
 
   .media-actions {

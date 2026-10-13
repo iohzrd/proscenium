@@ -1,9 +1,10 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import type { CallState } from "$lib/types";
-  import { shortId, getDisplayName } from "$lib/utils";
   import Avatar from "$lib/Avatar.svelte";
   import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
+  import { focusTrap } from "$lib/composables";
+  import { useDisplayName } from "$lib/name.svelte";
 
   let {
     callId,
@@ -17,29 +18,40 @@
     selfId: string;
   } = $props();
 
-  let muted = $state(false);
-  let showDevices = $state(false);
-  let duration = $state(0);
-  let durationInterval: ReturnType<typeof setInterval> | null = null;
-  let peerName = $state("");
-
-  $effect(() => {
-    getDisplayName(peerPubkey, selfId).then((name) => (peerName = name));
+  // Per-call state. Each value returns to its initial value when `callId`
+  // changes: this instance can be reused for the next call, which starts
+  // unmuted in the backend.
+  let muted = $derived.by(() => {
+    void callId;
+    return false;
+  });
+  let showDevices = $derived.by(() => {
+    void callId;
+    return false;
+  });
+  let errorMessage = $derived.by(() => {
+    void callId;
+    return "";
+  });
+  // True from the click on Answer until `callState` changes or the command fails.
+  let accepting = $derived.by(() => {
+    void callId;
+    void callState;
+    return false;
   });
 
+  let duration = $state(0);
+
+  const peer = useDisplayName(
+    () => peerPubkey,
+    () => selfId,
+  );
+
   $effect(() => {
-    if (callState === "active") {
-      duration = 0;
-      durationInterval = setInterval(() => (duration += 1), 1000);
-    } else {
-      if (durationInterval) {
-        clearInterval(durationInterval);
-        durationInterval = null;
-      }
-    }
-    return () => {
-      if (durationInterval) clearInterval(durationInterval);
-    };
+    if (callState !== "active") return;
+    duration = 0;
+    const timer = setInterval(() => (duration += 1), 1000);
+    return () => clearInterval(timer);
   });
 
   function formatDuration(seconds: number): string {
@@ -49,10 +61,14 @@
   }
 
   async function accept() {
+    if (accepting) return;
+    accepting = true;
+    errorMessage = "";
     try {
       await invoke("accept_call", { callId });
     } catch (e) {
-      console.error("Failed to accept call:", e);
+      errorMessage = `Failed to answer: ${e}`;
+      accepting = false;
     }
   }
 
@@ -60,7 +76,7 @@
     try {
       await invoke("reject_call", { callId });
     } catch (e) {
-      console.error("Failed to reject call:", e);
+      errorMessage = `Failed to decline: ${e}`;
     }
   }
 
@@ -68,46 +84,64 @@
     try {
       await invoke("hangup_call");
     } catch (e) {
-      console.error("Failed to hang up:", e);
+      errorMessage = `Failed to hang up: ${e}`;
     }
   }
 
   async function toggleMute() {
     try {
-      muted = await invoke("toggle_mute_call");
+      muted = await invoke<boolean>("toggle_mute_call");
     } catch (e) {
-      console.error("Failed to toggle mute:", e);
+      errorMessage = `Failed to change mute: ${e}`;
     }
   }
 </script>
 
 <div class="call-overlay">
-  <div class="call-card">
+  <div
+    class="call-card"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Call with {peer.name}"
+    tabindex="-1"
+    use:focusTrap
+  >
     <div class="call-avatar">
-      <Avatar pubkey={peerPubkey} name={peerName} size={72} />
+      <Avatar pubkey={peerPubkey} name={peer.name} size={72} />
     </div>
-    <div class="call-peer-name">{peerName}</div>
+    <!-- Takes the initial focus, so that Enter or Space does not activate Answer, Decline or Hang up. -->
+    <div class="call-peer-name" tabindex="-1" data-autofocus>{peer.name}</div>
 
     {#if callState === "ringing"}
-      <div class="call-status">Calling...</div>
+      <div class="call-status" role="status">Calling...</div>
       <div class="call-actions">
         <button class="call-btn hangup" onclick={hangup}>Cancel</button>
       </div>
     {:else if callState === "incoming"}
-      <div class="call-status">Incoming call</div>
+      <div class="call-status" role="status">
+        {accepting ? "Connecting..." : "Incoming call"}
+      </div>
       <div class="call-actions">
-        <button class="call-btn accept" onclick={accept}>Answer</button>
+        <button class="call-btn accept" onclick={accept} disabled={accepting}>
+          {accepting ? "Answering..." : "Answer"}
+        </button>
         <button class="call-btn hangup" onclick={reject}>Decline</button>
       </div>
     {:else if callState === "active"}
       <div class="call-status">{formatDuration(duration)}</div>
       <div class="call-actions">
-        <button class="call-btn mute" class:muted onclick={toggleMute}>
+        <button
+          class="call-btn mute"
+          class:muted
+          onclick={toggleMute}
+          aria-pressed={muted}
+        >
           {muted ? "Unmute" : "Mute"}
         </button>
         <button
           class="call-btn devices-btn"
           onclick={() => (showDevices = !showDevices)}
+          aria-expanded={showDevices}
         >
           Audio
         </button>
@@ -119,7 +153,13 @@
         </div>
       {/if}
     {:else if callState === "failed"}
-      <div class="call-status call-failed">Call failed</div>
+      <div class="call-status call-failed" role="status">Call failed</div>
+    {:else if callState === "ended"}
+      <div class="call-status" role="status">Call ended</div>
+    {/if}
+
+    {#if errorMessage}
+      <p class="call-error" role="alert">{errorMessage}</p>
     {/if}
   </div>
 </div>
@@ -165,6 +205,11 @@
     word-break: break-all;
   }
 
+  .call-card:focus,
+  .call-peer-name:focus {
+    outline: none;
+  }
+
   .call-status {
     font-size: var(--text-base);
     color: var(--text-secondary);
@@ -173,6 +218,14 @@
 
   .call-failed {
     color: var(--color-error);
+  }
+
+  .call-error {
+    color: var(--color-error-light);
+    font-size: var(--text-sm);
+    text-align: center;
+    margin: 0;
+    overflow-wrap: anywhere;
   }
 
   .call-actions {
@@ -194,12 +247,17 @@
     min-width: 100px;
   }
 
-  .call-btn:hover {
+  .call-btn:hover:not(:disabled) {
     transform: scale(1.05);
   }
 
-  .call-btn:active {
+  .call-btn:active:not(:disabled) {
     transform: scale(0.95);
+  }
+
+  .call-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
 
   .call-btn.accept {

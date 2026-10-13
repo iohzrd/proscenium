@@ -1,53 +1,76 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import Avatar from "$lib/Avatar.svelte";
   import Timeago from "$lib/Timeago.svelte";
   import type { ConversationMeta } from "$lib/types";
-  import { shortId, getDisplayName, getCachedAvatarTicket } from "$lib/utils";
+  import { useEventListeners, useNodeInit } from "$lib/composables";
+  import {
+    coalesce,
+    dedupeBy,
+    shortId,
+    getDisplayName,
+    getCachedAvatarTicket,
+    isPubkeyFormat,
+  } from "$lib/utils";
+
+  const ERROR_DURATION_MS = 4000;
 
   let conversations = $state<ConversationMeta[]>([]);
-  let loading = $state(true);
-  let nodeId = $state("");
   let names = $state<Record<string, string>>({});
   let newPubkey = $state("");
   let newError = $state("");
+  let loadError = $state("");
+  let errorTimer: ReturnType<typeof setTimeout> | null = null;
 
-  async function loadConversations() {
+  const node = useNodeInit(async () => {
+    await loadConversations();
+  });
+
+  /** Load the conversation list, then the display name of each peer. */
+  const loadConversations = coalesce(async () => {
     try {
-      conversations = await invoke("get_conversations");
+      const list: ConversationMeta[] = await invoke("get_conversations");
+      conversations = dedupeBy(list, (c) => c.peer_pubkey);
+      loadError = "";
     } catch (e) {
+      loadError = `Failed to load conversations: ${e}`;
       console.error("Failed to load conversations:", e);
+      return;
     }
-  }
+    const resolved = await Promise.all(
+      conversations.map(
+        async (c) =>
+          [
+            c.peer_pubkey,
+            await getDisplayName(c.peer_pubkey, node.pubkey),
+          ] as const,
+      ),
+    );
+    names = Object.fromEntries(resolved);
+  });
 
-  async function resolveNames(convos: ConversationMeta[]) {
-    const updated: Record<string, string> = {};
-    for (const c of convos) {
-      updated[c.peer_pubkey] = await getDisplayName(c.peer_pubkey, nodeId);
-    }
-    names = updated;
-  }
-
-  async function init() {
-    try {
-      nodeId = await invoke("get_pubkey");
-      await loadConversations();
-      await resolveNames(conversations);
-      loading = false;
-    } catch {
-      setTimeout(init, 500);
-    }
+  function showNewError(message: string) {
+    newError = message;
+    if (errorTimer) clearTimeout(errorTimer);
+    errorTimer = setTimeout(() => {
+      newError = "";
+      errorTimer = null;
+    }, ERROR_DURATION_MS);
   }
 
   function startConversation() {
-    const key = newPubkey.trim();
+    const key = newPubkey.trim().toLowerCase();
     if (!key) return;
-    if (key === nodeId) {
-      newError = "Cannot message yourself";
-      setTimeout(() => (newError = ""), 2000);
+    if (!isPubkeyFormat(key)) {
+      showNewError(
+        "Enter a public key: 64 hex digits. A Node ID does not identify a user.",
+      );
+      return;
+    }
+    if (key === node.pubkey) {
+      showNewError("Cannot message yourself");
       return;
     }
     newPubkey = "";
@@ -56,23 +79,28 @@
   }
 
   onMount(() => {
-    init();
-    const unlisteners: Promise<UnlistenFn>[] = [];
-    unlisteners.push(
-      listen("dm-received", () => {
-        loadConversations().then(() => resolveNames(conversations));
-      }),
-    );
+    node.init();
+    const cleanupListeners = useEventListeners({
+      "dm-received": () => {
+        loadConversations();
+      },
+    });
     return () => {
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      if (errorTimer) clearTimeout(errorTimer);
+      cleanupListeners();
     };
   });
 </script>
 
-{#if loading}
+{#if node.loading}
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading messages...</p>
+  </div>
+{:else if node.error}
+  <div class="empty">
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
   </div>
 {:else}
   <h2 class="page-title">Messages</h2>
@@ -81,7 +109,11 @@
     <input
       type="text"
       class="input-base new-input"
-      placeholder="Paste a Node ID to start a conversation..."
+      placeholder="Paste a public key to start a conversation..."
+      aria-label="Public key of the user to message"
+      autocomplete="off"
+      autocapitalize="none"
+      spellcheck="false"
       bind:value={newPubkey}
       onkeydown={(e) => e.key === "Enter" && startConversation()}
     />
@@ -94,7 +126,10 @@
     </button>
   </div>
   {#if newError}
-    <p class="new-error">{newError}</p>
+    <p class="new-error" role="alert">{newError}</p>
+  {/if}
+  {#if loadError}
+    <p class="new-error" role="alert">{loadError}</p>
   {/if}
 
   {#if conversations.length === 0}

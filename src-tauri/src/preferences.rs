@@ -22,7 +22,7 @@ pub async fn get_dht_discovery(storage: &Storage) -> bool {
         .unwrap_or(false)
 }
 
-/// Defaults to true — users share their follow list unless they opt out.
+/// True unless the stored value is "0": the follow list is shared by default.
 pub async fn get_share_follows(storage: &Storage) -> bool {
     storage
         .get_preference(SHARE_FOLLOWS)
@@ -33,7 +33,7 @@ pub async fn get_share_follows(storage: &Storage) -> bool {
         .unwrap_or(true)
 }
 
-/// Defaults to true — users share their followers list unless they opt out.
+/// True unless the stored value is "0": the followers list is shared by default.
 pub async fn get_share_followers(storage: &Storage) -> bool {
     storage
         .get_preference(SHARE_FOLLOWERS)

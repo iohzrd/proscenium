@@ -5,6 +5,12 @@ use sqlx::Row;
 
 use super::Storage;
 
+/// Convert a millisecond timestamp to the SQLite integer type; values above `i64::MAX`
+/// become `i64::MAX`.
+fn to_db_millis(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 impl Storage {
     pub fn conversation_id(pubkey_a: &str, pubkey_b: &str) -> String {
         let mut keys = [pubkey_a, pubkey_b];
@@ -15,28 +21,6 @@ impl Storage {
         hasher.update(b":");
         hasher.update(keys[1].as_bytes());
         hex::encode(hasher.finalize())
-    }
-
-    pub async fn upsert_conversation(
-        &self,
-        peer_pubkey: &str,
-        my_pubkey: &str,
-        last_message_at: u64,
-        preview: &str,
-    ) -> Result<(), AppError> {
-        let conv_id = Self::conversation_id(my_pubkey, peer_pubkey);
-        sqlx::query(
-            "INSERT INTO dm_conversations (conversation_id, peer_pubkey, last_message_at, last_message_preview, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?3)
-             ON CONFLICT(conversation_id) DO UPDATE SET last_message_at=?3, last_message_preview=?4",
-        )
-        .bind(&conv_id)
-        .bind(peer_pubkey)
-        .bind(last_message_at as i64)
-        .bind(preview)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn get_conversations(&self) -> Result<Vec<ConversationMeta>, AppError> {
@@ -64,70 +48,112 @@ impl Storage {
         my_pubkey: &str,
     ) -> Result<(), AppError> {
         let conv_id = Self::conversation_id(my_pubkey, peer_pubkey);
+        let mut tx = self.pool.begin().await?;
         sqlx::query("UPDATE dm_conversations SET unread_count = 0 WHERE conversation_id=?1")
             .bind(&conv_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query("UPDATE dm_messages SET read = 1 WHERE conversation_id=?1 AND read = 0")
             .bind(&conv_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    pub async fn insert_dm_message(&self, msg: &StoredMessage) -> Result<(), AppError> {
-        let media_json = serde_json::to_string(&msg.media)?;
+    /// Store a message written by the local user: the conversation row (created or its
+    /// preview replaced), the message row, and the outbox entry holding `payload_json`,
+    /// in one transaction. The outbox entry is not selected by
+    /// `get_due_outbox_entries` before `next_attempt_at`.
+    pub async fn insert_outgoing_dm(
+        &self,
+        message: &StoredMessage,
+        preview: &str,
+        payload_json: &str,
+        next_attempt_at: u64,
+    ) -> Result<(), AppError> {
+        let media_json = serde_json::to_string(&message.media)?;
+        let timestamp = to_db_millis(message.timestamp);
+
+        let mut tx = self.pool.begin().await?;
+
         sqlx::query(
-            "INSERT OR IGNORE INTO dm_messages (id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO dm_conversations
+                 (conversation_id, peer_pubkey, last_message_at, last_message_preview, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?3)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                    last_message_at = MAX(last_message_at, ?3),
+                    last_message_preview = ?4",
         )
-        .bind(&msg.id)
-        .bind(&msg.conversation_id)
-        .bind(&msg.from_pubkey)
-        .bind(&msg.to_pubkey)
-        .bind(&msg.content)
-        .bind(msg.timestamp as i64)
-        .bind(&media_json)
-        .bind(msg.read as i32)
-        .bind(msg.delivered as i32)
-        .bind(&msg.reply_to)
-        .execute(&self.pool)
+        .bind(&message.conversation_id)
+        .bind(&message.to_pubkey)
+        .bind(timestamp)
+        .bind(preview)
+        .execute(&mut *tx)
         .await?;
+
+        sqlx::query(
+            "INSERT INTO dm_messages
+                 (id, conversation_id, from_pubkey, to_pubkey, content, timestamp,
+                  media_json, read, delivered, reply_to)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(&message.id)
+        .bind(&message.conversation_id)
+        .bind(&message.from_pubkey)
+        .bind(&message.to_pubkey)
+        .bind(&message.content)
+        .bind(timestamp)
+        .bind(&media_json)
+        .bind(message.read as i32)
+        .bind(message.delivered as i32)
+        .bind(&message.reply_to)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO dm_outbox
+                 (message_id, peer_pubkey, payload_json, created_at, attempts, next_attempt_at)
+                 VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        )
+        .bind(&message.id)
+        .bind(&message.to_pubkey)
+        .bind(payload_json)
+        .bind(timestamp)
+        .bind(to_db_millis(next_attempt_at))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
+    /// Return up to `limit` messages of a conversation in ascending `(timestamp, id)`
+    /// order: the newest ones, or with a cursor the newest ones older than the cursor.
+    ///
+    /// `before` and `before_id` are the timestamp and id of the oldest message of the
+    /// previous page. With `before` alone, only messages with a lower timestamp are returned.
     pub async fn get_dm_messages(
         &self,
         conversation_id: &str,
         limit: usize,
         before: Option<u64>,
+        before_id: Option<&str>,
     ) -> Result<Vec<StoredMessage>, AppError> {
-        let rows = match before {
-            Some(b) => {
-                sqlx::query(
-                    "SELECT id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to
-                     FROM dm_messages WHERE conversation_id=?1 AND timestamp < ?2
-                     ORDER BY timestamp DESC LIMIT ?3",
-                )
-                .bind(conversation_id)
-                .bind(b as i64)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-            None => {
-                sqlx::query(
-                    "SELECT id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to
-                     FROM dm_messages WHERE conversation_id=?1
-                     ORDER BY timestamp DESC LIMIT ?2",
-                )
-                .bind(conversation_id)
-                .bind(limit as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        };
-        let mut messages = Vec::new();
+        let rows = sqlx::query(
+            "SELECT id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to
+             FROM dm_messages
+             WHERE conversation_id=?1
+               AND (?2 IS NULL OR timestamp < ?2 OR (timestamp = ?2 AND ?3 IS NOT NULL AND id < ?3))
+             ORDER BY timestamp DESC, id DESC LIMIT ?4",
+        )
+        .bind(conversation_id)
+        .bind(before.map(to_db_millis))
+        .bind(before_id)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages = Vec::with_capacity(rows.len());
         for row in &rows {
             messages.push(Self::row_to_stored_message(row)?);
         }
@@ -152,27 +178,70 @@ impl Storage {
         })
     }
 
-    pub async fn mark_dm_delivered(&self, message_id: &str) -> Result<(), AppError> {
-        sqlx::query("UPDATE dm_messages SET delivered = 1 WHERE id=?1")
-            .bind(message_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Set `delivered` on message `message_id` and delete its outbox entry, only if the
+    /// message is in `conversation_id` and was sent by `from_pubkey`.
+    /// Returns true if such a message exists.
+    pub async fn mark_dm_delivered(
+        &self,
+        conversation_id: &str,
+        from_pubkey: &str,
+        message_id: &str,
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE dm_messages SET delivered = 1
+             WHERE id=?1 AND conversation_id=?2 AND from_pubkey=?3",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(from_pubkey)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if updated {
+            sqlx::query("DELETE FROM dm_outbox WHERE message_id=?1")
+                .bind(message_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
     }
 
-    pub async fn mark_dm_read_by_id(&self, message_id: &str) -> Result<(), AppError> {
-        sqlx::query("UPDATE dm_messages SET read = 1 WHERE id=?1")
-            .bind(message_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+    /// Set `read` on message `message_id`, only if the message is in `conversation_id`
+    /// and was sent by `from_pubkey`. Returns true if such a message exists.
+    pub async fn mark_dm_read_by_id(
+        &self,
+        conversation_id: &str,
+        from_pubkey: &str,
+        message_id: &str,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE dm_messages SET read = 1
+             WHERE id=?1 AND conversation_id=?2 AND from_pubkey=?3",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(from_pubkey)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
+    /// Delete a message and its outbox entry in one transaction.
+    /// Returns true if the message row existed.
     pub async fn delete_dm_message(&self, message_id: &str) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM dm_outbox WHERE message_id=?1")
+            .bind(message_id)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM dm_messages WHERE id=?1")
             .bind(message_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -184,92 +253,172 @@ impl Storage {
         Ok(count as u32)
     }
 
-    pub async fn insert_outbox_message(
+    /// Return `(message_id, peer_pubkey, attempts)` of up to `limit` outbox entries,
+    /// oldest first: those with `next_attempt_at <= now`, and if `include_backed_off`
+    /// also every entry with at least one failed attempt.
+    pub async fn get_due_outbox_entries(
         &self,
-        id: &str,
-        peer_pubkey: &str,
-        envelope_json: &str,
-        created_at: u64,
-        message_id: &str,
-    ) -> Result<(), AppError> {
-        sqlx::query(
-            "INSERT INTO dm_outbox (id, peer_pubkey, envelope_json, created_at, message_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )
-        .bind(id)
-        .bind(peer_pubkey)
-        .bind(envelope_json)
-        .bind(created_at as i64)
-        .bind(message_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Returns all pending dm_outbox entries ordered oldest-first.
-    pub async fn get_all_outbox_messages(
-        &self,
-    ) -> Result<Vec<(String, String, String, String)>, AppError> {
+        now: u64,
+        include_backed_off: bool,
+        limit: u32,
+    ) -> Result<Vec<(String, String, u32)>, AppError> {
         let rows = sqlx::query(
-            "SELECT id, peer_pubkey, envelope_json, message_id FROM dm_outbox ORDER BY created_at ASC",
+            "SELECT message_id, peer_pubkey, attempts FROM dm_outbox
+             WHERE next_attempt_at <= ?1 OR (?2 AND attempts > 0)
+             ORDER BY created_at ASC, message_id ASC LIMIT ?3",
         )
+        .bind(to_db_millis(now))
+        .bind(include_backed_off)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .into_iter()
-            .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+            .map(|r| {
+                let attempts = u32::try_from(r.get::<i64, _>(2)).unwrap_or(u32::MAX);
+                (r.get(0), r.get(1), attempts)
+            })
             .collect())
     }
 
-    pub async fn remove_outbox_message(&self, id: &str) -> Result<(), AppError> {
-        sqlx::query("DELETE FROM dm_outbox WHERE id=?1")
-            .bind(id)
+    /// Return the queued `DmPayload` JSON of a message, or `None` if it is not queued.
+    pub async fn get_outbox_payload(&self, message_id: &str) -> Result<Option<String>, AppError> {
+        let payload: Option<String> =
+            sqlx::query_scalar("SELECT payload_json FROM dm_outbox WHERE message_id=?1")
+                .bind(message_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(payload)
+    }
+
+    pub async fn remove_outbox_message(&self, message_id: &str) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM dm_outbox WHERE message_id=?1")
+            .bind(message_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
+    /// Record a failed delivery of `message_id`: increment its attempt counter and set its
+    /// next attempt time. Every other entry for `peer_pubkey` with an earlier next attempt
+    /// time is moved to `next_attempt_at`; its attempt counter is unchanged.
+    pub async fn record_outbox_failure(
+        &self,
+        message_id: &str,
+        peer_pubkey: &str,
+        next_attempt_at: u64,
+    ) -> Result<(), AppError> {
+        let next_attempt_at = to_db_millis(next_attempt_at);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE dm_outbox SET attempts = attempts + 1, next_attempt_at = ?2
+             WHERE message_id=?1",
+        )
+        .bind(message_id)
+        .bind(next_attempt_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE dm_outbox SET next_attempt_at = ?2
+             WHERE peer_pubkey=?3 AND message_id != ?1 AND next_attempt_at < ?2",
+        )
+        .bind(message_id)
+        .bind(next_attempt_at)
+        .bind(peer_pubkey)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Clear the next attempt time of the entries for `peer_pubkey` that have at least one
+    /// failed attempt and a next attempt time after `now`. Returns the number of entries
+    /// changed. Entries without a failed attempt keep their time: their first delivery
+    /// may still be running.
+    pub async fn make_peer_outbox_due(&self, peer_pubkey: &str, now: u64) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            "UPDATE dm_outbox SET next_attempt_at = 0
+             WHERE peer_pubkey=?1 AND attempts > 0 AND next_attempt_at > ?2",
+        )
+        .bind(peer_pubkey)
+        .bind(to_db_millis(now))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete outbox entries created before `created_before`. Returns the number deleted.
+    pub async fn delete_expired_outbox(&self, created_before: u64) -> Result<u64, AppError> {
+        let result = sqlx::query("DELETE FROM dm_outbox WHERE created_at < ?1")
+            .bind(to_db_millis(created_before))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Store the ratchet session of `peer_dm_pubkey` and a message received through it,
+    /// in one transaction. Returns true if the message was inserted.
+    ///
+    /// If a message with the same id is already stored, only the ratchet session is
+    /// written: the conversation preview, `last_message_at` and `unread_count` keep their
+    /// values, and false is returned.
     pub async fn receive_dm_message_atomically(
         &self,
-        peer_signing_pubkey: &str,
+        peer_dm_pubkey: &str,
         peer_master_pubkey: &str,
         ratchet_state: &str,
         ratchet_updated_at: u64,
         message: &StoredMessage,
         preview: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let conv_id = &message.conversation_id;
         let media_json = serde_json::to_string(&message.media)?;
+        let timestamp = to_db_millis(message.timestamp);
 
         let mut tx = self.pool.begin().await?;
 
+        // The first statement is a write, so no other writer can insert the same message
+        // id between the existence check and the insert below.
         sqlx::query(
             "INSERT INTO dm_ratchet_sessions (peer_pubkey, state_json, updated_at)
              VALUES (?1, ?2, ?3)
              ON CONFLICT(peer_pubkey) DO UPDATE SET state_json=?2, updated_at=?3",
         )
-        .bind(peer_signing_pubkey)
+        .bind(peer_dm_pubkey)
         .bind(ratchet_state)
-        .bind(ratchet_updated_at as i64)
+        .bind(to_db_millis(ratchet_updated_at))
         .execute(&mut *tx)
         .await?;
 
+        let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM dm_messages WHERE id=?1")
+            .bind(&message.id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
         sqlx::query(
             "INSERT INTO dm_conversations
-                 (conversation_id, peer_pubkey, last_message_at, last_message_preview, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?3)
-                 ON CONFLICT(conversation_id)
-                 DO UPDATE SET last_message_at=?3, last_message_preview=?4",
+                 (conversation_id, peer_pubkey, last_message_at, last_message_preview,
+                  unread_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?3)
+                 ON CONFLICT(conversation_id) DO UPDATE SET
+                    unread_count = unread_count + 1,
+                    last_message_preview = CASE WHEN ?3 >= last_message_at
+                        THEN ?4 ELSE last_message_preview END,
+                    last_message_at = MAX(last_message_at, ?3)",
         )
         .bind(conv_id)
         .bind(peer_master_pubkey)
-        .bind(message.timestamp as i64)
+        .bind(timestamp)
         .bind(preview)
         .execute(&mut *tx)
         .await?;
 
         sqlx::query(
-            "INSERT OR IGNORE INTO dm_messages
+            "INSERT INTO dm_messages
                  (id, conversation_id, from_pubkey, to_pubkey, content, timestamp,
                   media_json, read, delivered, reply_to)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -279,7 +428,7 @@ impl Storage {
         .bind(&message.from_pubkey)
         .bind(&message.to_pubkey)
         .bind(&message.content)
-        .bind(message.timestamp as i64)
+        .bind(timestamp)
         .bind(&media_json)
         .bind(message.read as i32)
         .bind(message.delivered as i32)
@@ -287,15 +436,7 @@ impl Storage {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(
-            "UPDATE dm_conversations SET unread_count = unread_count + 1
-             WHERE conversation_id=?1",
-        )
-        .bind(conv_id)
-        .execute(&mut *tx)
-        .await?;
-
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 }

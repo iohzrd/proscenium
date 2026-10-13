@@ -1,47 +1,63 @@
+use crate::constants::{GOSSIP_FRAME_OVERHEAD, GOSSIP_MAX_MESSAGE_SIZE};
 use crate::error::AppError;
 use bytes::Bytes;
 use proscenium_types::{
-    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, Profile, PushMessage,
-    SigningKeyRotation, StageTicket,
+    GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
+    PushMessage, SigningKeyRotation, StageTicket, now_millis, short_id, sign_stage_announcement,
+    sign_stage_ended,
 };
 
+/// A `PushMessage` of `author` without content.
+fn empty_push(author: String) -> PushMessage {
+    PushMessage {
+        author,
+        posts: vec![],
+        interactions: vec![],
+        profile: None,
+        announcement: None,
+        tombstones: vec![],
+    }
+}
+
 impl super::GossipService {
-    /// Serialize and broadcast a gossip message if we have an active sender.
-    /// Returns `true` if the message was broadcast, `false` if no sender is active.
+    /// Serialize `msg` and broadcast it on the own feed topic.
+    ///
+    /// Returns `Ok(false)` without broadcasting if no own feed topic is open, or if the
+    /// serialized message does not fit in one gossip frame (iroh-gossip ends the send loop
+    /// to a neighbor when asked to write a larger frame).
     pub(super) async fn broadcast_msg(
         &self,
         msg: &GossipMessage,
         label: &str,
     ) -> Result<bool, AppError> {
         let sender = self.inner.lock().await.my_sender.clone();
-        if let Some(sender) = sender {
-            let payload = serde_json::to_vec(msg)?;
-            sender.broadcast(Bytes::from(payload)).await?;
-            log::info!("[gossip] broadcast {label}");
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(sender) = sender else {
+            return Ok(false);
+        };
+        let payload = serde_json::to_vec(msg)?;
+        let max_payload = GOSSIP_MAX_MESSAGE_SIZE - GOSSIP_FRAME_OVERHEAD;
+        if payload.len() > max_payload {
+            log::warn!(
+                "[gossip] {label} not broadcast: {} bytes exceed the {max_payload} byte limit",
+                payload.len()
+            );
+            return Ok(false);
         }
+        sender.broadcast(Bytes::from(payload)).await?;
+        log::info!("[gossip] broadcast {label}");
+        Ok(true)
     }
 
-    pub async fn broadcast_heartbeat(&self) -> Result<(), AppError> {
-        self.broadcast_msg(&GossipMessage::Heartbeat, "heartbeat")
-            .await?;
-        Ok(())
+    async fn my_master_pubkey(&self) -> String {
+        self.identity.read().await.master_pubkey.clone()
     }
 
     pub async fn broadcast_profile(&self, profile: &Profile) -> Result<(), AppError> {
         let msg = GossipMessage::ProfileUpdate(profile.clone());
-        if !self
-            .broadcast_msg(&msg, &format!("profile: {}", profile.display_name))
-            .await?
-        {
-            let my_id = self.identity.read().await.master_pubkey.clone();
+        if !self.broadcast_msg(&msg, "profile").await? {
             self.attempt_push(PushMessage {
-                author: my_id,
-                posts: vec![],
-                interactions: vec![],
                 profile: Some(profile.clone()),
+                ..empty_push(self.my_master_pubkey().await)
             })
             .await;
         }
@@ -51,34 +67,52 @@ impl super::GossipService {
     pub async fn broadcast_post(&self, post: &Post) -> Result<(), AppError> {
         let msg = GossipMessage::NewPost(post.clone());
         if !self
-            .broadcast_msg(&msg, &format!("post {}", &post.id))
+            .broadcast_msg(&msg, &format!("post {}", short_id(&post.id)))
             .await?
         {
-            let my_id = self.identity.read().await.master_pubkey.clone();
             self.attempt_push(PushMessage {
-                author: my_id,
                 posts: vec![post.clone()],
-                interactions: vec![],
-                profile: None,
+                ..empty_push(self.my_master_pubkey().await)
             })
             .await;
         }
         Ok(())
     }
 
+    /// Record the signed deletion of the local user's post `id` as a tombstone, then send
+    /// it to followers: on the own feed topic, or by push if no topic is open.
+    ///
+    /// The tombstone makes the deletion part of the sync protocol, so a follower that is
+    /// offline now receives it at its next sync.
     pub async fn broadcast_delete(
         &self,
         id: &str,
         author: &str,
         signature: &str,
     ) -> Result<(), AppError> {
+        let tombstone = PostTombstone {
+            id: id.to_string(),
+            author: author.to_string(),
+            signature: signature.to_string(),
+        };
+        self.storage
+            .apply_post_tombstones(author, std::slice::from_ref(&tombstone), now_millis())
+            .await?;
+
         let msg = GossipMessage::DeletePost {
             id: id.to_string(),
             author: author.to_string(),
             signature: signature.to_string(),
         };
-        if !self.broadcast_msg(&msg, &format!("delete {id}")).await? {
-            log::debug!("[gossip] delete post {id}: no gossip sender, peers will sync");
+        if !self
+            .broadcast_msg(&msg, &format!("delete {}", short_id(id)))
+            .await?
+        {
+            self.attempt_push(PushMessage {
+                tombstones: vec![tombstone],
+                ..empty_push(author.to_string())
+            })
+            .await;
         }
         Ok(())
     }
@@ -87,68 +121,115 @@ impl super::GossipService {
         let msg = GossipMessage::NewInteraction(interaction.clone());
         let label = format!(
             "{:?} on post {}",
-            interaction.kind, &interaction.target_post_id
+            interaction.kind,
+            short_id(&interaction.target_post_id)
         );
         if !self.broadcast_msg(&msg, &label).await? {
-            let my_id = self.identity.read().await.master_pubkey.clone();
             self.attempt_push(PushMessage {
-                author: my_id,
-                posts: vec![],
                 interactions: vec![interaction.clone()],
-                profile: None,
+                ..empty_push(self.my_master_pubkey().await)
             })
             .await;
         }
         Ok(())
     }
 
+    /// Record the deletion of the local user's interaction `id` as a tombstone and
+    /// broadcast it on the own feed topic.
+    ///
+    /// `PushMessage` has no field for interaction deletions. Without an own feed topic
+    /// nothing is sent; a follower removes the interaction at its next sync, when the
+    /// responder's interaction set no longer contains it.
     pub async fn broadcast_delete_interaction(
         &self,
         id: &str,
         author: &str,
         signature: &str,
     ) -> Result<(), AppError> {
+        self.storage
+            .record_interaction_tombstone(author, id, now_millis())
+            .await?;
+
         let msg = GossipMessage::DeleteInteraction {
             id: id.to_string(),
             author: author.to_string(),
             signature: signature.to_string(),
         };
         if !self
-            .broadcast_msg(&msg, &format!("delete interaction {id}"))
+            .broadcast_msg(&msg, &format!("delete interaction {}", short_id(id)))
             .await?
         {
-            log::debug!("[gossip] delete interaction {id}: no gossip sender, peers will sync");
+            log::debug!(
+                "[gossip] delete interaction {}: no own feed topic, followers remove it at their next sync",
+                short_id(id)
+            );
         }
         Ok(())
     }
 
+    /// Send the signed device list to followers: on the own feed topic, or by push if no
+    /// topic is open. The announcement carries the current delegation.
     pub async fn broadcast_linked_devices(
         &self,
         announcement: &LinkedDevicesAnnouncement,
     ) -> Result<(), AppError> {
         let msg = GossipMessage::LinkedDevices(announcement.clone());
-        self.broadcast_msg(
-            &msg,
-            &format!("device announcement v{}", announcement.version),
-        )
-        .await?;
+        if !self
+            .broadcast_msg(
+                &msg,
+                &format!("device announcement v{}", announcement.version),
+            )
+            .await?
+        {
+            self.attempt_push(PushMessage {
+                announcement: Some(announcement.clone()),
+                ..empty_push(announcement.master_pubkey.clone())
+            })
+            .await;
+        }
         Ok(())
     }
 
+    /// Send a signing key rotation to followers.
+    ///
+    /// With an own feed topic the rotation message is broadcast. Without one, a
+    /// `PushMessage` without content is pushed; `attempt_push` attaches the signed device
+    /// list, which carries the delegation. That push is skipped while the local identity
+    /// still holds the delegation that the rotation replaces, because the attached device
+    /// list would then carry the old delegation; the device announcement that follows a
+    /// rotation delivers the new one.
     pub async fn broadcast_signing_key_rotation(
         &self,
         rotation: &SigningKeyRotation,
     ) -> Result<(), AppError> {
         let msg = GossipMessage::SigningKeyRotation(rotation.clone());
-        self.broadcast_msg(
-            &msg,
-            &format!("signing key rotation to index {}", rotation.new_key_index),
-        )
-        .await?;
+        if self
+            .broadcast_msg(
+                &msg,
+                &format!("signing key rotation to index {}", rotation.new_key_index),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        let (my_id, local_key_index) = {
+            let id = self.identity.read().await;
+            (id.master_pubkey.clone(), id.delegation.key_index)
+        };
+        if local_key_index >= rotation.new_key_index {
+            self.attempt_push(empty_push(my_id)).await;
+        } else {
+            log::info!(
+                "[gossip] rotation to index {} not pushed: local delegation has index {local_key_index}",
+                rotation.new_key_index
+            );
+        }
         Ok(())
     }
 
     /// Announce a new Stage room on the host's own user-feed gossip topic so followers discover it.
+    /// The announcement is signed with the local signing key; `host_pubkey` must be the
+    /// local master pubkey or receivers reject it.
     pub async fn broadcast_stage_announcement(
         &self,
         stage_id: String,
@@ -157,20 +238,44 @@ impl super::GossipService {
         host_pubkey: String,
         started_at: u64,
     ) -> Result<(), AppError> {
+        let signature = {
+            let id = self.identity.read().await;
+            sign_stage_announcement(
+                &stage_id,
+                &title,
+                &ticket,
+                &host_pubkey,
+                started_at,
+                &id.signing_key,
+            )
+        };
         let msg = GossipMessage::StageAnnouncement {
             stage_id,
             title,
             ticket,
             host_pubkey,
             started_at,
+            signature,
         };
         self.broadcast_msg(&msg, "stage announcement").await?;
         Ok(())
     }
 
     /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic.
+    /// Signed with the local signing key.
     pub async fn broadcast_stage_ended(&self, stage_id: String) -> Result<(), AppError> {
-        let msg = GossipMessage::StageEnded { stage_id };
+        let (host_pubkey, signature) = {
+            let id = self.identity.read().await;
+            (
+                id.master_pubkey.clone(),
+                sign_stage_ended(&stage_id, &id.master_pubkey, &id.signing_key),
+            )
+        };
+        let msg = GossipMessage::StageEnded {
+            stage_id,
+            host_pubkey,
+            signature,
+        };
         self.broadcast_msg(&msg, "stage ended").await?;
         Ok(())
     }

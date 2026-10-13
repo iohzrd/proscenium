@@ -2,152 +2,124 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
 
-  let mdnsDiscovery = $state(false);
-  let dhtDiscovery = $state(false);
-  let mdnsLoading = $state(false);
-  let dhtLoading = $state(false);
-  let shareFollows = $state(true);
-  let shareFollowers = $state(true);
-  let shareFollowsLoading = $state(false);
-  let shareFollowersLoading = $state(false);
+  interface Toggle {
+    label: string;
+    description: string;
+    getCommand: string;
+    setCommand: string;
+    /** Value shown until the stored preference is loaded. */
+    initial: boolean;
+  }
+
+  // Applied at the next start of the app.
+  const DISCOVERY_TOGGLES: Toggle[] = [
+    {
+      label: "Local network discovery (mDNS)",
+      description:
+        "Announce on your local network so nearby peers can discover and connect directly. Only exposes your IP to devices on the same LAN.",
+      getCommand: "get_mdns_discovery",
+      setCommand: "set_mdns_discovery",
+      initial: false,
+    },
+    {
+      label: "Global discovery (DHT)",
+      description:
+        "Publish your IP address to the Mainline DHT so any peer who knows your public key can connect directly without a relay. Exposes your IP globally.",
+      getCommand: "get_dht_discovery",
+      setCommand: "set_dht_discovery",
+      initial: false,
+    },
+  ];
+
+  const SHARING_TOGGLES: Toggle[] = [
+    {
+      label: "Share follow list",
+      description:
+        "Allow others to see who you follow when they visit your profile.",
+      getCommand: "get_share_follows",
+      setCommand: "set_share_follows",
+      initial: true,
+    },
+    {
+      label: "Share followers list",
+      description:
+        "Allow others to see who follows you when they visit your profile.",
+      getCommand: "get_share_followers",
+      setCommand: "set_share_followers",
+      initial: true,
+    },
+  ];
+
+  const ALL_TOGGLES = [...DISCOVERY_TOGGLES, ...SHARING_TOGGLES];
+
+  // Keyed by `setCommand`.
+  let enabled = $state<Record<string, boolean>>(
+    Object.fromEntries(ALL_TOGGLES.map((t) => [t.setCommand, t.initial])),
+  );
+  let loaded = $state(false);
+  let saving = $state<Record<string, boolean>>({});
+  let errorMessage = $state("");
 
   onMount(async () => {
     try {
-      [mdnsDiscovery, dhtDiscovery, shareFollows, shareFollowers] =
-        await Promise.all([
-          invoke<boolean>("get_mdns_discovery"),
-          invoke<boolean>("get_dht_discovery"),
-          invoke<boolean>("get_share_follows"),
-          invoke<boolean>("get_share_followers"),
-        ]);
-    } catch {
-      // preferences not available yet
+      const values = await Promise.all(
+        ALL_TOGGLES.map((t) => invoke<boolean>(t.getCommand)),
+      );
+      for (const [i, toggle] of ALL_TOGGLES.entries()) {
+        enabled[toggle.setCommand] = values[i];
+      }
+      loaded = true;
+    } catch (e) {
+      errorMessage = `Failed to load privacy settings: ${e}`;
     }
   });
 
-  async function toggleMdns() {
-    mdnsLoading = true;
+  async function flip(toggle: Toggle) {
+    const next = !enabled[toggle.setCommand];
+    saving[toggle.setCommand] = true;
+    errorMessage = "";
     try {
-      const next = !mdnsDiscovery;
-      await invoke("set_mdns_discovery", { enabled: next });
-      mdnsDiscovery = next;
+      await invoke(toggle.setCommand, { enabled: next });
+      enabled[toggle.setCommand] = next;
     } catch (e) {
-      console.error("Failed to toggle mDNS:", e);
+      errorMessage = `Failed to change "${toggle.label}": ${e}`;
     }
-    mdnsLoading = false;
-  }
-
-  async function toggleDht() {
-    dhtLoading = true;
-    try {
-      const next = !dhtDiscovery;
-      await invoke("set_dht_discovery", { enabled: next });
-      dhtDiscovery = next;
-    } catch (e) {
-      console.error("Failed to toggle DHT:", e);
-    }
-    dhtLoading = false;
-  }
-
-  async function toggleShareFollows() {
-    shareFollowsLoading = true;
-    try {
-      const next = !shareFollows;
-      await invoke("set_share_follows", { enabled: next });
-      shareFollows = next;
-    } catch (e) {
-      console.error("Failed to toggle share follows:", e);
-    }
-    shareFollowsLoading = false;
-  }
-
-  async function toggleShareFollowers() {
-    shareFollowersLoading = true;
-    try {
-      const next = !shareFollowers;
-      await invoke("set_share_followers", { enabled: next });
-      shareFollowers = next;
-    } catch (e) {
-      console.error("Failed to toggle share followers:", e);
-    }
-    shareFollowersLoading = false;
+    saving[toggle.setCommand] = false;
   }
 </script>
 
+{#snippet row(toggle: Toggle)}
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <span class="toggle-label">{toggle.label}</span>
+      <p class="toggle-desc">{toggle.description}</p>
+    </div>
+    <button
+      class="toggle-switch"
+      class:active={enabled[toggle.setCommand]}
+      role="switch"
+      aria-checked={enabled[toggle.setCommand]}
+      aria-label={toggle.label}
+      onclick={() => flip(toggle)}
+      disabled={!loaded || saving[toggle.setCommand]}
+    >
+      <span class="toggle-knob"></span>
+    </button>
+  </div>
+{/snippet}
+
 <section class="settings-section">
   <h3>Privacy</h3>
-  <div class="toggle-row">
-    <div class="toggle-info">
-      <span class="toggle-label">Local network discovery (mDNS)</span>
-      <p class="toggle-desc">
-        Announce on your local network so nearby peers can discover and connect
-        directly. Only exposes your IP to devices on the same LAN.
-      </p>
-    </div>
-    <button
-      class="toggle-switch"
-      class:active={mdnsDiscovery}
-      onclick={toggleMdns}
-      disabled={mdnsLoading}
-      aria-label="Toggle mDNS discovery"
-    >
-      <span class="toggle-knob"></span>
-    </button>
-  </div>
-  <div class="toggle-row">
-    <div class="toggle-info">
-      <span class="toggle-label">Global discovery (DHT)</span>
-      <p class="toggle-desc">
-        Publish your IP address to the Mainline DHT so any peer who knows your
-        public key can connect directly without a relay. Exposes your IP
-        globally.
-      </p>
-    </div>
-    <button
-      class="toggle-switch"
-      class:active={dhtDiscovery}
-      onclick={toggleDht}
-      disabled={dhtLoading}
-      aria-label="Toggle DHT discovery"
-    >
-      <span class="toggle-knob"></span>
-    </button>
-  </div>
+  {#each DISCOVERY_TOGGLES as toggle}
+    {@render row(toggle)}
+  {/each}
   <p class="setting-hint">Changes take effect on next restart.</p>
-  <div class="toggle-row">
-    <div class="toggle-info">
-      <span class="toggle-label">Share follow list</span>
-      <p class="toggle-desc">
-        Allow others to see who you follow when they visit your profile.
-      </p>
-    </div>
-    <button
-      class="toggle-switch"
-      class:active={shareFollows}
-      onclick={toggleShareFollows}
-      disabled={shareFollowsLoading}
-      aria-label="Toggle share follows"
-    >
-      <span class="toggle-knob"></span>
-    </button>
-  </div>
-  <div class="toggle-row">
-    <div class="toggle-info">
-      <span class="toggle-label">Share followers list</span>
-      <p class="toggle-desc">
-        Allow others to see who follows you when they visit your profile.
-      </p>
-    </div>
-    <button
-      class="toggle-switch"
-      class:active={shareFollowers}
-      onclick={toggleShareFollowers}
-      disabled={shareFollowersLoading}
-      aria-label="Toggle share followers"
-    >
-      <span class="toggle-knob"></span>
-    </button>
-  </div>
+  {#each SHARING_TOGGLES as toggle}
+    {@render row(toggle)}
+  {/each}
+  {#if errorMessage}
+    <p class="toggle-error" role="alert">{errorMessage}</p>
+  {/if}
 </section>
 
 <style>
@@ -230,5 +202,11 @@
 
   .toggle-switch.active .toggle-knob {
     transform: translateX(20px);
+  }
+
+  .toggle-error {
+    color: var(--color-error-light);
+    font-size: var(--text-sm);
+    margin: 0.5rem 0 0;
   }
 </style>

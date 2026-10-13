@@ -1,31 +1,67 @@
 <script lang="ts">
   import Avatar from "$lib/Avatar.svelte";
   import Icon from "$lib/Icon.svelte";
+  import { focusTrap } from "$lib/composables";
   import type { StageParticipant } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import { shortId, truncate } from "$lib/utils";
+
+  const MAX_NAME_CHARS = 64;
 
   let {
     target,
     onpromote,
     ondemote,
+    onmute,
+    onkick,
+    onban,
     onclose,
   }: {
     target: StageParticipant;
     onpromote: (pubkey: string) => void;
     ondemote: (pubkey: string) => void;
+    /** Mutes the microphone of a speaker for all listeners. */
+    onmute?: (pubkey: string) => void;
+    /** Removes the participant from the stage. */
+    onkick?: (pubkey: string) => void;
+    /** Removes the participant and rejects every later join. */
+    onban?: (pubkey: string) => void;
     onclose: () => void;
   } = $props();
 
-  function displayName(p: StageParticipant): string {
-    return p.display_name ?? shortId(p.pubkey);
+  // `onban` is called on the second click of the ban button.
+  let confirmingBan = $state(false);
+
+  let name = $derived(
+    truncate(target.display_name ?? shortId(target.pubkey), MAX_NAME_CHARS),
+  );
+  let canSpeak = $derived(
+    target.role === "Speaker" || target.role === "CoHost",
+  );
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") onclose();
   }
 </script>
 
-<button class="popover-backdrop" onclick={onclose} aria-label="Close"></button>
-<div class="participant-popover">
+<svelte:window onkeydown={handleKeydown} />
+
+<button
+  class="popover-backdrop"
+  onclick={onclose}
+  aria-label="Close"
+  tabindex="-1"
+></button>
+<div
+  class="participant-popover"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Actions for {name}"
+  tabindex="-1"
+  use:focusTrap
+>
   <div class="popover-header">
-    <Avatar pubkey={target.pubkey} name={displayName(target)} size={40} />
-    <span class="popover-name">{displayName(target)}</span>
+    <Avatar pubkey={target.pubkey} {name} size={40} />
+    <span class="popover-name">{name}</span>
   </div>
   <div class="popover-actions">
     {#if target.role === "Listener"}
@@ -36,6 +72,42 @@
       <button class="popover-btn" onclick={() => ondemote(target.pubkey)}>
         Demote to Listener
       </button>
+    {/if}
+    {#if onmute && canSpeak}
+      <button
+        class="popover-btn"
+        onclick={() => onmute?.(target.pubkey)}
+        disabled={target.host_muted}
+      >
+        {target.host_muted ? "Muted by host" : "Mute microphone"}
+      </button>
+    {/if}
+    {#if target.role !== "Host"}
+      {#if onkick}
+        <button
+          class="popover-btn danger"
+          onclick={() => onkick?.(target.pubkey)}
+        >
+          Remove from stage
+        </button>
+      {/if}
+      {#if onban}
+        {#if confirmingBan}
+          <button
+            class="popover-btn danger"
+            onclick={() => onban?.(target.pubkey)}
+          >
+            Confirm ban: cannot rejoin this stage
+          </button>
+        {:else}
+          <button
+            class="popover-btn danger"
+            onclick={() => (confirmingBan = true)}
+          >
+            Ban from stage
+          </button>
+        {/if}
+      {/if}
     {/if}
   </div>
   <button class="popover-close" onclick={onclose} aria-label="Close">
@@ -71,6 +143,10 @@
     gap: 0.75rem;
   }
 
+  .participant-popover:focus {
+    outline: none;
+  }
+
   .popover-header {
     display: flex;
     align-items: center;
@@ -81,6 +157,9 @@
     font-weight: 600;
     color: var(--text-primary);
     font-size: var(--text-base);
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding-right: 1.25rem;
   }
 
   .popover-actions {
@@ -102,8 +181,22 @@
     transition: background var(--transition-fast);
   }
 
-  .popover-btn:hover {
+  .popover-btn:hover:not(:disabled) {
     background: var(--bg-elevated-hover);
+  }
+
+  .popover-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .popover-btn.danger {
+    color: var(--color-error-light);
+    border-color: var(--color-error-light-border);
+  }
+
+  .popover-btn.danger:hover {
+    background: var(--color-error-bg-hover);
   }
 
   .popover-close {

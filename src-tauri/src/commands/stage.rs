@@ -13,6 +13,7 @@ pub async fn create_stage(state: State<'_, Arc<AppState>>, title: String) -> Cmd
 #[tauri::command]
 pub async fn join_stage(state: State<'_, Arc<AppState>>, ticket: String) -> CmdResult<()> {
     let ticket = ticket
+        .trim()
         .parse()
         .map_err(|e: String| crate::error::AppError::Other(e))?;
     state.stage().actor_handle().join_stage(ticket).await
@@ -47,6 +48,24 @@ pub async fn stage_demote_speaker(
     pubkey: String,
 ) -> CmdResult<()> {
     state.stage().actor_handle().demote_speaker(pubkey).await
+}
+
+/// Remove a participant from the stage (host or co-host).
+#[tauri::command]
+pub async fn stage_kick(state: State<'_, Arc<AppState>>, pubkey: String) -> CmdResult<()> {
+    state.stage().actor_handle().kick(pubkey).await
+}
+
+/// Remove a participant and reject it for the rest of the stage (host).
+#[tauri::command]
+pub async fn stage_ban(state: State<'_, Arc<AppState>>, pubkey: String) -> CmdResult<()> {
+    state.stage().actor_handle().ban(pubkey).await
+}
+
+/// Make the host discard a speaker's audio until the speaker is demoted (host or co-host).
+#[tauri::command]
+pub async fn stage_mute_speaker(state: State<'_, Arc<AppState>>, pubkey: String) -> CmdResult<()> {
+    state.stage().actor_handle().mute_speaker(pubkey).await
 }
 
 #[tauri::command]

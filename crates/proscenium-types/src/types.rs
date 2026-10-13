@@ -38,6 +38,10 @@ pub struct Profile {
     pub avatar_hash: Option<String>,
     pub avatar_ticket: Option<String>,
     pub visibility: Visibility,
+    /// When the owner last changed this profile (Unix ms). Covered by the signature.
+    /// A stored profile is replaced only by one with a greater or equal value.
+    #[serde(default)]
+    pub updated_at: u64,
     #[serde(default)]
     pub signature: String,
 }
@@ -108,57 +112,73 @@ pub struct SocialGraphEntry {
     pub is_online: bool,
 }
 
-/// Encoded in the QR code displayed by the existing device during pairing.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Encoded in the QR code displayed by the existing device during linking.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LinkQrPayload {
     /// Existing device's iroh NodeId (for QUIC connection).
     pub node_id: String,
-    /// One-time secret for Noise PSK (32 bytes, base64-encoded).
+    /// One-time secret for the Noise PSK (32 bytes, URL-safe base64 without padding).
     pub secret: String,
     /// Existing device's relay URL for connection (if available).
     pub relay_url: Option<String>,
+    /// Unix ms after which the existing device rejects this payload.
+    pub expires_at: u64,
 }
 
-/// Data bundle sent from existing device to new device during pairing.
-/// Encrypted inside the Noise channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for LinkQrPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkQrPayload")
+            .field("node_id", &self.node_id)
+            .field("relay_url", &self.relay_url)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Data sent from the existing device to the new device during linking,
+/// encrypted with the Noise transport state.
+///
+/// Every other key (signing, DM, transport) is derived from the master key and the
+/// indexes below. Double Ratchet sessions are not transferred.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LinkBundleData {
-    /// The signing key secret (32 bytes, base64-encoded).
-    pub signing_secret_key: String,
-    /// The DM key secret (32 bytes, base64-encoded).
-    /// Used for X25519 DH (Noise IK + Double Ratchet).
-    pub dm_secret_key: String,
-    /// The signing key delegation (signed by master key).
-    pub delegation: crate::delegation::SigningKeyDelegation,
-    /// The new device's transport secret key (32 bytes, base64-encoded).
-    /// Derived by the existing device from the master key.
-    pub transport_secret_key: String,
-    /// The device index used to derive the transport key.
+    /// The master secret key (32 bytes, standard base64).
+    pub master_secret_key: String,
+    /// Transport key derivation index assigned to the new device
+    /// (`1..MAX_LINKED_DEVICES`).
     pub device_index: u32,
-    /// The master secret key (32 bytes, base64-encoded).
-    /// Only included if the sending device holds it AND user opts in.
-    pub master_secret_key: Option<String>,
-    /// User profile.
+    /// Current signing key derivation index.
+    pub signing_key_index: u32,
+    /// Current DM key derivation index.
+    pub dm_key_index: u32,
+    /// The existing device's device list. Does not contain the new device.
+    pub devices: Vec<DeviceEntry>,
+    /// The user's signed profile.
     pub profile: Option<Profile>,
-    /// Follow list.
-    pub follows: Vec<SocialGraphEntry>,
-    /// Bookmarked post IDs.
-    pub bookmarks: Vec<String>,
-    /// Blocked user pubkeys.
-    pub blocked_users: Vec<String>,
-    /// Muted user pubkeys.
-    pub muted_users: Vec<String>,
-    /// Current DM ratchet sessions (serialized).
-    pub ratchet_sessions: Vec<RatchetSessionExport>,
+    /// Follow rows, including removed ones.
+    pub follows: Vec<FollowEntry>,
+    /// Mute and block rows, including removed ones.
+    pub moderation: Vec<ModerationEntry>,
+    /// Bookmark rows, including removed ones.
+    pub bookmarks: Vec<BookmarkEntry>,
+    /// Signed device announcements of followed users. Each carries the user's current
+    /// delegation and transport NodeIds, which sync and gossip subscription require.
+    pub peer_announcements: Vec<crate::protocol::LinkedDevicesAnnouncement>,
 }
 
-/// Exported ratchet session for transfer during device pairing and sync.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RatchetSessionExport {
-    pub peer_pubkey: String,
-    pub state_json: String,
-    #[serde(default)]
-    pub updated_at: u64,
+impl std::fmt::Debug for LinkBundleData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LinkBundleData")
+            .field("device_index", &self.device_index)
+            .field("signing_key_index", &self.signing_key_index)
+            .field("dm_key_index", &self.dm_key_index)
+            .field("devices", &self.devices.len())
+            .field("follows", &self.follows.len())
+            .field("moderation", &self.moderation.len())
+            .field("bookmarks", &self.bookmarks.len())
+            .field("peer_announcements", &self.peer_announcements.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Follow entry with LWW state for device sync.
@@ -166,6 +186,7 @@ pub struct RatchetSessionExport {
 pub struct FollowEntry {
     pub pubkey: String,
     pub followed_at: u64,
+    /// `"active"` or `"removed"`.
     pub state: String,
     pub last_changed_at: u64,
 }
@@ -174,17 +195,22 @@ pub struct FollowEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModerationEntry {
     pub pubkey: String,
+    /// `"mute"` or `"block"`.
     pub kind: String,
     pub created_at: u64,
+    /// `"active"` or `"removed"`.
     pub state: String,
     pub last_changed_at: u64,
 }
 
-/// Ratchet session summary for device sync vector comparison.
+/// Bookmark entry with LWW state for device sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RatchetSyncEntry {
-    pub peer_pubkey: String,
-    pub updated_at: u64,
+pub struct BookmarkEntry {
+    pub post_id: String,
+    pub created_at: u64,
+    /// `"active"` or `"removed"`.
+    pub state: String,
+    pub last_changed_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,7 +251,6 @@ pub struct ServerEntry {
     pub registered_at: Option<i64>,
     pub visibility: String,
     pub added_at: i64,
-    pub last_synced_at: Option<i64>,
 }
 
 // ── Frontend / Tauri IPC response types ───────────────────────────────────────
@@ -279,6 +304,33 @@ pub struct ServerFeedPost {
     pub quote_of_author: Option<String>,
     pub signature: String,
     pub indexed_at: i64,
+    /// Set by the client, never by the server: true if the post signature verified
+    /// against the signing key the client holds for `author`.
+    #[serde(default)]
+    pub verified: bool,
+}
+
+impl ServerFeedPost {
+    /// Rebuild the signed `Post` from the server's row.
+    /// Returns `None` if `timestamp` is negative or `media_json` is not a list of attachments.
+    pub fn to_post(&self) -> Option<Post> {
+        let media = match &self.media_json {
+            Some(json) => serde_json::from_str(json).ok()?,
+            None => Vec::new(),
+        };
+        Some(Post {
+            id: self.id.clone(),
+            author: self.author.clone(),
+            content: self.content.clone(),
+            timestamp: u64::try_from(self.timestamp).ok()?,
+            media,
+            reply_to: self.reply_to.clone(),
+            reply_to_author: self.reply_to_author.clone(),
+            quote_of: self.quote_of.clone(),
+            quote_of_author: self.quote_of_author.clone(),
+            signature: self.signature.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +361,9 @@ pub struct ServerUser {
     pub registered_at: i64,
     pub post_count: i64,
     pub latest_post_at: Option<i64>,
+    /// Transport NodeId of one of the user's devices, if the server holds one.
+    #[serde(default)]
+    pub transport_node_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,20 +373,8 @@ pub struct UserSearchResponse {
     pub query: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ServerSearchPost {
-    pub id: String,
-    pub author: String,
-    pub content: String,
-    pub timestamp: i64,
-    pub media_json: Option<String>,
-    pub reply_to: Option<String>,
-    pub reply_to_author: Option<String>,
-    pub quote_of: Option<String>,
-    pub quote_of_author: Option<String>,
-    pub signature: String,
-    pub indexed_at: i64,
-}
+/// A post in a search response. The server sends the same row as in a feed response.
+pub type ServerSearchPost = ServerFeedPost;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostSearchResponse {
@@ -340,21 +383,18 @@ pub struct PostSearchResponse {
     pub query: String,
 }
 
-/// Compact summary of local state for device sync negotiation.
+/// Summary of one device's state, exchanged at the start of a device sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceSyncVector {
     pub post_count: u64,
     pub newest_post_ts: u64,
     pub interaction_count: u64,
     pub newest_interaction_ts: u64,
-    /// Full follow list with LWW timestamps.
-    pub follows: Vec<FollowEntry>,
-    /// Full moderation list (mutes + blocks) with LWW timestamps.
-    pub moderation: Vec<ModerationEntry>,
-    /// All bookmark post IDs.
-    pub bookmarks: Vec<String>,
-    /// Ratchet session summaries (peer + updated_at).
-    pub ratchet_summaries: Vec<RatchetSyncEntry>,
-    /// Newest DM message timestamp across all conversations.
-    pub dm_newest_ts: u64,
+    /// Hex SHA-256 over the sender's follow, moderation and bookmark rows
+    /// (key, state, `last_changed_at`). Equal digests mean equal rows.
+    pub lww_digest: String,
+    /// The sender's device list.
+    pub devices: Vec<DeviceEntry>,
+    /// The sender's signing key derivation index.
+    pub signing_key_index: u32,
 }

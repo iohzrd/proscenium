@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
   import Icon from "$lib/Icon.svelte";
-  import { useNodeInit } from "$lib/composables";
+  import { useNodeInit, useToast } from "$lib/composables";
   import ServerSelector from "$lib/discover/ServerSelector.svelte";
   import DiscoverSearchBar from "$lib/discover/DiscoverSearchBar.svelte";
   import UserResultsList from "$lib/discover/UserResultsList.svelte";
@@ -17,6 +17,7 @@
     PostSearchResponse,
     SocialGraphEntry,
   } from "$lib/types";
+  import { dedupeBy, dedupeById, isPubkeyFormat, shortId } from "$lib/utils";
 
   type Tab = "users" | "posts" | "trending";
 
@@ -25,7 +26,6 @@
   let activeTab = $state<Tab>("users");
   let searchQuery = $state("");
   let searching = $state(false);
-  let myPubkey = $state("");
 
   let users = $state<ServerUser[]>([]);
   let posts = $state<ServerSearchPost[]>([]);
@@ -37,8 +37,15 @@
     new Map(users.map((u) => [u.pubkey, u.display_name || shortId(u.pubkey)])),
   );
 
+  // Incremented when another server is selected. A response is applied only
+  // if the value it started with is still current.
+  let serverGeneration = 0;
+  // Number of user and post requests in progress.
+  let activeSearches = 0;
+
+  const toast = useToast();
+
   const node = useNodeInit(async () => {
-    myPubkey = await invoke<string>("get_pubkey");
     const follows: SocialGraphEntry[] = await invoke("get_follows");
     followedPubkeys = new Set(follows.map((f) => f.pubkey));
     servers = await invoke("list_servers");
@@ -49,78 +56,114 @@
     }
   });
 
-  async function loadUsers() {
-    if (!activeServer) return;
+  /**
+   * Run `request` against the active server and pass its result to `apply`
+   * unless another server was selected meanwhile. A failure is shown as a toast.
+   */
+  async function withServer<T>(
+    failure: string,
+    request: (url: string) => Promise<T>,
+    apply: (result: T) => void,
+  ) {
+    const server = activeServer;
+    if (!server) return;
+    const generation = serverGeneration;
+    try {
+      const result = await request(server.url);
+      if (generation === serverGeneration) apply(result);
+    } catch (e) {
+      if (generation === serverGeneration) toast.show(`${failure}: ${e}`);
+      console.error(`${failure}:`, e);
+    }
+  }
+
+  async function searchRequest<T>(
+    failure: string,
+    request: (url: string) => Promise<T>,
+    apply: (result: T) => void,
+  ) {
+    activeSearches += 1;
     searching = true;
     try {
-      const resp: UserSearchResponse = await invoke("server_list_users", {
-        url: activeServer.url,
-        limit: 50,
-      });
-      users = resp.users;
-    } catch (e) {
-      console.error("Failed to load users:", e);
+      await withServer(failure, request, apply);
+    } finally {
+      activeSearches -= 1;
+      searching = activeSearches > 0;
     }
-    searching = false;
+  }
+
+  function setUsers(list: ServerUser[]) {
+    users = dedupeBy(list, (u) => u.pubkey);
+  }
+
+  function loadUsers() {
+    return searchRequest(
+      "Failed to load users",
+      (url) =>
+        invoke<UserSearchResponse>("server_list_users", { url, limit: 50 }),
+      (resp) => setUsers(resp.users),
+    );
   }
 
   async function loadPosts() {
     if (!activeServer) return;
     if (users.length === 0) await loadUsers();
-    searching = true;
-    try {
-      const resp: { posts: ServerSearchPost[] } = await invoke(
-        "server_get_feed",
-        { url: activeServer.url, limit: 50 },
-      );
-      posts = resp.posts;
-    } catch (e) {
-      console.error("Failed to load feed:", e);
-    }
-    searching = false;
+    await searchRequest(
+      "Failed to load posts",
+      (url) =>
+        invoke<{ posts: ServerSearchPost[] }>("server_get_feed", {
+          url,
+          limit: 50,
+        }),
+      (resp) => (posts = dedupeById(resp.posts)),
+    );
   }
 
   async function loadTrending() {
-    if (!activeServer) return;
+    const generation = serverGeneration;
     loadingTrending = true;
-    try {
-      const resp: { hashtags: TrendingHashtag[] } = await invoke(
-        "server_get_trending",
-        { url: activeServer.url, limit: 20 },
-      );
-      trending = resp.hashtags;
-    } catch (e) {
-      console.error("Failed to load trending:", e);
-    }
-    loadingTrending = false;
+    await withServer(
+      "Failed to load trending tags",
+      (url) =>
+        invoke<{ hashtags: TrendingHashtag[] }>("server_get_trending", {
+          url,
+          limit: 20,
+        }),
+      (resp) => (trending = dedupeBy(resp.hashtags, (t) => t.tag)),
+    );
+    if (generation === serverGeneration) loadingTrending = false;
   }
 
   async function search() {
-    if (!activeServer || !searchQuery.trim()) return;
-    searching = true;
-    try {
-      if (activeTab === "users") {
-        const resp: UserSearchResponse = await invoke("server_search_users", {
-          url: activeServer.url,
-          query: searchQuery.trim(),
-          limit: 50,
-        });
-        users = resp.users;
-      } else if (activeTab === "posts") {
-        const resp: PostSearchResponse = await invoke("server_search_posts", {
-          url: activeServer.url,
-          query: searchQuery.trim(),
-          limit: 50,
-        });
-        posts = resp.posts;
-      }
-    } catch (e) {
-      console.error("Search failed:", e);
+    const query = searchQuery.trim();
+    if (!activeServer || !query) return;
+    if (activeTab === "users") {
+      await searchRequest(
+        "Search failed",
+        (url) =>
+          invoke<UserSearchResponse>("server_search_users", {
+            url,
+            query,
+            limit: 50,
+          }),
+        (resp) => setUsers(resp.users),
+      );
+    } else if (activeTab === "posts") {
+      await searchRequest(
+        "Search failed",
+        (url) =>
+          invoke<PostSearchResponse>("server_search_posts", {
+            url,
+            query,
+            limit: 50,
+          }),
+        (resp) => (posts = dedupeById(resp.posts)),
+      );
     }
-    searching = false;
   }
 
   async function switchServer(server: ServerEntry) {
+    serverGeneration += 1;
     activeServer = server;
     users = [];
     posts = [];
@@ -128,6 +171,7 @@
     searchQuery = "";
     await loadTrending();
     if (activeTab === "users") await loadUsers();
+    else if (activeTab === "posts") await loadPosts();
   }
 
   async function switchTab(tab: Tab) {
@@ -139,47 +183,49 @@
     }
   }
 
+  async function unfollow(pubkey: string) {
+    if (
+      !confirm(
+        "Unfollow this user? Their posts will be deleted from your device.",
+      )
+    ) {
+      return;
+    }
+    await invoke("unfollow_user", { pubkey });
+    followedPubkeys = new Set([...followedPubkeys].filter((p) => p !== pubkey));
+  }
+
+  async function follow(pubkey: string) {
+    const nodeId = users.find((u) => u.pubkey === pubkey)?.transport_node_id;
+    if (!nodeId || !isPubkeyFormat(nodeId)) {
+      toast.show("The server lists no Node ID for this user");
+      return;
+    }
+    // `follow_user` fails if the node reports a master pubkey other than `pubkey`.
+    const followed: string = await invoke("follow_user", {
+      nodeId,
+      expectedPubkey: pubkey,
+    });
+    followedPubkeys = new Set([...followedPubkeys, followed]);
+  }
+
   async function toggleFollow(pubkey: string) {
+    if (togglingFollow) return;
     togglingFollow = pubkey;
     try {
-      if (followedPubkeys.has(pubkey)) {
-        if (
-          !confirm(
-            "Unfollow this user? Their posts will be deleted from your device.",
-          )
-        ) {
-          togglingFollow = null;
-          return;
-        }
-        await invoke("unfollow_user", { pubkey });
-        followedPubkeys = new Set(
-          [...followedPubkeys].filter((p) => p !== pubkey),
-        );
-      } else {
-        const user = users.find((u) => u.pubkey === pubkey);
-        const nodeId = user?.transport_node_id;
-        if (!nodeId) {
-          console.error("No transport node ID for user:", pubkey);
-          togglingFollow = null;
-          return;
-        }
-        await invoke("follow_user", { nodeId });
-        followedPubkeys = new Set([...followedPubkeys, pubkey]);
-      }
+      await (followedPubkeys.has(pubkey) ? unfollow(pubkey) : follow(pubkey));
     } catch (e) {
+      toast.show(`Failed to update follow: ${e}`);
       console.error("Follow toggle failed:", e);
+    } finally {
+      togglingFollow = null;
     }
-    togglingFollow = null;
   }
 
   function searchTag(tag: string) {
     searchQuery = `#${tag}`;
     activeTab = "posts";
     search();
-  }
-
-  function shortId(id: string): string {
-    return id.length > 12 ? id.slice(0, 6) + ".." + id.slice(-4) : id;
   }
 
   onMount(() => {
@@ -191,6 +237,11 @@
   <div class="loading">
     <div class="spinner"></div>
     <p>Loading...</p>
+  </div>
+{:else if node.error}
+  <div class="empty">
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
   </div>
 {:else if servers.length === 0}
   <div class="empty-state">
@@ -248,7 +299,7 @@
     {:else if activeTab === "users"}
       <UserResultsList
         {users}
-        {myPubkey}
+        myPubkey={node.pubkey}
         {followedPubkeys}
         {togglingFollow}
         ontogglefollow={toggleFollow}
@@ -262,6 +313,12 @@
         onsearchtag={searchTag}
       />
     {/if}
+  </div>
+{/if}
+
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
   </div>
 {/if}
 

@@ -3,11 +3,74 @@ use crate::error::CmdResult;
 use crate::preferences;
 use crate::state::AppState;
 use std::sync::Arc;
-use tauri::State;
+use std::time::Duration;
+use tauri::{Manager, State};
 
+/// Time limit for stopping the network stack and for shutting down the blob store.
+const WIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Delete all local data, then restart the app.
+///
+/// Asks for confirmation in a native dialog first and returns the error `"cancelled"` if
+/// the user declines. After confirmation:
+/// 1. The network stack is stopped (`setup::stop_network`), so no peer request is
+///    answered and no received message is stored while tables are empty (an absent own
+///    profile row reads as public visibility).
+/// 2. Every database row is deleted in one transaction.
+/// 3. The blob store is shut down and its directory is removed.
+/// 4. The process restarts. Key files are kept, so the identity is the same afterwards.
+///
+/// If the database transaction fails, nothing is deleted and the process still restarts,
+/// because the endpoint is already closed.
 #[tauri::command]
 pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
-    state.storage.wipe_all_data().await
+    let app = state.app_handle.clone();
+    let confirmed = crate::confirm::confirm_native(
+        &app,
+        "Delete all data",
+        "Delete all posts, messages, follows, media and settings stored on this device? This cannot be undone. The app restarts afterwards.",
+        "Delete everything",
+    )
+    .await;
+    if !confirmed {
+        return Err("cancelled".into());
+    }
+    let blobs_dir = app.path().app_data_dir()?.join("blobs");
+
+    if tokio::time::timeout(WIPE_SHUTDOWN_TIMEOUT, crate::setup::stop_network(&state))
+        .await
+        .is_err()
+    {
+        log::warn!("[wipe] stopping the network stack timed out");
+    }
+
+    if let Err(e) = state.storage.wipe_all_data().await {
+        // Nothing was deleted (the deletes are one transaction). The network stack is
+        // stopped, so the process restarts in either case.
+        log::error!("[wipe] failed to delete database rows: {e}");
+        app.request_restart();
+        return Err(e);
+    }
+    log::info!("[wipe] database rows deleted");
+
+    // iroh-blobs has no public call that deletes blobs from an open store, so the store
+    // is shut down and its directory removed. `FsStore::load` creates it again at startup.
+    match tokio::time::timeout(WIPE_SHUTDOWN_TIMEOUT, state.blob_store.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::warn!("[wipe] blob store shutdown failed: {e}"),
+        Err(_) => log::warn!("[wipe] blob store shutdown timed out"),
+    }
+    match tokio::fs::remove_dir_all(&blobs_dir).await {
+        Ok(()) => log::info!("[wipe] blob store removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::error!(
+            "[wipe] failed to remove blob store {}: {e}",
+            blobs_dir.display()
+        ),
+    }
+
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]
@@ -91,18 +154,11 @@ pub async fn set_audio_input_device(
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> CmdResult<()> {
-    if name.is_empty() {
-        // Empty string means "use default" -- remove the preference
-        state
-            .storage
-            .set_preference(preferences::AUDIO_INPUT_DEVICE, "")
-            .await
-    } else {
-        state
-            .storage
-            .set_preference(preferences::AUDIO_INPUT_DEVICE, &name)
-            .await
-    }
+    // An empty name is stored as is and selects the system default device.
+    state
+        .storage
+        .set_preference(preferences::AUDIO_INPUT_DEVICE, &name)
+        .await
 }
 
 #[tauri::command]
@@ -134,15 +190,9 @@ pub async fn set_audio_output_device(
     state: State<'_, Arc<AppState>>,
     name: String,
 ) -> CmdResult<()> {
-    if name.is_empty() {
-        state
-            .storage
-            .set_preference(preferences::AUDIO_OUTPUT_DEVICE, "")
-            .await
-    } else {
-        state
-            .storage
-            .set_preference(preferences::AUDIO_OUTPUT_DEVICE, &name)
-            .await
-    }
+    // An empty name is stored as is and selects the system default device.
+    state
+        .storage
+        .set_preference(preferences::AUDIO_OUTPUT_DEVICE, &name)
+        .await
 }

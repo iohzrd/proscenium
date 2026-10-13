@@ -9,9 +9,37 @@ pub fn generate_id() -> String {
     )
 }
 
+/// Maximum number of characters of a message shown in the conversation list.
+const MESSAGE_PREVIEW_CHARS: usize = 80;
+
+/// Conversation-list preview of a message: the whole text if it has at most
+/// `MESSAGE_PREVIEW_CHARS` characters, otherwise the first 77 characters followed by "...".
+/// Truncation is by character, never inside a UTF-8 sequence.
+pub fn message_preview(content: &str) -> String {
+    if content.chars().count() > MESSAGE_PREVIEW_CHARS {
+        format!(
+            "{}...",
+            proscenium_types::truncate_chars(content, MESSAGE_PREVIEW_CHARS - 3)
+        )
+    } else {
+        content.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_preview_truncates_on_char_boundaries() {
+        assert_eq!(message_preview("short"), "short");
+        let cjk = "\u{65e5}".repeat(100);
+        let preview = message_preview(&cjk);
+        assert_eq!(preview.chars().count(), 80);
+        assert!(preview.ends_with("..."));
+        let cyrillic = "\u{43f}".repeat(45);
+        assert_eq!(message_preview(&cyrillic), cyrillic);
+    }
     use std::collections::HashSet;
 
     #[test]

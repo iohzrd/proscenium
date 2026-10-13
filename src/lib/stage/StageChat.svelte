@@ -1,9 +1,17 @@
 <script lang="ts">
+  import { isSubmitEnter } from "$lib/messages/compose";
+  import { truncate } from "$lib/utils";
+
   interface ChatMessage {
     pubkey: string;
     name: string;
     text: string;
   }
+
+  // Bounds applied on render: names and texts come from other participants.
+  const MAX_RENDERED_MESSAGES = 200;
+  const MAX_NAME_CHARS = 64;
+  const MAX_TEXT_CHARS = 500;
 
   let {
     messages,
@@ -17,32 +25,33 @@
 
   let chatEl = $state<HTMLDivElement | null>(null);
 
+  let visible = $derived(messages.slice(-MAX_RENDERED_MESSAGES));
+
+  // Runs after the DOM update of every list change: scroll to the newest message.
   $effect(() => {
-    // Auto-scroll when messages change
-    if (messages.length > 0 && chatEl) {
-      setTimeout(() => {
-        if (chatEl) chatEl.scrollTop = chatEl.scrollHeight;
-      }, 0);
+    if (visible.length > 0 && chatEl) {
+      chatEl.scrollTop = chatEl.scrollHeight;
     }
   });
 
   function handleChatKey(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
+    // A single-line input has no newline, so Enter also sends on mobile.
+    if (isSubmitEnter(e, false)) {
       e.preventDefault();
-      onsend();
+      if (chatInput.trim()) onsend();
     }
   }
 </script>
 
 <div class="room-sidebar">
   <div class="chat-messages" bind:this={chatEl}>
-    {#each messages as msg}
+    {#each visible as msg}
       <div class="chat-msg">
-        <span class="chat-author">{msg.name}</span>
-        <span class="chat-text">{msg.text}</span>
+        <span class="chat-author">{truncate(msg.name, MAX_NAME_CHARS)}</span>
+        <span class="chat-text">{truncate(msg.text, MAX_TEXT_CHARS)}</span>
       </div>
     {/each}
-    {#if messages.length === 0}
+    {#if visible.length === 0}
       <div class="chat-empty">No messages yet</div>
     {/if}
   </div>
@@ -51,6 +60,8 @@
       class="chat-input"
       type="text"
       placeholder="Chat..."
+      aria-label="Chat message"
+      maxlength={MAX_TEXT_CHARS}
       bind:value={chatInput}
       onkeydown={handleChatKey}
     />

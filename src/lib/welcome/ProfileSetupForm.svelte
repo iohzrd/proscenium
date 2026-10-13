@@ -1,8 +1,10 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import { detectImageMime } from "$lib/utils";
+  import Avatar from "$lib/Avatar.svelte";
+  import VisibilityPicker from "$lib/profile/VisibilityPicker.svelte";
   import type { Visibility } from "$lib/types";
+  import { uploadFiles } from "$lib/utils";
 
   let {
     onback,
@@ -13,63 +15,38 @@
   let displayName = $state("");
   let bio = $state("");
   let visibility = $state<Visibility>("public");
-  let avatarPreview = $state<string | null>(null);
   let avatarHash = $state<string | null>(null);
   let avatarTicket = $state<string | null>(null);
   let saving = $state(false);
   let uploading = $state(false);
+  let errorMessage = $state("");
   let fileInput = $state<HTMLInputElement>(null!);
 
-  const visibilityOptions: {
-    value: Visibility;
-    label: string;
-    hint: string;
-  }[] = [
-    {
-      value: "public",
-      label: "Public",
-      hint: "Anyone can see your posts and sync your profile.",
-    },
-    {
-      value: "listed",
-      label: "Listed",
-      hint: "Profile discoverable, but posts only shared with approved followers.",
-    },
-    {
-      value: "private",
-      label: "Private",
-      hint: "Only mutual follows can see your posts. Invisible to servers.",
-    },
-  ];
-
   async function handleAvatarUpload(e: Event) {
-    const input = e.target as HTMLInputElement;
+    const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
+    input.value = "";
     if (!file) return;
     uploading = true;
+    errorMessage = "";
     try {
-      const buffer = await file.arrayBuffer();
-      const data = Array.from(new Uint8Array(buffer));
-      const result: { hash: string; ticket: string } = await invoke(
-        "add_blob_bytes",
-        { data },
-      );
-      avatarHash = result.hash;
-      avatarTicket = result.ticket;
-      const blob = new Blob([new Uint8Array(buffer)], {
-        type: detectImageMime(new Uint8Array(buffer)),
-      });
-      avatarPreview = URL.createObjectURL(blob);
-    } catch (e) {
-      console.error("Failed to upload avatar:", e);
+      const [uploaded] = await uploadFiles([file]);
+      // The preview is rendered by Avatar from the ticket.
+      if (uploaded.previewUrl.startsWith("blob:")) {
+        URL.revokeObjectURL(uploaded.previewUrl);
+      }
+      avatarHash = uploaded.hash;
+      avatarTicket = uploaded.ticket;
+    } catch (err) {
+      errorMessage = `Upload failed: ${err instanceof Error ? err.message : err}`;
     }
     uploading = false;
-    input.value = "";
   }
 
   async function saveProfile() {
     if (!displayName.trim()) return;
     saving = true;
+    errorMessage = "";
     try {
       await invoke("save_my_profile", {
         displayName: displayName.trim(),
@@ -78,9 +55,9 @@
         avatarTicket,
         visibility,
       });
-      goto("/");
-    } catch (e) {
-      console.error("Failed to save profile:", e);
+      await goto("/");
+    } catch (err) {
+      errorMessage = `Failed to save profile: ${err}`;
     }
     saving = false;
   }
@@ -88,7 +65,7 @@
 
 <input
   type="file"
-  accept="image/*"
+  accept="image/png,image/jpeg,image/gif,image/webp"
   class="hidden-input"
   bind:this={fileInput}
   onchange={handleAvatarUpload}
@@ -102,9 +79,10 @@
       class="avatar-upload"
       onclick={() => fileInput?.click()}
       disabled={uploading}
+      aria-label="Add a photo"
     >
-      {#if avatarPreview}
-        <img src={avatarPreview} alt="Avatar" />
+      {#if avatarTicket}
+        <Avatar pubkey="" name={displayName} ticket={avatarTicket} size={76} />
       {:else}
         <span class="avatar-placeholder">
           {uploading ? "..." : "+"}
@@ -137,31 +115,19 @@
 
   <div class="field">
     <span class="field-label">Visibility</span>
-    <div class="visibility-options">
-      {#each visibilityOptions as opt}
-        <label
-          class="visibility-option"
-          class:selected={visibility === opt.value}
-        >
-          <input
-            type="radio"
-            name="visibility"
-            value={opt.value}
-            bind:group={visibility}
-          />
-          <span class="visibility-label">{opt.label}</span>
-          <span class="visibility-hint">{opt.hint}</span>
-        </label>
-      {/each}
-    </div>
+    <VisibilityPicker bind:value={visibility} />
   </div>
+
+  {#if errorMessage}
+    <p class="error" role="alert">{errorMessage}</p>
+  {/if}
 
   <div class="actions">
     <button class="secondary-btn" onclick={onback}>Back</button>
     <button
       class="btn-accent primary-btn"
       onclick={saveProfile}
-      disabled={!displayName.trim() || saving}
+      disabled={!displayName.trim() || saving || uploading}
     >
       {saving ? "Saving..." : "Get Started"}
     </button>
@@ -206,12 +172,6 @@
     border-color: var(--accent);
   }
 
-  .avatar-upload img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-  }
-
   .avatar-placeholder {
     color: var(--text-tertiary);
     font-size: var(--text-icon-xl);
@@ -230,6 +190,12 @@
   .field textarea {
     resize: vertical;
     min-height: 60px;
+  }
+
+  .error {
+    color: var(--color-error);
+    font-size: var(--text-sm);
+    margin: 0 0 1rem;
   }
 
   .actions {
@@ -261,54 +227,5 @@
   .secondary-btn:hover {
     color: var(--accent-light);
     border-color: var(--accent);
-  }
-
-  .visibility-options {
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
-  }
-
-  .visibility-option {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.6rem 0.75rem;
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    cursor: pointer;
-    text-align: left;
-    transition:
-      border-color var(--transition-normal),
-      background var(--transition-normal);
-  }
-
-  .visibility-option:hover {
-    border-color: var(--border-hover);
-  }
-
-  .visibility-option.selected {
-    border-color: var(--accent);
-    background: var(--bg-elevated);
-  }
-
-  .visibility-option input[type="radio"] {
-    accent-color: var(--accent);
-    margin: 0;
-  }
-
-  .visibility-label {
-    font-size: var(--text-base);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .visibility-hint {
-    width: 100%;
-    font-size: var(--text-sm);
-    color: var(--text-tertiary);
-    padding-left: 1.5rem;
   }
 </style>

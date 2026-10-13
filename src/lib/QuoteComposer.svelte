@@ -1,9 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import InlineComposer from "$lib/InlineComposer.svelte";
+  import { useDisplayName } from "$lib/name.svelte";
   import type { Post } from "$lib/types";
-  import { shortId, getDisplayName } from "$lib/utils";
-  import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete, autogrow } from "$lib/composables";
+  import { truncate } from "$lib/utils";
 
   let {
     quotedPost,
@@ -17,92 +17,48 @@
     oncancel?: () => void;
   } = $props();
 
-  let content = $state("");
-  let posting = $state(false);
-  let mentionAutocomplete: MentionAutocomplete;
+  const PREVIEW_CHARS = 120;
 
-  const mention = useMentionAutocomplete(
-    () => content,
-    (v) => (content = v),
-    ".quote-composer textarea",
+  const author = useDisplayName(
+    () => quotedPost.author,
+    () => pubkey,
   );
 
-  let preview = $derived(
-    quotedPost.content.length > 120
-      ? quotedPost.content.slice(0, 120) + "..."
-      : quotedPost.content,
-  );
-
-  async function submit() {
-    if (posting) return;
-    posting = true;
-    try {
-      await invoke("create_post", {
-        content: content.trim(),
-        media: null,
-        replyTo: null,
-        replyToAuthor: null,
-        quoteOf: quotedPost.id,
-        quoteOfAuthor: quotedPost.author,
-      });
-      content = "";
-      onsubmitted?.();
-    } catch (e) {
-      console.error("Failed to post quote:", e);
-    }
-    posting = false;
-  }
-
-  function handleKey(e: KeyboardEvent) {
-    if (mentionAutocomplete?.handleKey(e)) return;
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      submit();
-    } else if (e.key === "Escape") {
-      oncancel?.();
-    }
-  }
+  let preview = $derived.by(() => {
+    const cut = truncate(quotedPost.content, PREVIEW_CHARS);
+    return cut === quotedPost.content ? cut : cut + "...";
+  });
 </script>
 
-<div class="composer quote-composer">
-  <div class="quoted-preview">
-    {#await getDisplayName(quotedPost.author, pubkey)}
-      <span class="quote-author">{shortId(quotedPost.author)}</span>
-    {:then name}
-      <span class="quote-author">{name}</span>
-    {/await}
-    {#if preview}
-      <span class="quote-text">{preview}</span>
-    {:else}
-      <span class="quote-text empty">[no text]</span>
-    {/if}
-  </div>
-  <MentionAutocomplete
-    bind:this={mentionAutocomplete}
-    query={mention.query}
-    selfId={pubkey}
-    visible={mention.active}
-    onselect={mention.insertMention}
-  />
-  <textarea
-    class="textarea-base"
-    bind:value={content}
-    placeholder="Add your commentary (optional)..."
-    rows="1"
-    onkeydown={handleKey}
-    oninput={mention.handleInput}
-    use:autogrow></textarea>
-  <div class="composer-actions">
-    <button class="btn-cancel" onclick={oncancel}>Cancel</button>
-    <button
-      class="btn-accent composer-submit"
-      onclick={submit}
-      disabled={posting}
-    >
-      {posting ? "Posting..." : "Quote"}
-    </button>
-  </div>
-</div>
+<!-- An empty text creates a repost of the quoted post. -->
+<InlineComposer
+  {pubkey}
+  placeholder="Add your commentary (optional)..."
+  submitLabel="Quote"
+  allowEmpty
+  create={(content) =>
+    invoke("create_post", {
+      content,
+      media: null,
+      replyTo: null,
+      replyToAuthor: null,
+      quoteOf: quotedPost.id,
+      quoteOfAuthor: quotedPost.author,
+    })}
+  {onsubmitted}
+  {oncancel}
+>
+  {#snippet header()}
+    <div class="quoted-preview">
+      <span class="quote-author">{author.name}</span>
+      {#if preview}
+        <span class="quote-text">{preview}</span>
+      {:else}
+        <span class="quote-text empty">[no text]</span>
+      {/if}
+    </div>
+  {/snippet}
+</InlineComposer>
 
 <style>
   .quoted-preview {

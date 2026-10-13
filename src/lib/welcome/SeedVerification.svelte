@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { PHRASE_INPUT_ATTRS } from "./phrase-input";
 
   let {
     onback,
@@ -42,6 +43,7 @@
       });
       if (valid) {
         await invoke("mark_seed_phrase_backed_up");
+        verifyInputs = ["", "", ""];
         onverified();
       } else {
         verifyError = "One or more words are incorrect. Please try again.";
@@ -69,15 +71,14 @@
           type="text"
           bind:value={verifyInputs[i]}
           placeholder="Enter word"
-          autocapitalize="none"
-          autocomplete="off"
+          {...PHRASE_INPUT_ATTRS}
         />
       </label>
     {/each}
   </div>
 
   {#if verifyError}
-    <p class="error">{verifyError}</p>
+    <p class="error" role="alert">{verifyError}</p>
   {/if}
 
   <div class="actions">
@@ -133,7 +134,7 @@
   }
 
   .error {
-    color: var(--color-danger);
+    color: var(--color-error);
     font-size: var(--text-sm);
     margin: 0 0 1rem;
   }

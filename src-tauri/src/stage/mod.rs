@@ -7,11 +7,13 @@ mod lifecycle;
 pub mod mixer;
 mod moderation;
 mod pipeline;
-pub mod relay;
+mod relay;
+mod serving;
 mod speaker_mixer;
 mod state;
 pub mod topology;
 
+use command::ActorSender;
 pub use command::StageActorHandle;
 pub(crate) use command::StageCommand;
 
@@ -22,34 +24,64 @@ use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_gossip::Gossip;
-use proscenium_types::{SignedStageControl, StageEvent, StageRole, StageState, short_id};
-use state::ActiveStage;
+use proscenium_types::{StageEvent, StageParticipant, StageState, short_id};
+use state::{ActiveStage, Moderation};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 
 /// Connection type byte: sent as first byte of the bi-stream by the initiating side.
 pub(super) const CONN_TYPE_SPEAKER: u8 = 0x01;
 pub(super) const CONN_TYPE_LISTENER: u8 = 0x02;
 
+/// Application close codes of STAGE_ALPN connections.
+pub(super) const CLOSE_NORMAL: u32 = 0;
+/// The identity named in the hello is banned from the stage.
+pub(super) const CLOSE_BANNED: u32 = 1;
+/// The serving node has no free connection slot.
+pub(super) const CLOSE_FULL: u32 = 2;
+/// The hello is invalid, or the node does not accept this connection type or role.
+pub(super) const CLOSE_REJECTED: u32 = 3;
+/// A newer connection from the same node or identity replaced this one.
+pub(super) const CLOSE_REPLACED: u32 = 4;
+
+/// Incoming connections whose hello is being read at one time. Further connections are
+/// closed until one of them completes.
+const MAX_PENDING_HELLOS: usize = 64;
+
+/// What the actor does with the active stage after a control message or command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outcome {
+    Continue,
+    /// The host ended the room.
+    Ended,
+    /// The local user was kicked or banned.
+    Kicked,
+}
+
 // ---- StageActor ---------------------------------------------------------
 
 pub(super) struct StageActor {
     cmd_rx: mpsc::Receiver<StageCommand>,
-    /// Cloned sender to ourselves, used to inject ControlReceived messages.
-    self_tx: mpsc::Sender<StageCommand>,
+    /// Sender to ourselves, handed to background tasks.
+    self_tx: ActorSender,
     pub(super) endpoint: Endpoint,
-    gossip: Gossip,
+    pub(super) gossip: Gossip,
     pub(super) identity: SharedIdentity,
     pub(super) gossip_service: GossipService,
     pub(super) app_handle: AppHandle,
     pub(super) active: Option<ActiveStage>,
+    /// Source of connection ids and mixer input ids. Never reused, so a late
+    /// `*ConnClosed` command cannot match a newer connection.
+    next_conn_id: u64,
+    pending_hellos: Arc<Semaphore>,
 }
 
 impl StageActor {
-    #[allow(clippy::too_many_arguments)]
     fn new(
         cmd_rx: mpsc::Receiver<StageCommand>,
-        self_tx: mpsc::Sender<StageCommand>,
+        self_tx: ActorSender,
         endpoint: Endpoint,
         gossip: Gossip,
         identity: SharedIdentity,
@@ -65,12 +97,18 @@ impl StageActor {
             gossip_service,
             app_handle,
             active: None,
+            next_conn_id: 0,
+            pending_hellos: Arc::new(Semaphore::new(MAX_PENDING_HELLOS)),
         }
     }
 
     async fn run(mut self) {
         while let Some(cmd) = self.cmd_rx.recv().await {
             self.handle(cmd).await;
+        }
+        // Every handle was dropped (the network stack was replaced).
+        if let Some(stage) = self.active.take() {
+            stage.shutdown();
         }
     }
 
@@ -88,173 +126,296 @@ impl StageActor {
             StageCommand::EndStage { reply } => {
                 let _ = reply.send(self.end_stage().await);
             }
-            StageCommand::IncomingConnection(conn) => {
-                if let Some(active) = &self.active {
-                    let my_role = active.my_role;
-                    let fanout = active.fanout.clone();
-                    let mixer_handle = active.mixer_handle.clone();
-                    let relay_handle = active.relay_handle.clone();
-                    let sfu_hub = active.sfu_hub.clone();
-                    let host_sfu_fanout = active.host_sfu_fanout.clone();
-                    let banned_node_ids = active.banned_node_ids.clone();
-                    let conn_cancel = active.cancel.child_token();
-                    tokio::spawn(async move {
-                        pipeline::handle_incoming_connection(
-                            conn,
-                            my_role,
-                            fanout,
-                            mixer_handle,
-                            relay_handle,
-                            sfu_hub,
-                            host_sfu_fanout,
-                            banned_node_ids,
-                            conn_cancel,
-                        )
-                        .await;
-                    });
-                } else {
-                    let remote = conn.remote_id().to_string();
-                    log::debug!(
-                        "[stage] closing connection from {} (not in stage)",
-                        short_id(&remote)
-                    );
-                    conn.close(0u32.into(), b"not in a stage");
+            StageCommand::IncomingConnection(conn) => self.accept_connection(conn),
+            StageCommand::AudioConnection(incoming) => {
+                let conn_id = self.next_conn_id();
+                match self.active.as_mut() {
+                    Some(stage) => stage.admit(incoming, conn_id).await,
+                    None => incoming
+                        .conn
+                        .close(CLOSE_REJECTED.into(), b"not in a stage"),
                 }
             }
-            StageCommand::ControlReceived(signed) => {
-                self.handle_control(signed).await;
+            StageCommand::ListenerConnClosed { node_id, conn_id } => {
+                if let Some(stage) = self.active.as_mut() {
+                    stage.listener_conn_closed(&node_id, conn_id);
+                }
             }
-            StageCommand::PromoteSpeaker { pubkey, reply } => {
-                let _ = reply.send(self.promote_speaker(pubkey).await);
+            StageCommand::SpeakerConnClosed { node_id, conn_id } => {
+                if let Some(stage) = self.active.as_mut() {
+                    stage.speaker_conn_closed(&node_id, conn_id);
+                }
             }
-            StageCommand::DemoteSpeaker { pubkey, reply } => {
-                let _ = reply.send(self.demote_speaker(pubkey).await);
+            StageCommand::UpstreamFailed { stage_id, node_id } => {
+                if let Some(stage) = self.active.as_mut()
+                    && stage.stage_id == stage_id
+                {
+                    stage.upstream_failed(node_id);
+                }
+            }
+            StageCommand::ControlReceived(msg) => {
+                let outcome = match self.active.as_mut() {
+                    Some(stage) => stage.handle_control(msg).await,
+                    None => Outcome::Continue,
+                };
+                self.finish(outcome);
             }
             StageCommand::SweepPresence => {
-                self.sweep_presence();
+                if let Some(stage) = self.active.as_mut() {
+                    stage.sweep_presence().await;
+                }
+            }
+            StageCommand::HostTick => {
+                if let Some(stage) = self.active.as_mut() {
+                    stage.host_tick().await;
+                }
+            }
+            StageCommand::PromoteSpeaker { pubkey, reply } => {
+                let _ = reply.send(self.moderate(Moderation::Promote, pubkey).await);
+            }
+            StageCommand::DemoteSpeaker { pubkey, reply } => {
+                let _ = reply.send(self.moderate(Moderation::Demote, pubkey).await);
+            }
+            StageCommand::MuteSpeaker { pubkey, reply } => {
+                let _ = reply.send(self.moderate(Moderation::Mute, pubkey).await);
+            }
+            StageCommand::Kick { pubkey, reply } => {
+                let _ = reply.send(self.moderate(Moderation::Kick, pubkey).await);
+            }
+            StageCommand::Ban { pubkey, reply } => {
+                let _ = reply.send(self.moderate(Moderation::Ban, pubkey).await);
             }
             StageCommand::VolunteerAsRelay { capacity, reply } => {
-                let _ = reply.send(self.volunteer_as_relay(capacity).await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.volunteer_as_relay(capacity).await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::RaiseHand { reply } => {
-                let _ = reply.send(self.raise_hand().await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.raise_hand().await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::LowerHand { reply } => {
-                let _ = reply.send(self.lower_hand().await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.lower_hand().await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::ToggleSelfMute { reply } => {
-                let _ = reply.send(self.toggle_self_mute().await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.toggle_self_mute().await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::SendReaction { emoji, reply } => {
-                let _ = reply.send(self.send_reaction(emoji).await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.send_reaction(emoji).await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::SendChat { text, reply } => {
-                let _ = reply.send(self.send_chat(text).await);
+                let result = match self.active.as_mut() {
+                    Some(stage) => stage.send_chat(text).await,
+                    None => Err(not_in_stage()),
+                };
+                let _ = reply.send(result);
             }
             StageCommand::GetState { reply } => {
-                let _ = reply.send(self.build_state());
+                let _ = reply.send(self.active.as_ref().map(ActiveStage::build_state));
             }
             StageCommand::GetActiveAnnouncement { reply } => {
-                let _ = reply.send(self.build_active_announcement());
+                let _ = reply.send(
+                    self.active
+                        .as_ref()
+                        .and_then(ActiveStage::build_announcement),
+                );
             }
         }
     }
 
     // ---- Helpers -----------------------------------------------------------
 
-    pub(super) fn require_active(&self, action: &str) -> Result<(), AppError> {
-        if self.active.is_none() {
-            return Err(AppError::Other(format!("cannot {action}: not in a stage")));
-        }
-        Ok(())
+    pub(super) fn next_conn_id(&mut self) -> u64 {
+        self.next_conn_id += 1;
+        self.next_conn_id
     }
 
-    pub(super) fn require_host_active(&self, _pubkey: &str, action: &str) -> Result<(), AppError> {
-        match &self.active {
-            None => Err(AppError::Other(format!("cannot {action}: not in a stage"))),
-            Some(s) if !matches!(s.my_role, StageRole::Host | StageRole::CoHost) => {
-                Err(AppError::Other(format!("cannot {action}: not the host")))
-            }
-            _ => Ok(()),
-        }
+    /// Return a sender to our own command channel for background tasks.
+    pub(super) fn cmd_tx(&self) -> ActorSender {
+        self.self_tx.clone()
     }
 
-    fn build_state(&self) -> Option<StageState> {
-        let s = self.active.as_ref()?;
-        let participants = s
-            .participants
-            .values()
-            .map(|p| proscenium_types::StageParticipant {
-                pubkey: p.pubkey.clone(),
-                role: p.role,
-                display_name: None,
-                avatar_hash: None,
-                hand_raised: p.hand_raised,
-                self_muted: p.self_muted,
-                host_muted: p.host_muted,
-            })
-            .collect();
-
-        Some(StageState {
-            stage_id: s.stage_id.clone(),
-            title: s.title.clone(),
-            host_pubkey: s.host_pubkey.clone(),
-            my_pubkey: s.my_pubkey.clone(),
-            my_role: s.my_role,
-            participants,
-            started_at: s.started_at,
-            ticket: s.ticket.as_ref().map(|t| t.to_string()),
-        })
-    }
-
-    /// Build a stage announcement from the active stage, if this node is the host.
-    fn build_active_announcement(&self) -> Option<proscenium_types::StageAnnouncement> {
-        let s = self.active.as_ref()?;
-        // Only include the announcement if we are the host
-        if s.my_role != StageRole::Host {
-            return None;
-        }
-        let ticket = s.ticket.as_ref()?;
-        Some(proscenium_types::StageAnnouncement {
-            stage_id: s.stage_id.clone(),
-            title: s.title.clone(),
-            ticket: ticket.clone(),
-            host_pubkey: s.host_pubkey.clone(),
-            started_at: s.started_at,
-        })
-    }
-
-    pub(super) fn emit_state_snapshot(&self) {
-        if let Some(state) = self.build_state() {
-            let _ = self
-                .app_handle
-                .emit("stage-event", StageEvent::StateSnapshot(state));
+    /// Stop the active stage and emit `event` to the frontend.
+    pub(super) fn close_stage(&mut self, event: StageEvent) {
+        if let Some(stage) = self.active.take() {
+            stage.shutdown();
+            let _ = self.app_handle.emit("stage-event", event);
         }
     }
 
-    /// Helper to build + broadcast a control message using current identity.
-    ///
-    /// The closure receives `(stage_id, my_pubkey_str, signing_key)` and returns
-    /// the `SignedStageControl` to broadcast.
-    pub(super) async fn broadcast_control<F>(&self, f: F)
-    where
-        F: FnOnce(&str, &str, &iroh::SecretKey) -> SignedStageControl,
-    {
+    /// Close the active stage if `outcome` requires it.
+    fn finish(&mut self, outcome: Outcome) {
         let Some(stage) = self.active.as_ref() else {
             return;
         };
-        let id = self.identity.read().await;
-        let signing_pubkey = id.signing_key.public().to_string();
-        let signed = f(&stage.stage_id, &signing_pubkey, &id.signing_key);
-        drop(id);
-        if let Err(e) = stage.control_plane.broadcast(&signed).await {
-            log::warn!("[stage] failed to broadcast control: {e}");
+        let stage_id = stage.stage_id.clone();
+        match outcome {
+            Outcome::Continue => {}
+            Outcome::Ended => {
+                log::info!("[stage] room ended by host: {}", short_id(&stage_id));
+                self.close_stage(StageEvent::Ended { stage_id });
+            }
+            Outcome::Kicked => {
+                log::info!("[stage] removed from stage {}", short_id(&stage_id));
+                self.close_stage(StageEvent::Kicked);
+            }
         }
     }
 
-    /// Return a clone of our own cmd_tx so background tasks can forward messages.
-    pub(super) fn cmd_rx_forwarder(&self) -> mpsc::Sender<StageCommand> {
-        self.self_tx.clone()
+    /// Run a moderation command of the local user.
+    async fn moderate(&mut self, action: Moderation, pubkey: String) -> Result<(), AppError> {
+        let stage = self.active.as_mut().ok_or_else(not_in_stage)?;
+        stage.moderate(action, pubkey).await
+    }
+
+    /// Start reading the hello of an incoming connection, or close the connection if
+    /// this node serves no audio.
+    fn accept_connection(&self, conn: Connection) {
+        let remote = conn.remote_id().to_string();
+        let Some(stage) = self.active.as_ref().filter(|s| s.serving.is_some()) else {
+            log::debug!(
+                "[stage] closing connection from {} (not serving audio)",
+                short_id(&remote)
+            );
+            conn.close(CLOSE_REJECTED.into(), b"not accepting connections");
+            return;
+        };
+        let Ok(permit) = self.pending_hellos.clone().try_acquire_owned() else {
+            conn.close(CLOSE_FULL.into(), b"busy");
+            return;
+        };
+        let stage_id = stage.stage_id.clone();
+        let cancel = stage.cancel.child_token();
+        let cmd_tx = self.cmd_tx();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let closer = conn.clone();
+            let accepted = tokio::select! {
+                _ = cancel.cancelled() => return,
+                accepted = pipeline::accept_audio_connection(conn, &stage_id) => accepted,
+            };
+            match accepted {
+                Ok(incoming) => {
+                    cmd_tx.send(StageCommand::AudioConnection(incoming)).await;
+                }
+                Err(reason) => {
+                    log::info!(
+                        "[stage] rejected connection from {}: {reason}",
+                        short_id(&remote)
+                    );
+                    closer.close(CLOSE_REJECTED.into(), b"invalid hello");
+                }
+            }
+        });
+    }
+}
+
+fn not_in_stage() -> AppError {
+    AppError::Other("not in a stage".into())
+}
+
+impl ActiveStage {
+    pub(super) fn emit(&self, event: StageEvent) {
+        let _ = self.rt.app_handle.emit("stage-event", event);
+    }
+
+    pub(super) fn emit_snapshot(&self) {
+        self.emit(StageEvent::StateSnapshot(self.build_state()));
+    }
+
+    /// Stop every task of this session and close its audio connections.
+    pub(super) fn shutdown(mut self) {
+        self.cancel.cancel();
+        if let Some(server) = self.serving.as_mut() {
+            server.shutdown(b"stage ended");
+        }
+        if let Some(host) = self.host.as_mut() {
+            for (_, speaker) in host.speaker_conns.drain() {
+                speaker.conn.close(CLOSE_NORMAL.into(), b"stage ended");
+            }
+        }
+        self.control_plane.shutdown();
+    }
+
+    /// Build the state the frontend displays. Roles and host mutes come from the
+    /// host-assigned sets; the entry of the local user carries the local flags.
+    pub(super) fn build_state(&self) -> StageState {
+        let self_muted = self.self_muted.load(Ordering::Relaxed);
+        let participants = self
+            .participants
+            .values()
+            .map(|p| {
+                let is_me = p.pubkey == self.my_pubkey;
+                StageParticipant {
+                    pubkey: p.pubkey.clone(),
+                    role: if is_me {
+                        self.my_role
+                    } else {
+                        self.roles.role_of(&p.pubkey)
+                    },
+                    display_name: None,
+                    avatar_hash: None,
+                    hand_raised: if is_me {
+                        self.hand_raised
+                    } else {
+                        p.hand_raised
+                    },
+                    self_muted: if is_me { self_muted } else { p.self_muted },
+                    host_muted: self.roles.is_host_muted(&p.pubkey),
+                }
+            })
+            .collect();
+
+        StageState {
+            stage_id: self.stage_id.clone(),
+            title: self.title.clone(),
+            host_pubkey: self.roles.host_pubkey.clone(),
+            my_pubkey: self.my_pubkey.clone(),
+            my_role: self.my_role,
+            participants,
+            started_at: self.started_at,
+            ticket: self.host.as_ref().map(|h| h.ticket.to_string()),
+            self_muted,
+            hand_raised: self.hand_raised,
+        }
+    }
+
+    /// Build the signed announcement of this stage, if this node is the host.
+    fn build_announcement(&self) -> Option<proscenium_types::StageAnnouncement> {
+        let host = self.host.as_ref()?;
+        let signature = proscenium_types::sign_stage_announcement(
+            &self.stage_id,
+            &self.title,
+            &host.ticket,
+            &self.roles.host_pubkey,
+            self.started_at,
+            self.signer.signing_key(),
+        );
+        Some(proscenium_types::StageAnnouncement {
+            stage_id: self.stage_id.clone(),
+            title: self.title.clone(),
+            ticket: host.ticket.clone(),
+            host_pubkey: self.roles.host_pubkey.clone(),
+            started_at: self.started_at,
+            signature,
+        })
     }
 }
 
@@ -278,7 +439,7 @@ impl StageHandler {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let actor = StageActor::new(
             cmd_rx,
-            cmd_tx.clone(),
+            ActorSender::new(&cmd_tx),
             endpoint,
             gossip,
             identity,
@@ -305,7 +466,7 @@ impl std::fmt::Debug for StageHandler {
 impl ProtocolHandler for StageHandler {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id().to_string();
-        log::info!("[stage] incoming connection from {}", short_id(&remote));
+        log::debug!("[stage] incoming connection from {}", short_id(&remote));
         self.handle.incoming_connection(conn).await;
         Ok(())
     }

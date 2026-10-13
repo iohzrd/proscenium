@@ -1,11 +1,13 @@
 use crate::constants::{
-    DRIP_ACTIVE_INTERVAL, DRIP_IDLE_INTERVAL, DRIP_PEER_PACE, PEER_READY_DELAY,
-    RELAY_CHECK_INTERVAL, RELAY_WAIT_ATTEMPTS, SYNC_CONCURRENCY,
+    DRIP_ACTIVE_INTERVAL, DRIP_IDLE_INTERVAL, PEER_READY_DELAY, RELAY_CHECK_INTERVAL,
+    RELAY_WAIT_ATTEMPTS, SYNC_CONCURRENCY,
 };
 use crate::state::{AppState, SyncCommand};
 use proscenium_types::short_id;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::task::{Id, JoinError, JoinSet};
 
 pub fn spawn(state: Arc<AppState>, sync_rx: mpsc::Receiver<SyncCommand>) {
     let token = state.shutdown().child_token();
@@ -18,6 +20,78 @@ pub fn spawn(state: Arc<AppState>, sync_rx: mpsc::Receiver<SyncCommand>) {
     });
 }
 
+/// Runs queued syncs, at most `SYNC_CONCURRENCY` at a time and one per user.
+///
+/// Dropping the scheduler aborts the running syncs (`JoinSet` aborts its tasks on drop).
+struct SyncScheduler {
+    state: Arc<AppState>,
+    running: JoinSet<()>,
+    /// Pubkey of each running task.
+    task_pubkeys: HashMap<Id, String>,
+    /// Pubkeys that are queued or running; a pubkey is not queued a second time.
+    active: HashSet<String>,
+    queue: VecDeque<(String, &'static str)>,
+}
+
+impl SyncScheduler {
+    fn new(state: Arc<AppState>) -> Self {
+        Self {
+            state,
+            running: JoinSet::new(),
+            task_pubkeys: HashMap::new(),
+            active: HashSet::new(),
+            queue: VecDeque::new(),
+        }
+    }
+
+    /// Queue a sync of `pubkey` unless one is queued or running.
+    fn enqueue(&mut self, pubkey: String, label: &'static str) {
+        if self.active.insert(pubkey.clone()) {
+            self.queue.push_back((pubkey, label));
+        }
+    }
+
+    /// Queue a sync of every followed user.
+    async fn enqueue_follows(&mut self, label: &'static str) {
+        let follows = get_follows(&self.state).await;
+        if !follows.is_empty() {
+            log::info!("[peer-sync] {label} sync: {} peers", follows.len());
+        }
+        for pubkey in follows {
+            self.enqueue(pubkey, label);
+        }
+    }
+
+    /// Start queued syncs while fewer than `SYNC_CONCURRENCY` are running.
+    fn start_queued(&mut self) {
+        while self.running.len() < SYNC_CONCURRENCY {
+            let Some((pubkey, label)) = self.queue.pop_front() else {
+                break;
+            };
+            let state = self.state.clone();
+            let task_pubkey = pubkey.clone();
+            let handle = self.running.spawn(async move {
+                sync_one(state, &task_pubkey, label).await;
+            });
+            self.task_pubkeys.insert(handle.id(), pubkey);
+        }
+    }
+
+    /// Record that a sync task ended, so its pubkey can be queued again.
+    fn finished(&mut self, result: Result<(Id, ()), JoinError>) {
+        let id = match result {
+            Ok((id, ())) => id,
+            Err(e) => {
+                log::error!("[peer-sync] sync task failed: {e}");
+                e.id()
+            }
+        };
+        if let Some(pubkey) = self.task_pubkeys.remove(&id) {
+            self.active.remove(&pubkey);
+        }
+    }
+}
+
 async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
     // Wait until the relay is connected before syncing so we can actually reach peers.
     wait_for_relay(&state).await;
@@ -25,16 +99,20 @@ async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
     // Small delay to let the network settle.
     tokio::time::sleep(PEER_READY_DELAY).await;
 
-    // Startup: sync all follows in parallel batches.
-    startup_sync(state.clone()).await;
+    // Startup: sync all follows. Then each drip tick syncs one follow in turn, and
+    // commands on `sync_rx` queue syncs on demand. Syncs run in their own tasks, so a
+    // slow peer does not delay the commands or the other peers.
+    let mut scheduler = SyncScheduler::new(state.clone());
+    scheduler.enqueue_follows("startup").await;
+    scheduler.start_queued();
 
-    // Drip loop: slowly re-sync follows + handle on-demand SyncCommand requests.
     let mut drip_interval = tokio::time::interval(DRIP_IDLE_INTERVAL);
     drip_interval.tick().await; // consume the immediate first tick
 
     let mut follows_iter: Vec<String> = Vec::new();
     let mut follow_idx: usize = 0;
     let mut last_activity = std::time::Instant::now();
+    let mut active_interval = false;
 
     loop {
         let shutdown = state.shutdown();
@@ -44,18 +122,20 @@ async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
             cmd = sync_rx.recv() => {
                 let Some(cmd) = cmd else { break };
                 match cmd {
-                    SyncCommand::SyncPeer(pubkey) => {
-                        sync_one(state.clone(), &pubkey, "on-demand").await;
-                        last_activity = std::time::Instant::now();
-                    }
-                    SyncCommand::SyncAll => {
-                        startup_sync(state.clone()).await;
-                        last_activity = std::time::Instant::now();
-                    }
+                    SyncCommand::SyncPeer(pubkey) => scheduler.enqueue(pubkey, "on-demand"),
+                    SyncCommand::SyncAll => scheduler.enqueue_follows("on-demand").await,
                 }
-                // Switch to active interval after any on-demand request.
-                drip_interval = tokio::time::interval(DRIP_ACTIVE_INTERVAL);
-                drip_interval.tick().await;
+                last_activity = std::time::Instant::now();
+                // Switch to the active interval after an on-demand request.
+                if !active_interval {
+                    active_interval = true;
+                    drip_interval = tokio::time::interval(DRIP_ACTIVE_INTERVAL);
+                    drip_interval.tick().await;
+                }
+            }
+
+            Some(result) = scheduler.running.join_next_with_id(), if !scheduler.running.is_empty() => {
+                scheduler.finished(result);
             }
 
             _ = drip_interval.tick() => {
@@ -64,23 +144,20 @@ async fn run(state: Arc<AppState>, mut sync_rx: mpsc::Receiver<SyncCommand>) {
                     follows_iter = get_follows(&state).await;
                     follow_idx = 0;
                 }
-                if follows_iter.is_empty() {
-                    continue;
+                if let Some(pubkey) = follows_iter.get(follow_idx) {
+                    scheduler.enqueue(pubkey.clone(), "drip");
+                    follow_idx += 1;
                 }
 
-                sync_one(state.clone(), &follows_iter[follow_idx], "drip").await;
-                follow_idx += 1;
-
-                // Pace between peers.
-                tokio::time::sleep(DRIP_PEER_PACE).await;
-
-                // Revert to idle interval if nothing has happened for a while.
-                if last_activity.elapsed() > DRIP_ACTIVE_INTERVAL * 3 {
+                // Revert to the idle interval if nothing has happened for a while.
+                if active_interval && last_activity.elapsed() > DRIP_ACTIVE_INTERVAL * 3 {
+                    active_interval = false;
                     drip_interval = tokio::time::interval(DRIP_IDLE_INTERVAL);
                     drip_interval.tick().await;
                 }
             }
         }
+        scheduler.start_queued();
     }
 }
 
@@ -95,28 +172,6 @@ async fn wait_for_relay(state: &AppState) {
     log::warn!(
         "[peer-sync] relay not connected after {RELAY_WAIT_ATTEMPTS} attempts, proceeding anyway"
     );
-}
-
-async fn startup_sync(state: Arc<AppState>) {
-    let follows = get_follows(&state).await;
-    if follows.is_empty() {
-        return;
-    }
-    log::info!("[peer-sync] startup sync: {} peers", follows.len());
-
-    for chunk in follows.chunks(SYNC_CONCURRENCY) {
-        let mut handles = Vec::new();
-        for pubkey in chunk {
-            let state = state.clone();
-            let pubkey = pubkey.clone();
-            handles.push(tokio::spawn(async move {
-                sync_one(state, &pubkey, "startup").await;
-            }));
-        }
-        for h in handles {
-            let _ = h.await;
-        }
-    }
 }
 
 async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
@@ -140,7 +195,7 @@ async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
             );
         }
         Err(e) => {
-            log::debug!("[peer-sync] {label} {} offline: {e}", short_id(pubkey));
+            log::debug!("[peer-sync] {label} {} not synced: {e}", short_id(pubkey));
         }
     }
 }

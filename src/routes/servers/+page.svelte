@@ -1,18 +1,19 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
   import Icon from "$lib/Icon.svelte";
-  import { useNodeInit } from "$lib/composables";
+  import { useNodeInit, useToast } from "$lib/composables";
   import type {
     ServerEntry,
     ServerInfo,
     ServerFeedPost,
     TrendingHashtag,
   } from "$lib/types";
+  import { dedupeBy, dedupeById, shortId } from "$lib/utils";
 
   let servers = $state<ServerEntry[]>([]);
   let newServerUrl = $state("");
-  let status = $state("");
   let adding = $state(false);
   let selectedServer = $state<ServerEntry | null>(null);
   let serverInfo = $state<ServerInfo | null>(null);
@@ -22,54 +23,84 @@
   let loadingFeed = $state(false);
   let registeringServer = $state<string | null>(null);
   let pendingRemoveUrl = $state<string | null>(null);
+  // Incremented when the detail view changes server or closes. A response is
+  // applied only if the value it started with is still current.
+  let selection = 0;
+
+  const toast = useToast();
 
   const node = useNodeInit(async () => {
     await loadServers();
   });
 
+  /** True if requests to `url` are sent without TLS. */
+  function isUnencrypted(url: string): boolean {
+    return url.trim().toLowerCase().startsWith("http://");
+  }
+
   async function loadServers() {
     try {
-      servers = await invoke("list_servers");
+      const list: ServerEntry[] = await invoke("list_servers");
+      servers = dedupeBy(list, (server) => server.url);
     } catch (e) {
+      toast.show("Failed to load servers");
       console.error("Failed to load servers:", e);
     }
   }
 
   async function addServer() {
     const url = newServerUrl.trim();
-    if (!url) return;
+    if (!url || adding) return;
+    let parsed: URL | null = null;
+    try {
+      parsed = new URL(url);
+    } catch {
+      // handled below
+    }
+    if (
+      !parsed ||
+      (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    ) {
+      toast.show("Enter a server URL that starts with https:// or http://");
+      return;
+    }
     adding = true;
-    status = "";
     try {
       const entry: ServerEntry = await invoke("add_server", { url });
       newServerUrl = "";
       await loadServers();
-      status = `Added ${entry.name || entry.url}`;
-      setTimeout(() => (status = ""), 3000);
+      toast.show(`Added ${entry.name || entry.url}`, "success");
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
     adding = false;
   }
 
+  function closeDetail() {
+    selection += 1;
+    selectedServer = null;
+    serverInfo = null;
+    serverFeed = [];
+    trending = [];
+    loadingInfo = false;
+    loadingFeed = false;
+  }
+
   async function removeServer() {
     if (!pendingRemoveUrl) return;
+    const url = pendingRemoveUrl;
+    pendingRemoveUrl = null;
     try {
-      await invoke("remove_server", { url: pendingRemoveUrl });
-      if (selectedServer?.url === pendingRemoveUrl) {
-        selectedServer = null;
-        serverInfo = null;
-        serverFeed = [];
-        trending = [];
-      }
+      await invoke("remove_server", { url });
+      if (selectedServer?.url === url) closeDetail();
       await loadServers();
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
-    pendingRemoveUrl = null;
   }
 
   async function selectServer(server: ServerEntry) {
+    const current = ++selection;
     selectedServer = server;
     serverInfo = null;
     serverFeed = [];
@@ -78,8 +109,14 @@
     loadingFeed = true;
 
     try {
-      serverInfo = await invoke("refresh_server_info", { url: server.url });
+      const info: ServerInfo = await invoke("refresh_server_info", {
+        url: server.url,
+      });
+      if (current !== selection) return;
+      serverInfo = info;
     } catch (e) {
+      if (current !== selection) return;
+      toast.show(`Failed to fetch server info: ${e}`);
       console.error("Failed to fetch server info:", e);
     }
     loadingInfo = false;
@@ -89,8 +126,11 @@
         "server_get_feed",
         { url: server.url, limit: 20 },
       );
-      serverFeed = resp.posts;
+      if (current !== selection) return;
+      serverFeed = dedupeById(resp.posts);
     } catch (e) {
+      if (current !== selection) return;
+      toast.show(`Failed to fetch server feed: ${e}`);
       console.error("Failed to fetch server feed:", e);
     }
 
@@ -99,43 +139,53 @@
         "server_get_trending",
         { url: server.url, limit: 10 },
       );
-      trending = resp.hashtags;
+      if (current !== selection) return;
+      trending = dedupeBy(resp.hashtags, (t) => t.tag);
     } catch (e) {
+      if (current !== selection) return;
       console.error("Failed to fetch trending:", e);
     }
     loadingFeed = false;
   }
 
-  async function registerWithServer(url: string, visibility: string) {
+  /** Invoke a registration command for `url`, then reload the server list. */
+  async function changeRegistration(
+    url: string,
+    command: "register_with_server" | "unregister_from_server",
+    args: Record<string, unknown>,
+    success: string,
+  ) {
+    if (registeringServer) return;
     registeringServer = url;
     try {
-      await invoke("register_with_server", { url, visibility });
+      await invoke(command, { url, ...args });
       await loadServers();
       if (selectedServer?.url === url) {
         selectedServer = servers.find((s) => s.url === url) ?? selectedServer;
       }
-      status = "Registered!";
-      setTimeout(() => (status = ""), 3000);
+      toast.show(success, "success");
     } catch (e) {
-      status = `Error: ${e}`;
+      toast.show(`Error: ${e}`);
     }
     registeringServer = null;
   }
 
-  async function unregisterFromServer(url: string) {
-    registeringServer = url;
-    try {
-      await invoke("unregister_from_server", { url });
-      await loadServers();
-      if (selectedServer?.url === url) {
-        selectedServer = servers.find((s) => s.url === url) ?? selectedServer;
-      }
-      status = "Unregistered";
-      setTimeout(() => (status = ""), 3000);
-    } catch (e) {
-      status = `Error: ${e}`;
-    }
-    registeringServer = null;
+  function registerWithServer(url: string, visibility: string) {
+    return changeRegistration(
+      url,
+      "register_with_server",
+      { visibility },
+      "Registered",
+    );
+  }
+
+  function unregisterFromServer(url: string) {
+    return changeRegistration(
+      url,
+      "unregister_from_server",
+      {},
+      "Unregistered",
+    );
   }
 
   function handleKey(e: KeyboardEvent) {
@@ -146,14 +196,10 @@
   }
 
   function handleGlobalKey(e: KeyboardEvent) {
-    if (e.key === "Escape") {
-      if (pendingRemoveUrl) pendingRemoveUrl = null;
-      else if (selectedServer) selectedServer = null;
+    // The remove confirmation handles Escape itself.
+    if (e.key === "Escape" && !pendingRemoveUrl && selectedServer) {
+      closeDetail();
     }
-  }
-
-  function shortId(id: string): string {
-    return id.length > 12 ? id.slice(0, 6) + ".." + id.slice(-4) : id;
   }
 
   function formatTime(ts: number): string {
@@ -174,17 +220,26 @@
     <div class="spinner"></div>
     <p>Loading...</p>
   </div>
+{:else if node.error}
+  <div class="empty">
+    <p>{node.error}</p>
+    <button class="btn-elevated" onclick={node.init}>Retry</button>
+  </div>
 {:else if selectedServer}
   <div class="server-detail">
-    <button class="back-btn" onclick={() => (selectedServer = null)}>
-      Back
-    </button>
+    <button class="back-btn" onclick={closeDetail}>Back</button>
 
     <h2 class="server-name">
       {selectedServer.name || selectedServer.url}
     </h2>
     {#if selectedServer.description}
       <p class="server-desc">{selectedServer.description}</p>
+    {/if}
+    {#if isUnencrypted(selectedServer.url)}
+      <p class="unencrypted-notice">
+        Unencrypted connection (http): requests to this server and its responses
+        can be read and changed in transit.
+      </p>
     {/if}
 
     {#if loadingInfo}
@@ -282,9 +337,19 @@
         {#each serverFeed as post (post.id)}
           <div class="feed-post">
             <div class="post-meta">
-              <a href="/profile/{post.author}" class="post-author">
+              <a
+                href="/profile/{encodeURIComponent(post.author)}"
+                class="post-author"
+              >
                 {shortId(post.author)}
               </a>
+              {#if !post.verified}
+                <span
+                  class="unverified-badge"
+                  title="The signature of this post was not verified on this device"
+                  >Unverified</span
+                >
+              {/if}
               <span class="post-time">{formatTime(post.timestamp)}</span>
             </div>
             <p class="post-content">{post.content}</p>
@@ -301,6 +366,10 @@
       class="input-base"
       bind:value={newServerUrl}
       placeholder="Server URL (e.g. https://community.example.com)"
+      aria-label="Server URL"
+      autocomplete="off"
+      autocapitalize="none"
+      spellcheck="false"
       onkeydown={handleKey}
     />
     <button
@@ -315,34 +384,11 @@
       {/if}
     </button>
   </div>
-
-  {#if status}
-    <p class="status">{status}</p>
-  {/if}
-
-  {#if pendingRemoveUrl}
-    <!-- svelte-ignore a11y_click_events_have_key_events -->
-    <div
-      class="modal-overlay"
-      onclick={() => (pendingRemoveUrl = null)}
-      role="presentation"
-    >
-      <!-- svelte-ignore a11y_interactive_supports_focus -->
-      <div
-        class="modal"
-        onclick={(e) => e.stopPropagation()}
-        role="dialog"
-        aria-label="Confirm remove server"
-      >
-        <p>Remove this server? This will not unregister you from it.</p>
-        <div class="modal-actions">
-          <button class="modal-cancel" onclick={() => (pendingRemoveUrl = null)}
-            >Cancel</button
-          >
-          <button class="modal-confirm" onclick={removeServer}>Remove</button>
-        </div>
-      </div>
-    </div>
+  {#if isUnencrypted(newServerUrl)}
+    <p class="unencrypted-notice">
+      This URL uses http: requests to the server and its responses are not
+      encrypted.
+    </p>
   {/if}
 
   <div class="server-list">
@@ -356,6 +402,9 @@
             </span>
             {#if server.name}
               <span class="server-card-url">{server.url}</span>
+            {/if}
+            {#if isUnencrypted(server.url)}
+              <span class="server-card-badge unencrypted">Unencrypted</span>
             {/if}
             {#if server.registered_at}
               <span class="server-card-badge registered"
@@ -376,6 +425,21 @@
         No servers added yet. Add a discovery server URL above to get started.
       </p>
     {/each}
+  </div>
+{/if}
+
+{#if pendingRemoveUrl}
+  <DeleteConfirmModal
+    message="Remove this server? This will not unregister you from it."
+    confirmLabel="Remove"
+    onconfirm={removeServer}
+    oncancel={() => (pendingRemoveUrl = null)}
+  />
+{/if}
+
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
   </div>
 {/if}
 
@@ -410,11 +474,10 @@
     background: var(--accent-hover);
   }
 
-  .status {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: var(--text-base);
-    margin: 0.5rem 0;
+  .unencrypted-notice {
+    color: var(--color-warning);
+    font-size: var(--text-sm);
+    margin: 0 0 0.75rem;
   }
 
   .server-list {
@@ -485,6 +548,12 @@
   .server-card-badge.registered {
     background: var(--color-success);
     color: var(--text-on-accent);
+  }
+
+  .server-card-badge.unencrypted {
+    background: var(--color-warning-bg);
+    color: var(--color-warning);
+    border: 1px solid var(--color-warning-border);
   }
 
   /* Detail view */
@@ -671,6 +740,13 @@
 
   .post-author:hover {
     text-decoration: underline;
+  }
+
+  .unverified-badge {
+    color: var(--color-warning);
+    font-size: var(--text-xs);
+    font-weight: 600;
+    margin: 0 auto 0 0.5rem;
   }
 
   .post-time {

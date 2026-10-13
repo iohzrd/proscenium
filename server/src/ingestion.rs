@@ -1,725 +1,681 @@
+use crate::config::Config;
 use crate::node::Node;
-use crate::storage::Storage;
-use bytes::Bytes;
+use crate::storage::{
+    AnnouncementOutcome, ChangeError, ChangeOutcome, RegistrationChange, RegistrationPolicy,
+    Storage,
+};
 use futures_lite::StreamExt;
-use iroh::PublicKey;
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointId, PublicKey};
 use iroh_gossip::Gossip;
+use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use proscenium_types::{
-    GossipMessage, Interaction, PEER_ALPN, PeerRequest, Post, SyncRequest, short_id,
-    user_feed_topic, validate_interaction, validate_post, validate_profile,
+    GossipMessage, Interaction, Post, Visibility, is_valid_id, now_millis, short_id,
+    truncate_chars, user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
     verify_profile_signature, verify_rotation,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use std::time::Duration;
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
+
+/// Delay before the first `join_peers` call on a topic without neighbors. Doubles after
+/// each call up to `REJOIN_MAX_DELAY`.
+const REJOIN_MIN_DELAY: Duration = Duration::from_secs(15);
+const REJOIN_MAX_DELAY: Duration = Duration::from_secs(600);
+/// Delay before subscribing again after the gossip event stream ended or a subscribe
+/// call failed.
+const RESUBSCRIBE_MIN_DELAY: Duration = Duration::from_secs(1);
+const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(60);
+/// Minimum time between two syncs requested by one subscription task.
+const EVENT_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// Rejected gossip messages logged per topic per `REJECT_LOG_WINDOW`.
+const REJECT_LOGS_PER_WINDOW: u32 = 5;
+const REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
+/// Characters of a rejection reason written to the log.
+const REJECT_REASON_LOG_CHARS: usize = 200;
+
+/// Limits applied to content received over gossip and sync.
+#[derive(Debug, Clone, Copy)]
+pub struct IngestLimits {
+    pub max_posts_per_user: u32,
+    pub max_interactions_per_user: u32,
+    /// Posts and interactions older than this many milliseconds are not stored.
+    /// `None` disables the check.
+    pub retention_ms: Option<u64>,
+}
+
+/// A spawned task. The boxed type states `Send` explicitly: the gossip task and the sync
+/// task each reach `reconcile_subscription`, which spawns both, so the compiler cannot
+/// infer `Send` for their unboxed futures.
+type Task = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+struct Subscription {
+    handle: JoinHandle<()>,
+    /// `registrations.transport_node_id` when the task was started.
+    transport_node_id: Option<String>,
+}
 
 pub struct IngestionManager {
     gossip: Gossip,
-    pub endpoint: Endpoint,
-    storage: Arc<Storage>,
-    subscriptions: Mutex<HashMap<String, JoinHandle<()>>>,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) storage: Arc<Storage>,
+    pub(crate) limits: IngestLimits,
+    policy: RegistrationPolicy,
+    /// One gossip task per master pubkey with an active public registration.
+    subscriptions: Mutex<HashMap<String, Subscription>>,
+    pub(crate) sync_permits: Semaphore,
+    /// Master pubkeys with a sync queued or running.
+    pub(crate) syncing: std::sync::Mutex<HashSet<String>>,
+}
+
+/// Writes at most `REJECT_LOGS_PER_WINDOW` warn records per window for one topic and
+/// reports the number of unlogged rejections when the next window starts.
+struct RejectLog {
+    window_start: Instant,
+    logged: u32,
+    suppressed: u32,
+}
+
+impl RejectLog {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            logged: 0,
+            suppressed: 0,
+        }
+    }
+
+    fn record(&mut self, topic_owner: &str, reason: &str) {
+        if self.window_start.elapsed() >= REJECT_LOG_WINDOW {
+            if self.suppressed > 0 {
+                tracing::warn!(
+                    "[ingestion] {} more rejected gossip messages for {} not logged",
+                    self.suppressed,
+                    short_id(topic_owner)
+                );
+            }
+            *self = Self::new();
+        }
+        if self.logged < REJECT_LOGS_PER_WINDOW {
+            self.logged += 1;
+            // `{:?}` escapes control characters of peer-supplied text.
+            tracing::warn!(
+                "[ingestion] rejected gossip message for {}: {:?}",
+                short_id(topic_owner),
+                truncate_chars(reason, REJECT_REASON_LOG_CHARS)
+            );
+        } else {
+            self.suppressed += 1;
+        }
+    }
 }
 
 impl IngestionManager {
-    pub fn new(node: &Node, storage: Arc<Storage>) -> Arc<Self> {
+    pub fn new(node: &Node, storage: Arc<Storage>, config: &Config) -> Arc<Self> {
+        let retention_ms = (config.limits.retention_days > 0).then(|| {
+            config
+                .limits
+                .retention_days
+                .saturating_mul(24 * 60 * 60 * 1000)
+        });
         Arc::new(Self {
             gossip: node.gossip.clone(),
             endpoint: node.endpoint.clone(),
             storage,
+            limits: IngestLimits {
+                max_posts_per_user: config.limits.max_posts_per_user,
+                max_interactions_per_user: config.limits.max_interactions_per_user,
+                retention_ms,
+            },
+            policy: RegistrationPolicy {
+                registration_open: config.server.registration_open,
+                max_registered_users: config.limits.max_registered_users,
+            },
             subscriptions: Mutex::new(HashMap::new()),
+            sync_permits: Semaphore::new(config.sync.max_concurrent_syncs),
+            syncing: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
-    pub async fn subscribe(self: &Arc<Self>, pubkey: &str) -> anyhow::Result<()> {
-        // Check if already subscribed without holding lock during network calls
-        {
-            let subs = self.subscriptions.lock().await;
-            if subs.contains_key(pubkey) {
-                return Ok(());
-            }
-        }
-
-        let topic = user_feed_topic(pubkey);
-
-        // Resolve transport NodeId from storage (registration or delegation cache)
-        let bootstrap: Vec<EndpointId> =
-            if let Ok(Some(node_id)) = self.storage.get_transport_node_id(pubkey).await {
-                match node_id.parse() {
-                    Ok(eid) => vec![eid],
-                    Err(_) => vec![],
-                }
-            } else {
-                vec![]
-            };
-
-        if bootstrap.is_empty() {
-            anyhow::bail!(
-                "no transport NodeId known for {}, cannot subscribe to gossip",
-                short_id(pubkey)
-            );
-        }
-
-        // Subscribe outside the lock to avoid holding mutex across await
-        let topic_handle = self.gossip.subscribe(topic, bootstrap.clone()).await?;
-        let (_sender, receiver) = topic_handle.split();
-
-        let gossip = self.gossip.clone();
-        let storage = self.storage.clone();
-        let pk = pubkey.to_string();
-        let handle = tokio::spawn(async move {
-            tracing::info!("[ingestion] listening on gossip for {}", short_id(&pk));
-            let mut _sender_hold = _sender;
-            let mut receiver = receiver;
-            let mut backoff = 1u64;
-
-            loop {
-                // Process events until stream ends or errors
-                loop {
-                    match receiver.try_next().await {
-                        Ok(Some(event)) => {
-                            if let iroh_gossip::api::Event::Received(msg) = &event {
-                                Self::process_gossip_message(&storage, &pk, &msg.content).await;
-                            }
-                        }
-                        Ok(None) => {
-                            tracing::warn!(
-                                "[ingestion] gossip stream ended for {}, will reconnect",
-                                short_id(&pk)
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[ingestion] gossip error for {}: {e}, will reconnect",
-                                short_id(&pk)
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                // Reconnect with exponential backoff
-                loop {
-                    tracing::info!(
-                        "[ingestion] reconnecting to {} in {backoff}s",
-                        short_id(&pk)
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
-                    match gossip.subscribe(topic, bootstrap.clone()).await {
-                        Ok(new_handle) => {
-                            let (new_sender, new_receiver) = new_handle.split();
-                            _sender_hold = new_sender;
-                            receiver = new_receiver;
-                            backoff = 1;
-                            tracing::info!(
-                                "[ingestion] reconnected to gossip for {}",
-                                short_id(&pk)
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "[ingestion] failed to resubscribe to {}: {e}",
-                                short_id(&pk)
-                            );
-                            backoff = (backoff * 2).min(60);
-                        }
-                    }
-                }
-            }
-        });
-
-        // Re-acquire lock to insert the handle
-        let mut subs = self.subscriptions.lock().await;
-        subs.insert(pubkey.to_string(), handle);
-        tracing::info!("[ingestion] subscribed to {}", short_id(pubkey));
-        Ok(())
+    pub fn node_id(&self) -> String {
+        self.endpoint.id().to_string()
     }
 
-    pub async fn unsubscribe(&self, pubkey: &str) {
-        let mut subs = self.subscriptions.lock().await;
-        if let Some(handle) = subs.remove(pubkey) {
-            handle.abort();
-            tracing::info!("[ingestion] unsubscribed from {}", short_id(pubkey));
-        }
+    /// Apply a registration, unregistration or profile change from any source.
+    ///
+    /// Runs `Storage::apply_registration_change` (one transaction: row update and
+    /// deletion of stored content when the user stops being public), then starts, stops
+    /// or restarts the gossip task of the user to match the stored row.
+    pub async fn apply_registration_change(
+        self: &Arc<Self>,
+        change: RegistrationChange<'_>,
+    ) -> Result<ChangeOutcome, ChangeError> {
+        let outcome = self
+            .storage
+            .apply_registration_change(&change, &self.policy)
+            .await?;
+        self.reconcile_subscription(change.master_pubkey(), true)
+            .await;
+        Ok(outcome)
     }
 
-    /// Resolve the signing public key for a peer from the delegation cache.
-    /// Returns None if no delegation is cached (backward compat: skip verification).
-    async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
-        match storage.get_peer_signing_pubkey(master_pubkey).await {
-            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
-                Ok(pk) => Some(pk),
-                Err(e) => {
-                    tracing::warn!(
-                        "[ingestion] bad signing pubkey for {}: {e}",
-                        short_id(master_pubkey)
-                    );
-                    None
-                }
-            },
-            _ => None,
-        }
-    }
-
-    async fn process_gossip_message(storage: &Storage, topic_owner: &str, data: &Bytes) {
-        match serde_json::from_slice::<GossipMessage>(data) {
-            Ok(GossipMessage::NewPost(post)) => {
-                if post.author != topic_owner {
-                    return;
-                }
-                Self::ingest_post(storage, &post).await;
-            }
-            Ok(GossipMessage::DeletePost {
-                id,
-                author,
-                signature,
-            }) => {
-                if author != topic_owner {
-                    return;
-                }
-                // Verify delete signature
-                if let Some(signer) = Self::resolve_signer(storage, &author).await
-                    && let Err(reason) =
-                        verify_delete_post_signature(&id, &author, &signature, &signer)
-                {
-                    tracing::warn!(
-                        "[ingestion] bad delete-post signature from {}: {reason}",
-                        short_id(&author)
-                    );
-                    return;
-                }
-                if let Ok(Some(existing)) = storage.get_post(&author, &id).await
-                    && existing.author == author
-                {
-                    let _ = storage.delete_post(&id, &author).await;
-                    tracing::info!("[ingestion] deleted post {id} from {}", short_id(&author));
-                }
-            }
-            Ok(GossipMessage::ProfileUpdate(profile)) => {
-                if let Err(reason) = validate_profile(&profile) {
-                    tracing::warn!(
-                        "[ingestion] rejected profile from {}: {reason}",
-                        short_id(topic_owner)
-                    );
-                    return;
-                }
-                // Verify profile signature
-                if let Some(signer) = Self::resolve_signer(storage, topic_owner).await
-                    && let Err(reason) = verify_profile_signature(&profile, &signer)
-                {
-                    tracing::warn!(
-                        "[ingestion] bad profile signature from {}: {reason}",
-                        short_id(topic_owner)
-                    );
-                    return;
-                }
-                if let Err(e) = storage.update_profile(topic_owner, &profile).await {
-                    tracing::error!("[ingestion] failed to update profile: {e}");
-                } else {
-                    tracing::info!(
-                        "[ingestion] updated profile for {}: {}",
-                        short_id(topic_owner),
-                        profile.display_name
-                    );
-                    if let Err(e) = storage
-                        .handle_visibility_change(topic_owner, profile.visibility)
-                        .await
-                    {
-                        tracing::error!("[ingestion] visibility change error: {e}");
-                    }
-                }
-            }
-            Ok(GossipMessage::NewInteraction(interaction)) => {
-                if interaction.author != topic_owner {
-                    return;
-                }
-                Self::ingest_interaction(storage, &interaction).await;
-            }
-            Ok(GossipMessage::DeleteInteraction {
-                id,
-                author,
-                signature,
-            }) => {
-                if author != topic_owner {
-                    return;
-                }
-                // Verify delete signature
-                if let Some(signer) = Self::resolve_signer(storage, &author).await
-                    && let Err(reason) =
-                        verify_delete_interaction_signature(&id, &author, &signature, &signer)
-                {
-                    tracing::warn!(
-                        "[ingestion] bad delete-interaction signature from {}: {reason}",
-                        short_id(&author)
-                    );
-                    return;
-                }
-                let _ = storage.delete_interaction(&id, &author).await;
-                tracing::info!(
-                    "[ingestion] deleted interaction {id} from {}",
-                    short_id(&author)
-                );
-            }
-            Ok(GossipMessage::LinkedDevices(announcement)) => {
-                if announcement.master_pubkey != topic_owner {
-                    return;
-                }
-                if let Err(reason) = verify_linked_devices_announcement(&announcement) {
-                    tracing::warn!(
-                        "[ingestion] bad device announcement from {}: {reason}",
-                        short_id(topic_owner)
-                    );
-                    return;
-                }
-                // Skip stale announcements
-                let cached_version = storage
-                    .get_peer_announcement_version(topic_owner)
-                    .await
-                    .unwrap_or(None);
-                if cached_version.is_some_and(|v| announcement.version as i64 <= v) {
-                    return;
-                }
-                let transport_ids: Vec<String> = announcement
-                    .devices
-                    .iter()
-                    .map(|d| d.node_id.clone())
-                    .collect();
-                let announcement_json = serde_json::to_string(&announcement).unwrap_or_default();
-                if let Err(e) = storage
-                    .cache_peer_device_announcement(
-                        topic_owner,
-                        &announcement_json,
-                        announcement.version as i64,
-                        &transport_ids,
-                    )
-                    .await
-                {
-                    tracing::error!("[ingestion] failed to cache device announcement: {e}");
-                } else {
-                    tracing::info!(
-                        "[ingestion] cached device announcement for {} v{} ({} devices)",
-                        short_id(topic_owner),
-                        announcement.version,
-                        announcement.devices.len()
-                    );
-                }
-            }
-            Ok(GossipMessage::SigningKeyRotation(rotation)) => {
-                if rotation.master_pubkey != topic_owner {
-                    return;
-                }
-                if let Err(reason) = verify_rotation(&rotation) {
-                    tracing::warn!(
-                        "[ingestion] bad key rotation from {}: {reason}",
-                        short_id(topic_owner)
-                    );
-                    return;
-                }
-                // Reject replay/downgrade: check cached delegation's key_index
-                if let Ok(Some(cached_json)) = sqlx::query_scalar::<_, String>(
-                    "SELECT delegation_json FROM peer_delegations WHERE master_pubkey = ?1",
-                )
-                .bind(topic_owner)
-                .fetch_optional(&storage.pool)
-                .await
-                    && let Ok(cached) =
-                        serde_json::from_str::<proscenium_types::SigningKeyDelegation>(&cached_json)
-                    && rotation.new_key_index <= cached.key_index
-                {
-                    tracing::warn!(
-                        "[ingestion] stale key rotation for {} (index {} <= cached {})",
-                        short_id(topic_owner),
-                        rotation.new_key_index,
-                        cached.key_index
-                    );
-                    return;
-                }
-                // Update cached delegation with the new signing key
-                let delegation_json =
-                    serde_json::to_string(&rotation.new_delegation).unwrap_or_default();
-                if let Err(e) = storage
-                    .cache_peer_delegation(
-                        topic_owner,
-                        &rotation.new_signing_pubkey,
-                        &delegation_json,
-                        None,
-                    )
-                    .await
-                {
-                    tracing::error!("[ingestion] failed to cache rotated delegation: {e}");
-                } else {
-                    tracing::info!(
-                        "[ingestion] signing key rotation for {} to index {}",
-                        short_id(topic_owner),
-                        rotation.new_key_index
-                    );
-                }
-                // Also update the registration's delegation_json
-                if let Err(e) =
-                    sqlx::query("UPDATE registrations SET delegation_json = ?2 WHERE pubkey = ?1")
-                        .bind(topic_owner)
-                        .bind(&delegation_json)
-                        .execute(&storage.pool)
-                        .await
-                {
-                    tracing::error!("[ingestion] failed to update registration delegation: {e}");
-                }
-            }
-            Ok(GossipMessage::Heartbeat) => {
-                // Keep-alive ping from publisher, nothing to store.
-            }
-            Ok(GossipMessage::StageAnnouncement { .. }) | Ok(GossipMessage::StageEnded { .. }) => {
-                // Stage events are ephemeral; the server does not index them.
-            }
+    /// Make the gossip task of `pubkey` match its stored registration.
+    ///
+    /// Without an active public registration, the task of `pubkey` is aborted. With
+    /// one, a task is started if none is running, and the running task is replaced if
+    /// the stored transport NodeId differs from the one it was started with. The map
+    /// lock is held from the storage read to the map update, so two calls for one user
+    /// cannot both start a task.
+    async fn reconcile_subscription(self: &Arc<Self>, pubkey: &str, sync_on_start: bool) {
+        let mut subscriptions = self.subscriptions.lock().await;
+        let target = match self.storage.get_subscription_target(pubkey).await {
+            Ok(target) => target,
             Err(e) => {
-                tracing::warn!("[ingestion] failed to parse gossip message: {e}");
-            }
-        }
-    }
-
-    async fn ingest_post(storage: &Storage, post: &Post) {
-        if let Err(reason) = validate_post(post) {
-            tracing::warn!("[ingestion] rejected post {}: {reason}", &post.id);
-            return;
-        }
-        // Look up the signing key from the delegation cache
-        let signer: PublicKey = match storage.get_peer_signing_pubkey(&post.author).await {
-            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
-                Ok(pk) => pk,
-                Err(e) => {
-                    tracing::warn!(
-                        "[ingestion] bad signing pubkey in delegation for {}: {e}",
-                        short_id(&post.author)
-                    );
-                    return;
-                }
-            },
-            _ => {
-                // No delegation cached -- fall back to author as signer (backward compat)
-                match post.author.parse() {
-                    Ok(pk) => pk,
-                    Err(e) => {
-                        tracing::warn!("[ingestion] bad author pubkey on post {}: {e}", &post.id);
-                        return;
-                    }
-                }
+                tracing::error!(
+                    "[ingestion] failed to read registration of {}: {e}",
+                    short_id(pubkey)
+                );
+                return;
             }
         };
-        if let Err(reason) = verify_post_signature(post, &signer) {
-            tracing::warn!("[ingestion] bad signature on post {}: {reason}", &post.id);
+
+        let Some(transport_node_id) = target else {
+            if let Some(subscription) = subscriptions.remove(pubkey) {
+                subscription.handle.abort();
+                tracing::info!("[ingestion] unsubscribed from {}", short_id(pubkey));
+            }
+            return;
+        };
+
+        let running = subscriptions
+            .get(pubkey)
+            .is_some_and(|s| !s.handle.is_finished() && s.transport_node_id == transport_node_id);
+        if running {
             return;
         }
-        match storage.insert_post(post).await {
-            Ok(true) => {
-                tracing::info!(
-                    "[ingestion] stored post {} from {}",
-                    &post.id,
-                    short_id(&post.author)
-                );
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::error!("[ingestion] failed to store post: {e}");
-            }
+        if let Some(previous) = subscriptions.remove(pubkey) {
+            previous.handle.abort();
+        }
+        let handle = tokio::spawn(self.clone().run_subscription(pubkey.to_string()));
+        subscriptions.insert(
+            pubkey.to_string(),
+            Subscription {
+                handle,
+                transport_node_id,
+            },
+        );
+        drop(subscriptions);
+        tracing::info!("[ingestion] subscribed to {}", short_id(pubkey));
+        if sync_on_start {
+            self.request_sync(pubkey);
         }
     }
 
-    async fn ingest_interaction(storage: &Storage, interaction: &Interaction) {
-        if let Err(reason) = validate_interaction(interaction) {
-            tracing::warn!(
-                "[ingestion] rejected interaction {}: {reason}",
-                &interaction.id
-            );
-            return;
-        }
-        // Look up the signing key from the delegation cache
-        let signer: PublicKey = match storage.get_peer_signing_pubkey(&interaction.author).await {
-            Ok(Some(signing_pubkey)) => match signing_pubkey.parse() {
-                Ok(pk) => pk,
-                Err(e) => {
-                    tracing::warn!(
-                        "[ingestion] bad signing pubkey in delegation for {}: {e}",
-                        short_id(&interaction.author)
-                    );
-                    return;
-                }
-            },
-            _ => {
-                // No delegation cached -- fall back to author as signer (backward compat)
-                match interaction.author.parse() {
-                    Ok(pk) => pk,
-                    Err(e) => {
+    /// NodeIds to dial for `pubkey`, read from storage: the registering device, then the
+    /// devices of the newest announcement. The server's own NodeId is left out.
+    pub(crate) async fn stored_node_ids(&self, pubkey: &str) -> Vec<EndpointId> {
+        let node_ids = match self.storage.get_device_node_ids(pubkey).await {
+            Ok(node_ids) => node_ids.unwrap_or_default(),
+            Err(e) => {
+                tracing::error!(
+                    "[ingestion] failed to read NodeIds of {}: {e}",
+                    short_id(pubkey)
+                );
+                return vec![];
+            }
+        };
+        let own_id = self.endpoint.id();
+        node_ids
+            .iter()
+            .filter_map(|id| id.parse::<EndpointId>().ok())
+            .filter(|id| *id != own_id)
+            .collect()
+    }
+
+    /// Gossip task of one user: subscribe to the feed topic and process its events.
+    /// Subscribes again when the event stream ends. The delay before the next attempt
+    /// doubles up to `RESUBSCRIBE_MAX_DELAY` and returns to `RESUBSCRIBE_MIN_DELAY`
+    /// after a subscription that lasted at least `RESUBSCRIBE_MAX_DELAY`.
+    fn run_subscription(self: Arc<Self>, pubkey: String) -> Task {
+        Box::pin(async move {
+            let topic = user_feed_topic(&pubkey);
+            let mut delay = RESUBSCRIBE_MIN_DELAY;
+            loop {
+                let bootstrap = self.stored_node_ids(&pubkey).await;
+                match self.gossip.subscribe(topic, bootstrap).await {
+                    Ok(topic_handle) => {
+                        let subscribed_at = Instant::now();
+                        let (sender, mut receiver) = topic_handle.split();
+                        self.process_topic_events(&pubkey, &sender, &mut receiver)
+                            .await;
+                        if subscribed_at.elapsed() >= RESUBSCRIBE_MAX_DELAY {
+                            delay = RESUBSCRIBE_MIN_DELAY;
+                        }
                         tracing::warn!(
-                            "[ingestion] bad author pubkey on interaction {}: {e}",
-                            &interaction.id
+                            "[ingestion] gossip stream ended for {}, subscribing again in {}s",
+                            short_id(&pubkey),
+                            delay.as_secs()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "[ingestion] failed to subscribe to {}: {e}, next attempt in {}s",
+                            short_id(&pubkey),
+                            delay.as_secs()
+                        );
+                    }
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(RESUBSCRIBE_MAX_DELAY);
+            }
+        })
+    }
+
+    /// Process events of one topic subscription until its stream ends.
+    ///
+    /// While the topic has no neighbor, `join_peers` is called with the NodeIds stored
+    /// at that time, first after `REJOIN_MIN_DELAY` and then with a doubling delay.
+    async fn process_topic_events(
+        self: &Arc<Self>,
+        pubkey: &str,
+        sender: &GossipSender,
+        receiver: &mut GossipReceiver,
+    ) {
+        let mut reject_log = RejectLog::new();
+        let mut rejoin_delay = REJOIN_MIN_DELAY;
+        let mut rejoin_at = Instant::now() + rejoin_delay;
+        let mut last_sync_request: Option<Instant> = None;
+
+        loop {
+            let has_neighbors = receiver.is_joined();
+            tokio::select! {
+                event = receiver.try_next() => match event {
+                    Ok(Some(Event::Received(message))) => {
+                        if let Err(reason) =
+                            self.handle_gossip_message(pubkey, &message.content).await
+                        {
+                            reject_log.record(pubkey, &reason);
+                        }
+                    }
+                    Ok(Some(Event::NeighborUp(_))) => {
+                        rejoin_delay = REJOIN_MIN_DELAY;
+                        // Messages broadcast while the topic had no neighbor were not
+                        // received; a sync fetches them.
+                        if !has_neighbors {
+                            self.request_event_sync(pubkey, &mut last_sync_request);
+                        }
+                    }
+                    Ok(Some(Event::NeighborDown(_))) => {
+                        if !receiver.is_joined() {
+                            tracing::debug!(
+                                "[ingestion] topic of {} has no neighbors",
+                                short_id(pubkey)
+                            );
+                            rejoin_delay = REJOIN_MIN_DELAY;
+                            rejoin_at = Instant::now() + rejoin_delay;
+                        }
+                    }
+                    Ok(Some(Event::Lagged)) => {
+                        tracing::warn!(
+                            "[ingestion] missed gossip events for {}",
+                            short_id(pubkey)
+                        );
+                        self.request_event_sync(pubkey, &mut last_sync_request);
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::error!("[ingestion] gossip error for {}: {e}", short_id(pubkey));
+                        return;
+                    }
+                },
+                _ = tokio::time::sleep_until(rejoin_at), if !has_neighbors => {
+                    let bootstrap = self.stored_node_ids(pubkey).await;
+                    if !bootstrap.is_empty()
+                        && let Err(e) = sender.join_peers(bootstrap).await
+                    {
+                        tracing::error!(
+                            "[ingestion] join_peers failed for {}: {e}",
+                            short_id(pubkey)
                         );
                         return;
                     }
+                    rejoin_delay = (rejoin_delay * 2).min(REJOIN_MAX_DELAY);
+                    rejoin_at = Instant::now() + rejoin_delay;
                 }
             }
-        };
-        if let Err(reason) = verify_interaction_signature(interaction, &signer) {
-            tracing::warn!(
-                "[ingestion] bad signature on interaction {}: {reason}",
-                &interaction.id
-            );
+        }
+    }
+
+    /// Request a sync unless this task requested one within `EVENT_SYNC_MIN_INTERVAL`.
+    fn request_event_sync(self: &Arc<Self>, pubkey: &str, last_request: &mut Option<Instant>) {
+        if last_request.is_some_and(|at| at.elapsed() < EVENT_SYNC_MIN_INTERVAL) {
             return;
         }
-        match storage.insert_interaction(interaction).await {
-            Ok(true) => {
-                tracing::info!(
-                    "[ingestion] stored {:?} from {} on post {}",
-                    interaction.kind,
-                    short_id(&interaction.author),
-                    &interaction.target_post_id
-                );
-            }
-            Ok(false) => {}
+        *last_request = Some(Instant::now());
+        self.request_sync(pubkey);
+    }
+
+    /// Start a task that syncs `pubkey` once a sync permit is free.
+    pub(crate) fn request_sync(self: &Arc<Self>, pubkey: &str) {
+        tokio::spawn(self.clone().sync_task(pubkey.to_string()));
+    }
+
+    fn sync_task(self: Arc<Self>, pubkey: String) -> Task {
+        Box::pin(async move { self.sync_user(&pubkey).await })
+    }
+
+    /// The key that signs content of `master_pubkey`, from the stored delegation.
+    /// Fails if no active registration, no stored key, an unparseable key, or a storage
+    /// error: content of a user is accepted only with a known signing key.
+    pub(crate) async fn resolve_signer(&self, master_pubkey: &str) -> Result<PublicKey, String> {
+        match self.storage.get_signing_pubkey(master_pubkey).await {
+            Ok(Some(signing_pubkey)) => signing_pubkey
+                .parse()
+                .map_err(|e| format!("stored signing key is invalid: {e}")),
+            Ok(None) => Err("no signing key stored".to_string()),
             Err(e) => {
-                tracing::error!("[ingestion] failed to store interaction: {e}");
+                tracing::error!(
+                    "[ingestion] signing key lookup failed for {}: {e}",
+                    short_id(master_pubkey)
+                );
+                Err("signing key lookup failed".to_string())
             }
         }
     }
 
-    pub async fn sync_from_peer(
-        endpoint: &Endpoint,
-        storage: &Storage,
-        pubkey: &str,
-    ) -> anyhow::Result<(usize, usize)> {
-        // Wrap the entire sync operation in a timeout to prevent hung peers
-        // from blocking the sync loop indefinitely
-        const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        tokio::time::timeout(
-            SYNC_TIMEOUT,
-            Self::sync_from_peer_inner(endpoint, storage, pubkey),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("sync timed out after {}s", SYNC_TIMEOUT.as_secs()))?
+    /// Lowest timestamp of content that is stored, from the retention setting.
+    fn min_timestamp(&self) -> u64 {
+        self.limits
+            .retention_ms
+            .map_or(0, |retention| now_millis().saturating_sub(retention))
     }
 
-    async fn sync_from_peer_inner(
-        endpoint: &Endpoint,
-        storage: &Storage,
-        pubkey: &str,
-    ) -> anyhow::Result<(usize, usize)> {
-        // Resolve transport NodeId from storage
-        let node_id = storage
-            .get_transport_node_id(pubkey)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("no transport NodeId for {}", short_id(pubkey)))?;
-        let target: EndpointId = node_id.parse()?;
-
-        let last_post_ts = storage.get_last_post_timestamp(pubkey).await?;
-        let last_interaction_ts = storage.get_last_interaction_timestamp(pubkey).await?;
-
-        let addr = EndpointAddr::from(target);
-        let conn = endpoint.connect(addr, PEER_ALPN).await?;
-
-        // Phase 1: Send sync request, read summary
-        let (mut send, mut recv) = conn.open_bi().await?;
-        let request = PeerRequest::Sync(SyncRequest {
-            author: pubkey.to_string(),
-            post_count: 0,
-            interaction_count: 0,
-            newest_timestamp: last_post_ts.unwrap_or(0),
-            newest_interaction_timestamp: last_interaction_ts.unwrap_or(0),
-        });
-        let request_bytes = serde_json::to_vec(&request)?;
-        send.write_all(&request_bytes).await?;
-        send.finish()?;
-
-        let summary_bytes = recv.read_to_end(65_536).await?;
-        let summary: proscenium_types::SyncSummary = serde_json::from_slice(&summary_bytes)?;
-
-        if let Some(profile) = &summary.profile
-            && validate_profile(profile).is_ok()
-        {
-            let _ = storage.update_profile(pubkey, profile).await;
+    /// Check that a post names `author`, passes `validate_post` and is inside the
+    /// retention period. Does not verify the signature.
+    pub(crate) fn check_post_fields(&self, post: &Post, author: &str) -> Result<(), String> {
+        if post.author != author {
+            return Err("post author differs from the expected author".to_string());
         }
-
-        if summary.mode == proscenium_types::SyncMode::UpToDate {
-            storage.update_sync_state(pubkey, None, None).await?;
-            return Ok((0, 0));
+        validate_post(post)?;
+        if post.timestamp < self.min_timestamp() {
+            return Err("post is older than the retention period".to_string());
         }
-
-        let (mut send2, mut recv2) = conn.open_bi().await?;
-        // Must finish send side to trigger accept_bi() on the peer
-        // (QUIC streams are lazy - peer won't see the stream until data/FIN is sent)
-        send2.finish()?;
-
-        let mut post_count = 0usize;
-        let mut interaction_count = 0usize;
-        let mut last_post = None;
-        let mut last_int = None;
-
-        loop {
-            let mut len_buf = [0u8; 4];
-            if recv2.read_exact(&mut len_buf).await.is_err() {
-                break;
-            }
-            let len = u32::from_be_bytes(len_buf) as usize;
-            if len == 0 {
-                break;
-            }
-            let mut buf = vec![0u8; len];
-            if recv2.read_exact(&mut buf).await.is_err() {
-                break;
-            }
-
-            match serde_json::from_slice::<proscenium_types::SyncFrame>(&buf) {
-                Ok(proscenium_types::SyncFrame::Posts(posts)) => {
-                    for post in &posts {
-                        Self::ingest_post(storage, post).await;
-                        post_count += 1;
-                        let ts = post.timestamp as i64;
-                        if last_post.is_none_or(|prev| ts > prev) {
-                            last_post = Some(ts);
-                        }
-                    }
-                }
-                Ok(proscenium_types::SyncFrame::Interactions(interactions)) => {
-                    for interaction in &interactions {
-                        Self::ingest_interaction(storage, interaction).await;
-                        interaction_count += 1;
-                        let ts = interaction.timestamp as i64;
-                        if last_int.is_none_or(|prev| ts > prev) {
-                            last_int = Some(ts);
-                        }
-                    }
-                }
-                Ok(proscenium_types::SyncFrame::DeviceAnnouncements(announcements)) => {
-                    for announcement in &announcements {
-                        if announcement.master_pubkey != pubkey {
-                            continue;
-                        }
-                        if verify_linked_devices_announcement(announcement).is_err() {
-                            continue;
-                        }
-                        let transport_ids: Vec<String> = announcement
-                            .devices
-                            .iter()
-                            .map(|d| d.node_id.clone())
-                            .collect();
-                        let json = serde_json::to_string(announcement).unwrap_or_default();
-                        let _ = storage
-                            .cache_peer_device_announcement(
-                                pubkey,
-                                &json,
-                                announcement.version as i64,
-                                &transport_ids,
-                            )
-                            .await;
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("[sync] failed to parse frame: {e}");
-                    break;
-                }
-            }
-        }
-
-        storage
-            .update_sync_state(pubkey, last_post, last_int)
-            .await?;
-        Ok((post_count, interaction_count))
+        Ok(())
     }
 
+    /// Check that an interaction names `author`, passes `validate_interaction` and is
+    /// inside the retention period. Does not verify the signature.
+    pub(crate) fn check_interaction_fields(
+        &self,
+        interaction: &Interaction,
+        author: &str,
+    ) -> Result<(), String> {
+        if interaction.author != author {
+            return Err("interaction author differs from the expected author".to_string());
+        }
+        validate_interaction(interaction)?;
+        if interaction.timestamp < self.min_timestamp() {
+            return Err("interaction is older than the retention period".to_string());
+        }
+        Ok(())
+    }
+
+    /// Verify one message received on the feed topic of `topic_owner` and apply it.
+    /// Returns the reason if the message was rejected.
+    async fn handle_gossip_message(
+        self: &Arc<Self>,
+        topic_owner: &str,
+        data: &[u8],
+    ) -> Result<(), String> {
+        let message: GossipMessage =
+            serde_json::from_slice(data).map_err(|e| format!("unparseable message: {e}"))?;
+        let storage_error = |e: anyhow::Error| {
+            tracing::error!(
+                "[ingestion] storage error for {}: {e}",
+                short_id(topic_owner)
+            );
+        };
+
+        match message {
+            GossipMessage::NewPost(post) => {
+                // Field checks run before the signing key is read from storage.
+                self.check_post_fields(&post, topic_owner)?;
+                let signer = self.resolve_signer(topic_owner).await?;
+                verify_post_signature(&post, &signer)?;
+                match self
+                    .storage
+                    .insert_posts(
+                        topic_owner,
+                        std::slice::from_ref(&post),
+                        self.limits.max_posts_per_user,
+                    )
+                    .await
+                {
+                    Ok(count) if count.stored > 0 => tracing::info!(
+                        "[ingestion] stored post {} from {}",
+                        post.id,
+                        short_id(topic_owner)
+                    ),
+                    Ok(count) if count.over_limit > 0 => {
+                        return Err("post limit of the user is reached".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(e) => storage_error(e),
+                }
+            }
+            GossipMessage::DeletePost {
+                id,
+                author,
+                signature,
+            } => {
+                if author != topic_owner {
+                    return Err("delete-post author is not the topic owner".to_string());
+                }
+                if !is_valid_id(&id) {
+                    return Err("invalid post id in delete-post".to_string());
+                }
+                let signer = self.resolve_signer(topic_owner).await?;
+                verify_delete_post_signature(&id, &author, &signature, &signer)?;
+                match self.storage.apply_tombstones(topic_owner, &[&id]).await {
+                    Ok(0) => {}
+                    Ok(_) => tracing::info!(
+                        "[ingestion] deleted post {id} from {}",
+                        short_id(topic_owner)
+                    ),
+                    Err(e) => storage_error(e),
+                }
+            }
+            GossipMessage::ProfileUpdate(profile) => {
+                validate_profile(&profile)?;
+                let signer = self.resolve_signer(topic_owner).await?;
+                verify_profile_signature(&profile, topic_owner, &signer)?;
+                let change = RegistrationChange::PeerProfile {
+                    master_pubkey: topic_owner,
+                    profile: &profile,
+                };
+                match self.apply_registration_change(change).await {
+                    Ok(outcome) if !outcome.profile_stored => {
+                        return Err("profile is older than the stored one".to_string());
+                    }
+                    Ok(outcome) => tracing::info!(
+                        "[ingestion] stored profile of {} (active={}, visibility={})",
+                        short_id(topic_owner),
+                        outcome.is_active,
+                        outcome.visibility
+                    ),
+                    Err(ChangeError::Rejected(rejection)) => return Err(rejection.to_string()),
+                    Err(ChangeError::Storage(e)) => storage_error(e),
+                }
+            }
+            GossipMessage::NewInteraction(interaction) => {
+                self.check_interaction_fields(&interaction, topic_owner)?;
+                let signer = self.resolve_signer(topic_owner).await?;
+                verify_interaction_signature(&interaction, &signer)?;
+                match self
+                    .storage
+                    .insert_interactions(
+                        topic_owner,
+                        std::slice::from_ref(&interaction),
+                        self.limits.max_interactions_per_user,
+                    )
+                    .await
+                {
+                    Ok(count) if count.over_limit > 0 => {
+                        return Err("interaction limit of the user is reached".to_string());
+                    }
+                    Ok(_) => {}
+                    Err(e) => storage_error(e),
+                }
+            }
+            GossipMessage::DeleteInteraction {
+                id,
+                author,
+                signature,
+            } => {
+                if author != topic_owner {
+                    return Err("delete-interaction author is not the topic owner".to_string());
+                }
+                if !is_valid_id(&id) {
+                    return Err("invalid interaction id in delete-interaction".to_string());
+                }
+                let signer = self.resolve_signer(topic_owner).await?;
+                verify_delete_interaction_signature(&id, &author, &signature, &signer)?;
+                if let Err(e) = self.storage.delete_interaction(&id, &author).await {
+                    storage_error(e);
+                }
+            }
+            GossipMessage::LinkedDevices(announcement) => {
+                if announcement.master_pubkey != topic_owner {
+                    return Err("device announcement is not from the topic owner".to_string());
+                }
+                verify_linked_devices_announcement(&announcement)?;
+                match self.storage.cache_announcement(&announcement).await {
+                    Ok(AnnouncementOutcome::Stored) => tracing::info!(
+                        "[ingestion] stored device announcement of {} v{} ({} devices)",
+                        short_id(topic_owner),
+                        announcement.version,
+                        announcement.devices.len()
+                    ),
+                    Ok(AnnouncementOutcome::NotNewer) => {}
+                    Err(ChangeError::Rejected(rejection)) => return Err(rejection.to_string()),
+                    Err(ChangeError::Storage(e)) => storage_error(e),
+                }
+            }
+            GossipMessage::SigningKeyRotation(rotation) => {
+                if rotation.master_pubkey != topic_owner {
+                    return Err("key rotation is not from the topic owner".to_string());
+                }
+                verify_rotation(&rotation)?;
+                match self
+                    .storage
+                    .cache_delegation(&rotation.new_delegation)
+                    .await
+                {
+                    Ok(()) => tracing::info!(
+                        "[ingestion] stored delegation of {} with key index {}",
+                        short_id(topic_owner),
+                        rotation.new_key_index
+                    ),
+                    Err(ChangeError::Rejected(rejection)) => return Err(rejection.to_string()),
+                    Err(ChangeError::Storage(e)) => storage_error(e),
+                }
+            }
+            // Keep-alive from the publisher; nothing to store.
+            GossipMessage::Heartbeat => {}
+            // Stage events are not indexed by the server.
+            GossipMessage::StageAnnouncement { .. } | GossipMessage::StageEnded { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Start a gossip task for every active public registration. With `startup_sync`,
+    /// also request one sync per user.
     pub async fn start(self: &Arc<Self>, startup_sync: bool) {
         let pubkeys = match self.storage.get_active_public_pubkeys().await {
-            Ok(pks) => pks,
+            Ok(pubkeys) => pubkeys,
             Err(e) => {
                 tracing::error!("[ingestion] failed to get public users: {e}");
                 return;
             }
         };
-
         tracing::info!("[ingestion] subscribing to {} public users", pubkeys.len());
-
-        for pk in &pubkeys {
-            if let Err(e) = self.subscribe(pk).await {
-                tracing::error!("[ingestion] failed to subscribe to {}: {e}", short_id(pk));
-            }
-        }
-
-        if startup_sync {
-            let mgr = self.clone();
-            let pks = pubkeys;
-            tokio::spawn(async move {
-                tracing::info!("[sync] starting initial sync for {} users", pks.len());
-                let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
-                let mut join_set = tokio::task::JoinSet::new();
-
-                for pk in pks {
-                    let ep = mgr.endpoint.clone();
-                    let st = mgr.storage.clone();
-                    let sem = semaphore.clone();
-                    join_set.spawn(async move {
-                        let _permit = sem.acquire().await;
-                        match Self::sync_from_peer(&ep, &st, &pk).await {
-                            Ok((posts, interactions)) => {
-                                if posts > 0 || interactions > 0 {
-                                    tracing::info!(
-                                        "[sync] synced {posts} posts, {interactions} interactions from {}",
-                                        short_id(&pk)
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[sync] failed to sync from {}: {e}",
-                                    short_id(&pk)
-                                );
-                            }
-                        }
-                    });
-                }
-
-                while let Some(result) = join_set.join_next().await {
-                    if let Err(e) = result {
-                        tracing::error!("[sync] task panicked: {e}");
-                    }
-                }
-                tracing::info!("[sync] initial sync complete");
-            });
+        for pubkey in &pubkeys {
+            self.reconcile_subscription(pubkey, startup_sync).await;
         }
     }
 
+    /// Every `interval_minutes`: make the gossip task of every active public user and
+    /// of every user with a registered task match storage, then sync every active
+    /// public user. At most `sync.max_concurrent_syncs` syncs run at the same time.
     pub fn start_periodic_sync(self: &Arc<Self>, interval_minutes: u64) {
-        let mgr = self.clone();
+        let manager = self.clone();
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(interval_minutes * 60);
+            let interval = Duration::from_secs(interval_minutes.saturating_mul(60));
             loop {
                 tokio::time::sleep(interval).await;
-                let pubkeys = match mgr.storage.get_active_public_pubkeys().await {
-                    Ok(pks) => pks,
+                let pubkeys = match manager.storage.get_active_public_pubkeys().await {
+                    Ok(pubkeys) => pubkeys,
                     Err(e) => {
                         tracing::error!("[periodic-sync] failed to get users: {e}");
                         continue;
                     }
                 };
 
-                for pk in &pubkeys {
-                    match Self::sync_from_peer(&mgr.endpoint, &mgr.storage, pk).await {
-                        Ok((posts, interactions)) => {
-                            if posts > 0 || interactions > 0 {
-                                tracing::info!(
-                                    "[periodic-sync] synced {posts} posts, {interactions} interactions from {}",
-                                    short_id(pk)
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("[periodic-sync] failed to sync {}: {e}", short_id(pk));
-                        }
+                // A task whose user is no longer public remains only if an earlier
+                // storage read in `reconcile_subscription` failed.
+                let public: HashSet<&str> = pubkeys.iter().map(String::as_str).collect();
+                let not_public: Vec<String> = manager
+                    .subscriptions
+                    .lock()
+                    .await
+                    .keys()
+                    .filter(|pubkey| !public.contains(pubkey.as_str()))
+                    .cloned()
+                    .collect();
+                for pubkey in &not_public {
+                    manager.reconcile_subscription(pubkey, false).await;
+                }
+
+                let mut syncs = JoinSet::new();
+                for pubkey in pubkeys {
+                    manager.reconcile_subscription(&pubkey, false).await;
+                    syncs.spawn(manager.clone().sync_task(pubkey));
+                }
+                while let Some(result) = syncs.join_next().await {
+                    if let Err(e) = result {
+                        tracing::error!("[periodic-sync] sync task failed: {e}");
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
         });
     }
+
+    /// True if a gossip task that has not finished is registered for `pubkey`.
+    #[cfg(test)]
+    pub(crate) async fn has_subscription(&self, pubkey: &str) -> bool {
+        self.subscriptions
+            .lock()
+            .await
+            .get(pubkey)
+            .is_some_and(|s| !s.handle.is_finished())
+    }
+
+    /// Abort every gossip task.
+    pub async fn shutdown(&self) {
+        let mut subscriptions = self.subscriptions.lock().await;
+        for (_, subscription) in subscriptions.drain() {
+            subscription.handle.abort();
+        }
+    }
+}
+
+/// True if `outcome` describes an active registration with public visibility.
+pub(crate) fn is_public(outcome: &ChangeOutcome) -> bool {
+    outcome.is_active && outcome.visibility == Visibility::Public
 }

@@ -1,5 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
+import { SvelteMap } from "svelte/reactivity";
 import type { Profile, PendingAttachment } from "$lib/types";
+
+/** Upload size limit in bytes; equals `MAX_BLOB_SIZE` in the types crate. */
+export const MAX_BLOB_SIZE = 50 * 1024 * 1024;
+
+/** Attachment limit per post or message; equals `MAX_MEDIA_COUNT` in the types crate. */
+export const MAX_ATTACHMENTS = 10;
 
 const AVATAR_COLORS = [
   "#c24b3f",
@@ -20,15 +27,47 @@ export function avatarColor(pubkey: string): string {
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
 }
 
+/** First `max` code points of `text`. */
+export function truncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const codePoints = Array.from(text);
+  return codePoints.length <= max ? text : codePoints.slice(0, max).join("");
+}
+
 export function getInitials(name: string, isSelf = false): string {
   if (!name || isSelf) return "Y";
-  const parts = name.trim().split(/\s+/);
-  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-  return name.slice(0, 2).toUpperCase();
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    return (truncate(parts[0], 1) + truncate(parts[1], 1)).toUpperCase();
+  }
+  return truncate(name.trim(), 2).toUpperCase();
 }
 
 export function shortId(id: string): string {
-  return id.slice(0, 8) + "..." + id.slice(-4);
+  const codePoints = Array.from(id);
+  if (codePoints.length <= 12) return id;
+  return (
+    codePoints.slice(0, 8).join("") + "..." + codePoints.slice(-4).join("")
+  );
+}
+
+const PUBKEY_PATTERN = /^[0-9a-f]{64}$/;
+
+/** True if `s` is 64 lowercase hex digits: the text form of a public key or Node ID. */
+export function isPubkeyFormat(s: string): boolean {
+  return PUBKEY_PATTERN.test(s);
+}
+
+const POST_ID_PATTERN = /^[0-9a-f]{32}$/;
+
+/** True if `s` is 32 lowercase hex digits: the text form of a post id. */
+export function isPostIdFormat(s: string): boolean {
+  return POST_ID_PATTERN.test(s);
+}
+
+/** True if the document is visible and its window has input focus. */
+export function isWindowActive(): boolean {
+  return !document.hidden && document.hasFocus();
 }
 
 // Shared profile cache (name + avatar) and resolver
@@ -37,39 +76,60 @@ interface CachedProfile {
   avatarTicket: string | null;
 }
 
-const profileCache = new Map<string, CachedProfile>();
-
-export function clearDisplayNameCache() {
-  profileCache.clear();
-}
+// Reactive: a template or effect that reads an entry runs again when the entry changes.
+const profileCache = new SvelteMap<string, CachedProfile>();
+const pendingLookups = new Map<string, Promise<string>>();
+// Incremented per pubkey by evictDisplayName; a lookup started before the
+// increment does not write its result to the cache.
+const evictionCounts = new Map<string, number>();
 
 export function evictDisplayName(pubkey: string) {
+  evictionCounts.set(pubkey, (evictionCounts.get(pubkey) ?? 0) + 1);
+  pendingLookups.delete(pubkey);
   profileCache.delete(pubkey);
 }
 
-export async function getDisplayName(
+async function lookupDisplayName(pubkey: string): Promise<string> {
+  const evictions = evictionCounts.get(pubkey) ?? 0;
+  try {
+    const profile = await invoke<Profile | null>("get_remote_profile", {
+      pubkey,
+    });
+    const name = profile?.display_name || shortId(pubkey);
+    if ((evictionCounts.get(pubkey) ?? 0) === evictions) {
+      profileCache.set(pubkey, {
+        name,
+        avatarTicket: profile?.avatar_ticket ?? null,
+      });
+    }
+    return name;
+  } catch {
+    // Not cached: the next call repeats the lookup.
+    return shortId(pubkey);
+  }
+}
+
+export function getDisplayName(
   pubkey: string,
   selfId: string,
 ): Promise<string> {
-  if (pubkey === selfId) return "You";
+  if (pubkey === selfId) return Promise.resolve("You");
   const cached = profileCache.get(pubkey);
-  if (cached !== undefined) return cached.name;
-  try {
-    const profile = (await invoke("get_remote_profile", {
-      pubkey,
-    })) as Profile | null;
-    const name =
-      profile && profile.display_name ? profile.display_name : shortId(pubkey);
-    profileCache.set(pubkey, {
-      name,
-      avatarTicket: profile?.avatar_ticket ?? null,
+  if (cached !== undefined) return Promise.resolve(cached.name);
+  let pending = pendingLookups.get(pubkey);
+  if (!pending) {
+    const lookup = lookupDisplayName(pubkey).finally(() => {
+      if (pendingLookups.get(pubkey) === lookup) pendingLookups.delete(pubkey);
     });
-    return name;
-  } catch {
-    const name = shortId(pubkey);
-    profileCache.set(pubkey, { name, avatarTicket: null });
-    return name;
+    pending = lookup;
+    pendingLookups.set(pubkey, lookup);
   }
+  return pending;
+}
+
+/** Cached display name of `pubkey`, or undefined if no lookup has completed. */
+export function getCachedDisplayName(pubkey: string): string | undefined {
+  return profileCache.get(pubkey)?.name;
 }
 
 export function getCachedAvatarTicket(pubkey: string): string | null {
@@ -102,13 +162,11 @@ export function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
-export function linkify(text: string): string {
-  return renderContent(text, "");
-}
-
 export function renderContent(text: string, selfId: string): string {
   const urlPattern = /https?:\/\/[^\s<>"')\]]+/g;
-  const mentionPattern = /@([0-9a-fA-F]{52,64})/g;
+  // Exactly 64 hex digits; a longer hex run is not a mention.
+  const mentionPattern = /@([0-9a-fA-F]{64})(?![0-9a-fA-F])/g;
+  const trailingPunctuation = /[.,!?;:]+$/;
 
   interface ContentMatch {
     start: number;
@@ -122,11 +180,14 @@ export function renderContent(text: string, selfId: string): string {
 
   let m;
   while ((m = urlPattern.exec(text)) !== null) {
+    const url = m[0].replace(trailingPunctuation, "");
+    // Skip a scheme with no host, such as "https://" followed by punctuation.
+    if (!/^https?:\/\/[^/]/.test(url)) continue;
     matches.push({
       start: m.index,
-      end: m.index + m[0].length,
+      end: m.index + url.length,
       type: "url",
-      text: m[0],
+      text: url,
     });
   }
   while ((m = mentionPattern.exec(text)) !== null) {
@@ -180,16 +241,32 @@ export function renderContent(text: string, selfId: string): string {
   return parts.join("");
 }
 
+/** MIME type without parameters, lowercase. */
+export function normalizeMime(mime: string): string {
+  return mime.split(";")[0].trim().toLowerCase();
+}
+
+// Raster formats only. `image/svg+xml` is a document format that can hold script.
+const INLINE_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/apng",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "image/avif",
+  "image/bmp",
+]);
+
 export function isImage(mime: string): boolean {
-  return mime.startsWith("image/");
+  return INLINE_IMAGE_TYPES.has(normalizeMime(mime));
 }
 
 export function isVideo(mime: string): boolean {
-  return mime.startsWith("video/");
+  return normalizeMime(mime).startsWith("video/");
 }
 
 export function isAudio(mime: string): boolean {
-  return mime.startsWith("audio/");
+  return normalizeMime(mime).startsWith("audio/");
 }
 
 export function formatSize(bytes: number): string {
@@ -197,6 +274,9 @@ export function formatSize(bytes: number): string {
   if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
   return (bytes / 1048576).toFixed(1) + " MB";
 }
+
+/** Distance below the viewport at which the infinite-scroll sentinel counts as reached. */
+export const SENTINEL_MARGIN_PX = 200;
 
 /**
  * Sets up an IntersectionObserver for infinite scroll on a sentinel element.
@@ -211,38 +291,150 @@ export function setupInfiniteScroll(
   if (!sentinel) return;
   const observer = new IntersectionObserver(
     (entries) => {
-      if (entries[0].isIntersecting && getHasMore() && !getLoadingMore()) {
+      // One callback can deliver several records for the sentinel, oldest
+      // first. The last record holds the current intersection state.
+      const latest = entries[entries.length - 1];
+      if (latest?.isIntersecting && getHasMore() && !getLoadingMore()) {
         loadMore();
       }
     },
-    { rootMargin: "0px 0px 200px 0px" },
+    { rootMargin: `0px 0px ${SENTINEL_MARGIN_PX}px 0px` },
   );
   observer.observe(sentinel);
   return () => observer.disconnect();
 }
 
-export async function uploadFiles(
-  files: FileList,
-): Promise<PendingAttachment[]> {
-  const results: PendingAttachment[] = [];
-  for (const file of files) {
-    const buffer = await file.arrayBuffer();
-    const data = Array.from(new Uint8Array(buffer));
-    const result: { hash: string; ticket: string } = await invoke(
-      "add_blob_bytes",
-      { data },
-    );
-    const previewUrl = URL.createObjectURL(file);
-    results.push({
-      hash: result.hash,
-      ticket: result.ticket,
-      mime_type: file.type || "application/octet-stream",
-      filename: file.name,
-      size: file.size,
-      previewUrl,
-    });
+/** Rows with a `(timestamp, id)` position, as used by the paginated commands. */
+export interface Positioned {
+  id: string;
+  timestamp: number;
+}
+
+/** Negative if `a` precedes `b` in ascending `(timestamp, id)` order. */
+export function comparePosition(a: Positioned, b: Positioned): number {
+  if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -1 : 1;
+}
+
+/** `items` without later elements whose key equals that of an earlier element. */
+export function dedupeBy<T>(items: T[], key: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const item of items) {
+    const k = key(item);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    result.push(item);
   }
-  return results;
+  return result;
+}
+
+export function dedupeById<T extends { id: string }>(items: T[]): T[] {
+  return dedupeBy(items, (item) => item.id);
+}
+
+/**
+ * Merge `fresh`, the first `limit` rows of a query, into `existing`, rows
+ * loaded earlier from the same query. Rows of `existing` positioned after the
+ * last row of `fresh` in query order are kept; all others are replaced by
+ * `fresh`. `exhausted` is true if `fresh` holds every row of the query.
+ */
+export function mergeFirstPage<T extends Positioned>(
+  existing: T[],
+  fresh: T[],
+  limit: number,
+  order: "asc" | "desc",
+): { items: T[]; exhausted: boolean; keptExisting: boolean } {
+  const head = dedupeById(fresh);
+  if (fresh.length < limit || head.length === 0) {
+    return { items: head, exhausted: true, keptExisting: false };
+  }
+  const last = head[head.length - 1];
+  const headIds = new Set(head.map((item) => item.id));
+  const rest = existing.filter((item) => {
+    if (headIds.has(item.id)) return false;
+    const cmp = comparePosition(item, last);
+    return order === "asc" ? cmp > 0 : cmp < 0;
+  });
+  return {
+    items: [...head, ...dedupeById(rest)],
+    exhausted: false,
+    keptExisting: rest.length > 0,
+  };
+}
+
+/**
+ * Wrap `fn` so that calls never overlap: a call made while `fn` is running
+ * schedules exactly one more run after the current one finishes.
+ */
+export function coalesce(fn: () => Promise<void>): () => Promise<void> {
+  let running: Promise<void> | null = null;
+  let again = false;
+  return () => {
+    if (running) {
+      again = true;
+      return running;
+    }
+    running = (async () => {
+      try {
+        do {
+          again = false;
+          await fn();
+        } while (again);
+      } finally {
+        running = null;
+      }
+    })();
+    return running;
+  };
+}
+
+function revokePreviews(attachments: PendingAttachment[]) {
+  for (const a of attachments) {
+    if (a.previewUrl.startsWith("blob:")) URL.revokeObjectURL(a.previewUrl);
+  }
+}
+
+/**
+ * Add each file to the blob store. Throws before reading any file if one
+ * exceeds `MAX_BLOB_SIZE`. If an upload fails, the preview URLs created for
+ * the earlier files are revoked before the error is rethrown.
+ */
+export async function uploadFiles(
+  files: Iterable<File>,
+): Promise<PendingAttachment[]> {
+  const list = Array.from(files);
+  for (const file of list) {
+    if (file.size > MAX_BLOB_SIZE) {
+      throw new Error(
+        `${truncate(file.name, 64)} is larger than ${formatSize(MAX_BLOB_SIZE)}`,
+      );
+    }
+  }
+  const results: PendingAttachment[] = [];
+  let completed = false;
+  try {
+    for (const file of list) {
+      const data = new Uint8Array(await file.arrayBuffer());
+      const result: { hash: string; ticket: string } = await invoke(
+        "add_blob_bytes",
+        { data },
+      );
+      results.push({
+        hash: result.hash,
+        ticket: result.ticket,
+        mime_type: file.type || "application/octet-stream",
+        filename: file.name,
+        size: file.size,
+        previewUrl: URL.createObjectURL(file),
+      });
+    }
+    completed = true;
+    return results;
+  } finally {
+    if (!completed) revokePreviews(results);
+  }
 }
 
 export function detectImageMime(data: Uint8Array): string {

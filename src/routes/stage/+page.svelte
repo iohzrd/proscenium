@@ -1,16 +1,23 @@
 <script lang="ts">
+  import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
   import Avatar from "$lib/Avatar.svelte";
   import Icon from "$lib/Icon.svelte";
-  import type {
-    StageState,
-    StageParticipant,
-    StageRole,
-    StageEvent,
-  } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import { useToast } from "$lib/composables";
+  import type { StageParticipant } from "$lib/types";
+  import { copyToClipboard, shortId } from "$lib/utils";
+  import {
+    stageStore,
+    selfMuted,
+    handRaised,
+    hostMuted,
+    createStage as createStageCommand,
+    joinStage as joinStageCommand,
+    leaveStage as leaveStageCommand,
+    endStage as endStageCommand,
+    toggleStageMute,
+    toggleStageHand,
+  } from "$lib/stage.svelte";
   import StageLanding from "$lib/stage/StageLanding.svelte";
   import StageChat from "$lib/stage/StageChat.svelte";
   import StageControlBar from "$lib/stage/StageControlBar.svelte";
@@ -19,9 +26,9 @@
 
   // --- state ---
 
-  let stage = $state<StageState | null>(null);
-  let selfMuted = $state(false);
-  let handRaised = $state(false);
+  // Stage state, chat and reactions live in the store that the layout keeps
+  // current; this page holds only form and selection state.
+  let stage = $derived(stageStore.stage);
 
   // landing form
   let createTitle = $state("");
@@ -30,26 +37,12 @@
   let errorMsg = $state("");
   let busy = $state(false);
 
-  // chat
-  interface ChatMessage {
-    pubkey: string;
-    name: string;
-    text: string;
-  }
-  let chatMessages = $state<ChatMessage[]>([]);
   let chatInput = $state("");
-
-  // reactions
-  interface FloatingReaction {
-    id: number;
-    emoji: string;
-    x: number;
-  }
-  let reactions = $state<FloatingReaction[]>([]);
-  let reactionCounter = 0;
 
   // host controls
   let selectedParticipant = $state<string | null>(null);
+
+  const toast = useToast();
 
   // derived
   let speakers = $derived(
@@ -74,131 +67,28 @@
       stage?.my_role === "CoHost",
   );
 
+  // Prefill the join field from `?ticket=` (set by a stage card) on every URL
+  // change. Joining still needs a click.
+  $effect(() => {
+    const ticket = page.url.searchParams.get("ticket");
+    if (ticket) joinTicket = ticket;
+  });
+
   // --- participant name helper ---
 
   function displayName(p: StageParticipant): string {
     return p.display_name ?? shortId(p.pubkey);
   }
 
-  // --- event handling ---
-
-  function applyEvent(ev: StageEvent) {
-    if (ev.type === "state_snapshot") {
-      const { type: _t, ...rest } = ev as { type: string } & StageState;
-      stage = rest as StageState;
-      // sync derived mute/hand state
-      const me = stage.participants.find((p) => p.pubkey === stage!.my_pubkey);
-      if (me) {
-        selfMuted = me.self_muted;
-        handRaised = me.hand_raised;
-      }
-      return;
-    }
-    if (!stage) return;
-
-    switch (ev.type) {
-      case "participant_joined":
-        if (!stage.participants.find((p) => p.pubkey === ev.pubkey)) {
-          stage.participants = [
-            ...stage.participants,
-            {
-              pubkey: ev.pubkey,
-              role: ev.role,
-              display_name: null,
-              avatar_hash: null,
-              hand_raised: false,
-              self_muted: false,
-              host_muted: false,
-            },
-          ];
-        }
-        break;
-      case "participant_left":
-        stage.participants = stage.participants.filter(
-          (p) => p.pubkey !== ev.pubkey,
-        );
-        break;
-      case "role_changed":
-        stage.participants = stage.participants.map((p) =>
-          p.pubkey === ev.pubkey ? { ...p, role: ev.role } : p,
-        );
-        if (ev.pubkey === stage.my_pubkey) {
-          stage.my_role = ev.role;
-        }
-        break;
-      case "mute_changed":
-        stage.participants = stage.participants.map((p) =>
-          p.pubkey === ev.pubkey
-            ? { ...p, self_muted: ev.self_muted, host_muted: ev.host_muted }
-            : p,
-        );
-        if (ev.pubkey === stage.my_pubkey) {
-          selfMuted = ev.self_muted;
-        }
-        break;
-      case "hand_raised":
-        stage.participants = stage.participants.map((p) =>
-          p.pubkey === ev.pubkey ? { ...p, hand_raised: true } : p,
-        );
-        if (ev.pubkey === stage.my_pubkey) handRaised = true;
-        break;
-      case "hand_lowered":
-        stage.participants = stage.participants.map((p) =>
-          p.pubkey === ev.pubkey ? { ...p, hand_raised: false } : p,
-        );
-        if (ev.pubkey === stage.my_pubkey) handRaised = false;
-        break;
-      case "reaction":
-        spawnReaction(ev.emoji);
-        break;
-      case "chat": {
-        const sender = stage.participants.find((p) => p.pubkey === ev.pubkey);
-        chatMessages = [
-          ...chatMessages,
-          {
-            pubkey: ev.pubkey,
-            name: sender?.display_name ?? shortId(ev.pubkey),
-            text: ev.text,
-          },
-        ];
-        break;
-      }
-      case "ended":
-        stage = null;
-        chatMessages = [];
-        break;
-      case "kicked":
-        errorMsg = "You were kicked from the stage.";
-        stage = null;
-        chatMessages = [];
-        break;
-      case "auth_failed":
-        console.warn("Stage auth failed:", ev.reason, "from", ev.source);
-        break;
-    }
-  }
-
-  function spawnReaction(emoji: string) {
-    const id = ++reactionCounter;
-    const x = 20 + Math.random() * 60;
-    reactions = [...reactions, { id, emoji, x }];
-    setTimeout(() => {
-      reactions = reactions.filter((r) => r.id !== id);
-    }, 2000);
-  }
-
   // --- commands ---
 
   async function createStage() {
-    if (!createTitle.trim()) return;
+    const title = createTitle.trim();
+    if (!title || busy) return;
     busy = true;
     errorMsg = "";
     try {
-      const ticket: string = await invoke("create_stage", {
-        title: createTitle.trim(),
-      });
-      createdTicket = ticket;
-      stage = await invoke("get_stage_state");
+      createdTicket = await createStageCommand(title);
       createTitle = "";
     } catch (e) {
       errorMsg = String(e);
@@ -207,12 +97,12 @@
   }
 
   async function joinStage() {
-    if (!joinTicket.trim()) return;
+    const ticket = joinTicket.trim();
+    if (!ticket || busy) return;
     busy = true;
     errorMsg = "";
     try {
-      await invoke("join_stage", { ticket: joinTicket.trim() });
-      stage = await invoke("get_stage_state");
+      await joinStageCommand(ticket);
       joinTicket = "";
       createdTicket = null;
     } catch (e) {
@@ -221,125 +111,80 @@
     busy = false;
   }
 
-  async function leaveStage() {
+  /** Run a stage command; show `failure` and the error as a toast if it rejects. */
+  async function run(action: () => Promise<unknown>, failure: string) {
     try {
-      await invoke("leave_stage");
+      await action();
+      return true;
     } catch (e) {
-      console.error(e);
+      toast.show(`${failure}: ${e}`);
+      console.error(`${failure}:`, e);
+      return false;
     }
-    stage = null;
-    chatMessages = [];
-    createdTicket = null;
+  }
+
+  async function leaveStage() {
+    if (await run(leaveStageCommand, "Failed to leave the stage")) {
+      createdTicket = null;
+    }
   }
 
   async function endStage() {
-    try {
-      await invoke("end_stage");
-    } catch (e) {
-      console.error(e);
-    }
-    stage = null;
-    chatMessages = [];
-    createdTicket = null;
-  }
-
-  async function toggleMute() {
-    try {
-      selfMuted = await invoke("stage_toggle_mute");
-    } catch (e) {
-      console.error(e);
+    if (await run(endStageCommand, "Failed to end the stage")) {
+      createdTicket = null;
     }
   }
 
-  async function toggleHand() {
-    try {
-      if (handRaised) {
-        await invoke("stage_lower_hand");
-        handRaised = false;
-      } else {
-        await invoke("stage_raise_hand");
-        handRaised = true;
-      }
-    } catch (e) {
-      console.error(e);
-    }
+  function toggleMute() {
+    return run(toggleStageMute, "Failed to change mute state");
   }
 
-  async function sendReaction(emoji: string) {
-    try {
-      await invoke("stage_send_reaction", { emoji });
-    } catch (e) {
-      console.error(e);
-    }
+  function toggleHand() {
+    return run(toggleStageHand, "Failed to change hand state");
+  }
+
+  function sendReaction(emoji: string) {
+    return run(
+      () => invoke("stage_send_reaction", { emoji }),
+      "Reaction not sent",
+    );
   }
 
   async function sendChat() {
     const text = chatInput.trim();
     if (!text) return;
     chatInput = "";
-    try {
-      await invoke("stage_send_chat", { text });
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  async function promoteSpeaker(pubkey: string) {
-    try {
-      await invoke("stage_promote_speaker", { pubkey });
-    } catch (e) {
-      console.error(e);
-    }
-    selectedParticipant = null;
-  }
-
-  async function demoteSpeaker(pubkey: string) {
-    try {
-      await invoke("stage_demote_speaker", { pubkey });
-    } catch (e) {
-      console.error(e);
-    }
-    selectedParticipant = null;
-  }
-
-  async function copyTicket() {
-    if (!createdTicket) return;
-    try {
-      await navigator.clipboard.writeText(createdTicket);
-    } catch {
-      // fallback: select text in input
-    }
-  }
-
-  // --- lifecycle ---
-
-  onMount(() => {
-    const unlisteners: Promise<UnlistenFn>[] = [];
-
-    // Prefill join ticket from ?ticket= URL param (e.g. navigated from a StageCard)
-    const params = new URLSearchParams(window.location.search);
-    const ticketParam = params.get("ticket");
-    if (ticketParam) {
-      joinTicket = ticketParam;
-    }
-
-    // Restore existing stage state on mount
-    invoke<StageState | null>("get_stage_state")
-      .then((s) => {
-        if (s) stage = s;
-      })
-      .catch(() => {});
-
-    unlisteners.push(
-      listen<StageEvent>("stage-event", (event) => {
-        applyEvent(event.payload);
-      }),
+    const sent = await run(
+      () => invoke("stage_send_chat", { text }),
+      "Message not sent",
     );
+    // Put the text back unless the user typed something else meanwhile.
+    if (!sent && !chatInput) chatInput = text;
+  }
 
-    return () => {
-      unlisteners.forEach((p) => p.then((fn) => fn()));
-    };
-  });
+  /** Invoke a host or co-host command for `pubkey`, then close the popover. */
+  async function moderate(command: string, pubkey: string, failure: string) {
+    await run(() => invoke(command, { pubkey }), failure);
+    selectedParticipant = null;
+  }
+
+  const promoteSpeaker = (pubkey: string) =>
+    moderate("stage_promote_speaker", pubkey, "Promote failed");
+  const demoteSpeaker = (pubkey: string) =>
+    moderate("stage_demote_speaker", pubkey, "Demote failed");
+  const muteSpeaker = (pubkey: string) =>
+    moderate("stage_mute_speaker", pubkey, "Mute failed");
+  const kickParticipant = (pubkey: string) =>
+    moderate("stage_kick", pubkey, "Kick failed");
+  const banParticipant = (pubkey: string) =>
+    moderate("stage_ban", pubkey, "Ban failed");
+
+  async function copyText(text: string | null | undefined) {
+    if (!text) return;
+    if (await run(() => copyToClipboard(text), "Copy failed")) {
+      toast.show("Copied", "success");
+    }
+  }
 
   const QUICK_REACTIONS = [
     "\u{1F44F}",
@@ -357,11 +202,11 @@
       bind:createTitle
       bind:joinTicket
       {createdTicket}
-      {errorMsg}
+      errorMsg={errorMsg || stageStore.notice}
       {busy}
       oncreate={createStage}
       onjoin={joinStage}
-      oncopyticket={copyTicket}
+      oncopyticket={() => copyText(createdTicket)}
     />
   {:else}
     <!-- Room view -->
@@ -373,7 +218,7 @@
           {#if isHost && stage.ticket}
             <button
               class="btn-invite"
-              onclick={() => navigator.clipboard.writeText(stage!.ticket!)}
+              onclick={() => copyText(stage?.ticket)}
               title="Copy invite ticket"
             >
               <Icon name="link" size={13} />
@@ -479,15 +324,20 @@
         </div>
 
         <!-- Chat panel -->
-        <StageChat messages={chatMessages} bind:chatInput onsend={sendChat} />
+        <StageChat
+          messages={stageStore.chat}
+          bind:chatInput
+          onsend={sendChat}
+        />
       </div>
 
       <!-- Bottom controls -->
       <StageControlBar
         {isSpeaker}
         {isHost}
-        {selfMuted}
-        {handRaised}
+        selfMuted={selfMuted()}
+        hostMuted={hostMuted()}
+        handRaised={handRaised()}
         quickReactions={QUICK_REACTIONS}
         ontoggleMute={toggleMute}
         ontoggleHand={toggleHand}
@@ -507,15 +357,24 @@
           {target}
           onpromote={promoteSpeaker}
           ondemote={demoteSpeaker}
+          onmute={muteSpeaker}
+          onkick={kickParticipant}
+          onban={banParticipant}
           onclose={() => (selectedParticipant = null)}
         />
       {/if}
     {/if}
 
     <!-- Floating reactions -->
-    <FloatingReactions {reactions} />
+    <FloatingReactions reactions={stageStore.reactions} />
   {/if}
 </div>
+
+{#if toast.message}
+  <div class="toast" class:error={toast.type === "error"}>
+    {toast.message}
+  </div>
+{/if}
 
 <style>
   .stage-page {

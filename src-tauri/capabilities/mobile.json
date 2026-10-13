@@ -9,9 +9,6 @@
     "barcode-scanner:allow-cancel",
     "barcode-scanner:allow-check-permissions",
     "barcode-scanner:allow-request-permissions",
-    "barcode-scanner:allow-open-app-settings",
-    "deep-link:default",
-    "haptics:default",
-    "notification:default"
+    "haptics:default"
   ]
 }

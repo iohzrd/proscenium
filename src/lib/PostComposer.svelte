@@ -2,19 +2,24 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { readImage } from "@tauri-apps/plugin-clipboard-manager";
-  import { platform } from "@tauri-apps/plugin-os";
   import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { isImage, isVideo } from "$lib/utils";
-  import type { PendingAttachment } from "$lib/types";
+  import { MAX_ATTACHMENTS, isImage, isVideo } from "$lib/utils";
   import {
     useMentionAutocomplete,
     useFileUpload,
     autogrow,
   } from "$lib/composables";
+  import {
+    MAX_CONTENT_BYTES,
+    isMobilePlatform,
+    isSubmitEnter,
+    toMediaAttachments,
+    utf8Length,
+  } from "$lib/messages/compose";
   import { onMount } from "svelte";
 
-  const MAX_POST_LENGTH = 10_000;
-  const isMobile = platform() === "android" || platform() === "ios";
+  const uid = $props.id();
+  const isMobile = isMobilePlatform();
 
   let {
     pubkey,
@@ -26,6 +31,7 @@
 
   let newPost = $state("");
   let posting = $state(false);
+  let postError = $state("");
   let dragging = $state(false);
   let fileInput = $state<HTMLInputElement>(null!);
   let cameraInput = $state<HTMLInputElement>(null!);
@@ -34,10 +40,31 @@
   const mention = useMentionAutocomplete(
     () => newPost,
     (v) => (newPost = v),
-    ".compose textarea",
+    `#${uid}`,
   );
 
   const upload = useFileUpload();
+
+  let contentBytes = $derived(utf8Length(newPost));
+  let overLimit = $derived(contentBytes > MAX_CONTENT_BYTES);
+  let tooManyAttachments = $derived(
+    upload.attachments.length > MAX_ATTACHMENTS,
+  );
+  // No attachment is added while a post is being created: `upload.clear()`
+  // runs when it succeeds, and an upload that completes later would be
+  // appended to the emptied composer.
+  let canAttach = $derived(
+    !posting &&
+      !upload.uploading &&
+      upload.attachments.length < MAX_ATTACHMENTS,
+  );
+  let canSubmit = $derived(
+    !posting &&
+      !upload.uploading &&
+      !overLimit &&
+      !tooManyAttachments &&
+      (newPost.trim().length > 0 || upload.attachments.length > 0),
+  );
 
   onMount(() => {
     let cancelled = false;
@@ -46,18 +73,15 @@
     getCurrentWebview()
       .onDragDropEvent(async (event) => {
         if (cancelled) return;
-        const { type } = event.payload;
-        if (type === "enter" || type === "over") {
+        const payload = event.payload;
+        if (payload.type === "enter" || payload.type === "over") {
           dragging = true;
-        } else if (type === "leave") {
+        } else if (payload.type === "leave") {
           dragging = false;
-        } else if (type === "drop") {
+        } else if (payload.type === "drop") {
           dragging = false;
-          const paths: string[] = (
-            event.payload as { type: string; paths: string[] }
-          ).paths;
-          if (paths.length > 0) {
-            await upload.addFilesFromPaths(paths);
+          if (canAttach && payload.paths.length > 0) {
+            await upload.addFilesFromPaths(payload.paths);
           }
         }
       })
@@ -72,22 +96,16 @@
     return () => {
       cancelled = true;
       unlisten?.();
+      upload.revokeAll();
     };
   });
 
   async function submitPost() {
-    if ((!newPost.trim() && upload.attachments.length === 0) || posting) return;
+    if (!canSubmit) return;
     posting = true;
+    postError = "";
     try {
-      const media = upload.attachments.map(
-        ({ hash, ticket, mime_type, filename, size }) => ({
-          hash,
-          ticket,
-          mime_type,
-          filename,
-          size,
-        }),
-      );
+      const media = toMediaAttachments(upload.attachments);
       await invoke("create_post", {
         content: newPost,
         media: media.length > 0 ? media : null,
@@ -96,29 +114,37 @@
       upload.clear();
       onsubmitted();
     } catch (e) {
-      console.error("Failed to create post:", e);
+      postError = String(e);
     }
     posting = false;
   }
 
-  async function handlePaste(e: ClipboardEvent) {
+  function handlePaste(e: ClipboardEvent) {
     if (isMobile) return;
+    // Text on the clipboard: the default action inserts it and no image is
+    // read. Checked before the first await, while the event is dispatched.
+    const types = e.clipboardData?.types ?? [];
+    if (types.some((type) => type.startsWith("text/"))) return;
+    e.preventDefault();
+    if (canAttach) pasteImage();
+  }
+
+  async function pasteImage() {
     try {
       const img = await readImage();
       const rgba = await img.rgba();
       const { width, height } = await img.size();
       await img.close();
-      if (rgba.length === 0) return;
-      e.preventDefault();
+      if (rgba.length === 0 || !canAttach) return;
       await upload.addImageFromRgba(rgba, width, height);
     } catch {
-      // No image in clipboard — let the default text paste through.
+      // The clipboard holds no image.
     }
   }
 
   function handleKey(e: KeyboardEvent) {
     if (mentionAutocomplete?.handleKey(e)) return;
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (isSubmitEnter(e, isMobile)) {
       e.preventDefault();
       submitPost();
     }
@@ -134,22 +160,24 @@
     onselect={mention.insertMention}
   />
   <textarea
+    id={uid}
     class="input-base compose-textarea"
     bind:value={newPost}
     placeholder="What's on your mind?"
     rows="1"
-    maxlength={MAX_POST_LENGTH}
+    maxlength={MAX_CONTENT_BYTES}
     onkeydown={handleKey}
     oninput={mention.handleInput}
     onpaste={handlePaste}
     use:autogrow></textarea>
   <div class="compose-meta">
-    <span class="hint">Shift+Enter for newline</span>
+    <span class="hint">{isMobile ? "" : "Shift+Enter for newline"}</span>
     <span
       class="char-count"
-      class:warn={newPost.length > MAX_POST_LENGTH * 0.9}
+      class:warn={contentBytes > MAX_CONTENT_BYTES * 0.9}
+      class:over={overLimit}
     >
-      {newPost.length}/{MAX_POST_LENGTH}
+      {contentBytes}/{MAX_CONTENT_BYTES} bytes
     </span>
   </div>
 
@@ -167,6 +195,7 @@
           <button
             class="remove-btn"
             onclick={() => upload.removeAttachment(i)}
+            disabled={posting}
             aria-label="Remove attachment">&times;</button
           >
         </div>
@@ -174,8 +203,16 @@
     </div>
   {/if}
 
+  {#if tooManyAttachments}
+    <p class="compose-error">
+      {upload.attachments.length} attachments; the limit is {MAX_ATTACHMENTS}.
+    </p>
+  {/if}
   {#if upload.errorMessage}
-    <p class="compose-error">{upload.errorMessage}</p>
+    <p class="compose-error" role="alert">{upload.errorMessage}</p>
+  {/if}
+  {#if postError}
+    <p class="compose-error" role="alert">{postError}</p>
   {/if}
 
   <div class="compose-actions">
@@ -183,14 +220,14 @@
       <button
         class="btn-elevated attach-btn"
         onclick={() => cameraInput.click()}
-        disabled={upload.uploading}
+        disabled={!canAttach}
       >
         {upload.uploading ? "..." : "Camera"}
       </button>
       <button
         class="btn-elevated attach-btn"
         onclick={() => fileInput.click()}
-        disabled={upload.uploading}
+        disabled={!canAttach}
       >
         {upload.uploading ? "..." : "Gallery"}
       </button>
@@ -198,7 +235,7 @@
       <button
         class="btn-elevated attach-btn"
         onclick={() => fileInput.click()}
-        disabled={upload.uploading}
+        disabled={!canAttach}
       >
         {upload.uploading ? "Uploading..." : "Attach"}
       </button>
@@ -222,7 +259,7 @@
     <button
       class="btn-accent post-btn"
       onclick={submitPost}
-      disabled={posting || (!newPost.trim() && upload.attachments.length === 0)}
+      disabled={!canSubmit}
     >
       {posting ? "Posting..." : "Post"}
     </button>
@@ -269,6 +306,10 @@
 
   .char-count.warn {
     color: var(--color-warning);
+  }
+
+  .char-count.over {
+    color: var(--color-error-light);
   }
 
   .compose-actions {

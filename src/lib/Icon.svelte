@@ -1,6 +1,29 @@
+<script lang="ts" module>
+  /** Names with a drawing below; any other name is a type error. */
+  export type IconName =
+    | "home"
+    | "bell"
+    | "message-circle"
+    | "users"
+    | "user"
+    | "settings"
+    | "server"
+    | "compass"
+    | "search"
+    | "x"
+    | "more-horizontal"
+    | "mic"
+    | "mic-off"
+    | "hand"
+    | "radio"
+    | "copy"
+    | "link"
+    | "log-out";
+</script>
+
 <script lang="ts">
   interface Props {
-    name: string;
+    name: IconName;
     size?: number;
   }
 
@@ -10,6 +33,7 @@
 <svg
   width={size}
   height={size}
+  aria-hidden="true"
   viewBox="0 0 24 24"
   fill="none"
   stroke="currentColor"
@@ -85,6 +109,9 @@
   {:else if name === "copy"}
     <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  {:else if name === "link"}
+    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
   {:else if name === "log-out"}
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
     <polyline points="16 17 21 12 16 7" />

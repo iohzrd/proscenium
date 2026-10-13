@@ -2,7 +2,6 @@
   import "../app.css";
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { onMount } from "svelte";
   import {
@@ -10,7 +9,7 @@
     requestPermission,
     sendNotification,
   } from "@tauri-apps/plugin-notification";
-  import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+  import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
   import { goto } from "$app/navigation";
   import type {
     NodeStatus,
@@ -18,7 +17,6 @@
     StoredMessage,
     CallEvent,
     CallState,
-    StageAnnouncement,
   } from "$lib/types";
   import Sidebar from "$lib/Sidebar.svelte";
   import RightSidebar from "$lib/RightSidebar.svelte";
@@ -26,23 +24,49 @@
   import MobileHeader from "$lib/MobileHeader.svelte";
   import CallOverlay from "$lib/CallOverlay.svelte";
   import { applyAccent, DEFAULT_ACCENT } from "$lib/accent";
+  import { useEventListeners, useNodeInit } from "$lib/composables";
+  import {
+    liveStages,
+    stageStore,
+    startLiveStageTracking,
+    startStageSync,
+  } from "$lib/stage.svelte";
+  import {
+    evictDisplayName,
+    getDisplayName,
+    isPubkeyFormat,
+    isWindowActive,
+    seedOwnProfile,
+    truncate,
+  } from "$lib/utils";
+  import StageIndicator from "./StageIndicator.svelte";
 
   const ZOOM_KEY = "app-zoom-level";
   const ZOOM_STEP = 0.2;
   const ZOOM_MIN = 0.2;
   const ZOOM_MAX = 10.0;
+  // Set in sessionStorage once the deep link that started the app was handled,
+  // so a webview reload does not navigate to it again.
+  const STARTUP_LINK_KEY = "startup-deep-link-handled";
+  const NOTIFICATION_BODY_CHARS = 100;
+  const CALL_END_DISPLAY_MS = 2000;
 
   let { children } = $props();
   let status = $state<NodeStatus | null>(null);
   let zoomLevel = $state(1.0);
   let unreadDmCount = $state(0);
   let unreadNotificationCount = $state(0);
-  let nodeId = $state("");
-  let pubkey = $state("");
   let activeCallId = $state<string | null>(null);
   let activeCallPeer = $state("");
   let activeCallState = $state<CallState | null>(null);
-  let liveStages = $state<Map<string, StageAnnouncement>>(new Map());
+  // Result of the OS notification permission request; false until it resolves.
+  let notificationsPermitted = false;
+
+  // The identity is read once per webview load. Flows that replace the local
+  // identity (recovery, device link) reload the webview afterwards.
+  const node = useNodeInit(async () => {
+    await seedOwnProfile(node.pubkey);
+  });
 
   async function applyZoom(level: number) {
     zoomLevel = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, level));
@@ -69,16 +93,27 @@
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== "proscenium:") return;
-      if (parsed.hostname === "profile" || parsed.hostname === "user") {
-        const id = parsed.pathname.slice(1);
-        if (id) {
-          const transport = parsed.searchParams.get("transport");
-          const query = transport ? `?transport=${transport}` : "";
-          goto(`/profile/${id}${query}`);
-        }
-      }
+      if (parsed.hostname !== "profile" && parsed.hostname !== "user") return;
+      const id = parsed.pathname.slice(1);
+      if (!isPubkeyFormat(id)) return;
+      const transport = parsed.searchParams.get("transport");
+      const query =
+        transport && isPubkeyFormat(transport) ? `?transport=${transport}` : "";
+      goto(`/profile/${id}${query}`);
     } catch {
       // malformed URL, ignore
+    }
+  }
+
+  /** Handle the deep link that started the app, once per app run. */
+  async function handleStartupDeepLink() {
+    if (sessionStorage.getItem(STARTUP_LINK_KEY)) return;
+    try {
+      const urls = await getCurrent();
+      sessionStorage.setItem(STARTUP_LINK_KEY, "1");
+      for (const url of urls ?? []) handleDeepLink(url);
+    } catch (e) {
+      console.error("Failed to read startup deep link:", e);
     }
   }
 
@@ -87,7 +122,10 @@
       status = await invoke("get_node_status");
     } catch {
       // Node not ready yet
+      return;
     }
+    // The node answers now; load the identity if the bounded retries ended before that.
+    if (node.error) node.init();
   }
 
   async function pollUnread() {
@@ -106,6 +144,70 @@
     }
   }
 
+  async function resolveNotificationPermission() {
+    try {
+      let granted = await isPermissionGranted();
+      if (!granted) granted = (await requestPermission()) === "granted";
+      notificationsPermitted = granted;
+    } catch (e) {
+      console.error("Notification permission request failed:", e);
+    }
+  }
+
+  /** True if the user is looking at `path`: it is the current route and the window is active. */
+  function isViewing(path: string): boolean {
+    return page.url.pathname === path && isWindowActive();
+  }
+
+  async function handleDmReceived(payload: {
+    from: string;
+    message: StoredMessage;
+  }) {
+    pollUnread();
+    if (!notificationsPermitted || isViewing(`/messages/${payload.from}`)) {
+      return;
+    }
+    const title = await getDisplayName(payload.from, node.pubkey);
+    sendNotification({
+      title,
+      body:
+        truncate(payload.message.content, NOTIFICATION_BODY_CHARS) ||
+        "Sent a message",
+    });
+  }
+
+  async function handleMention(post: Post) {
+    pollUnreadNotifications();
+    if (!notificationsPermitted || isViewing("/activity")) return;
+    const name = await getDisplayName(post.author, node.pubkey);
+    sendNotification({
+      title: `${name} mentioned you`,
+      body:
+        truncate(post.content, NOTIFICATION_BODY_CHARS) ||
+        "Mentioned you in a post",
+    });
+  }
+
+  function handleCallState({ call_id, peer_pubkey, state }: CallEvent) {
+    activeCallId = call_id;
+    activeCallPeer = peer_pubkey;
+    activeCallState = state;
+    if (state === "ended" || state === "failed") {
+      // Show briefly then dismiss
+      setTimeout(() => {
+        if (activeCallId === call_id) {
+          activeCallId = null;
+          activeCallState = null;
+        }
+      }, CALL_END_DISPLAY_MS);
+    }
+  }
+
+  function handleProfileUpdated(updated: string) {
+    evictDisplayName(updated);
+    if (updated === node.pubkey) seedOwnProfile(updated);
+  }
+
   onMount(() => {
     const saved = localStorage.getItem(ZOOM_KEY);
     if (saved) {
@@ -116,157 +218,55 @@
     }
 
     window.addEventListener("keydown", handleZoomKeys);
-    invoke<string>("get_node_id")
-      .then((id) => (nodeId = id))
-      .catch(() => {});
-    invoke<string>("get_pubkey")
-      .then((id) => (pubkey = id))
-      .catch(() => {});
+
+    // Listeners are registered before any await, so no event emitted during
+    // the permission request or the identity load is missed.
+    const cleanupListeners = useEventListeners({
+      "dm-received": (payload) =>
+        handleDmReceived(payload as { from: string; message: StoredMessage }),
+      "mentioned-in-post": (payload) => handleMention(payload as Post),
+      "notification-received": () => pollUnreadNotifications(),
+      "call-state": (payload) => handleCallState(payload as CallEvent),
+      "profile-updated": (payload) => handleProfileUpdated(payload as string),
+      "deep-link-received": (payload) => {
+        for (const url of payload as string[]) handleDeepLink(url);
+      },
+    });
+    const unlistenOpenUrl = onOpenUrl((urls) => {
+      for (const url of urls) handleDeepLink(url);
+    });
+    const stopStageSync = startStageSync();
+    const stopLiveStageTracking = startLiveStageTracking();
+
+    node.init();
     invoke<string | null>("get_accent_color")
       .then((name) => applyAccent(name ?? DEFAULT_ACCENT))
       .catch(() => applyAccent(DEFAULT_ACCENT));
+    resolveNotificationPermission();
+    handleStartupDeepLink();
     pollStatus();
     pollUnread();
     pollUnreadNotifications();
     const statusInterval = setInterval(pollStatus, 10000);
     const unreadInterval = setInterval(pollUnread, 10000);
     const notificationInterval = setInterval(pollUnreadNotifications, 10000);
-    const unlisteners: Promise<UnlistenFn>[] = [];
-
-    async function setupNotifications() {
-      let permitted = await isPermissionGranted();
-      if (!permitted) {
-        const result = await requestPermission();
-        permitted = result === "granted";
-      }
-      unlisteners.push(
-        listen<{ from: string; message: StoredMessage }>(
-          "dm-received",
-          async (event) => {
-            pollUnread();
-            const senderPubkey = event.payload.from;
-            const isViewingConversation =
-              page.url.pathname === `/messages/${senderPubkey}`;
-            if (!isViewingConversation && permitted) {
-              let title = senderPubkey.slice(0, 8);
-              try {
-                const profile = await invoke<{ display_name: string } | null>(
-                  "get_remote_profile",
-                  { pubkey: senderPubkey },
-                );
-                if (profile?.display_name) {
-                  title = profile.display_name;
-                }
-              } catch {
-                // keep short pubkey as title
-              }
-              sendNotification({
-                title,
-                body: event.payload.message.content || "Sent a message",
-              });
-            }
-          },
-        ),
-      );
-      unlisteners.push(
-        listen<Post>("mentioned-in-post", async (event) => {
-          pollUnreadNotifications();
-          const isViewingActivity = page.url.pathname === "/activity";
-          if (!isViewingActivity && permitted) {
-            const post = event.payload;
-            let title = post.author.slice(0, 8);
-            try {
-              const profile = await invoke<{ display_name: string } | null>(
-                "get_remote_profile",
-                { pubkey: post.author },
-              );
-              if (profile?.display_name) {
-                title = profile.display_name;
-              }
-            } catch {
-              // keep short pubkey as title
-            }
-            sendNotification({
-              title: `${title} mentioned you`,
-              body: post.content.slice(0, 100) || "Mentioned you in a post",
-            });
-          }
-        }),
-      );
-      unlisteners.push(
-        listen("notification-received", () => {
-          pollUnreadNotifications();
-        }),
-      );
-      unlisteners.push(
-        listen<CallEvent>("call-state", (event) => {
-          const { call_id, peer_pubkey, state } = event.payload;
-          if (state === "ended" || state === "failed") {
-            // Show briefly then dismiss
-            activeCallId = call_id;
-            activeCallPeer = peer_pubkey;
-            activeCallState = state;
-            setTimeout(() => {
-              if (activeCallId === call_id) {
-                activeCallId = null;
-                activeCallState = null;
-              }
-            }, 2000);
-          } else {
-            activeCallId = call_id;
-            activeCallPeer = peer_pubkey;
-            activeCallState = state;
-          }
-        }),
-      );
-    }
-
-    setupNotifications();
-
-    // Stage announcements (drive the right sidebar live-stages panel)
-    unlisteners.push(
-      listen<StageAnnouncement>("stage-announced", (event) => {
-        const ann = event.payload;
-        liveStages = new Map(liveStages).set(ann.stage_id, ann);
-      }),
-    );
-    unlisteners.push(
-      listen<string>("stage-ended-remote", (event) => {
-        const next = new Map(liveStages);
-        next.delete(event.payload);
-        liveStages = next;
-      }),
-    );
-
-    // Deep link handling
-    unlisteners.push(
-      onOpenUrl((urls) => {
-        for (const url of urls) {
-          handleDeepLink(url);
-        }
-      }),
-    );
-    unlisteners.push(
-      listen<string[]>("deep-link-received", (event) => {
-        for (const url of event.payload) {
-          handleDeepLink(url);
-        }
-      }),
-    );
 
     return () => {
       window.removeEventListener("keydown", handleZoomKeys);
       clearInterval(statusInterval);
       clearInterval(unreadInterval);
       clearInterval(notificationInterval);
-      unlisteners.forEach((p) => p.then((fn) => fn()));
+      cleanupListeners();
+      unlistenOpenUrl.then((fn) => fn());
+      stopStageSync();
+      stopLiveStageTracking();
     };
   });
 </script>
 
 <div class="app-shell">
   <Sidebar
-    {pubkey}
+    pubkey={node.pubkey}
     {status}
     {unreadDmCount}
     {unreadNotificationCount}
@@ -282,6 +282,9 @@
         <span>Relay disconnected -- messages and sync may not work</span>
       </div>
     {/if}
+    {#if stageStore.stage && page.url.pathname !== "/stage"}
+      <StageIndicator />
+    {/if}
     <main>
       {@render children()}
     </main>
@@ -290,7 +293,7 @@
   <RightSidebar {liveStages} />
 
   <BottomNav
-    {pubkey}
+    pubkey={node.pubkey}
     {unreadDmCount}
     {unreadNotificationCount}
     currentPath={page.url.pathname}
@@ -298,12 +301,14 @@
 </div>
 
 {#if activeCallId && activeCallState}
-  <CallOverlay
-    callId={activeCallId}
-    peerPubkey={activeCallPeer}
-    callState={activeCallState}
-    selfId={pubkey}
-  />
+  {#key activeCallId}
+    <CallOverlay
+      callId={activeCallId}
+      peerPubkey={activeCallPeer}
+      callState={activeCallState}
+      selfId={node.pubkey}
+    />
+  {/key}
 {/if}
 
 <style>

@@ -4,6 +4,8 @@ use proscenium_types::{FrontendSyncResult, SyncStatus};
 use std::sync::Arc;
 use tauri::State;
 
+/// Sync the content of `pubkey` now. Returns the newest newly stored posts (at most
+/// `SYNC_RETURNED_POSTS_MAX`, newest first) and the post count the remote reported.
 #[tauri::command]
 pub async fn sync_posts(
     state: State<'_, Arc<AppState>>,
@@ -36,12 +38,12 @@ pub async fn get_sync_status(
     Ok(SyncStatus { local_count })
 }
 
+/// Ask the peer sync task to sync every followed user. Fails if its queue is full.
 #[tauri::command]
 pub async fn sync_all_peers(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     state
         .sync_tx()
-        .send(SyncCommand::SyncAll)
-        .await
-        .map_err(|_| "sync task unavailable")?;
+        .try_send(SyncCommand::SyncAll)
+        .map_err(|_| "sync task unavailable or busy")?;
     Ok(())
 }

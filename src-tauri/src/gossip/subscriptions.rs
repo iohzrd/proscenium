@@ -1,17 +1,66 @@
+use crate::constants::GOSSIP_REJOIN_INTERVAL;
 use crate::error::AppError;
+use crate::state::{AppState, SyncCommand};
+use crate::storage::Storage;
 use futures_lite::StreamExt;
 use iroh::EndpointId;
-use iroh_gossip::api::Event;
+use iroh_gossip::api::{Event, GossipSender};
 use proscenium_types::{short_id, user_feed_topic};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
+use tauri::{AppHandle, Manager};
+
+/// Parse cached transport NodeId strings; entries that do not parse are skipped.
+fn parse_node_ids(node_ids: &[String]) -> Vec<EndpointId> {
+    node_ids.iter().filter_map(|id| id.parse().ok()).collect()
+}
+
+/// Queue a `SyncCommand::SyncPeer` for `pubkey` on the peer sync task. Does nothing if
+/// the application state is not managed yet or the command queue is full.
+fn queue_sync(app_handle: &AppHandle, pubkey: &str) {
+    if let Some(state) = app_handle.try_state::<Arc<AppState>>()
+        && state
+            .sync_tx()
+            .try_send(SyncCommand::SyncPeer(pubkey.to_string()))
+            .is_err()
+    {
+        log::debug!(
+            "[gossip-rx] sync queue full, {} not queued",
+            short_id(pubkey)
+        );
+    }
+}
+
+/// Call `join_peers` on the topic of `pubkey` with its cached transport NodeIds.
+async fn rejoin(storage: &Storage, sender: &GossipSender, pubkey: &str) {
+    let node_ids = storage
+        .get_peer_transport_node_ids(pubkey)
+        .await
+        .unwrap_or_default();
+    let peers = parse_node_ids(&node_ids);
+    if peers.is_empty() {
+        return;
+    }
+    log::debug!(
+        "[gossip-rx] no neighbors for {}, joining {} cached node(s)",
+        short_id(pubkey),
+        peers.len()
+    );
+    if let Err(e) = sender.join_peers(peers).await {
+        log::warn!(
+            "[gossip-rx] join_peers for {} failed: {e}",
+            short_id(pubkey)
+        );
+    }
+}
 
 impl super::GossipService {
     /// Subscribe to a user's gossip feed topic.
     /// `pubkey` is the master pubkey (permanent identity).
     /// `transport_node_ids` are the transport NodeIds to use as gossip bootstrap peers.
+    ///
+    /// The subscription task handles received messages. While the topic has no neighbor
+    /// it calls `join_peers` with the cached NodeIds every `GOSSIP_REJOIN_INTERVAL`,
+    /// because iroh-gossip does not dial a bootstrap peer again after a failed attempt.
     pub async fn follow_user(
         &self,
         pubkey: String,
@@ -20,7 +69,7 @@ impl super::GossipService {
         let mut inner = self.inner.lock().await;
 
         // Skip if already subscribed with a live task; clean up finished handles.
-        if let Some((handle, _)) = inner.subscriptions.get(&pubkey) {
+        if let Some(handle) = inner.subscriptions.get(&pubkey) {
             if !handle.is_finished() {
                 log::info!("[gossip] already subscribed to {}", short_id(&pubkey));
                 return Ok(());
@@ -29,10 +78,7 @@ impl super::GossipService {
         }
 
         let topic = user_feed_topic(&pubkey);
-        let bootstrap: Vec<EndpointId> = transport_node_ids
-            .iter()
-            .filter_map(|id| id.parse().ok())
-            .collect();
+        let bootstrap = parse_node_ids(&transport_node_ids);
 
         if bootstrap.is_empty() {
             return Err(AppError::Other(format!(
@@ -47,25 +93,25 @@ impl super::GossipService {
             bootstrap.len(),
         );
         let topic_handle = self.gossip.subscribe(topic, bootstrap).await?;
-        let (sender, receiver) = topic_handle.split();
-        log::info!("[gossip] subscribed to {}", short_id(&pubkey));
+        let (sender, mut receiver) = topic_handle.split();
 
         let storage = self.storage.clone();
         let pk = pubkey.clone();
         let my_id = self.identity.read().await.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
-        let has_neighbor = Arc::new(AtomicBool::new(false));
-        let has_neighbor_task = has_neighbor.clone();
         let reconnect_tx = self.reconnect_tx.clone();
 
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
-            let _sender_hold = sender;
-            let mut receiver = receiver;
+            let mut rejoin_timer = tokio::time::interval(GOSSIP_REJOIN_INTERVAL);
+            rejoin_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick of an interval completes immediately; the subscribe call
+            // above already dialed the bootstrap nodes.
+            rejoin_timer.tick().await;
             loop {
-                match receiver.try_next().await {
-                    Ok(Some(event)) => match &event {
-                        Event::Received(msg) => {
+                tokio::select! {
+                    event = receiver.try_next() => match event {
+                        Ok(Some(Event::Received(msg))) => {
                             Self::handle_follow_message(
                                 &storage,
                                 &pk,
@@ -75,24 +121,44 @@ impl super::GossipService {
                             )
                             .await;
                         }
-                        Event::NeighborUp(_) => {
-                            has_neighbor_task.store(true, Ordering::Relaxed);
-                            log::info!("[gossip-rx] neighbor up for {}", short_id(&pk));
+                        Ok(Some(Event::NeighborUp(_))) => {
+                            log::info!(
+                                "[gossip-rx] neighbor up for {} ({} neighbors)",
+                                short_id(&pk),
+                                receiver.neighbors().count()
+                            );
                         }
-                        Event::NeighborDown(_) => {
-                            log::info!("[gossip-rx] neighbor down for {}", short_id(&pk));
+                        Ok(Some(Event::NeighborDown(_))) => {
+                            log::info!(
+                                "[gossip-rx] neighbor down for {} ({} neighbors)",
+                                short_id(&pk),
+                                receiver.neighbors().count()
+                            );
                         }
-                        other => {
-                            log::info!("[gossip-rx] event from {}: {other:?}", short_id(&pk));
+                        Ok(Some(Event::Lagged)) => {
+                            // Events were discarded, including messages and possibly
+                            // neighbor changes: fetch the missed content by sync and
+                            // dial the cached nodes again.
+                            log::warn!(
+                                "[gossip-rx] receiver for {} lagged, queueing a sync",
+                                short_id(&pk)
+                            );
+                            queue_sync(&app_handle, &pk);
+                            rejoin(&storage, &sender, &pk).await;
+                        }
+                        Ok(None) => {
+                            log::warn!("[gossip-rx] stream ended for {}", short_id(&pk));
+                            break;
+                        }
+                        Err(e) => {
+                            log::error!("[gossip-rx] receiver error for {}: {e}", short_id(&pk));
+                            break;
                         }
                     },
-                    Ok(None) => {
-                        log::warn!("[gossip-rx] stream ended for {}", short_id(&pk));
-                        break;
-                    }
-                    Err(e) => {
-                        log::error!("[gossip-rx] receiver error for {}: {e}", short_id(&pk));
-                        break;
+                    _ = rejoin_timer.tick() => {
+                        if !receiver.is_joined() {
+                            rejoin(&storage, &sender, &pk).await;
+                        }
                     }
                 }
             }
@@ -103,13 +169,13 @@ impl super::GossipService {
             let _ = reconnect_tx.send(pk);
         });
 
-        inner.subscriptions.insert(pubkey, (handle, has_neighbor));
+        inner.subscriptions.insert(pubkey, handle);
         Ok(())
     }
 
     pub async fn unfollow_user(&self, pubkey: &str) {
         let mut inner = self.inner.lock().await;
-        if let Some((handle, _)) = inner.subscriptions.remove(pubkey) {
+        if let Some(handle) = inner.subscriptions.remove(pubkey) {
             log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
             handle.abort();
         }

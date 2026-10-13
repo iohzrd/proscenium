@@ -14,7 +14,7 @@
   } = $props();
 
   function handleSearchKey(e: KeyboardEvent) {
-    if (e.key === "Enter") {
+    if (e.key === "Enter" && !e.isComposing) {
       e.preventDefault();
       onsearch();
     }
@@ -31,6 +31,7 @@
       : activeTab === "posts"
         ? "Search posts..."
         : "Search..."}
+    aria-label="Search"
     onkeydown={handleSearchKey}
   />
   <button

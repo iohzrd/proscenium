@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import Avatar from "$lib/Avatar.svelte";
+  import { profileHref } from "$lib/profile/links";
   import { shortId, getDisplayName, getCachedAvatarTicket } from "$lib/utils";
 
   let {
@@ -17,7 +18,7 @@
 </script>
 
 <div class="follow-item">
-  <a href="/profile/{pubkey}" class="follow-info">
+  <a href={profileHref(pubkey)} class="follow-info">
     {#await getDisplayName(pubkey, "") then name}
       <Avatar {pubkey} {name} ticket={getCachedAvatarTicket(pubkey)} />
       <div class="follow-identity">
