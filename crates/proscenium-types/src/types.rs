@@ -384,6 +384,11 @@ pub struct DeviceSyncVector {
     pub devices: Vec<DeviceEntry>,
     /// Ids of the sender's newest direct messages, at most `MAX_DEVICE_SYNC_DM_IDS`.
     pub dm_ids: Vec<String>,
+    /// Ids of the sender's newest deletions of own posts, at most `MAX_SYNC_TOMBSTONES`.
+    pub post_tombstone_ids: Vec<String>,
+    /// Ids of the sender's newest deletions of own interactions, at most
+    /// `MAX_SYNC_TOMBSTONES`.
+    pub interaction_tombstone_ids: Vec<String>,
 }
 
 /// Number of direct message ids a `DeviceSyncVector` lists.

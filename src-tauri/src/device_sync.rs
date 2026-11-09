@@ -15,8 +15,9 @@
 //!
 //! Data frames: own posts and interactions newer than the newest timestamp in the
 //! receiver's vector; all follow, moderation and bookmark rows unless both vectors carry
-//! the same `lww_digest`; and the direct messages among the sender's newest
-//! `MAX_DEVICE_SYNC_DM_IDS` whose ids the receiver's vector does not list.
+//! the same `lww_digest`; the direct messages among the sender's newest
+//! `MAX_DEVICE_SYNC_DM_IDS`, and the deletions of own posts and interactions among the
+//! sender's newest `MAX_SYNC_TOMBSTONES`, whose ids the receiver's vector does not list.
 
 use crate::constants::BATCH_SIZE;
 use crate::error::AppError;
@@ -31,8 +32,9 @@ use iroh::{
 };
 use proscenium_types::{
     BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, DirectMessage, FollowEntry, Interaction,
-    MAX_DEVICE_SYNC_DM_IDS, MAX_LINKED_DEVICES, ModerationEntry, PEER_ALPN, PeerRequest, Post,
-    StoredMessage, is_valid_pubkey, short_id, validate_interaction, validate_post,
+    MAX_DEVICE_SYNC_DM_IDS, MAX_LINKED_DEVICES, MAX_SYNC_TOMBSTONES, ModerationEntry, PEER_ALPN,
+    PeerRequest, Post, StoredMessage, is_valid_id, is_valid_pubkey, now_millis, short_id,
+    validate_interaction, validate_post, verify_delete_post_signature,
     verify_interaction_signature, verify_post_signature,
 };
 use sha2::{Digest, Sha256};
@@ -54,6 +56,8 @@ const MAX_SYNC_ITEMS: usize = 200_000;
 const LWW_BATCH_SIZE: usize = 500;
 /// Direct messages per frame. One message is at most about 64 KiB of JSON.
 const DM_BATCH_SIZE: usize = 100;
+/// Tombstones per frame.
+const TOMBSTONE_BATCH_SIZE: usize = 1_000;
 /// QUIC close code for a rejected or failed device sync.
 const CLOSE_FAILED: u32 = 1;
 
@@ -107,6 +111,10 @@ pub struct DeviceSyncStats {
     pub devices_added: u32,
     /// Direct messages stored for the first time, by the other user of the conversation.
     pub dms_imported: BTreeMap<String, Vec<StoredMessage>>,
+    /// Own posts deleted by tombstones from the other device.
+    pub posts_removed: u64,
+    /// Own interactions deleted by tombstones from the other device.
+    pub interactions_removed: u32,
 }
 
 /// True if `post` is authored by `master_pubkey`, passes `validate_post`, and is signed
@@ -161,6 +169,8 @@ fn frame_item_count(frame: &DeviceSyncFrame) -> usize {
         DeviceSyncFrame::Moderation(items) => items.len(),
         DeviceSyncFrame::Bookmarks(items) => items.len(),
         DeviceSyncFrame::DirectMessages(items) => items.len(),
+        DeviceSyncFrame::PostTombstones(items) => items.len(),
+        DeviceSyncFrame::InteractionTombstones(items) => items.len(),
     }
 }
 
@@ -315,6 +325,38 @@ impl DeviceSync<'_> {
             write_sync_frame(send, &DeviceSyncFrame::DirectMessages(messages)).await?;
         }
 
+        let listed: HashSet<&str> = peer.post_tombstone_ids.iter().map(String::as_str).collect();
+        let tombstones: Vec<_> = self
+            .storage
+            .get_post_tombstones(master_pubkey, MAX_SYNC_TOMBSTONES)
+            .await?
+            .into_iter()
+            .filter(|tombstone| !listed.contains(tombstone.id.as_str()))
+            .collect();
+        for chunk in tombstones.chunks(TOMBSTONE_BATCH_SIZE) {
+            write_sync_frame(send, &DeviceSyncFrame::PostTombstones(chunk.to_vec())).await?;
+        }
+
+        let listed: HashSet<&str> = peer
+            .interaction_tombstone_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let tombstone_ids: Vec<String> = self
+            .storage
+            .get_interaction_tombstone_ids(master_pubkey, MAX_SYNC_TOMBSTONES)
+            .await?
+            .into_iter()
+            .filter(|id| !listed.contains(id.as_str()))
+            .collect();
+        for chunk in tombstone_ids.chunks(TOMBSTONE_BATCH_SIZE) {
+            write_sync_frame(
+                send,
+                &DeviceSyncFrame::InteractionTombstones(chunk.to_vec()),
+            )
+            .await?;
+        }
+
         write_end_frame(send).await
     }
 
@@ -322,8 +364,9 @@ impl DeviceSync<'_> {
     ///
     /// A post or interaction is stored only if it is authored by the local user, passes
     /// validation and is signed by the master key; a direct message only if
-    /// `own_dm_peer` accepts it. At most `MAX_SYNC_FRAMES` frames and `MAX_SYNC_ITEMS`
-    /// items are accepted.
+    /// `own_dm_peer` accepts it. A post tombstone is applied only if it names the local
+    /// user and its signature verifies; an interaction tombstone only if its id is valid.
+    /// At most `MAX_SYNC_FRAMES` frames and `MAX_SYNC_ITEMS` items are accepted.
     async fn import_frames(
         &self,
         recv: &mut RecvStream,
@@ -404,6 +447,38 @@ impl DeviceSync<'_> {
                         }
                     }
                 }
+                DeviceSyncFrame::PostTombstones(tombstones) => {
+                    let received = tombstones.len();
+                    let valid: Vec<_> = tombstones
+                        .into_iter()
+                        .filter(|t| {
+                            t.author == master_pubkey
+                                && is_valid_id(&t.id)
+                                && verify_delete_post_signature(&t.id, &t.author, &t.signature)
+                                    .is_ok()
+                        })
+                        .collect();
+                    stats.rejected += (received - valid.len()) as u32;
+                    let outcome = self
+                        .storage
+                        .apply_post_tombstones(master_pubkey, &valid, now_millis())
+                        .await?;
+                    stats.posts_removed += outcome.posts_removed;
+                }
+                DeviceSyncFrame::InteractionTombstones(ids) => {
+                    for id in ids {
+                        if !is_valid_id(&id) {
+                            stats.rejected += 1;
+                            continue;
+                        }
+                        self.storage
+                            .record_interaction_tombstone(master_pubkey, &id, now_millis())
+                            .await?;
+                        if self.storage.delete_interaction(&id, master_pubkey).await? {
+                            stats.interactions_removed += 1;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -469,9 +544,9 @@ impl DeviceSync<'_> {
 
 /// Apply the results of a completed exchange that need more than the database.
 ///
-/// Emits `feed-updated` if posts were imported, `dm-synced` (`{ peer, messages }`) for each
-/// conversation with imported direct messages, and broadcasts the device announcement if
-/// the device list changed.
+/// Emits `feed-updated` if posts were imported or removed, `dm-synced`
+/// (`{ peer, messages }`) for each conversation with imported direct messages, and
+/// broadcasts the device announcement if the device list changed.
 async fn after_sync(
     storage: &Storage,
     identity: &SharedIdentity,
@@ -479,7 +554,7 @@ async fn after_sync(
     app_handle: &AppHandle,
     stats: &DeviceSyncStats,
 ) {
-    if stats.posts_imported > 0 {
+    if stats.posts_imported > 0 || stats.posts_removed > 0 || stats.interactions_removed > 0 {
         let _ = app_handle.emit("feed-updated", ());
     }
     for (peer, messages) in &stats.dms_imported {
@@ -506,11 +581,13 @@ async fn after_sync(
 
 fn log_stats(role: &str, node_id: &str, stats: &DeviceSyncStats) {
     log::info!(
-        "[device-sync] {role} sync with {}: posts={}, interactions={}, dms={}, rejected={}, follows={}, moderation={}, bookmarks={}, devices={}",
+        "[device-sync] {role} sync with {}: posts={}, interactions={}, dms={}, posts removed={}, interactions removed={}, rejected={}, follows={}, moderation={}, bookmarks={}, devices={}",
         short_id(node_id),
         stats.posts_imported,
         stats.interactions_imported,
         stats.dms_imported.values().map(Vec::len).sum::<usize>(),
+        stats.posts_removed,
+        stats.interactions_removed,
         stats.rejected,
         stats.follows_merged,
         stats.moderation_merged,
@@ -666,7 +743,8 @@ mod tests {
     use crate::state::{Identity, device_node_id, test_support::loopback_endpoint};
     use iroh::SecretKey;
     use proscenium_types::{
-        InteractionKind, derive_transport_key, now_millis, sign_interaction, sign_post,
+        InteractionKind, PostTombstone, derive_transport_key, sign_delete_post, sign_interaction,
+        sign_post,
     };
     use std::sync::Arc;
 
@@ -767,6 +845,24 @@ mod tests {
         a.upsert_linked_device(&node_b, "Device 1", false, false, 2)
             .await
             .unwrap();
+        // A post that device A deleted and device B still holds, and an old like that
+        // device B removed and device A still holds.
+        let mut deleted = signed_post(&master, "deleted on device a");
+        deleted.timestamp = 1_000;
+        sign_post(&mut deleted, &SecretKey::from_bytes(&master));
+        let deletion = PostTombstone {
+            id: deleted.id.clone(),
+            author: me.clone(),
+            signature: sign_delete_post(&deleted.id, &me, &SecretKey::from_bytes(&master)),
+        };
+        a.apply_post_tombstones(&me, std::slice::from_ref(&deletion), 1)
+            .await
+            .unwrap();
+        let mut unliked = signed_like(&master, &signed_post(&other, "old target"));
+        unliked.id = "ef".repeat(16);
+        unliked.timestamp = 1_000;
+        sign_interaction(&mut unliked, &SecretKey::from_bytes(&master));
+        a.save_interaction(&unliked).await.unwrap();
         // A message from `followed` that only device A received.
         let received = dm(&me, &followed, &followed, &me, "hi from followed");
         assert!(
@@ -793,6 +889,10 @@ mod tests {
             .await
             .unwrap();
         b.upsert_linked_device(&node_b, "Device 1", false, true, 2)
+            .await
+            .unwrap();
+        b.insert_post(&deleted).await.unwrap();
+        b.record_interaction_tombstone(&me, &unliked.id, 1)
             .await
             .unwrap();
         // A message to `followed` that device B sent, and the message A received.
@@ -847,6 +947,12 @@ mod tests {
         assert_eq!(stats_a.interactions_imported, 1);
         assert_eq!(stats_a.rejected, 0);
         assert_eq!(a.count_interactions_by_author(&me).await.unwrap(), 1);
+
+        // Each device applied the deletion it lacked.
+        assert_eq!(stats_b.posts_removed, 1);
+        assert!(b.is_post_tombstoned(&me, &deleted.id).await.unwrap());
+        assert_eq!(stats_a.interactions_removed, 1);
+        assert!(a.is_interaction_tombstoned(&me, &unliked.id).await.unwrap());
 
         // A received B's message; B held both messages, so A sent none.
         let conversation = Storage::conversation_id(&me, &followed);

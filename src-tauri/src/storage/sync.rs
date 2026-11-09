@@ -202,6 +202,23 @@ impl Storage {
         Ok(exists)
     }
 
+    /// Ids of the interaction tombstones stored for `author`, newest `deleted_at` first,
+    /// at most `limit`.
+    pub async fn get_interaction_tombstone_ids(
+        &self,
+        author: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM interaction_tombstones WHERE author=?1
+             ORDER BY deleted_at DESC, id ASC LIMIT ?2",
+        )
+        .bind(author)
+        .bind(limit.min(MAX_SYNC_TOMBSTONES) as i64)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     /// Delete the interaction `(author, id)` if a tombstone exists for it.
     /// Returns `true` if a row was deleted.
     pub async fn remove_interaction_if_tombstoned(

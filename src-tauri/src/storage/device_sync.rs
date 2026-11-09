@@ -1,8 +1,8 @@
 use crate::device_sync::LwwState;
 use crate::error::AppError;
 use proscenium_types::{
-    BookmarkEntry, DeviceSyncVector, FollowEntry, MAX_DEVICE_SYNC_DM_IDS, ModerationEntry,
-    is_valid_id, is_valid_pubkey, now_millis,
+    BookmarkEntry, DeviceSyncVector, FollowEntry, MAX_DEVICE_SYNC_DM_IDS, MAX_SYNC_TOMBSTONES,
+    ModerationEntry, is_valid_id, is_valid_pubkey, now_millis,
 };
 
 use super::Storage;
@@ -129,6 +129,15 @@ impl Storage {
             lww_digest: lww.digest(),
             devices: self.get_linked_devices().await?,
             dm_ids: self.get_newest_dm_ids(MAX_DEVICE_SYNC_DM_IDS).await?,
+            post_tombstone_ids: self
+                .get_post_tombstones(master_pubkey, MAX_SYNC_TOMBSTONES)
+                .await?
+                .into_iter()
+                .map(|tombstone| tombstone.id)
+                .collect(),
+            interaction_tombstone_ids: self
+                .get_interaction_tombstone_ids(master_pubkey, MAX_SYNC_TOMBSTONES)
+                .await?,
         })
     }
 

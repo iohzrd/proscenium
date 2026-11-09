@@ -387,6 +387,10 @@ pub enum DeviceSyncFrame {
     Bookmarks(Vec<BookmarkEntry>),
     /// Direct messages the receiver's vector does not list.
     DirectMessages(Vec<StoredMessage>),
+    /// Signed deletions of own posts the receiver's vector does not list.
+    PostTombstones(Vec<PostTombstone>),
+    /// Ids of deleted own interactions the receiver's vector does not list.
+    InteractionTombstones(Vec<String>),
 }
 
 const FOLLOW_REQUEST_TAG: &str = "proscenium/follow-request/2";

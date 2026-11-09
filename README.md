@@ -297,8 +297,8 @@ Several devices can share one identity.
 - **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device dials that NodeId, so QUIC authenticates the existing device, and sends the secret. The existing device compares it in constant time, sends the link bundle, and registers the new device after the new device reported that it stored the bundle.
 - **Bundle**: the master key, the new device's index, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
 - **Keys**: every device holds the master key and derives its own transport key from its device index. A device cannot be removed from the identity.
-- **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins), and direct messages (by id, among the newest 50,000). A device serves device sync only to a NodeId that derives from its own master key.
-- **Not replicated**: post deletions, and read state of direct messages.
+- **Device sync**: devices exchange own posts and interactions, their deletions, follows, moderation entries and bookmarks (last writer wins), and direct messages (by id, among the newest 50,000). A device serves device sync only to a NodeId that derives from its own master key.
+- **Not replicated**: read state of direct messages.
 
 ## Recommended IDE Setup
 
