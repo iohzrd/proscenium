@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { PendingAttachment } from "$lib/types";
+import type { PendingAttachment } from "#lib/types.ts";
 import {
   MAX_ATTACHMENTS,
   formatSize,
@@ -7,7 +7,7 @@ import {
   isVideo,
   normalizeMime,
   uploadFiles,
-} from "$lib/utils";
+} from "#lib/utils.ts";
 
 const ERROR_DURATION_MS = 4000;
 // Largest raw RGBA buffer accepted from the clipboard (4096 x 4096 pixels).

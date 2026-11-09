@@ -1,8 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import QrCodeDialog from "$lib/QrCodeDialog.svelte";
-  import type { LinkQrPayload } from "$lib/types";
-  import { copyToClipboard } from "$lib/utils";
+  import QrCodeDialog from "#lib/QrCodeDialog.svelte";
+  import type { LinkQrPayload } from "#lib/types.ts";
+  import { copyToClipboard } from "#lib/utils.ts";
 
   interface Props {
     payload: LinkQrPayload;

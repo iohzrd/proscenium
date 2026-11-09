@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import { isPostIdFormat } from "$lib/utils";
+  import { isPostIdFormat } from "#lib/utils.ts";
   import Thread from "./Thread.svelte";
 
   let postId = $derived(page.params.id ?? "");

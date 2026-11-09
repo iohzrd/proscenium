@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  import { isAudio, isImage, isVideo } from "$lib/utils";
+  import { isAudio, isImage, isVideo } from "#lib/utils.ts";
 
   export type MediaKind = "image" | "video" | "audio" | "file";
 
@@ -18,9 +18,9 @@
 
 <script lang="ts">
   import { untrack, type Snippet } from "svelte";
-  import { requiresClickToLoad, type BlobCache } from "$lib/blobs";
-  import type { MediaAttachment } from "$lib/types";
-  import { formatSize } from "$lib/utils";
+  import { requiresClickToLoad, type BlobCache } from "#lib/blobs.ts";
+  import type { MediaAttachment } from "#lib/types.ts";
+  import { formatSize } from "#lib/utils.ts";
 
   let {
     att,

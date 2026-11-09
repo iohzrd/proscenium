@@ -1,10 +1,10 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
-  import Avatar from "$lib/Avatar.svelte";
-  import VisibilityPicker from "$lib/profile/VisibilityPicker.svelte";
-  import type { Visibility } from "$lib/types";
-  import { uploadFiles } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import VisibilityPicker from "#lib/profile/VisibilityPicker.svelte";
+  import type { Visibility } from "#lib/types.ts";
+  import { uploadFiles } from "#lib/utils.ts";
 
   let {
     onback,

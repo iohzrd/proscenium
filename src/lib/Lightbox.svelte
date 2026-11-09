@@ -1,8 +1,8 @@
 <script lang="ts">
-  import type { MediaAttachment } from "$lib/types";
-  import { getBlobContext } from "$lib/blobs";
-  import { focusTrap } from "$lib/composables";
-  import { showContextMenu } from "$lib/context-menu";
+  import type { MediaAttachment } from "#lib/types.ts";
+  import { getBlobContext } from "#lib/blobs.ts";
+  import { focusTrap } from "#lib/composables/index.ts";
+  import { showContextMenu } from "#lib/context-menu.ts";
 
   interface Props {
     src: string;

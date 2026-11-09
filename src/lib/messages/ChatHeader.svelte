@@ -1,5 +1,5 @@
 <script lang="ts">
-  import Avatar from "$lib/Avatar.svelte";
+  import Avatar from "#lib/Avatar.svelte";
 
   let {
     pubkey,

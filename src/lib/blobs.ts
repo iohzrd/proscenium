@@ -2,8 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeFile } from "@tauri-apps/plugin-fs";
 import { setContext, getContext } from "svelte";
-import type { MediaAttachment } from "$lib/types";
-import { isAudio, isImage, isVideo, normalizeMime } from "$lib/utils";
+import type { MediaAttachment } from "#lib/types.ts";
+import { isAudio, isImage, isVideo, normalizeMime } from "#lib/utils.ts";
 
 export type BlobCache = ReturnType<typeof createBlobCache>;
 

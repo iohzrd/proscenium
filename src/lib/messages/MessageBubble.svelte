@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { StoredMessage } from "$lib/types";
-  import type { BlobCache } from "$lib/blobs";
+  import type { StoredMessage } from "#lib/types.ts";
+  import type { BlobCache } from "#lib/blobs.ts";
   import MessageMedia from "./MessageMedia.svelte";
 
   let {

@@ -1,6 +1,6 @@
 <script lang="ts" module>
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-  import type { Interaction } from "$lib/types";
+  import type { Interaction } from "#lib/types.ts";
 
   /** Delay between an event that names no post and the counts reload. */
   const RELOAD_DEBOUNCE_MS = 500;
@@ -63,7 +63,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import type { PostCounts } from "$lib/types";
+  import type { PostCounts } from "#lib/types.ts";
 
   let {
     postId,

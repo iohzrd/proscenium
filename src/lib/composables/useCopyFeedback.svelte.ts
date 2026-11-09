@@ -1,4 +1,4 @@
-import { copyToClipboard } from "$lib/utils";
+import { copyToClipboard } from "#lib/utils.ts";
 
 const FEEDBACK_DURATION_MS = 1500;
 

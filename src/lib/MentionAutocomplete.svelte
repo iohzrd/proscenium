@@ -1,8 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import Avatar from "$lib/Avatar.svelte";
-  import { getDisplayName, getCachedAvatarTicket, shortId } from "$lib/utils";
-  import type { SocialGraphEntry } from "$lib/types";
+  import Avatar from "#lib/Avatar.svelte";
+  import {
+    getDisplayName,
+    getCachedAvatarTicket,
+    shortId,
+  } from "#lib/utils.ts";
+  import type { SocialGraphEntry } from "#lib/types.ts";
 
   const DEBOUNCE_MS = 150;
   const MAX_RESULTS = 8;

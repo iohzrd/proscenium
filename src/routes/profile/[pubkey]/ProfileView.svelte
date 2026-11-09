@@ -1,17 +1,17 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Lightbox from "$lib/Lightbox.svelte";
-  import QrModal from "$lib/QrModal.svelte";
-  import PostFeed from "$lib/PostFeed.svelte";
-  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
-  import ProfileEditor from "$lib/ProfileEditor.svelte";
-  import ProfileHeaderCard from "$lib/profile/ProfileHeaderCard.svelte";
-  import ProfileIdSection from "$lib/profile/ProfileIdSection.svelte";
-  import ProfileActions from "$lib/profile/ProfileActions.svelte";
-  import SocialGraphAccordion from "$lib/profile/SocialGraphAccordion.svelte";
-  import MediaFilterBar from "$lib/profile/MediaFilterBar.svelte";
-  import { createBlobCache, setBlobContext } from "$lib/blobs";
+  import Lightbox from "#lib/Lightbox.svelte";
+  import QrModal from "#lib/QrModal.svelte";
+  import PostFeed from "#lib/PostFeed.svelte";
+  import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import ProfileEditor from "#lib/ProfileEditor.svelte";
+  import ProfileHeaderCard from "#lib/profile/ProfileHeaderCard.svelte";
+  import ProfileIdSection from "#lib/profile/ProfileIdSection.svelte";
+  import ProfileActions from "#lib/profile/ProfileActions.svelte";
+  import SocialGraphAccordion from "#lib/profile/SocialGraphAccordion.svelte";
+  import MediaFilterBar from "#lib/profile/MediaFilterBar.svelte";
+  import { createBlobCache, setBlobContext } from "#lib/blobs.ts";
   import type {
     FollowRequestOutcome,
     Post,
@@ -21,14 +21,14 @@
     SyncStatus,
     RemoteSocialResult,
     RemoteFollowersResult,
-  } from "$lib/types";
+  } from "#lib/types.ts";
   import {
     coalesce,
     dedupeById,
     mergeFirstPage,
     seedOwnProfile,
     shortId,
-  } from "$lib/utils";
+  } from "#lib/utils.ts";
   import {
     useToast,
     useCopyFeedback,
@@ -37,7 +37,7 @@
     useInfiniteScroll,
     useDeleteConfirm,
     useLightbox,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
 
   // The parent creates one instance per pubkey, so `pubkey` does not change
   // during the lifetime of this component.

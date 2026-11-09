@@ -1,12 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import LinkQrModal from "$lib/LinkQrModal.svelte";
-  import LinkScannerModal from "$lib/LinkScannerModal.svelte";
-  import Timeago from "$lib/Timeago.svelte";
-  import { useEventListeners } from "$lib/composables";
-  import type { DeviceEntry, LinkQrPayload } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import LinkQrModal from "#lib/LinkQrModal.svelte";
+  import LinkScannerModal from "#lib/LinkScannerModal.svelte";
+  import Timeago from "#lib/Timeago.svelte";
+  import { useEventListeners } from "#lib/composables/index.ts";
+  import type { DeviceEntry, LinkQrPayload } from "#lib/types.ts";
+  import { shortId } from "#lib/utils.ts";
   import ConfirmDialog from "../../ConfirmDialog.svelte";
 
   let devices = $state<DeviceEntry[]>([]);

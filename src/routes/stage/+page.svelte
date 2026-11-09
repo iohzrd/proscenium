@@ -1,11 +1,11 @@
 <script lang="ts">
   import { page } from "$app/state";
   import { invoke } from "@tauri-apps/api/core";
-  import Avatar from "$lib/Avatar.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import { useToast } from "$lib/composables";
-  import type { StageParticipant } from "$lib/types";
-  import { copyToClipboard, shortId } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import { useToast } from "#lib/composables/index.ts";
+  import type { StageParticipant } from "#lib/types.ts";
+  import { copyToClipboard, shortId } from "#lib/utils.ts";
   import {
     stageStore,
     selfMuted,
@@ -17,12 +17,12 @@
     endStage as endStageCommand,
     toggleStageMute,
     toggleStageHand,
-  } from "$lib/stage.svelte";
-  import StageLanding from "$lib/stage/StageLanding.svelte";
-  import StageChat from "$lib/stage/StageChat.svelte";
-  import StageControlBar from "$lib/stage/StageControlBar.svelte";
-  import ParticipantPopover from "$lib/stage/ParticipantPopover.svelte";
-  import FloatingReactions from "$lib/stage/FloatingReactions.svelte";
+  } from "#lib/stage.svelte.ts";
+  import StageLanding from "#lib/stage/StageLanding.svelte";
+  import StageChat from "#lib/stage/StageChat.svelte";
+  import StageControlBar from "#lib/stage/StageControlBar.svelte";
+  import ParticipantPopover from "#lib/stage/ParticipantPopover.svelte";
+  import FloatingReactions from "#lib/stage/FloatingReactions.svelte";
 
   // --- state ---
 

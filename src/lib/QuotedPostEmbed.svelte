@@ -1,11 +1,11 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import Avatar from "$lib/Avatar.svelte";
-  import Timeago from "$lib/Timeago.svelte";
-  import { useDisplayName } from "$lib/name.svelte";
-  import { postHref } from "$lib/profile/links";
-  import type { Post } from "$lib/types";
-  import { shortId, getCachedAvatarTicket, truncate } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import Timeago from "#lib/Timeago.svelte";
+  import { useDisplayName } from "#lib/name.svelte.ts";
+  import { postHref } from "#lib/profile/links.ts";
+  import type { Post } from "#lib/types.ts";
+  import { shortId, getCachedAvatarTicket, truncate } from "#lib/utils.ts";
 
   let {
     quoteOfId,

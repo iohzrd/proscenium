@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { SvelteMap } from "svelte/reactivity";
-import type { Profile, PendingAttachment } from "$lib/types";
+import type { Profile, PendingAttachment } from "#lib/types.ts";
 
 /** Upload size limit in bytes; equals `MAX_BLOB_SIZE` in the types crate. */
 export const MAX_BLOB_SIZE = 50 * 1024 * 1024;

@@ -1,12 +1,12 @@
 <script lang="ts">
-  import Icon from "$lib/Icon.svelte";
+  import Icon from "#lib/Icon.svelte";
   import {
     stageStore,
     selfMuted,
     hostMuted,
     toggleStageMute,
     leaveStage,
-  } from "$lib/stage.svelte";
+  } from "#lib/stage.svelte.ts";
 
   let busy = $state(false);
   let error = $state("");

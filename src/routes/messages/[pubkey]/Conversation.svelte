@@ -1,21 +1,25 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import MessageComposer from "$lib/MessageComposer.svelte";
-  import ChatHeader from "$lib/messages/ChatHeader.svelte";
-  import MessageBubble from "$lib/messages/MessageBubble.svelte";
-  import TypingIndicator from "$lib/messages/TypingIndicator.svelte";
-  import type { StoredMessage, Profile, MediaAttachment } from "$lib/types";
+  import MessageComposer from "#lib/MessageComposer.svelte";
+  import ChatHeader from "#lib/messages/ChatHeader.svelte";
+  import MessageBubble from "#lib/messages/MessageBubble.svelte";
+  import TypingIndicator from "#lib/messages/TypingIndicator.svelte";
+  import type { StoredMessage, Profile, MediaAttachment } from "#lib/types.ts";
   import {
     comparePosition,
     dedupeById,
     getDisplayName,
     getCachedAvatarTicket,
     isWindowActive,
-  } from "$lib/utils";
-  import { createBlobCache } from "$lib/blobs";
-  import { hapticNotification } from "$lib/haptics";
-  import { useNodeInit, useEventListeners, useToast } from "$lib/composables";
+  } from "#lib/utils.ts";
+  import { createBlobCache } from "#lib/blobs.ts";
+  import { hapticNotification } from "#lib/haptics.ts";
+  import {
+    useNodeInit,
+    useEventListeners,
+    useToast,
+  } from "#lib/composables/index.ts";
 
   // The parent creates one instance per peer, so `pubkey` does not change
   // during the lifetime of this component.

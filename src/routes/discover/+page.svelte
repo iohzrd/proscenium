@@ -1,13 +1,13 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Icon from "$lib/Icon.svelte";
-  import { useNodeInit, useToast } from "$lib/composables";
-  import ServerSelector from "$lib/discover/ServerSelector.svelte";
-  import DiscoverSearchBar from "$lib/discover/DiscoverSearchBar.svelte";
-  import UserResultsList from "$lib/discover/UserResultsList.svelte";
-  import PostResultsList from "$lib/discover/PostResultsList.svelte";
-  import TrendingList from "$lib/discover/TrendingList.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import { useNodeInit, useToast } from "#lib/composables/index.ts";
+  import ServerSelector from "#lib/discover/ServerSelector.svelte";
+  import DiscoverSearchBar from "#lib/discover/DiscoverSearchBar.svelte";
+  import UserResultsList from "#lib/discover/UserResultsList.svelte";
+  import PostResultsList from "#lib/discover/PostResultsList.svelte";
+  import TrendingList from "#lib/discover/TrendingList.svelte";
   import type {
     ServerEntry,
     ServerUser,
@@ -16,8 +16,8 @@
     UserSearchResponse,
     PostSearchResponse,
     SocialGraphEntry,
-  } from "$lib/types";
-  import { dedupeBy, dedupeById, isPubkeyFormat, shortId } from "$lib/utils";
+  } from "#lib/types.ts";
+  import { dedupeBy, dedupeById, isPubkeyFormat, shortId } from "#lib/utils.ts";
 
   type Tab = "users" | "posts" | "trending";
 

@@ -1,8 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { postHref } from "$lib/profile/links";
-  import type { Post } from "$lib/types";
-  import { getDisplayName, truncate } from "$lib/utils";
+  import { postHref } from "#lib/profile/links.ts";
+  import type { Post } from "#lib/types.ts";
+  import { getDisplayName, truncate } from "#lib/utils.ts";
 
   let {
     replyToId,

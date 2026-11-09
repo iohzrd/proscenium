@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Visibility } from "$lib/types";
+  import type { Visibility } from "#lib/types.ts";
 
   let { value = $bindable() }: { value: Visibility } = $props();
 

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import Modal from "$lib/Modal.svelte";
+  import Modal from "#lib/Modal.svelte";
 
   let {
     label,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { ServerEntry } from "$lib/types";
+  import type { ServerEntry } from "#lib/types.ts";
 
   let {
     servers,

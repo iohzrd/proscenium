@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { SvelteMap } from "svelte/reactivity";
-import type { StageAnnouncement, StageEvent, StageState } from "$lib/types";
-import { shortId, truncate } from "$lib/utils";
+import type { StageAnnouncement, StageEvent, StageState } from "#lib/types.ts";
+import { shortId, truncate } from "#lib/utils.ts";
 
 export interface StageChatMessage {
   id: number;

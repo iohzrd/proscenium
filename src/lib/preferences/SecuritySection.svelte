@@ -1,9 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Modal from "$lib/Modal.svelte";
-  import SeedVerification from "$lib/welcome/SeedVerification.svelte";
-  import SeedWordGrid from "$lib/welcome/SeedWordGrid.svelte";
+  import Modal from "#lib/Modal.svelte";
+  import SeedVerification from "#lib/welcome/SeedVerification.svelte";
+  import SeedWordGrid from "#lib/welcome/SeedWordGrid.svelte";
 
   // null until `is_seed_phrase_backed_up` returned.
   let backedUp = $state<boolean | null>(null);

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { useCopyFeedback } from "$lib/composables";
+  import { useCopyFeedback } from "#lib/composables/index.ts";
 
   let {
     nodeId,

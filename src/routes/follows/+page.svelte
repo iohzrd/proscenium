@@ -3,18 +3,22 @@
   import { invoke } from "@tauri-apps/api/core";
   import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
-  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
-  import PersonItem from "$lib/PersonItem.svelte";
-  import ScannerModal from "$lib/ScannerModal.svelte";
-  import { hapticImpact } from "$lib/haptics";
-  import type { SocialGraphEntry, FollowRequestEntry } from "$lib/types";
-  import { dedupeBy, getCachedDisplayName, isPubkeyFormat } from "$lib/utils";
+  import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import PersonItem from "#lib/PersonItem.svelte";
+  import ScannerModal from "#lib/ScannerModal.svelte";
+  import { hapticImpact } from "#lib/haptics.ts";
+  import type { SocialGraphEntry, FollowRequestEntry } from "#lib/types.ts";
+  import {
+    dedupeBy,
+    getCachedDisplayName,
+    isPubkeyFormat,
+  } from "#lib/utils.ts";
   import {
     useNodeInit,
     useEventListeners,
     useCopyFeedback,
     useToast,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
   import ConfirmDialog from "../ConfirmDialog.svelte";
 
   type Tab = "following" | "followers" | "requests";

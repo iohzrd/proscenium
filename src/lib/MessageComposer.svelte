@@ -1,15 +1,15 @@
 <script lang="ts">
   import { onDestroy } from "svelte";
-  import type { MediaAttachment } from "$lib/types";
-  import { MAX_ATTACHMENTS, isImage } from "$lib/utils";
-  import { autogrow, useFileUpload } from "$lib/composables";
+  import type { MediaAttachment } from "#lib/types.ts";
+  import { MAX_ATTACHMENTS, isImage } from "#lib/utils.ts";
+  import { autogrow, useFileUpload } from "#lib/composables/index.ts";
   import {
     MAX_CONTENT_BYTES,
     isMobilePlatform,
     isSubmitEnter,
     toMediaAttachments,
     utf8Length,
-  } from "$lib/messages/compose";
+  } from "#lib/messages/compose.ts";
 
   let {
     onsubmit,

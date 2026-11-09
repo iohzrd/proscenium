@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import Modal from "$lib/Modal.svelte";
+  import Modal from "#lib/Modal.svelte";
 
   let showWipeConfirm = $state(false);
   let wiping = $state(false);

@@ -1,4 +1,4 @@
-import { shortId, getDisplayName, getCachedDisplayName } from "$lib/utils";
+import { shortId, getDisplayName, getCachedDisplayName } from "#lib/utils.ts";
 
 /**
  * Reactive display name resolution using Svelte 5 runes.

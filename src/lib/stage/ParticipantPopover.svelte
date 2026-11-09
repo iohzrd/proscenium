@@ -1,9 +1,9 @@
 <script lang="ts">
-  import Avatar from "$lib/Avatar.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import { focusTrap } from "$lib/composables";
-  import type { StageParticipant } from "$lib/types";
-  import { shortId, truncate } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import { focusTrap } from "#lib/composables/index.ts";
+  import type { StageParticipant } from "#lib/types.ts";
+  import { shortId, truncate } from "#lib/utils.ts";
 
   const MAX_NAME_CHARS = 64;
 

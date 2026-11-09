@@ -2,16 +2,16 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Lightbox from "$lib/Lightbox.svelte";
-  import PostFeed from "$lib/PostFeed.svelte";
-  import StageCard from "$lib/StageCard.svelte";
-  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
-  import PostComposer from "$lib/PostComposer.svelte";
-  import { createBlobCache, setBlobContext } from "$lib/blobs";
-  import { hapticImpact } from "$lib/haptics";
-  import { liveStages } from "$lib/stage.svelte";
-  import type { Post } from "$lib/types";
-  import { coalesce, dedupeById, mergeFirstPage, shortId } from "$lib/utils";
+  import Lightbox from "#lib/Lightbox.svelte";
+  import PostFeed from "#lib/PostFeed.svelte";
+  import StageCard from "#lib/StageCard.svelte";
+  import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import PostComposer from "#lib/PostComposer.svelte";
+  import { createBlobCache, setBlobContext } from "#lib/blobs.ts";
+  import { hapticImpact } from "#lib/haptics.ts";
+  import { liveStages } from "#lib/stage.svelte.ts";
+  import type { Post } from "#lib/types.ts";
+  import { coalesce, dedupeById, mergeFirstPage, shortId } from "#lib/utils.ts";
   import {
     useToast,
     useCopyFeedback,
@@ -21,7 +21,7 @@
     useDeleteConfirm,
     useLightbox,
     usePullToRefresh,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
 
   const PAGE_SIZE = 20;
   // Largest number of rows one feed refresh reads again.

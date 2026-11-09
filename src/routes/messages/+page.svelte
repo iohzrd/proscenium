@@ -2,10 +2,10 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Avatar from "$lib/Avatar.svelte";
-  import Timeago from "$lib/Timeago.svelte";
-  import type { ConversationMeta } from "$lib/types";
-  import { useEventListeners, useNodeInit } from "$lib/composables";
+  import Avatar from "#lib/Avatar.svelte";
+  import Timeago from "#lib/Timeago.svelte";
+  import type { ConversationMeta } from "#lib/types.ts";
+  import { useEventListeners, useNodeInit } from "#lib/composables/index.ts";
   import {
     coalesce,
     dedupeBy,
@@ -13,7 +13,7 @@
     getDisplayName,
     getCachedAvatarTicket,
     isPubkeyFormat,
-  } from "$lib/utils";
+  } from "#lib/utils.ts";
 
   const ERROR_DURATION_MS = 4000;
 

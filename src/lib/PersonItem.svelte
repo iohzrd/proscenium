@@ -1,8 +1,12 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import Avatar from "$lib/Avatar.svelte";
-  import { profileHref } from "$lib/profile/links";
-  import { shortId, getDisplayName, getCachedAvatarTicket } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import { profileHref } from "#lib/profile/links.ts";
+  import {
+    shortId,
+    getDisplayName,
+    getCachedAvatarTicket,
+  } from "#lib/utils.ts";
 
   let {
     pubkey,

@@ -17,20 +17,20 @@
     StoredMessage,
     CallEvent,
     CallState,
-  } from "$lib/types";
-  import Sidebar from "$lib/Sidebar.svelte";
-  import RightSidebar from "$lib/RightSidebar.svelte";
-  import BottomNav from "$lib/BottomNav.svelte";
-  import MobileHeader from "$lib/MobileHeader.svelte";
-  import CallOverlay from "$lib/CallOverlay.svelte";
-  import { applyAccent, DEFAULT_ACCENT } from "$lib/accent";
-  import { useEventListeners, useNodeInit } from "$lib/composables";
+  } from "#lib/types.ts";
+  import Sidebar from "#lib/Sidebar.svelte";
+  import RightSidebar from "#lib/RightSidebar.svelte";
+  import BottomNav from "#lib/BottomNav.svelte";
+  import MobileHeader from "#lib/MobileHeader.svelte";
+  import CallOverlay from "#lib/CallOverlay.svelte";
+  import { applyAccent, DEFAULT_ACCENT } from "#lib/accent.ts";
+  import { useEventListeners, useNodeInit } from "#lib/composables/index.ts";
   import {
     liveStages,
     stageStore,
     startLiveStageTracking,
     startStageSync,
-  } from "$lib/stage.svelte";
+  } from "#lib/stage.svelte.ts";
   import {
     evictDisplayName,
     getDisplayName,
@@ -38,7 +38,7 @@
     isWindowActive,
     seedOwnProfile,
     truncate,
-  } from "$lib/utils";
+  } from "#lib/utils.ts";
   import StageIndicator from "./StageIndicator.svelte";
 
   const ZOOM_KEY = "app-zoom-level";

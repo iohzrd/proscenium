@@ -1,19 +1,19 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import Lightbox from "$lib/Lightbox.svelte";
-  import PostCard from "$lib/PostCard.svelte";
-  import ReplyComposer from "$lib/ReplyComposer.svelte";
-  import { createBlobCache, setBlobContext } from "$lib/blobs";
-  import type { Post } from "$lib/types";
-  import { coalesce, dedupeById, mergeFirstPage } from "$lib/utils";
+  import Lightbox from "#lib/Lightbox.svelte";
+  import PostCard from "#lib/PostCard.svelte";
+  import ReplyComposer from "#lib/ReplyComposer.svelte";
+  import { createBlobCache, setBlobContext } from "#lib/blobs.ts";
+  import type { Post } from "#lib/types.ts";
+  import { coalesce, dedupeById, mergeFirstPage } from "#lib/utils.ts";
   import {
     useNodeInit,
     useEventListeners,
     useInfiniteScroll,
     useLightbox,
     useToast,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
 
   // The parent creates one instance per post id, so `postId` does not change
   // during the lifetime of this component.

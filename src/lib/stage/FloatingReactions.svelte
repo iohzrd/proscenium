@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { truncate } from "$lib/utils";
+  import { truncate } from "#lib/utils.ts";
 
   interface FloatingReaction {
     id: number;

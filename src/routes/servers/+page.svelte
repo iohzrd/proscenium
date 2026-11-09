@@ -1,16 +1,16 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import DeleteConfirmModal from "$lib/DeleteConfirmModal.svelte";
-  import Icon from "$lib/Icon.svelte";
-  import { useNodeInit, useToast } from "$lib/composables";
+  import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import Icon from "#lib/Icon.svelte";
+  import { useNodeInit, useToast } from "#lib/composables/index.ts";
   import type {
     ServerEntry,
     ServerInfo,
     ServerFeedPost,
     TrendingHashtag,
-  } from "$lib/types";
-  import { dedupeBy, dedupeById, shortId } from "$lib/utils";
+  } from "#lib/types.ts";
+  import { dedupeBy, dedupeById, shortId } from "#lib/utils.ts";
 
   let servers = $state<ServerEntry[]>([]);
   let newServerUrl = $state("");

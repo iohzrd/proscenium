@@ -1,9 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import InlineComposer from "$lib/InlineComposer.svelte";
-  import { useDisplayName } from "$lib/name.svelte";
-  import type { Post } from "$lib/types";
-  import { truncate } from "$lib/utils";
+  import InlineComposer from "#lib/InlineComposer.svelte";
+  import { useDisplayName } from "#lib/name.svelte.ts";
+  import type { Post } from "#lib/types.ts";
+  import { truncate } from "#lib/utils.ts";
 
   let {
     quotedPost,

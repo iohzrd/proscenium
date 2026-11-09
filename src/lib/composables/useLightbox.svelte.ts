@@ -1,4 +1,4 @@
-import type { MediaAttachment } from "$lib/types";
+import type { MediaAttachment } from "#lib/types.ts";
 
 export function useLightbox() {
   let src = $state("");

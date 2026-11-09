@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import { focusTrap } from "$lib/composables";
+  import { focusTrap } from "#lib/composables/index.ts";
 
   let {
     label,

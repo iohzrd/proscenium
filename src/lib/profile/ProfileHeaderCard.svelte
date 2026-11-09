@@ -1,6 +1,6 @@
 <script lang="ts">
-  import Avatar from "$lib/Avatar.svelte";
-  import type { Profile } from "$lib/types";
+  import Avatar from "#lib/Avatar.svelte";
+  import type { Profile } from "#lib/types.ts";
 
   let {
     pubkey,

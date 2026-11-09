@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { messagesHref } from "$lib/profile/links";
+  import { messagesHref } from "#lib/profile/links.ts";
 
   let {
     pubkey,

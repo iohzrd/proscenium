@@ -1,15 +1,15 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import Avatar from "$lib/Avatar.svelte";
-  import Timeago from "$lib/Timeago.svelte";
-  import PostActions from "$lib/PostActions.svelte";
-  import MediaGrid from "$lib/MediaGrid.svelte";
-  import ReplyContextBlock from "$lib/ReplyContextBlock.svelte";
-  import QuotedPostEmbed from "$lib/QuotedPostEmbed.svelte";
-  import { useDisplayName } from "$lib/name.svelte";
-  import { postHref, profileHref } from "$lib/profile/links";
-  import type { MediaAttachment, Post } from "$lib/types";
-  import { getCachedAvatarTicket, renderContent } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import Timeago from "#lib/Timeago.svelte";
+  import PostActions from "#lib/PostActions.svelte";
+  import MediaGrid from "#lib/MediaGrid.svelte";
+  import ReplyContextBlock from "#lib/ReplyContextBlock.svelte";
+  import QuotedPostEmbed from "#lib/QuotedPostEmbed.svelte";
+  import { useDisplayName } from "#lib/name.svelte.ts";
+  import { postHref, profileHref } from "#lib/profile/links.ts";
+  import type { MediaAttachment, Post } from "#lib/types.ts";
+  import { getCachedAvatarTicket, renderContent } from "#lib/utils.ts";
 
   let {
     post,

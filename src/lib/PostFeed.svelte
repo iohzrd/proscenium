@@ -1,8 +1,8 @@
 <script lang="ts">
-  import PostCard from "$lib/PostCard.svelte";
-  import ReplyComposer from "$lib/ReplyComposer.svelte";
-  import QuoteComposer from "$lib/QuoteComposer.svelte";
-  import type { MediaAttachment, Post } from "$lib/types";
+  import PostCard from "#lib/PostCard.svelte";
+  import ReplyComposer from "#lib/ReplyComposer.svelte";
+  import QuoteComposer from "#lib/QuoteComposer.svelte";
+  import type { MediaAttachment, Post } from "#lib/types.ts";
 
   let {
     posts,

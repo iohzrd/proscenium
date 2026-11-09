@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { NodeStatus } from "$lib/types";
-  import Icon from "$lib/Icon.svelte";
+  import type { NodeStatus } from "#lib/types.ts";
+  import Icon from "#lib/Icon.svelte";
 
   interface Props {
     pubkey: string;

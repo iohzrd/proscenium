@@ -300,8 +300,6 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 - **Moderation**: hand raising, promote and demote, host mute, kick, ban, in-room chat. Demotion stops the speaker's capture.
 - **Announcements**: signed by the host and broadcast on the host's feed topic.
 
-[docs/spaces-design.md](docs/spaces-design.md) is the original design document. Its control protocol section predates protocol version 2.
-
 ## Linked Devices
 
 Several devices can share one identity.
@@ -311,8 +309,6 @@ Several devices can share one identity.
 - **Keys**: every device holds the master key and derives its own transport key from its device index. A device cannot be removed from the identity.
 - **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins). A device serves device sync only to a NodeId that derives from its own master key.
 - **Not replicated**: DM ratchet sessions and post deletions. A DM is delivered to the first device that acknowledges it; another device establishes its own session when it sends.
-
-[docs/linked-devices.md](docs/linked-devices.md) is the original design document and describes an earlier design.
 
 ## Recommended IDE Setup
 

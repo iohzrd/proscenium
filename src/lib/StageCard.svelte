@@ -1,8 +1,8 @@
 <script lang="ts">
   import { goto } from "$app/navigation";
-  import Icon from "$lib/Icon.svelte";
-  import type { StageAnnouncement } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import Icon from "#lib/Icon.svelte";
+  import type { StageAnnouncement } from "#lib/types.ts";
+  import { shortId } from "#lib/utils.ts";
 
   const ELAPSED_REFRESH_MS = 30_000;
 

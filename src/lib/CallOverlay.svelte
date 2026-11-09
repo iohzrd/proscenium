@@ -1,10 +1,10 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import type { CallState } from "$lib/types";
-  import Avatar from "$lib/Avatar.svelte";
-  import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
-  import { focusTrap } from "$lib/composables";
-  import { useDisplayName } from "$lib/name.svelte";
+  import type { CallState } from "#lib/types.ts";
+  import Avatar from "#lib/Avatar.svelte";
+  import AudioDeviceSelect from "#lib/AudioDeviceSelect.svelte";
+  import { focusTrap } from "#lib/composables/index.ts";
+  import { useDisplayName } from "#lib/name.svelte.ts";
 
   let {
     callId,

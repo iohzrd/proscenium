@@ -1,6 +1,6 @@
 <script lang="ts" module>
   import { invoke } from "@tauri-apps/api/core";
-  import { detectImageMime } from "$lib/utils";
+  import { detectImageMime } from "#lib/utils.ts";
 
   /** A ticket whose fetch failed is not fetched again for this long. */
   const RETRY_AFTER_MS = 60_000;
@@ -75,7 +75,7 @@
 </script>
 
 <script lang="ts">
-  import { avatarColor, getInitials } from "$lib/utils";
+  import { avatarColor, getInitials } from "#lib/utils.ts";
 
   interface Props {
     pubkey: string;

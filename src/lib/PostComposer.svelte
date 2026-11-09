@@ -2,20 +2,20 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { readImage } from "@tauri-apps/plugin-clipboard-manager";
-  import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { MAX_ATTACHMENTS, isImage, isVideo } from "$lib/utils";
+  import MentionAutocomplete from "#lib/MentionAutocomplete.svelte";
+  import { MAX_ATTACHMENTS, isImage, isVideo } from "#lib/utils.ts";
   import {
     useMentionAutocomplete,
     useFileUpload,
     autogrow,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
   import {
     MAX_CONTENT_BYTES,
     isMobilePlatform,
     isSubmitEnter,
     toMediaAttachments,
     utf8Length,
-  } from "$lib/messages/compose";
+  } from "#lib/messages/compose.ts";
   import { onMount } from "svelte";
 
   const uid = $props.id();

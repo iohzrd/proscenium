@@ -1,6 +1,6 @@
 <script lang="ts">
-  import StageCard from "$lib/StageCard.svelte";
-  import type { StageAnnouncement } from "$lib/types";
+  import StageCard from "#lib/StageCard.svelte";
+  import type { StageAnnouncement } from "#lib/types.ts";
 
   interface Props {
     liveStages: Map<string, StageAnnouncement>;

@@ -1,4 +1,4 @@
-import { isPubkeyFormat } from "$lib/utils";
+import { isPubkeyFormat } from "#lib/utils.ts";
 
 const POST_ID = /^[0-9a-f]{32}$/;
 

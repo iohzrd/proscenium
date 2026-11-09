@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { isSubmitEnter } from "$lib/messages/compose";
-  import { truncate } from "$lib/utils";
+  import { isSubmitEnter } from "#lib/messages/compose.ts";
+  import { truncate } from "#lib/utils.ts";
 
   interface ChatMessage {
     pubkey: string;

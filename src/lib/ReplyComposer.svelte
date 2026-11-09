@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import InlineComposer from "$lib/InlineComposer.svelte";
+  import InlineComposer from "#lib/InlineComposer.svelte";
 
   let {
     replyToId,

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { TrendingHashtag } from "$lib/types";
+  import type { TrendingHashtag } from "#lib/types.ts";
 
   let {
     trending,

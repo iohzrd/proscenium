@@ -1,12 +1,12 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import PostCard from "$lib/PostCard.svelte";
-  import Lightbox from "$lib/Lightbox.svelte";
-  import Avatar from "$lib/Avatar.svelte";
-  import Timeago from "$lib/Timeago.svelte";
-  import { createBlobCache, setBlobContext } from "$lib/blobs";
-  import type { AppNotification, Post } from "$lib/types";
+  import PostCard from "#lib/PostCard.svelte";
+  import Lightbox from "#lib/Lightbox.svelte";
+  import Avatar from "#lib/Avatar.svelte";
+  import Timeago from "#lib/Timeago.svelte";
+  import { createBlobCache, setBlobContext } from "#lib/blobs.ts";
+  import type { AppNotification, Post } from "#lib/types.ts";
   import {
     coalesce,
     dedupeById,
@@ -15,14 +15,14 @@
     isWindowActive,
     mergeFirstPage,
     shortId,
-  } from "$lib/utils";
+  } from "#lib/utils.ts";
   import {
     useNodeInit,
     useEventListeners,
     useInfiniteScroll,
     useLightbox,
     useToast,
-  } from "$lib/composables";
+  } from "#lib/composables/index.ts";
 
   const PAGE_SIZE = 30;
   // Largest number of rows one refresh reads again.

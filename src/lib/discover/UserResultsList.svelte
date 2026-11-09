@@ -1,8 +1,8 @@
 <script lang="ts">
-  import Icon from "$lib/Icon.svelte";
-  import { profileHref } from "$lib/profile/links";
-  import type { ServerUser } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import Icon from "#lib/Icon.svelte";
+  import { profileHref } from "#lib/profile/links.ts";
+  import type { ServerUser } from "#lib/types.ts";
+  import { shortId } from "#lib/utils.ts";
 
   let {
     users,

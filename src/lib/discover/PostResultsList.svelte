@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { profileHref } from "$lib/profile/links";
-  import type { ServerSearchPost } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import { profileHref } from "#lib/profile/links.ts";
+  import type { ServerSearchPost } from "#lib/types.ts";
+  import { shortId } from "#lib/utils.ts";
 
   let {
     posts,

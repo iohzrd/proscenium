@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import AudioDeviceSelect from "$lib/AudioDeviceSelect.svelte";
-  import { useNodeInit } from "$lib/composables";
-  import ServerManagement from "$lib/preferences/ServerManagement.svelte";
-  import PrivacyToggles from "$lib/preferences/PrivacyToggles.svelte";
-  import SecuritySection from "$lib/preferences/SecuritySection.svelte";
-  import DangerZoneSection from "$lib/preferences/DangerZoneSection.svelte";
-  import AccentPicker from "$lib/preferences/AccentPicker.svelte";
+  import AudioDeviceSelect from "#lib/AudioDeviceSelect.svelte";
+  import { useNodeInit } from "#lib/composables/index.ts";
+  import ServerManagement from "#lib/preferences/ServerManagement.svelte";
+  import PrivacyToggles from "#lib/preferences/PrivacyToggles.svelte";
+  import SecuritySection from "#lib/preferences/SecuritySection.svelte";
+  import DangerZoneSection from "#lib/preferences/DangerZoneSection.svelte";
+  import AccentPicker from "#lib/preferences/AccentPicker.svelte";
 
   const node = useNodeInit(async () => {});
 

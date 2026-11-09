@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { hapticNotification } from "$lib/haptics";
-  import Modal from "$lib/Modal.svelte";
-  import QrScanner from "$lib/QrScanner.svelte";
-  import { isPubkeyFormat } from "$lib/utils";
+  import { hapticNotification } from "#lib/haptics.ts";
+  import Modal from "#lib/Modal.svelte";
+  import QrScanner from "#lib/QrScanner.svelte";
+  import { isPubkeyFormat } from "#lib/utils.ts";
 
   interface ScannedResult {
     pubkey: string;

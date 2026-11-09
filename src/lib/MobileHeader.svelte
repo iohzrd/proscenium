@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { NodeStatus } from "$lib/types";
+  import type { NodeStatus } from "#lib/types.ts";
 
   interface Props {
     status: NodeStatus | null;

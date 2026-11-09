@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent } from "$lib/accent";
+  import { ACCENT_PRESETS, DEFAULT_ACCENT, applyAccent } from "#lib/accent.ts";
 
   let selected = $state(DEFAULT_ACCENT);
 

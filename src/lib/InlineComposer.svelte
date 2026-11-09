@@ -1,13 +1,13 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
-  import MentionAutocomplete from "$lib/MentionAutocomplete.svelte";
-  import { useMentionAutocomplete, autogrow } from "$lib/composables";
+  import MentionAutocomplete from "#lib/MentionAutocomplete.svelte";
+  import { useMentionAutocomplete, autogrow } from "#lib/composables/index.ts";
   import {
     MAX_CONTENT_BYTES,
     isMobilePlatform,
     isSubmitEnter,
     utf8Length,
-  } from "$lib/messages/compose";
+  } from "#lib/messages/compose.ts";
 
   let {
     pubkey,

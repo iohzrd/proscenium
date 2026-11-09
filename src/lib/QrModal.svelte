@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { useCopyFeedback } from "$lib/composables";
-  import QrCodeDialog from "$lib/QrCodeDialog.svelte";
+  import { useCopyFeedback } from "#lib/composables/index.ts";
+  import QrCodeDialog from "#lib/QrCodeDialog.svelte";
 
   interface Props {
     pubkey: string;

@@ -1,4 +1,4 @@
-import { SENTINEL_MARGIN_PX, setupInfiniteScroll } from "$lib/utils";
+import { SENTINEL_MARGIN_PX, setupInfiniteScroll } from "#lib/utils.ts";
 
 /**
  * `loadMoreFn` loads the next page. It returns `false` when the load failed;

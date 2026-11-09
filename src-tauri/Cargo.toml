@@ -16,9 +16,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-aec3 = "0.3.2"
+aec3 = "0.4"
 base64 = "0.23"
-bip39 = { version = "2", features = ["zeroize"] }
+bip39 = { version = "3", features = ["zeroize"] }
 bytes = "1"
 chacha20poly1305 = "0.11"
 cpal = "0.18.1"
@@ -28,17 +28,17 @@ getrandom = "0.4.1"
 hex = "0.4.3"
 hkdf = "0.13"
 iroh = "1.0.3"
-iroh-blobs = { version = "0.103.0", features = ["fs-store"] }
+iroh-blobs = { version = "0.104", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
-iroh-mainline-address-lookup = "0.5"
-iroh-mdns-address-lookup = "0.5"
+iroh-mainline-address-lookup = "0.6"
+iroh-mdns-address-lookup = "0.6"
 log = "0.4"
 mime_guess = "2.0.5"
 opus = "0.4"
 png = "0.18.1"
 proscenium-types = { path = "../crates/proscenium-types" }
 reqwest = { version = "0.13.2", default-features = false, features = ["json"] }
-ringbuf = "0.5.0"
+ringbuf = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -45,9 +45,9 @@ dependencies = [
 
 [[package]]
 name = "aec3"
-version = "0.3.2"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e625efea8522770d535f2b7a0eed377414871360566e1aa916d2a1ba0da6e693"
+checksum = "95b94681e57494d8d3933597fbf49c3537be1f2f33647e41317aab3dfc3d6fc8"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -459,9 +459,9 @@ dependencies = [
 
 [[package]]
 name = "bao-tree"
-version = "0.16.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "149a2a6017771141e2cd5d0c55b3892d8ff1958df5c318b2e496bf3544b426ed"
+checksum = "50d0e17303b78c9bb240014f3f401ecae5c0460438ace49a171e5f97e3ae57ba"
 dependencies = [
  "blake3",
  "bytes",
@@ -514,9 +514,9 @@ checksum = "597bb81c80a54b6a4381b23faba8d7774b144c94cbd1d6fe3f1329bd776554ab"
 
 [[package]]
 name = "bip39"
-version = "2.2.2"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
+checksum = "4559bb9225f8401dcea601cf8dc9ed81ea0dadd9cf7755fdefdd93ef7961e19e"
 dependencies = [
  "bitcoin_hashes",
  "serde",
@@ -590,7 +590,7 @@ dependencies = [
  "arrayvec",
  "cc",
  "cfg-if",
- "constant_time_eq",
+ "constant_time_eq 0.4.2",
  "cpufeatures 0.3.1",
 ]
 
@@ -981,6 +981,15 @@ name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb6feb175df65d0a3ccd3e73484e940d0ac664e8034f0519fd49a93db3071d9"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "convert_case"
@@ -3059,16 +3068,15 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.1"
+version = "0.104.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3148ad01585eb6b7cfb641e4100564f4f56db644f4cbed8c10ab2478663161f"
+checksum = "4f0c0f527363afa91564f82080fc5d31dd463e1831df0b546ff9594bbfa3cb60"
 dependencies = [
- "arrayvec",
  "bao-tree",
  "bytes",
  "cfg_aliases",
  "chrono",
- "constant_time_eq",
+ "constant_time_eq 0.6.1",
  "data-encoding",
  "derive_more",
  "genawaiter",
@@ -3163,9 +3171,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-mainline-address-lookup"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b22c9822c36917ef39bba3d507391192806e079a1787cc0f663c01e2e7ca18bd"
+checksum = "4624139b4c3e5e9b5e9aa137e4e591b4462a450c77e64ef3f137230d3d787230"
 dependencies = [
  "derive_more",
  "iroh",
@@ -3181,9 +3189,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-mdns-address-lookup"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cad3dfcaddd5c3681bf0a42606498fc6e8891de793408dfbc46a9fbe76f370b3"
+checksum = "c7e00b132891c9cfad726fb437b62315e722949d409717b6c7dcb535e9f24112"
 dependencies = [
  "data-encoding",
  "derive_more",
@@ -3287,9 +3295,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-util"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20e41eb982f15230c55f0a70a74a514360e1f565b07861924fd0e8db172b3d00"
+checksum = "889d5cc9da2eaac9f63657237c491db17d1fe9fffdc7c0f2f0e04c49d5d45053"
 dependencies = [
  "derive_more",
  "iroh",
@@ -3910,9 +3918,9 @@ dependencies = [
 
 [[package]]
 name = "n0-mainline"
-version = "0.6.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e1350c6f72a2b3368ebf17779844746f246decd886d610f11b2317148fb9fd4"
+checksum = "b739fb0145326fa2287f704a5a3bceb5d21c5b6f1b09436403b504f85c2e6ded"
 dependencies = [
  "crc",
  "dyn-clone",
@@ -5274,7 +5282,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "aec3",
  "base64 0.23.1",
@@ -5330,7 +5338,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.33"
+version = "0.2.34"
 dependencies = [
  "hex",
  "hkdf",
@@ -5621,9 +5629,9 @@ dependencies = [
 
 [[package]]
 name = "ringbuf"
-version = "0.5.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b58b631e416dd7d84549d7e6a50f767e111f9b03e30d04f40072f6618f386aaf"
+checksum = "33d5f59e4145df5f29e84b6389394a8a3fedf7bd8c12570560ae67a917e6eae3"
 dependencies = [
  "crossbeam-utils",
  "portable-atomic",

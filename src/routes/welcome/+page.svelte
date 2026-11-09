@@ -2,12 +2,12 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
-  import { useNodeInit } from "$lib/composables";
-  import WelcomeIntro from "$lib/welcome/WelcomeIntro.svelte";
-  import RecoveryForm from "$lib/welcome/RecoveryForm.svelte";
-  import SeedPhraseDisplay from "$lib/welcome/SeedPhraseDisplay.svelte";
-  import SeedVerification from "$lib/welcome/SeedVerification.svelte";
-  import ProfileSetupForm from "$lib/welcome/ProfileSetupForm.svelte";
+  import { useNodeInit } from "#lib/composables/index.ts";
+  import WelcomeIntro from "#lib/welcome/WelcomeIntro.svelte";
+  import RecoveryForm from "#lib/welcome/RecoveryForm.svelte";
+  import SeedPhraseDisplay from "#lib/welcome/SeedPhraseDisplay.svelte";
+  import SeedVerification from "#lib/welcome/SeedVerification.svelte";
+  import ProfileSetupForm from "#lib/welcome/ProfileSetupForm.svelte";
 
   const RECOVERY = -1;
   const INTRO = 0;

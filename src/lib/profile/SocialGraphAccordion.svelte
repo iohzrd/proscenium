@@ -1,8 +1,11 @@
 <script lang="ts">
-  import Avatar from "$lib/Avatar.svelte";
-  import { profileHref } from "$lib/profile/links";
-  import type { RemoteSocialResult, RemoteFollowersResult } from "$lib/types";
-  import { shortId } from "$lib/utils";
+  import Avatar from "#lib/Avatar.svelte";
+  import { profileHref } from "#lib/profile/links.ts";
+  import type {
+    RemoteSocialResult,
+    RemoteFollowersResult,
+  } from "#lib/types.ts";
+  import { shortId } from "#lib/utils.ts";
 
   let {
     remoteFollows,

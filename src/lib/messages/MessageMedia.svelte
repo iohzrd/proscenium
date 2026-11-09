@@ -1,9 +1,9 @@
 <script lang="ts">
-  import type { MediaAttachment } from "$lib/types";
-  import type { BlobCache } from "$lib/blobs";
-  import { showContextMenu } from "$lib/context-menu";
-  import MediaLoader, { mediaKind } from "$lib/MediaLoader.svelte";
-  import { formatSize } from "$lib/utils";
+  import type { MediaAttachment } from "#lib/types.ts";
+  import type { BlobCache } from "#lib/blobs.ts";
+  import { showContextMenu } from "#lib/context-menu.ts";
+  import MediaLoader, { mediaKind } from "#lib/MediaLoader.svelte";
+  import { formatSize } from "#lib/utils.ts";
 
   let {
     media,

@@ -1,9 +1,9 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onDestroy, onMount } from "svelte";
-  import Icon from "$lib/Icon.svelte";
-  import Modal from "$lib/Modal.svelte";
-  import type { ServerEntry } from "$lib/types";
+  import Icon from "#lib/Icon.svelte";
+  import Modal from "#lib/Modal.svelte";
+  import type { ServerEntry } from "#lib/types.ts";
 
   let servers = $state<ServerEntry[]>([]);
   let newServerUrl = $state("");

@@ -1,5 +1,5 @@
 import { platform } from "@tauri-apps/plugin-os";
-import type { MediaAttachment, PendingAttachment } from "$lib/types";
+import type { MediaAttachment, PendingAttachment } from "#lib/types.ts";
 
 /** Byte limit of post and message text (`MAX_POST_CONTENT_LEN` in Rust). */
 export const MAX_CONTENT_BYTES = 10_000;

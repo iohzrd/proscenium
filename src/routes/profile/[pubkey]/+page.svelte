@@ -1,6 +1,6 @@
 <script lang="ts">
   import { page } from "$app/state";
-  import { isPubkeyFormat } from "$lib/utils";
+  import { isPubkeyFormat } from "#lib/utils.ts";
   import ProfileView from "./ProfileView.svelte";
 
   let pubkey = $derived(page.params.pubkey ?? "");

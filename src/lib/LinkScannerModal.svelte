@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { hapticNotification } from "$lib/haptics";
-  import Modal from "$lib/Modal.svelte";
-  import QrScanner from "$lib/QrScanner.svelte";
-  import type { LinkQrPayload } from "$lib/types";
-  import { isPubkeyFormat } from "$lib/utils";
+  import { hapticNotification } from "#lib/haptics.ts";
+  import Modal from "#lib/Modal.svelte";
+  import QrScanner from "#lib/QrScanner.svelte";
+  import type { LinkQrPayload } from "#lib/types.ts";
+  import { isPubkeyFormat } from "#lib/utils.ts";
 
   interface Props {
     /** Called with a payload whose shape and expiry were checked. Nothing is invoked here. */
