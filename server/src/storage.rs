@@ -1,7 +1,7 @@
 use futures_lite::Stream;
 use proscenium_types::{
     Interaction, InteractionKind, LinkedDevicesAnnouncement, MAX_SYNC_TOMBSTONES, Post, Profile,
-    ProfileUpdateRequest, RegistrationRequest, SigningKeyDelegation, Visibility, now_millis,
+    ProfileUpdateRequest, RegistrationRequest, Visibility, now_millis,
 };
 use serde::Serialize;
 use sqlx::sqlite::{
@@ -111,11 +111,11 @@ impl<'a> RegistrationChange<'a> {
         }
     }
 
-    /// `timestamp` and delegation of the signed HTTP request, if the change is one.
-    fn signed_request(&self) -> Option<(u64, &'a SigningKeyDelegation)> {
+    /// `timestamp` of the signed HTTP request, if the change is one.
+    fn request_timestamp(&self) -> Option<u64> {
         match *self {
-            Self::Register(req) | Self::Unregister(req) => Some((req.timestamp, &req.delegation)),
-            Self::UpdateProfile(req) => Some((req.timestamp, &req.delegation)),
+            Self::Register(req) | Self::Unregister(req) => Some(req.timestamp),
+            Self::UpdateProfile(req) => Some(req.timestamp),
             Self::PeerProfile { .. } => None,
         }
     }
@@ -146,8 +146,6 @@ pub struct ChangeOutcome {
 pub enum Rejection {
     /// `timestamp` is not greater than that of the last accepted request.
     Replayed,
-    /// The delegation has a lower `key_index` or `dm_key_index` than an accepted one.
-    StaleDelegation,
     /// No active registration exists for the master pubkey.
     NotRegistered,
     RegistrationClosed,
@@ -160,7 +158,6 @@ impl std::fmt::Display for Rejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Replayed => "timestamp is not newer than the last accepted request",
-            Self::StaleDelegation => "delegation is older than the stored one",
             Self::NotRegistered => "user not registered",
             Self::RegistrationClosed => "registration is closed",
             Self::UserLimitReached => "registration limit reached",
@@ -241,8 +238,6 @@ struct RegistrationRow {
     profile_visibility: Option<String>,
     visibility: String,
     last_request_timestamp: i64,
-    key_index: i64,
-    dm_key_index: i64,
     profile_updated_at: i64,
     announcement_version: i64,
 }
@@ -391,8 +386,7 @@ impl Storage {
     ) -> Result<Option<RegistrationRow>, sqlx::Error> {
         sqlx::query_as::<_, RegistrationRow>(
             "SELECT registered_at, is_active, requested_visibility, profile_visibility, visibility,
-                    last_request_timestamp, key_index, dm_key_index, profile_updated_at,
-                    announcement_version
+                    last_request_timestamp, profile_updated_at, announcement_version
              FROM registrations WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -410,38 +404,6 @@ impl Storage {
             .ok_or(ChangeError::Rejected(Rejection::NotRegistered))
     }
 
-    fn check_delegation_not_older(
-        row: &RegistrationRow,
-        delegation: &SigningKeyDelegation,
-    ) -> Result<(), Rejection> {
-        if i64::from(delegation.key_index) < row.key_index
-            || i64::from(delegation.dm_key_index) < row.dm_key_index
-        {
-            return Err(Rejection::StaleDelegation);
-        }
-        Ok(())
-    }
-
-    async fn store_delegation(
-        conn: &mut SqliteConnection,
-        pubkey: &str,
-        delegation: &SigningKeyDelegation,
-    ) -> Result<(), ChangeError> {
-        sqlx::query(
-            "UPDATE registrations
-             SET signing_pubkey = ?2, delegation_json = ?3, key_index = ?4, dm_key_index = ?5
-             WHERE pubkey = ?1",
-        )
-        .bind(pubkey)
-        .bind(&delegation.signing_pubkey)
-        .bind(serde_json::to_string(delegation)?)
-        .bind(i64::from(delegation.key_index))
-        .bind(i64::from(delegation.dm_key_index))
-        .execute(conn)
-        .await?;
-        Ok(())
-    }
-
     /// Delete the posts, interactions and tombstones stored for `pubkey`.
     async fn delete_content(conn: &mut SqliteConnection, pubkey: &str) -> Result<(), sqlx::Error> {
         for sql in [
@@ -454,8 +416,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Mark the registration inactive at time `now` and clear profile, delegation and
-    /// device columns. The replay and downgrade floors are kept.
+    /// Mark the registration inactive at time `now` and clear profile and device
+    /// columns. The replay and downgrade floors are kept.
     async fn deactivate(
         conn: &mut SqliteConnection,
         pubkey: &str,
@@ -464,8 +426,8 @@ impl Storage {
         sqlx::query(
             "UPDATE registrations
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
-                 bio = NULL, avatar_hash = NULL, transport_node_id = NULL, signing_pubkey = NULL,
-                 delegation_json = NULL, device_node_ids_json = NULL
+                 bio = NULL, avatar_hash = NULL, transport_node_id = NULL,
+                 device_node_ids_json = NULL
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -490,11 +452,10 @@ impl Storage {
     /// Apply one registration, unregistration or profile change in one transaction.
     ///
     /// For a signed HTTP request the transaction first rejects a `timestamp` that is not
-    /// greater than the last accepted one and a delegation older than the stored one.
-    /// A profile is stored only if its `updated_at` is not lower than the stored value;
-    /// a profile with private visibility deactivates the registration. Posts,
-    /// interactions and tombstones of the user are deleted when the registration stops
-    /// being active with public visibility.
+    /// greater than the last accepted one. A profile is stored only if its `updated_at`
+    /// is not lower than the stored value; a profile with private visibility deactivates
+    /// the registration. Posts, interactions and tombstones of the user are deleted when
+    /// the registration stops being active with public visibility.
     pub async fn apply_registration_change(
         &self,
         change: &RegistrationChange<'_>,
@@ -505,11 +466,10 @@ impl Storage {
         let mut tx = self.begin_write().await?;
         let row = Self::load_registration_row(&mut tx, pubkey).await?;
 
-        if let (Some((timestamp, delegation)), Some(row)) = (change.signed_request(), &row) {
-            if to_i64(timestamp) <= row.last_request_timestamp {
-                return Err(Rejection::Replayed.into());
-            }
-            Self::check_delegation_not_older(row, delegation)?;
+        if let (Some(timestamp), Some(row)) = (change.request_timestamp(), &row)
+            && to_i64(timestamp) <= row.last_request_timestamp
+        {
+            return Err(Rejection::Replayed.into());
         }
 
         let was_active = row.as_ref().is_some_and(|r| r.is_active);
@@ -562,7 +522,6 @@ impl Storage {
                 .bind(to_i64(req.timestamp))
                 .execute(&mut *tx)
                 .await?;
-                Self::store_delegation(&mut tx, pubkey, &req.delegation).await?;
                 ChangeOutcome {
                     was_active,
                     is_active: true,
@@ -577,14 +536,10 @@ impl Storage {
                     .ok_or(Rejection::NotRegistered)?;
                 Self::deactivate(&mut tx, pubkey, now).await?;
                 sqlx::query(
-                    "UPDATE registrations
-                     SET last_request_timestamp = ?2, key_index = ?3, dm_key_index = ?4
-                     WHERE pubkey = ?1",
+                    "UPDATE registrations SET last_request_timestamp = ?2 WHERE pubkey = ?1",
                 )
                 .bind(pubkey)
                 .bind(to_i64(req.timestamp))
-                .bind(i64::from(req.delegation.key_index))
-                .bind(i64::from(req.delegation.dm_key_index))
                 .execute(&mut *tx)
                 .await?;
                 ChangeOutcome {
@@ -606,7 +561,6 @@ impl Storage {
                 .bind(to_i64(req.timestamp))
                 .execute(&mut *tx)
                 .await?;
-                Self::store_delegation(&mut tx, pubkey, &req.delegation).await?;
                 Self::apply_profile(&mut tx, pubkey, &row, &req.profile, now).await?
             }
             RegistrationChange::PeerProfile { profile, .. } => {
@@ -687,43 +641,19 @@ impl Storage {
         Ok(outcome)
     }
 
-    /// Store a delegation whose master-key signature the caller has verified, for an
-    /// active registration. Rejected if it is older than the stored one.
-    pub async fn cache_delegation(
-        &self,
-        delegation: &SigningKeyDelegation,
-    ) -> Result<(), ChangeError> {
-        let mut tx = self.begin_write().await?;
-        let row = Self::load_active_row(&mut tx, &delegation.master_pubkey).await?;
-        Self::check_delegation_not_older(&row, delegation)?;
-        Self::store_delegation(&mut tx, &delegation.master_pubkey, delegation).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Store a device announcement that passed `verify_linked_devices_announcement`,
-    /// for an active registration.
+    /// Store the device NodeIds of an announcement that passed
+    /// `verify_linked_devices_announcement`, for an active registration.
     ///
-    /// The embedded delegation is stored under the rule of `cache_delegation`. The
-    /// device NodeId list is replaced only if `announcement.version` is greater than
-    /// the stored version.
+    /// The stored list is replaced only if `announcement.version` is greater than the
+    /// stored version.
     pub async fn cache_announcement(
         &self,
         announcement: &LinkedDevicesAnnouncement,
     ) -> Result<AnnouncementOutcome, ChangeError> {
         let mut tx = self.begin_write().await?;
         let row = Self::load_active_row(&mut tx, &announcement.master_pubkey).await?;
-        Self::check_delegation_not_older(&row, &announcement.delegation)?;
-        Self::store_delegation(
-            &mut tx,
-            &announcement.master_pubkey,
-            &announcement.delegation,
-        )
-        .await?;
-
         let version = to_i64(announcement.version);
         if version <= row.announcement_version {
-            tx.commit().await?;
             return Ok(AnnouncementOutcome::NotNewer);
         }
         let node_ids: Vec<&str> = announcement
@@ -742,17 +672,6 @@ impl Storage {
         .await?;
         tx.commit().await?;
         Ok(AnnouncementOutcome::Stored)
-    }
-
-    /// The signing key of an active registration, if one is stored.
-    pub async fn get_signing_pubkey(&self, pubkey: &str) -> anyhow::Result<Option<String>> {
-        let key: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT signing_pubkey FROM registrations WHERE pubkey = ?1 AND is_active = 1",
-        )
-        .bind(pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(key.flatten())
     }
 
     /// The NodeIds known for an active registration: the registering device first, then

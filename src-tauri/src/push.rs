@@ -5,8 +5,8 @@ use crate::constants::{
 use crate::error::AppError;
 use crate::framing::{read_to_end_timeout, wait_closed, write_all_timeout};
 use crate::ingest::{
-    InteractionOutcome, resolve_signer, verify_and_apply_post_tombstones,
-    verify_and_store_interaction, verify_and_store_post, verify_and_store_profile,
+    InteractionOutcome, verify_and_apply_post_tombstones, verify_and_store_interaction,
+    verify_and_store_post, verify_and_store_profile,
 };
 use crate::storage::Storage;
 use iroh::{
@@ -63,7 +63,7 @@ pub async fn push_to_peer(
 ///
 /// Content is accepted only if the local user follows `msg.author` (and, with Private
 /// visibility, `msg.author` is also an approved follower), the sending NodeId is in the
-/// author's stored device list, and a signing key is cached for the author.
+/// author's stored device list, and the author signed it.
 pub async fn handle_push(
     storage: &Storage,
     my_pubkey: &str,
@@ -110,9 +110,8 @@ pub async fn handle_push(
         return Err(reject("unauthorized"));
     }
 
-    // The author's signed device list carries its current delegation and device NodeIds.
-    // It is stored before the sender and the content are checked, so a push sent after a
-    // signing key rotation or from a newly linked device verifies.
+    // The author's signed device list is stored before the sender is checked, so a push
+    // from a newly linked device is accepted.
     if let Some(announcement) = &msg.announcement {
         if announcement.master_pubkey != author {
             return Err(reject("announcement of another user"));
@@ -160,24 +159,14 @@ pub async fn handle_push(
         .is_hidden(author)
         .await
         .map_err(AcceptError::from_err)?;
-    let signer = resolve_signer(storage, author).await;
-    if signer.is_none() {
-        log::warn!(
-            "[push-rx] no cached signing key for {}, content not stored",
-            short_id(author)
-        );
-    }
-
-    if !hidden && let Some(signer) = signer {
-        let removed =
-            verify_and_apply_post_tombstones(storage, author, &msg.tombstones, &signer, "push-rx")
-                .await
-                .posts_removed;
+    if !hidden {
+        let removed = verify_and_apply_post_tombstones(storage, author, &msg.tombstones, "push-rx")
+            .await
+            .posts_removed;
 
         for post in &msg.posts {
             if post.author == author
-                && verify_and_store_post(storage, post, &signer, "push-rx", my_pubkey, app_handle)
-                    .await
+                && verify_and_store_post(storage, post, "push-rx", my_pubkey, app_handle).await
             {
                 ack.received_post_ids.push(post.id.clone());
             }
@@ -188,7 +177,6 @@ pub async fn handle_push(
                 storage,
                 interaction,
                 author,
-                &signer,
                 "push-rx",
                 my_pubkey,
                 app_handle,
@@ -200,7 +188,7 @@ pub async fn handle_push(
         }
 
         if let Some(profile) = &msg.profile {
-            match verify_and_store_profile(storage, author, profile, &signer).await {
+            match verify_and_store_profile(storage, author, profile).await {
                 Ok(true) => {
                     let _ = app_handle.emit("profile-updated", author);
                 }

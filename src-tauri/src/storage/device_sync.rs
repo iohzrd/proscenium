@@ -107,7 +107,6 @@ impl Storage {
         &self,
         master_pubkey: &str,
         lww: &LwwState,
-        signing_key_index: u32,
     ) -> Result<DeviceSyncVector, AppError> {
         let (post_count, newest_post_ts): (i64, i64) = sqlx::query_as(
             "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM posts WHERE author = ?1",
@@ -129,7 +128,6 @@ impl Storage {
             newest_interaction_ts: newest_interaction_ts as u64,
             lww_digest: lww.digest(),
             devices: self.get_linked_devices().await?,
-            signing_key_index,
         })
     }
 

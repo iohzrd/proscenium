@@ -7,18 +7,16 @@ use crate::ingest::{
     verify_and_store_post,
 };
 use crate::storage::Storage;
-use iroh::PublicKey;
 use proscenium_types::{MAX_SYNC_TOMBSTONES, Post, SyncFrame};
 use tauri::AppHandle;
 
 /// Verifies and stores the frames of one sync stream as they arrive.
 ///
-/// Every item must be authored by `pubkey` and signed by `signer`, the cached signing key
-/// of `pubkey`. Items that fail a check are skipped; exceeding an item cap is an error.
+/// Every item must be authored and signed by `pubkey`. Items that fail a check are
+/// skipped; exceeding an item cap is an error.
 pub(super) struct FrameIngest<'a> {
     storage: &'a Storage,
     pubkey: &'a str,
-    signer: PublicKey,
     label: &'a str,
     my_id: &'a str,
     app_handle: &'a AppHandle,
@@ -42,7 +40,6 @@ impl<'a> FrameIngest<'a> {
     pub fn new(
         storage: &'a Storage,
         pubkey: &'a str,
-        signer: PublicKey,
         label: &'a str,
         my_id: &'a str,
         app_handle: &'a AppHandle,
@@ -51,7 +48,6 @@ impl<'a> FrameIngest<'a> {
         Self {
             storage,
             pubkey,
-            signer,
             label,
             my_id,
             app_handle,
@@ -82,7 +78,6 @@ impl<'a> FrameIngest<'a> {
                     self.storage,
                     self.pubkey,
                     &tombstones,
-                    &self.signer,
                     self.label,
                 )
                 .await;
@@ -103,7 +98,6 @@ impl<'a> FrameIngest<'a> {
                     if verify_and_store_post(
                         self.storage,
                         &post,
-                        &self.signer,
                         self.label,
                         self.my_id,
                         self.app_handle,
@@ -132,7 +126,6 @@ impl<'a> FrameIngest<'a> {
                         self.storage,
                         &interaction,
                         self.pubkey,
-                        &self.signer,
                         self.label,
                         self.my_id,
                         self.app_handle,

@@ -9,10 +9,10 @@ impl ActiveStage {
     /// Process a control message whose signature, payload limits and timestamp window
     /// the receive task checked.
     ///
-    /// The actor of a message is the master pubkey bound to its signer: by the delegation
-    /// of the `Presence` itself, or by an earlier verified `Presence` of that signer.
-    /// A message from an unbound signer, a banned identity, or with a timestamp that is
-    /// not higher than the signer's last one is discarded.
+    /// The actor of a message is its signer (`sender_pubkey`). A verified `Presence`
+    /// admits its signer; a message from a signer without an admitted `Presence`, from a
+    /// banned identity, or with a timestamp that is not higher than the signer's last one
+    /// is discarded.
     pub(super) async fn handle_control(&mut self, msg: VerifiedControl) -> Outcome {
         let VerifiedControl { signed, presence } = msg;
         if signed.stage_id != self.stage_id {
@@ -22,28 +22,26 @@ impl ActiveStage {
         let actor = match (&signed.control, presence) {
             (StageControl::Presence { .. }, Some(presence)) => {
                 if self.roles.is_banned(&presence.master_pubkey)
-                    || !self
-                        .signers
-                        .bind(&presence.signing_pubkey, &presence.master_pubkey)
+                    || !self.senders.admit(&presence.master_pubkey)
                 {
                     return Outcome::Continue;
                 }
                 presence.master_pubkey
             }
             (StageControl::Presence { .. }, None) => return Outcome::Continue,
-            _ => match self.signers.master_of(&signed.sender_pubkey) {
-                Some(master) => master.to_string(),
-                None => {
+            _ => {
+                if !self.senders.contains(&signed.sender_pubkey) {
                     log::debug!(
                         "[stage-ctrl] discarding message of unknown signer {}",
                         short_id(&signed.sender_pubkey)
                     );
                     return Outcome::Continue;
                 }
-            },
+                signed.sender_pubkey.clone()
+            }
         };
         if !self
-            .signers
+            .senders
             .accept_timestamp(&signed.sender_pubkey, signed.timestamp)
         {
             log::debug!(

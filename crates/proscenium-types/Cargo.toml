@@ -11,8 +11,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 iroh-gossip = { workspace = true }
-
-[dev-dependencies]
-getrandom = "0.4.2"
-hex = "0.4"
-x25519-dalek = { version = "3", features = ["static_secrets"] }

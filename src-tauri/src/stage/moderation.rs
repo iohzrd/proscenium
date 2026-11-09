@@ -320,8 +320,8 @@ impl ActiveStage {
 
         let participants = &self.participants;
         let host_pubkey = &self.roles.host_pubkey;
-        self.signers.prune(now, |master| {
-            master == host_pubkey || participants.contains_key(master)
+        self.senders.prune(now, |sender| {
+            sender == host_pubkey || participants.contains_key(sender)
         });
     }
 }

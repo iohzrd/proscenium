@@ -2,7 +2,6 @@
 
 use crate::ingestion::{IngestionManager, is_public};
 use crate::storage::{ChangeError, RegistrationChange};
-use iroh::PublicKey;
 use iroh::endpoint::{Connection, RecvStream};
 use proscenium_types::{
     Interaction, MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, PEER_ALPN, PeerRequest, Post, PostTombstone,
@@ -221,8 +220,7 @@ impl IngestionManager {
         .await
         .map_err(|_| anyhow::anyhow!("no summary within {}s", SUMMARY_TIMEOUT.as_secs()))??;
 
-        // The signed device list carries the current delegation. It is stored before any
-        // content is verified, so content signed after a key rotation is accepted.
+        // The signed device list replaces the stored device NodeIds if its version is higher.
         if let Some(announcement) = &summary.announcement {
             if announcement.master_pubkey != pubkey {
                 tracing::warn!(
@@ -246,14 +244,9 @@ impl IngestionManager {
             }
         }
 
-        let signer = self
-            .resolve_signer(pubkey)
-            .await
-            .map_err(|reason| anyhow::anyhow!(reason))?;
-
         if let Some(profile) = &summary.profile {
-            let verified = validate_profile(profile)
-                .and_then(|()| verify_profile_signature(profile, pubkey, &signer));
+            let verified =
+                validate_profile(profile).and_then(|()| verify_profile_signature(profile, pubkey));
             match verified {
                 Ok(()) => {
                     let change = RegistrationChange::PeerProfile {
@@ -309,15 +302,14 @@ impl IngestionManager {
             };
             match serde_json::from_slice::<SyncFrame>(&frame)? {
                 SyncFrame::Tombstones(tombstones) => {
-                    self.store_synced_tombstones(pubkey, &signer, tombstones, stats)
+                    self.store_synced_tombstones(pubkey, tombstones, stats)
                         .await?;
                 }
                 SyncFrame::Posts(posts) => {
-                    self.store_synced_posts(pubkey, &signer, posts, stats)
-                        .await?;
+                    self.store_synced_posts(pubkey, posts, stats).await?;
                 }
                 SyncFrame::Interactions(interactions) => {
-                    self.store_synced_interactions(pubkey, &signer, interactions, stats)
+                    self.store_synced_interactions(pubkey, interactions, stats)
                         .await?;
                 }
             }
@@ -329,7 +321,6 @@ impl IngestionManager {
     async fn store_synced_tombstones(
         &self,
         pubkey: &str,
-        signer: &PublicKey,
         tombstones: Vec<PostTombstone>,
         stats: &mut SyncStats,
     ) -> anyhow::Result<()> {
@@ -341,7 +332,7 @@ impl IngestionManager {
         let verified = retain_valid(tombstones, |t| {
             t.author == pubkey
                 && is_valid_id(&t.id)
-                && verify_delete_post_signature(&t.id, &t.author, &t.signature, signer).is_ok()
+                && verify_delete_post_signature(&t.id, &t.author, &t.signature).is_ok()
         })
         .await;
         stats.rejected += received - verified.len();
@@ -355,7 +346,6 @@ impl IngestionManager {
     async fn store_synced_posts(
         &self,
         pubkey: &str,
-        signer: &PublicKey,
         posts: Vec<Post>,
         stats: &mut SyncStats,
     ) -> anyhow::Result<()> {
@@ -366,8 +356,7 @@ impl IngestionManager {
         }
         let received = posts.len();
         let verified = retain_valid(posts, |post| {
-            self.check_post_fields(post, pubkey).is_ok()
-                && verify_post_signature(post, signer).is_ok()
+            self.check_post_fields(post, pubkey).is_ok() && verify_post_signature(post).is_ok()
         })
         .await;
         stats.rejected += received - verified.len();
@@ -385,7 +374,6 @@ impl IngestionManager {
     async fn store_synced_interactions(
         &self,
         pubkey: &str,
-        signer: &PublicKey,
         interactions: Vec<Interaction>,
         stats: &mut SyncStats,
     ) -> anyhow::Result<()> {
@@ -399,7 +387,7 @@ impl IngestionManager {
         let received = interactions.len();
         let verified = retain_valid(interactions, |interaction| {
             self.check_interaction_fields(interaction, pubkey).is_ok()
-                && verify_interaction_signature(interaction, signer).is_ok()
+                && verify_interaction_signature(interaction).is_ok()
         })
         .await;
         stats.rejected += received - verified.len();

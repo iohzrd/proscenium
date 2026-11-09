@@ -2,7 +2,6 @@ use super::{after_cursor, as_storage_cursor, before_cursor, require_id, require_
 use crate::constants::{DEFAULT_FEED_LIMIT, DEFAULT_REPLY_LIMIT};
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh::SecretKey;
 use proscenium_types::{
     MediaAttachment, Post, now_millis, sign_delete_post, sign_post, validate_post,
 };
@@ -19,9 +18,9 @@ pub async fn repost(
 ) -> CmdResult<Post> {
     require_id(&target_post_id)?;
     require_pubkey(&target_author)?;
-    let (author, signing_key_bytes) = {
+    let (author, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     if state.storage.has_repost(&author, &target_post_id).await? {
         return Err("post is already reposted".into());
@@ -39,7 +38,7 @@ pub async fn repost(
         quote_of_author: Some(target_author),
         signature: String::new(),
     };
-    sign_post(&mut post, &SecretKey::from_bytes(&signing_key_bytes));
+    sign_post(&mut post, &master_key);
     validate_post(&post)?;
     state.storage.insert_post(&post).await?;
     state.gossip().broadcast_post(&post).await?;
@@ -57,9 +56,9 @@ pub async fn create_post(
     quote_of: Option<String>,
     quote_of_author: Option<String>,
 ) -> CmdResult<Post> {
-    let (author, signing_key_bytes) = {
+    let (author, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let media_count = media.as_ref().map_or(0, |m| m.len());
     let mut post = Post {
@@ -75,7 +74,7 @@ pub async fn create_post(
         quote_of_author,
         signature: String::new(),
     };
-    sign_post(&mut post, &SecretKey::from_bytes(&signing_key_bytes));
+    sign_post(&mut post, &master_key);
     // Rejects oversized content, invalid media and malformed `reply_to` / `quote_of`
     // ids and authors before anything is stored or sent.
     validate_post(&post)?;
@@ -95,19 +94,18 @@ pub async fn create_post(
 #[tauri::command]
 pub async fn unrepost(state: State<'_, Arc<AppState>>, target_post_id: String) -> CmdResult<()> {
     require_id(&target_post_id)?;
-    let (my_id, signing_key_bytes) = {
+    let (my_id, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let ids = state
         .storage
         .delete_repost_by_target(&my_id, &target_post_id)
         .await?;
-    let signing_key = SecretKey::from_bytes(&signing_key_bytes);
     // Every deleted id is broadcast even if an earlier broadcast failed.
     let mut result = Ok(());
     for id in &ids {
-        let signature = sign_delete_post(id, &my_id, &signing_key);
+        let signature = sign_delete_post(id, &my_id, &master_key);
         if let Err(e) = state
             .gossip()
             .broadcast_delete(id, &my_id, &signature)
@@ -125,15 +123,15 @@ pub async fn unrepost(state: State<'_, Arc<AppState>>, target_post_id: String) -
 #[tauri::command]
 pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
     require_id(&id)?;
-    let (my_id, signing_key_bytes) = {
+    let (my_id, master_key) = {
         let ident = state.identity.read().await;
-        (ident.master_pubkey.clone(), ident.signing_secret_key_bytes)
+        (ident.master_pubkey.clone(), ident.master_key.clone())
     };
     if !state.storage.delete_post(&my_id, &id).await? {
         return Err(format!("no post {id} by the local user").into());
     }
     log::info!("[post] deleted post {id}");
-    let signature = sign_delete_post(&id, &my_id, &SecretKey::from_bytes(&signing_key_bytes));
+    let signature = sign_delete_post(&id, &my_id, &master_key);
     state
         .gossip()
         .broadcast_delete(&id, &my_id, &signature)

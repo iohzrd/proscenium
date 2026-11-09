@@ -79,7 +79,7 @@ async fn handshake_with_node(
 /// Returns the serialized `DmHandshake::Response`.
 ///
 /// A session is stored only if all of these hold: `sender` is the static key the Noise
-/// handshake authenticated; `sender` is the DM pubkey of a cached delegation, or of the
+/// handshake authenticated; `sender` is the DM pubkey of a cached device list, or of the
 /// verified identity that `remote` returns; that user is not blocked.
 pub(super) async fn handle_handshake(
     handler: &DmHandler,
@@ -130,7 +130,7 @@ pub(super) async fn handle_handshake(
         None => {
             // Unknown DM key: ask the connecting node for its signed identity.
             let identity = crate::peer::query_identity(&handler.endpoint, remote).await?;
-            if identity.delegation().dm_pubkey != sender {
+            if identity.dm_pubkey() != sender {
                 return Err(AppError::Other(
                     "handshake sender is not the DM pubkey of the node's identity".into(),
                 ));

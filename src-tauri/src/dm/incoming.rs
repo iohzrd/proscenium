@@ -73,7 +73,7 @@ impl DmHandler {
         }
 
         // Attribute the DM key to a user before any state is read or written. Without a
-        // cached delegation the sender must run a handshake, which verifies its identity.
+        // cached device list the sender must run a handshake, which verifies its identity.
         let Some(peer_master_pubkey) = self
             .storage
             .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)

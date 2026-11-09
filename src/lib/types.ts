@@ -157,8 +157,6 @@ export interface ServerFeedPost {
   quote_of_author: string | null;
   signature: string;
   indexed_at: number;
-  /** True if the client verified the post signature against a cached delegation of the author. */
-  verified: boolean;
 }
 
 export interface TrendingHashtag {
@@ -197,8 +195,6 @@ export interface ServerSearchPost {
   quote_of_author: string | null;
   signature: string;
   indexed_at: number;
-  /** True if the client verified the post signature against a cached delegation of the author. */
-  verified: boolean;
 }
 
 export interface PostSearchResponse {

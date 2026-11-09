@@ -25,14 +25,14 @@ use crate::gossip::GossipService;
 use crate::state::{AppState, SharedIdentity};
 use crate::storage::Storage;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, PublicKey, SecretKey,
+    Endpoint, EndpointAddr, EndpointId,
     endpoint::{Connection, RecvStream, SendStream, VarInt},
     protocol::AcceptError,
 };
 use proscenium_types::{
     BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, FollowEntry, Interaction, MAX_LINKED_DEVICES,
-    ModerationEntry, PEER_ALPN, PeerRequest, Post, derive_signing_key, short_id,
-    validate_interaction, validate_post, verify_interaction_signature, verify_post_signature,
+    ModerationEntry, PEER_ALPN, PeerRequest, Post, short_id, validate_interaction, validate_post,
+    verify_interaction_signature, verify_post_signature,
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -50,9 +50,6 @@ const MAX_SYNC_FRAMES: usize = 1_000;
 const MAX_SYNC_ITEMS: usize = 200_000;
 /// Follow, moderation or bookmark rows per frame.
 const LWW_BATCH_SIZE: usize = 500;
-/// Number of signing key indexes, counted back from the current one, whose signatures
-/// are accepted on imported posts and interactions.
-const MAX_SIGNING_KEY_HISTORY: u32 = 64;
 /// QUIC close code for a rejected or failed device sync.
 const CLOSE_FAILED: u32 = 1;
 
@@ -104,48 +101,22 @@ pub struct DeviceSyncStats {
     pub moderation_merged: u32,
     pub bookmarks_merged: u32,
     pub devices_added: u32,
-    /// Signing key index in the other device's vector.
-    pub peer_signing_key_index: u32,
 }
 
-/// Public signing keys for the indexes up to `signing_key_index`, at most
-/// `MAX_SIGNING_KEY_HISTORY` of them. Own posts made before a key rotation carry a
-/// signature of an earlier index.
-fn own_signing_pubkeys(
-    master_secret_key_bytes: &[u8; 32],
-    signing_key_index: u32,
-) -> Vec<PublicKey> {
-    let first = signing_key_index.saturating_sub(MAX_SIGNING_KEY_HISTORY - 1);
-    (first..=signing_key_index)
-        .rev()
-        .map(|index| {
-            SecretKey::from_bytes(&derive_signing_key(master_secret_key_bytes, index)).public()
-        })
-        .collect()
-}
-
-/// True if `post` is authored by `master_pubkey`, passes `validate_post`, and carries a
-/// signature of one of `signers`.
-fn is_own_valid_post(post: &Post, master_pubkey: &str, signers: &[PublicKey]) -> bool {
+/// True if `post` is authored by `master_pubkey`, passes `validate_post`, and is signed
+/// by its author.
+fn is_own_valid_post(post: &Post, master_pubkey: &str) -> bool {
     post.author == master_pubkey
         && validate_post(post).is_ok()
-        && signers
-            .iter()
-            .any(|signer| verify_post_signature(post, signer).is_ok())
+        && verify_post_signature(post).is_ok()
 }
 
 /// True if `interaction` is authored by `master_pubkey`, passes `validate_interaction`,
-/// and carries a signature of one of `signers`.
-fn is_own_valid_interaction(
-    interaction: &Interaction,
-    master_pubkey: &str,
-    signers: &[PublicKey],
-) -> bool {
+/// and is signed by its author.
+fn is_own_valid_interaction(interaction: &Interaction, master_pubkey: &str) -> bool {
     interaction.author == master_pubkey
         && validate_interaction(interaction).is_ok()
-        && signers
-            .iter()
-            .any(|signer| verify_interaction_signature(interaction, signer).is_ok())
+        && verify_interaction_signature(interaction).is_ok()
 }
 
 /// Number of posts, interactions or rows in a data frame.
@@ -214,27 +185,22 @@ struct DeviceSync<'a> {
 impl DeviceSync<'_> {
     /// Load the local rows and build the vector that describes the local state.
     async fn local_state(&self) -> Result<(String, LwwState, DeviceSyncVector), AppError> {
-        let (master_pubkey, signing_key_index) = {
-            let id = self.identity.read().await;
-            (id.master_pubkey.clone(), id.signing_key_index)
-        };
+        let master_pubkey = self.identity.read().await.master_pubkey.clone();
         let lww = self.storage.load_lww_state(&master_pubkey).await?;
         let vector = self
             .storage
-            .build_device_sync_vector(&master_pubkey, &lww, signing_key_index)
+            .build_device_sync_vector(&master_pubkey, &lww)
             .await?;
         Ok((master_pubkey, lww, vector))
     }
 
-    /// Apply the parts of the other device's vector that are not row data: record its
-    /// signing key index, and store its device entries that are not stored yet and whose
-    /// NodeId derives from the local master key.
+    /// Store the device entries of the other device's vector that are not stored yet and
+    /// whose NodeId derives from the local master key.
     async fn apply_peer_vector(
         &self,
         peer: &DeviceSyncVector,
         stats: &mut DeviceSyncStats,
     ) -> Result<(), AppError> {
-        stats.peer_signing_key_index = peer.signing_key_index;
         let other_devices: Vec<_> = {
             let id = self.identity.read().await;
             id.own_devices(&peer.devices)
@@ -309,22 +275,14 @@ impl DeviceSync<'_> {
     /// Read data frames until the zero-length frame and store their content.
     ///
     /// A post or interaction is stored only if it is authored by the local user, passes
-    /// validation and carries a signature of a signing key of this identity, up to the
-    /// higher of the two devices' signing key indexes. At most `MAX_SYNC_FRAMES` frames
-    /// and `MAX_SYNC_ITEMS` items are accepted.
+    /// validation and is signed by the master key. At most `MAX_SYNC_FRAMES` frames and
+    /// `MAX_SYNC_ITEMS` items are accepted.
     async fn import_frames(
         &self,
         recv: &mut RecvStream,
         master_pubkey: &str,
         stats: &mut DeviceSyncStats,
     ) -> Result<(), AppError> {
-        let signers = {
-            let id = self.identity.read().await;
-            own_signing_pubkeys(
-                &id.master_secret_key_bytes,
-                id.signing_key_index.max(stats.peer_signing_key_index),
-            )
-        };
         let mut frames = 0usize;
         let mut items = 0usize;
 
@@ -344,7 +302,7 @@ impl DeviceSync<'_> {
                 DeviceSyncFrame::Posts(posts) => {
                     for post in &posts {
                         // A post deleted on this device is not stored again from another.
-                        if !is_own_valid_post(post, master_pubkey, &signers)
+                        if !is_own_valid_post(post, master_pubkey)
                             || self
                                 .storage
                                 .is_post_tombstoned(&post.author, &post.id)
@@ -358,7 +316,7 @@ impl DeviceSync<'_> {
                 }
                 DeviceSyncFrame::Interactions(interactions) => {
                     for interaction in &interactions {
-                        if !is_own_valid_interaction(interaction, master_pubkey, &signers)
+                        if !is_own_valid_interaction(interaction, master_pubkey)
                             || self
                                 .storage
                                 .is_interaction_tombstoned(&interaction.author, &interaction.id)
@@ -447,9 +405,8 @@ impl DeviceSync<'_> {
 
 /// Apply the results of a completed exchange that need more than the database.
 ///
-/// Raises the local signing key index if the other device reported a higher one, emits
-/// `feed-updated` if posts were imported, and broadcasts the device announcement if the
-/// device list or the signing key changed.
+/// Emits `feed-updated` if posts were imported, and broadcasts the device announcement if
+/// the device list changed.
 async fn after_sync(
     storage: &Storage,
     identity: &SharedIdentity,
@@ -457,31 +414,10 @@ async fn after_sync(
     app_handle: &AppHandle,
     stats: &DeviceSyncStats,
 ) {
-    let current_index = identity.read().await.signing_key_index;
-    let mut signing_key_raised = false;
-    if stats.peer_signing_key_index > current_index {
-        match crate::setup::raise_signing_key_index(
-            app_handle,
-            identity,
-            stats.peer_signing_key_index,
-        )
-        .await
-        {
-            Ok(_) => {
-                log::info!(
-                    "[device-sync] signing key index raised from {current_index} to {}",
-                    stats.peer_signing_key_index
-                );
-                signing_key_raised = true;
-            }
-            Err(e) => log::warn!("[device-sync] signing key index not raised: {e}"),
-        }
-    }
-
     if stats.posts_imported > 0 {
         let _ = app_handle.emit("feed-updated", ());
     }
-    if stats.devices_added == 0 && !signing_key_raised {
+    if stats.devices_added == 0 {
         return;
     }
     match crate::announcement::build_own_identity_response(storage, identity).await {
@@ -656,12 +592,13 @@ pub async fn sync_all_devices(state: &AppState) {
 mod tests {
     use super::*;
     use crate::state::{Identity, device_node_id, test_support::loopback_endpoint};
+    use iroh::SecretKey;
     use proscenium_types::{
         InteractionKind, derive_transport_key, now_millis, sign_interaction, sign_post,
     };
     use std::sync::Arc;
 
-    fn signed_post(master: &[u8; 32], signing_index: u32, content: &str) -> Post {
+    fn signed_post(master: &[u8; 32], content: &str) -> Post {
         let mut post = Post {
             id: String::new(),
             author: SecretKey::from_bytes(master).public().to_string(),
@@ -674,12 +611,11 @@ mod tests {
             quote_of_author: None,
             signature: String::new(),
         };
-        let key = SecretKey::from_bytes(&derive_signing_key(master, signing_index));
-        sign_post(&mut post, &key);
+        sign_post(&mut post, &SecretKey::from_bytes(master));
         post
     }
 
-    fn signed_like(master: &[u8; 32], signing_index: u32, target: &Post) -> Interaction {
+    fn signed_like(master: &[u8; 32], target: &Post) -> Interaction {
         let mut like = Interaction {
             id: "ab".repeat(16),
             author: SecretKey::from_bytes(master).public().to_string(),
@@ -689,8 +625,7 @@ mod tests {
             timestamp: now_millis(),
             signature: String::new(),
         };
-        let key = SecretKey::from_bytes(&derive_signing_key(master, signing_index));
-        sign_interaction(&mut like, &key);
+        sign_interaction(&mut like, &SecretKey::from_bytes(master));
         like
     }
 
@@ -723,9 +658,8 @@ mod tests {
         let master = [1u8; 32];
         let other = [2u8; 32];
         let shared = |identity: Identity| Arc::new(tokio::sync::RwLock::new(identity));
-        // Device A is the primary device and has rotated its signing key once.
-        let id_a = shared(Identity::derive(master, 0, 1, 0));
-        let id_b = shared(Identity::derive(master, 1, 0, 0));
+        let id_a = shared(Identity::derive(master, 0));
+        let id_b = shared(Identity::derive(master, 1));
         let me = id_a.read().await.master_pubkey.clone();
         let (node_a, node_b) = (device_node_id(&master, 0), device_node_id(&master, 1));
         let followed = SecretKey::from_bytes(&other).public().to_string();
@@ -737,9 +671,9 @@ mod tests {
             last_changed_at: changed,
         };
 
-        // Device A: a post signed with index 1, a follow, a removed bookmark, both devices.
+        // Device A: a post, a follow, a removed bookmark, both devices.
         let a = Arc::new(Storage::open_in_memory().await.unwrap());
-        let post = signed_post(&master, 1, "from device a");
+        let post = signed_post(&master, "from device a");
         a.insert_post(&post).await.unwrap();
         a.merge_follows_lww(
             &me,
@@ -765,7 +699,7 @@ mod tests {
         // Device B: a like, a mute, the same bookmark in its older active state, and
         // only its own device row.
         let b = Arc::new(Storage::open_in_memory().await.unwrap());
-        let like = signed_like(&master, 0, &signed_post(&other, 0, "target"));
+        let like = signed_like(&master, &signed_post(&other, "target"));
         b.save_interaction(&like).await.unwrap();
         b.merge_moderation_lww(&[ModerationEntry {
             pubkey: muted.clone(),
@@ -818,10 +752,9 @@ mod tests {
         ep_b.close().await;
         ep_a.close().await;
 
-        // B received A's post although B's own signing key index is lower.
+        // B received A's post.
         assert_eq!(stats_b.posts_imported, 1);
         assert_eq!(stats_b.rejected, 0);
-        assert_eq!(stats_b.peer_signing_key_index, 1);
         assert_eq!(b.count_posts_by_author(&me).await.unwrap(), 1);
         // A received B's like.
         assert_eq!(stats_a.interactions_imported, 1);
@@ -846,88 +779,43 @@ mod tests {
     }
 
     #[test]
-    fn imported_post_must_be_own_valid_and_signed_by_an_own_key() {
+    fn imported_post_must_be_own_valid_and_signed_by_the_master_key() {
         let master = [1u8; 32];
+        let other = [2u8; 32];
         let me = SecretKey::from_bytes(&master).public().to_string();
-        let signers = own_signing_pubkeys(&master, 2);
-        assert_eq!(signers.len(), 3);
 
-        // Signed with the current index and with an index from before a rotation.
-        assert!(is_own_valid_post(
-            &signed_post(&master, 2, "a"),
-            &me,
-            &signers
-        ));
-        assert!(is_own_valid_post(
-            &signed_post(&master, 0, "b"),
-            &me,
-            &signers
-        ));
-        // Signed with an index that the local device has not reached.
-        assert!(!is_own_valid_post(
-            &signed_post(&master, 3, "c"),
-            &me,
-            &signers
-        ));
+        assert!(is_own_valid_post(&signed_post(&master, "a"), &me));
 
         // Another author, signed by that author's key.
-        let other = [2u8; 32];
-        assert!(!is_own_valid_post(
-            &signed_post(&other, 0, "d"),
-            &me,
-            &signers
-        ));
+        assert!(!is_own_valid_post(&signed_post(&other, "b"), &me));
 
         // Own author field, signature made by a foreign key.
-        let mut forged = signed_post(&master, 0, "e");
-        let foreign_key = SecretKey::from_bytes(&derive_signing_key(&other, 0));
-        sign_post(&mut forged, &foreign_key);
-        assert!(!is_own_valid_post(&forged, &me, &signers));
+        let mut forged = signed_post(&master, "c");
+        sign_post(&mut forged, &SecretKey::from_bytes(&other));
+        assert!(!is_own_valid_post(&forged, &me));
 
         // Content changed after signing: the id no longer matches.
-        let mut tampered = signed_post(&master, 2, "f");
+        let mut tampered = signed_post(&master, "d");
         tampered.content.push('!');
-        assert!(!is_own_valid_post(&tampered, &me, &signers));
+        assert!(!is_own_valid_post(&tampered, &me));
     }
 
     #[test]
-    fn imported_interaction_must_be_own_valid_and_signed_by_an_own_key() {
+    fn imported_interaction_must_be_own_valid_and_signed_by_the_master_key() {
         let master = [1u8; 32];
         let me = SecretKey::from_bytes(&master).public().to_string();
-        let signers = own_signing_pubkeys(&master, 0);
-        let target = signed_post(&[2u8; 32], 0, "target");
+        let target = signed_post(&[2u8; 32], "target");
 
-        let mut like = Interaction {
-            id: "ab".repeat(16),
-            author: me.clone(),
-            kind: InteractionKind::Like,
-            target_post_id: target.id.clone(),
-            target_author: target.author.clone(),
-            timestamp: now_millis(),
-            signature: String::new(),
-        };
-        sign_interaction(
-            &mut like,
-            &SecretKey::from_bytes(&derive_signing_key(&master, 0)),
-        );
-        assert!(is_own_valid_interaction(&like, &me, &signers));
+        let like = signed_like(&master, &target);
+        assert!(is_own_valid_interaction(&like, &me));
 
         let mut unsigned = like.clone();
         unsigned.signature = "00".repeat(64);
-        assert!(!is_own_valid_interaction(&unsigned, &me, &signers));
+        assert!(!is_own_valid_interaction(&unsigned, &me));
 
         let mut bad_id = like.clone();
         bad_id.target_post_id = "not-an-id".to_string();
-        assert!(!is_own_valid_interaction(&bad_id, &me, &signers));
-    }
-
-    #[test]
-    fn signing_key_history_is_bounded() {
-        let master = [1u8; 32];
-        let signers = own_signing_pubkeys(&master, 1_000);
-        assert_eq!(signers.len(), MAX_SIGNING_KEY_HISTORY as usize);
-        let current = SecretKey::from_bytes(&derive_signing_key(&master, 1_000)).public();
-        assert_eq!(signers.first(), Some(&current));
+        assert!(!is_own_valid_interaction(&bad_id, &me));
     }
 
     #[test]

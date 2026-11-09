@@ -95,7 +95,7 @@ pub struct DeviceEntry {
     pub node_id: String,
     /// Human-readable device name.
     pub device_name: String,
-    /// Whether this is the primary device (created the signing key).
+    /// Whether this is the device with transport key derivation index 0.
     pub is_primary: bool,
     /// When this device was added (Unix timestamp ms).
     pub added_at: u64,
@@ -138,8 +138,8 @@ impl std::fmt::Debug for LinkQrPayload {
 /// Data sent from the existing device to the new device during linking,
 /// encrypted with the Noise transport state.
 ///
-/// Every other key (signing, DM, transport) is derived from the master key and the
-/// indexes below. Double Ratchet sessions are not transferred.
+/// The new device derives its transport key from the master key and `device_index`, and
+/// the DM key from the master key. Double Ratchet sessions are not transferred.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LinkBundleData {
     /// The master secret key (32 bytes, standard base64).
@@ -147,10 +147,6 @@ pub struct LinkBundleData {
     /// Transport key derivation index assigned to the new device
     /// (`1..MAX_LINKED_DEVICES`).
     pub device_index: u32,
-    /// Current signing key derivation index.
-    pub signing_key_index: u32,
-    /// Current DM key derivation index.
-    pub dm_key_index: u32,
     /// The existing device's device list. Does not contain the new device.
     pub devices: Vec<DeviceEntry>,
     /// The user's signed profile.
@@ -161,8 +157,8 @@ pub struct LinkBundleData {
     pub moderation: Vec<ModerationEntry>,
     /// Bookmark rows, including removed ones.
     pub bookmarks: Vec<BookmarkEntry>,
-    /// Signed device announcements of followed users. Each carries the user's current
-    /// delegation and transport NodeIds, which sync and gossip subscription require.
+    /// Signed device announcements of followed users. Each carries the user's transport
+    /// NodeIds and DM pubkey, which sync, gossip subscription and DMs require.
     pub peer_announcements: Vec<crate::protocol::LinkedDevicesAnnouncement>,
 }
 
@@ -170,8 +166,6 @@ impl std::fmt::Debug for LinkBundleData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkBundleData")
             .field("device_index", &self.device_index)
-            .field("signing_key_index", &self.signing_key_index)
-            .field("dm_key_index", &self.dm_key_index)
             .field("devices", &self.devices.len())
             .field("follows", &self.follows.len())
             .field("moderation", &self.moderation.len())
@@ -304,10 +298,6 @@ pub struct ServerFeedPost {
     pub quote_of_author: Option<String>,
     pub signature: String,
     pub indexed_at: i64,
-    /// Set by the client, never by the server: true if the post signature verified
-    /// against the signing key the client holds for `author`.
-    #[serde(default)]
-    pub verified: bool,
 }
 
 impl ServerFeedPost {
@@ -395,6 +385,4 @@ pub struct DeviceSyncVector {
     pub lww_digest: String,
     /// The sender's device list.
     pub devices: Vec<DeviceEntry>,
-    /// The sender's signing key derivation index.
-    pub signing_key_index: u32,
 }

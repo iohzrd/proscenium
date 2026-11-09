@@ -1,6 +1,5 @@
-use crate::delegation::{SigningKeyDelegation, verify_delegation};
-use crate::signing::{canonical_bytes, hex_to_signature, signature_to_hex};
-use crate::validation::{is_valid_id, is_valid_pubkey};
+use crate::signing::{canonical_bytes, signature_to_hex, verify_signed_by};
+use crate::validation::{is_valid_id, is_valid_pubkey, parse_pubkey};
 use iroh::{PublicKey, SecretKey};
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
@@ -68,8 +67,9 @@ pub struct RoomState {
 }
 
 /// Control-plane messages exchanged over the iroh-gossip Stage topic.
-/// The acting participant is the verified signer of the enclosing `SignedStageControl`;
-/// a `pubkey` field names the target of the action and is a master pubkey.
+/// The acting participant is the master pubkey that signed the enclosing
+/// `SignedStageControl`; a `pubkey` field names the target of the action and is a master
+/// pubkey.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StageControl {
     /// Host signals the room has ended.
@@ -77,8 +77,6 @@ pub enum StageControl {
     /// Participant heartbeat (15 s interval). Also sent as the first frame of every
     /// audio connection.
     Presence {
-        /// Master-signed delegation naming the key that signed this message.
-        delegation: SigningKeyDelegation,
         /// Transport NodeId of the sending device.
         node_id: String,
     },
@@ -144,7 +142,6 @@ pub fn validate_room_state(state: &RoomState) -> Result<(), String> {
 }
 
 /// Check field formats and size limits of a control payload.
-/// Does not verify the delegation of a `Presence`; see `verify_presence`.
 pub fn validate_stage_control(control: &StageControl) -> Result<(), String> {
     match control {
         StageControl::End
@@ -152,7 +149,7 @@ pub fn validate_stage_control(control: &StageControl) -> Result<(), String> {
         | StageControl::LowerHand
         | StageControl::SelfMuteToggle { .. }
         | StageControl::RelayVolunteer { .. } => Ok(()),
-        StageControl::Presence { node_id, .. } => {
+        StageControl::Presence { node_id } => {
             if is_valid_pubkey(node_id) {
                 Ok(())
             } else {
@@ -206,8 +203,7 @@ pub fn validate_stage_control(control: &StageControl) -> Result<(), String> {
 pub struct SignedStageControl {
     /// Stage this message belongs to. Covered by the signature.
     pub stage_id: String,
-    /// Signing pubkey of the sender. A receiver maps it to a master pubkey through the
-    /// delegation of a verified `Presence`.
+    /// Master pubkey of the sender.
     pub sender_pubkey: String,
     /// Unix timestamp milliseconds when this was signed. Strictly increasing per sender.
     pub timestamp: u64,
@@ -233,16 +229,16 @@ fn stage_control_signing_bytes(
     ))
 }
 
-/// Sign a StageControl message for `stage_id` with the sender's signing key.
+/// Sign a StageControl message for `stage_id` with the sender's master key.
 pub fn sign_stage_control(
     stage_id: &str,
     control: StageControl,
-    signing_key: &SecretKey,
+    master_key: &SecretKey,
     timestamp: u64,
 ) -> SignedStageControl {
-    let sender_pubkey = signing_key.public().to_string();
+    let sender_pubkey = master_key.public().to_string();
     let bytes = stage_control_signing_bytes(stage_id, &sender_pubkey, timestamp, &control);
-    let sig = signing_key.sign(&bytes);
+    let sig = master_key.sign(&bytes);
     SignedStageControl {
         stage_id: stage_id.to_string(),
         sender_pubkey,
@@ -252,61 +248,42 @@ pub fn sign_stage_control(
     }
 }
 
-/// Verify the signature of a StageControl message against `signed.sender_pubkey`.
-/// Returns the signer key. The caller maps the signer to an identity and checks
-/// `stage_id` and `timestamp`.
-pub fn verify_stage_control(signed: &SignedStageControl) -> Result<PublicKey, String> {
-    if !is_valid_pubkey(&signed.sender_pubkey) {
-        return Err("invalid sender pubkey".to_string());
-    }
-    let signer: PublicKey = signed
-        .sender_pubkey
-        .parse()
-        .map_err(|e| format!("invalid sender pubkey: {e}"))?;
-    let sig = hex_to_signature(&signed.signature)?;
-    let bytes = stage_control_signing_bytes(
-        &signed.stage_id,
+/// Verify that a StageControl message was signed by the key `signed.sender_pubkey`.
+/// The caller checks `stage_id` and `timestamp`.
+pub fn verify_stage_control(signed: &SignedStageControl) -> Result<(), String> {
+    verify_signed_by(
         &signed.sender_pubkey,
-        signed.timestamp,
-        &signed.control,
-    );
-    signer
-        .verify(&bytes, &sig)
-        .map_err(|_| "stage control signature verification failed".to_string())?;
-    Ok(signer)
+        &stage_control_signing_bytes(
+            &signed.stage_id,
+            &signed.sender_pubkey,
+            signed.timestamp,
+            &signed.control,
+        ),
+        &signed.signature,
+        "stage control",
+    )
 }
 
-/// Identity proven by a `Presence` message.
+/// Identity and device named by a verified `Presence` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedPresence {
     pub master_pubkey: String,
-    pub signing_pubkey: String,
     pub node_id: String,
 }
 
-/// Verify a signed `Presence`: the message signature, the master-signed delegation,
-/// and that the delegation names the key that signed the message.
+/// Verify a signed `Presence`: the message signature and the NodeId format.
 /// The caller checks `stage_id`, `timestamp` and, on an audio connection, that
 /// `node_id` equals the remote NodeId.
 pub fn verify_presence(signed: &SignedStageControl) -> Result<VerifiedPresence, String> {
-    let StageControl::Presence {
-        delegation,
-        node_id,
-    } = &signed.control
-    else {
+    let StageControl::Presence { node_id } = &signed.control else {
         return Err("not a presence message".to_string());
     };
     verify_stage_control(signed)?;
     if !is_valid_pubkey(node_id) {
         return Err("presence holds an invalid node id".to_string());
     }
-    verify_delegation(delegation)?;
-    if delegation.signing_pubkey != signed.sender_pubkey {
-        return Err("presence delegation does not name the message signer".to_string());
-    }
     Ok(VerifiedPresence {
-        master_pubkey: delegation.master_pubkey.clone(),
-        signing_pubkey: delegation.signing_pubkey.clone(),
+        master_pubkey: signed.sender_pubkey.clone(),
         node_id: node_id.clone(),
     })
 }
@@ -316,18 +293,16 @@ pub fn verify_presence(signed: &SignedStageControl) -> Result<VerifiedPresence, 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StageTicket {
     pub stage_id: String,
-    /// Host's master pubkey.
+    /// Host's master pubkey. Its key signs the host's control messages and the
+    /// checkpoints of the mixed audio stream.
     pub host_pubkey: String,
-    /// Master-signed delegation naming the host's signing key. That key signs the
-    /// host's control messages and the checkpoints of the mixed audio stream.
-    pub host_delegation: SigningKeyDelegation,
     /// Transport NodeId of the host (for direct QUIC connection).
     pub host_node_id: String,
     pub title: String,
 }
 
 impl StageTicket {
-    /// Check field formats and the host delegation. Returns the host's signing pubkey.
+    /// Check the field formats. Returns the host's master public key.
     pub fn verify(&self) -> Result<PublicKey, String> {
         if !is_valid_id(&self.stage_id) {
             return Err("invalid stage id".to_string());
@@ -335,20 +310,10 @@ impl StageTicket {
         if self.title.chars().count() > MAX_STAGE_TITLE_CHARS {
             return Err("stage title too long".to_string());
         }
-        if !is_valid_pubkey(&self.host_pubkey) {
-            return Err("invalid host pubkey".to_string());
-        }
         if !is_valid_pubkey(&self.host_node_id) {
             return Err("invalid host node id".to_string());
         }
-        verify_delegation(&self.host_delegation)?;
-        if self.host_delegation.master_pubkey != self.host_pubkey {
-            return Err("host delegation does not name the host pubkey".to_string());
-        }
-        self.host_delegation
-            .signing_pubkey
-            .parse()
-            .map_err(|e| format!("invalid host signing pubkey: {e}"))
+        parse_pubkey(&self.host_pubkey).map_err(|e| format!("invalid host pubkey: {e}"))
     }
 }
 
@@ -443,33 +408,20 @@ pub enum StageEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delegation::{derive_signing_key, sign_delegation};
     use crate::validation::now_millis;
 
     const STAGE_ID: &str = "000102030405060708090a0b0c0d0e0f";
 
     struct TestIdentity {
         master_pubkey: String,
-        signing: SecretKey,
-        delegation: SigningKeyDelegation,
+        key: SecretKey,
     }
 
     fn identity(seed: u8) -> TestIdentity {
-        let master_bytes = [seed; 32];
-        let master = SecretKey::from_bytes(&master_bytes);
-        let signing = SecretKey::from_bytes(&derive_signing_key(&master_bytes, 0));
-        let delegation = sign_delegation(
-            &master,
-            &signing.public(),
-            0,
-            &"ab".repeat(32),
-            0,
-            now_millis(),
-        );
+        let key = SecretKey::from_bytes(&[seed; 32]);
         TestIdentity {
-            master_pubkey: master.public().to_string(),
-            signing,
-            delegation,
+            master_pubkey: key.public().to_string(),
+            key,
         }
     }
 
@@ -481,10 +433,9 @@ mod tests {
         sign_stage_control(
             STAGE_ID,
             StageControl::Presence {
-                delegation: id.delegation.clone(),
                 node_id: node.to_string(),
             },
-            &id.signing,
+            &id.key,
             now_millis(),
         )
     }
@@ -497,7 +448,7 @@ mod tests {
             StageControl::Chat {
                 text: "hello".to_string(),
             },
-            &id.signing,
+            &id.key,
             1000,
         );
         assert!(verify_stage_control(&signed).is_ok());
@@ -517,49 +468,38 @@ mod tests {
         assert!(verify_stage_control(&other_payload).is_err());
 
         let mut other_sender = signed;
-        other_sender.sender_pubkey = identity(2).signing.public().to_string();
+        other_sender.sender_pubkey = identity(2).master_pubkey;
         assert!(verify_stage_control(&other_sender).is_err());
     }
 
     #[test]
-    fn presence_proves_master_pubkey_of_signer() {
+    fn presence_names_master_pubkey_of_signer() {
         let a = identity(1);
         let node = node_id(40);
         let verified = verify_presence(&presence(&a, &node)).unwrap();
         assert_eq!(verified.master_pubkey, a.master_pubkey);
-        assert_eq!(verified.signing_pubkey, a.signing.public().to_string());
         assert_eq!(verified.node_id, node);
     }
 
     #[test]
-    fn presence_with_delegation_of_another_identity_is_rejected() {
+    fn presence_signed_by_another_identity_is_rejected() {
         let a = identity(1);
         let b = identity(2);
-        // Signed by b's key, carrying a's delegation.
-        let forged = sign_stage_control(
-            STAGE_ID,
-            StageControl::Presence {
-                delegation: a.delegation.clone(),
-                node_id: node_id(40),
-            },
-            &b.signing,
-            now_millis(),
-        );
+        // Signed by b's key, naming a as the sender.
+        let mut forged = presence(&b, &node_id(40));
+        forged.sender_pubkey = a.master_pubkey.clone();
         assert!(verify_presence(&forged).is_err());
 
-        // Delegation that names a's master pubkey without a's signature.
-        let mut delegation = b.delegation.clone();
-        delegation.master_pubkey = a.master_pubkey.clone();
-        let forged = sign_stage_control(
+        // Not a presence message.
+        let chat = sign_stage_control(
             STAGE_ID,
-            StageControl::Presence {
-                delegation,
-                node_id: node_id(40),
+            StageControl::Chat {
+                text: "hi".to_string(),
             },
-            &b.signing,
+            &a.key,
             now_millis(),
         );
-        assert!(verify_presence(&forged).is_err());
+        assert!(verify_presence(&chat).is_err());
     }
 
     #[test]
@@ -568,16 +508,15 @@ mod tests {
         let ticket = StageTicket {
             stage_id: STAGE_ID.to_string(),
             host_pubkey: host.master_pubkey.clone(),
-            host_delegation: host.delegation.clone(),
             host_node_id: node_id(41),
             title: "title".to_string(),
         };
         let parsed: StageTicket = ticket.to_string().parse().unwrap();
-        assert_eq!(parsed.verify().unwrap(), host.signing.public());
+        assert_eq!(parsed.verify().unwrap(), host.key.public());
 
-        let mut wrong_host = parsed.clone();
-        wrong_host.host_pubkey = identity(4).master_pubkey;
-        assert!(wrong_host.verify().is_err());
+        let mut bad_host = parsed.clone();
+        bad_host.host_pubkey = host.master_pubkey.to_uppercase();
+        assert!(bad_host.verify().is_err());
 
         let mut bad_id = parsed;
         bad_id.stage_id = "not-an-id".to_string();

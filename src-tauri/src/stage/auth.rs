@@ -58,16 +58,17 @@ pub struct HostAuthState {
     chain_hash: [u8; 32],
     /// Number of frames processed since the stage started.
     sequence: u64,
-    signing_key: SecretKey,
+    /// The host's master key.
+    master_key: SecretKey,
     stage_id: String,
 }
 
 impl HostAuthState {
-    pub fn new(signing_key: SecretKey, stage_id: String) -> Self {
+    pub fn new(master_key: SecretKey, stage_id: String) -> Self {
         Self {
             chain_hash: [0u8; 32],
             sequence: 0,
-            signing_key,
+            master_key,
             stage_id,
         }
     }
@@ -80,7 +81,7 @@ impl HostAuthState {
         self.sequence += 1;
 
         if self.sequence.is_multiple_of(CHECKPOINT_INTERVAL) {
-            let sig: Signature = self.signing_key.sign(&checkpoint_signing_bytes(
+            let sig: Signature = self.master_key.sign(&checkpoint_signing_bytes(
                 &self.stage_id,
                 self.sequence,
                 &self.chain_hash,

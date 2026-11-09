@@ -217,70 +217,55 @@ impl RoomRoles {
     }
 }
 
-// ---- Signer table (replay rejection) ------------------------------------
+// ---- Sender table (replay rejection) ------------------------------------
 
-struct SignerEntry {
-    master_pubkey: String,
-    /// Highest `SignedStageControl.timestamp` accepted from this signer.
-    last_timestamp: u64,
-}
-
-/// Signing keys bound to a master pubkey by a verified `Presence` (or by the stage ticket,
-/// for the host), with the highest message timestamp accepted from each.
+/// Master pubkeys admitted by a verified `Presence` (or by the stage ticket, for the
+/// host), with the highest `SignedStageControl.timestamp` accepted from each.
 #[derive(Default)]
-pub(super) struct SignerTable {
-    entries: HashMap<String, SignerEntry>,
+pub(super) struct SenderTable {
+    last_timestamps: HashMap<String, u64>,
 }
 
-impl SignerTable {
-    /// Largest number of signing keys tracked.
+impl SenderTable {
+    /// Largest number of senders tracked.
     const MAX_ENTRIES: usize = 2 * MAX_STAGE_PARTICIPANTS;
 
-    /// Bind `signing_pubkey` to `master_pubkey`. The caller verified the delegation.
-    /// Returns false if the key is bound to another master pubkey or the table is full.
-    pub(super) fn bind(&mut self, signing_pubkey: &str, master_pubkey: &str) -> bool {
-        if let Some(entry) = self.entries.get(signing_pubkey) {
-            return entry.master_pubkey == master_pubkey;
+    /// Admit `sender`. Returns false if the table is full and `sender` is not in it.
+    pub(super) fn admit(&mut self, sender: &str) -> bool {
+        if self.last_timestamps.contains_key(sender) {
+            return true;
         }
-        if self.entries.len() >= Self::MAX_ENTRIES {
+        if self.last_timestamps.len() >= Self::MAX_ENTRIES {
             return false;
         }
-        self.entries.insert(
-            signing_pubkey.to_string(),
-            SignerEntry {
-                master_pubkey: master_pubkey.to_string(),
-                last_timestamp: 0,
-            },
-        );
+        self.last_timestamps.insert(sender.to_string(), 0);
         true
     }
 
-    /// Master pubkey bound to `signing_pubkey`, if any.
-    pub(super) fn master_of(&self, signing_pubkey: &str) -> Option<&str> {
-        self.entries
-            .get(signing_pubkey)
-            .map(|e| e.master_pubkey.as_str())
+    /// True if `sender` was admitted.
+    pub(super) fn contains(&self, sender: &str) -> bool {
+        self.last_timestamps.contains_key(sender)
     }
 
-    /// Record the timestamp of a message from `signing_pubkey`. Returns false for an
-    /// unbound signer and for a timestamp that is not higher than the last one accepted
-    /// from that signer (a replayed or reordered message).
-    pub(super) fn accept_timestamp(&mut self, signing_pubkey: &str, timestamp: u64) -> bool {
-        match self.entries.get_mut(signing_pubkey) {
-            Some(entry) if timestamp > entry.last_timestamp => {
-                entry.last_timestamp = timestamp;
+    /// Record the timestamp of a message from `sender`. Returns false for a sender that
+    /// was not admitted and for a timestamp that is not higher than the last one accepted
+    /// from that sender (a replayed or reordered message).
+    pub(super) fn accept_timestamp(&mut self, sender: &str, timestamp: u64) -> bool {
+        match self.last_timestamps.get_mut(sender) {
+            Some(last) if timestamp > *last => {
+                *last = timestamp;
                 true
             }
             _ => false,
         }
     }
 
-    /// Remove signers that `keep` rejects and whose last message is older than the
+    /// Remove senders that `keep` rejects and whose last message is older than the
     /// accepted timestamp window. A replay of such a message fails the window check.
     pub(super) fn prune(&mut self, now_ms: u64, keep: impl Fn(&str) -> bool) {
         let cutoff = now_ms.saturating_sub(2 * MAX_TIMESTAMP_DRIFT_MS);
-        self.entries
-            .retain(|_, e| e.last_timestamp >= cutoff || keep(&e.master_pubkey));
+        self.last_timestamps
+            .retain(|sender, last| *last >= cutoff || keep(sender));
     }
 }
 
@@ -467,8 +452,9 @@ pub(crate) struct ActiveStage {
     pub(super) my_role: StageRole,
     /// Host-assigned roles; `roles.host_pubkey` is the host's master pubkey.
     pub(super) roles: RoomRoles,
-    /// Key that signs the host's control messages and audio checkpoints.
-    pub(super) host_signing_pubkey: PublicKey,
+    /// The host's master public key. It signs the host's control messages and audio
+    /// checkpoints.
+    pub(super) host_key: PublicKey,
     /// The host's transport NodeId. Speakers and relays always dial this node.
     pub(super) host_node_id: String,
     /// Whether this node has muted its own microphone. Shared with the microphone
@@ -479,7 +465,7 @@ pub(crate) struct ActiveStage {
     pub(super) started_at: u64,
     /// Live participant list, keyed by master pubkey.
     pub(super) participants: HashMap<String, Participant>,
-    pub(super) signers: SignerTable,
+    pub(super) senders: SenderTable,
     /// Signs this node's control messages.
     pub(super) signer: Arc<ControlSigner>,
     /// Gossip control plane for this room.
@@ -644,39 +630,41 @@ mod tests {
     }
 
     #[test]
-    fn signer_table_rejects_unbound_replayed_and_rebound_signers() {
-        let mut table = SignerTable::default();
-        assert!(!table.accept_timestamp("key-a", 100));
-        assert!(table.master_of("key-a").is_none());
+    fn sender_table_rejects_unadmitted_and_replayed_messages() {
+        let mut table = SenderTable::default();
+        assert!(!table.accept_timestamp("master-a", 100));
+        assert!(!table.contains("master-a"));
 
-        assert!(table.bind("key-a", "master-a"));
-        assert_eq!(table.master_of("key-a"), Some("master-a"));
-        assert!(table.bind("key-a", "master-a"));
-        assert!(!table.bind("key-a", "master-b"));
+        assert!(table.admit("master-a"));
+        assert!(table.contains("master-a"));
+        assert!(table.admit("master-a"));
 
-        assert!(table.accept_timestamp("key-a", 100));
+        assert!(table.accept_timestamp("master-a", 100));
         // Same message again.
-        assert!(!table.accept_timestamp("key-a", 100));
+        assert!(!table.accept_timestamp("master-a", 100));
         // Older message.
-        assert!(!table.accept_timestamp("key-a", 99));
-        assert!(table.accept_timestamp("key-a", 101));
+        assert!(!table.accept_timestamp("master-a", 99));
+        assert!(table.accept_timestamp("master-a", 101));
+        // Admitting again keeps the last timestamp.
+        assert!(table.admit("master-a"));
+        assert!(!table.accept_timestamp("master-a", 101));
     }
 
     #[test]
-    fn signer_table_is_bounded_and_prunes_departed_signers() {
-        let mut table = SignerTable::default();
-        for i in 0..SignerTable::MAX_ENTRIES {
-            assert!(table.bind(&format!("key-{i}"), &format!("master-{i}")));
+    fn sender_table_is_bounded_and_prunes_departed_senders() {
+        let mut table = SenderTable::default();
+        for i in 0..SenderTable::MAX_ENTRIES {
+            assert!(table.admit(&format!("master-{i}")));
         }
-        assert!(!table.bind("one-more", "master-x"));
+        assert!(!table.admit("master-x"));
 
         let now = 10 * MAX_TIMESTAMP_DRIFT_MS;
-        assert!(table.accept_timestamp("key-0", now));
-        table.prune(now, |master| master == "master-1");
-        assert!(table.master_of("key-0").is_some());
-        assert!(table.master_of("key-1").is_some());
-        assert!(table.master_of("key-2").is_none());
-        assert!(table.bind("one-more", "master-x"));
+        assert!(table.accept_timestamp("master-0", now));
+        table.prune(now, |sender| sender == "master-1");
+        assert!(table.contains("master-0"));
+        assert!(table.contains("master-1"));
+        assert!(!table.contains("master-2"));
+        assert!(table.admit("master-x"));
     }
 
     #[test]

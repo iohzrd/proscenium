@@ -93,8 +93,8 @@ pub(super) async fn open_audio_connection(
 }
 
 /// Accept the audio bi-stream of an incoming connection and read its hello.
-/// Checks the signature, delegation and stage id of the `Presence`, and that it names
-/// the NodeId QUIC authenticated for this connection.
+/// Checks the signature and stage id of the `Presence`, and that it names the NodeId QUIC
+/// authenticated for this connection.
 pub(super) async fn accept_audio_connection(
     conn: Connection,
     stage_id: &str,
@@ -304,8 +304,8 @@ pub(super) struct ListenerConfig {
     /// Node to receive the mixed stream from: the host or a relay.
     pub(super) upstream_node_id: String,
     pub(super) host_node_id: String,
-    /// Key that signs the checkpoints of the mixed stream.
-    pub(super) host_signing_pubkey: PublicKey,
+    /// The host's master public key. It signs the checkpoints of the mixed stream.
+    pub(super) host_key: PublicKey,
     pub(super) signer: Arc<ControlSigner>,
     /// Highest checkpoint sequence number verified in this stage session.
     pub(super) checkpoint_floor: Arc<AtomicU64>,
@@ -432,7 +432,7 @@ async fn run_listener_once(config: &ListenerConfig, upstream_node_id: &str) -> S
     );
 
     let mut auth = ListenerAuthState::new(
-        config.host_signing_pubkey,
+        config.host_key,
         config.stage_id.clone(),
         config.checkpoint_floor.load(Ordering::Relaxed),
     );

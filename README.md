@@ -20,16 +20,15 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 
 ### Identity and Key Architecture
 
-Each user has one master key and three kinds of derived keys:
+Each user has one master key and two kinds of keys derived from it:
 
-- **Master key** (Ed25519) -- The permanent identity. Stored in `master_key.key` (mode 0600) on every device of the user. The master public key is what others follow. It signs delegations and key rotations, never content. A 24-word BIP39 recovery phrase encodes it.
+- **Master key** (Ed25519) -- The identity. The master public key is what others follow. The master key signs all of the user's content: posts, interactions, profiles, deletions, device lists, follow requests, server registrations and Stage messages. Stored in `master_key.key` (mode 0600) on every device of the user. A 24-word BIP39 recovery phrase encodes it.
 - **Transport key** (Ed25519) -- Derived from the master key with a per-device index (`device_index` file, 0 on the first device). It is the iroh NodeId of that device. Never signs content.
-- **Signing key** (Ed25519) -- Derived from the master key and a key index. The same on all devices of the user. Signs posts, interactions, profiles, deletions, device lists and server registrations. Rotation increments the index.
-- **DM key** (X25519) -- Derived from the master key with its own index. Used for the Noise IK handshake and as the first ratchet key of a DM session.
+- **DM key** (X25519) -- Derived from the master key, the same on all devices of the user. Used for the Noise IK handshake and as the first ratchet key of a DM session.
 
-The master key signs a `SigningKeyDelegation` that names the current signing key and DM key. Peers accept a delegation only if the master signature verifies and its key indexes are not lower than the ones they already hold.
+Content is verified against the public key in its `author` field, so it verifies without other cached data. There is no key rotation: a leaked master key can only be replaced by a new identity.
 
-A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the signing key. An identity response is accepted only if the delegation verifies, the device list verifies, and the device list contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
+A user's devices and DM public key are listed in a `LinkedDevicesAnnouncement` signed by the master key. An identity response is accepted only if the device list verifies and contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
 
 Every signed byte string is a JSON array that starts with a type tag (`proscenium/<type>/2`), so a signature made for one message type does not verify as another. Post ids are a SHA-256 hash over the post's other fields, including the author. Profiles carry a signed `updated_at`; an older profile does not replace a newer one.
 
@@ -37,8 +36,8 @@ Every signed byte string is a JSON array that starts with a type tag (`prosceniu
 
 All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
 
-- **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and key rotations. Every message is verified against the topic owner's cached signing key; a message without a resolvable signer is discarded.
-- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower that missed a key rotation can still verify content.
+- **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and Stage announcements. A message is stored only if the topic owner is its author and signed it.
+- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
 - **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows.
 - **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is checked before download; blobs over 50 MiB are rejected. Media over 10 MiB is fetched only after a click.
 - **DM** -- End-to-end encrypted direct messages. See "Direct Messaging".
@@ -183,9 +182,9 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 
 ## Discovery Server
 
-A self-hosted server binary (`server/`) that adds opt-in search, trending and a user directory. A user registers with a request signed by the signing key; the server verifies the master-signed delegation, the timestamp, and that the request names this server. The server then subscribes to the user's gossip topic, syncs the user's posts, and indexes them in SQLite with FTS5. It stores and serves content only for users whose registration and profile are both Public.
+A self-hosted server binary (`server/`) that adds opt-in search, trending and a user directory. A user registers with a request signed by the master key; the server verifies the signature, the timestamp, and that the request names this server. The server then subscribes to the user's gossip topic, syncs the user's posts, and indexes them in SQLite with FTS5. It stores and serves content only for users whose registration and profile are both Public.
 
-The server is an overlay. Users who never connect to a server lose nothing. Clients verify the signatures of posts a server returns and label posts they cannot verify.
+The server is an overlay. Users who never connect to a server lose nothing. Clients verify the signatures of posts a server returns and discard posts that do not verify.
 
 ### Running
 
@@ -230,7 +229,7 @@ Builds a static musl binary, uploads it to a temporary directory on the host, ve
 - `GET /api/v1/posts/{author}/{id}/interactions` -- Interactions of one post
 - HTML pages: `/`, `/users`, `/user/{pubkey}`, `/post/{author}/{id}`, `/trending`
 
-Signed requests are rejected if the timestamp is more than 5 minutes from the server clock, not greater than the last accepted timestamp of that user, or if the delegation is older than the stored one.
+Signed requests are rejected if the timestamp is more than 5 minutes from the server clock or not greater than the last accepted timestamp of that user.
 
 ### Registration Visibility
 
@@ -246,7 +245,7 @@ End-to-end encrypted direct messages over a QUIC protocol (`proscenium/dm/2`). O
 
 **Phase 1: Noise IK handshake.** When Alice first messages Bob, a `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake runs over a QUIC bi-stream:
 
-1. Alice takes Bob's X25519 DM public key from his cached, master-signed delegation.
+1. Alice takes Bob's X25519 DM public key from his cached, signed device list.
 2. Alice sends the first Noise message and her DM public key.
 3. Bob processes it, checks that the key Noise authenticated equals the claimed sender key, and resolves that key to a master public key. If the key is unknown he asks the connecting NodeId for its identity and verifies it. A blocked user is rejected here.
 4. Both sides derive the ratchet seed: `HKDF-SHA256(ikm = k1 || k2, salt = handshake hash, info = "proscenium-dm-root-v2")`, where `k1` and `k2` are the two Noise transport keys. The handshake hash covers only transmitted bytes and serves as a public salt.
@@ -292,7 +291,7 @@ Undelivered messages are queued as plaintext payloads and encrypted at send time
 
 Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with roles Host, Co-host, Speaker and Listener.
 
-- **Identity**: participants are identified by master public key. A participant proves the link between its signing key and its master key by sending its delegation in a signed presence message. A control message from a signer without verified presence is discarded.
+- **Identity**: participants are identified by master public key, and the master key signs their control messages. A control message from a signer that has not sent a verified presence message is discarded.
 - **Roles**: only messages signed by the host (or, for promote, demote, mute and kick, by a co-host the host appointed) change roles. The host broadcasts a signed room-state snapshot periodically and on every change. A promotion starts the microphone only if the local user raised a hand.
 - **Control plane**: iroh-gossip on a per-room topic. Signatures cover the stage id and a timestamp that must increase per signer.
 - **Audio plane**: speakers stream Opus to the host. The host accepts a speaker connection only from the NodeId of a participant with a speaking role, mixes the streams and fans the mix out to listeners. Speakers receive individual forwarded streams.
@@ -308,8 +307,8 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 Several devices can share one identity.
 
 - **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device runs a `Noise_IKpsk2` handshake with that secret, receives the link bundle, and confirms the keys before the existing device registers it.
-- **Bundle**: the master key, the new device's index, the key indexes, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
-- **Keys**: every device holds the master key and derives its own transport key from its device index.
+- **Bundle**: the master key, the new device's index, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
+- **Keys**: every device holds the master key and derives its own transport key from its device index. A device cannot be removed from the identity.
 - **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins). A device serves device sync only to a NodeId that derives from its own master key.
 - **Not replicated**: DM ratchet sessions and post deletions. A DM is delivered to the first device that acknowledges it; another device establishes its own session when it sends.
 

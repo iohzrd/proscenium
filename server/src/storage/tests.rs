@@ -117,13 +117,6 @@ async fn register_creates_then_updates() {
     assert_eq!(storage.registration_count().await.unwrap(), 1);
     assert_eq!(
         storage
-            .get_signing_pubkey(&user.master_pubkey)
-            .await
-            .unwrap(),
-        Some(user.signing.public().to_string())
-    );
-    assert_eq!(
-        storage
             .get_subscription_target(&user.master_pubkey)
             .await
             .unwrap(),
@@ -191,92 +184,6 @@ async fn replayed_timestamp_is_rejected_on_every_method() {
     register(&storage, &user, 7_001, Visibility::Public)
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn stale_delegation_is_rejected_on_every_method() {
-    let storage = storage().await;
-    let old_key = TestUser::new(1);
-    let new_key = old_key.rotated(1);
-
-    register(&storage, &old_key, 1_000, Visibility::Public)
-        .await
-        .unwrap();
-    // The newer delegation replaces the stored signing key.
-    register(&storage, &new_key, 2_000, Visibility::Public)
-        .await
-        .unwrap();
-    let stored_key = Some(new_key.signing.public().to_string());
-    assert_eq!(
-        storage
-            .get_signing_pubkey(&new_key.master_pubkey)
-            .await
-            .unwrap(),
-        stored_key
-    );
-
-    // The rotated-out key holds a delegation with a valid master signature.
-    assert_eq!(
-        rejection(register(&storage, &old_key, 3_000, Visibility::Public).await),
-        Rejection::StaleDelegation
-    );
-    assert_eq!(
-        rejection(unregister(&storage, &old_key, 3_000).await),
-        Rejection::StaleDelegation
-    );
-    let profile = old_key.profile("attacker", Visibility::Public, 9);
-    assert_eq!(
-        rejection(put_profile(&storage, &old_key, 3_000, profile).await),
-        Rejection::StaleDelegation
-    );
-    assert_eq!(
-        rejection(storage.cache_delegation(&old_key.delegation).await),
-        Rejection::StaleDelegation
-    );
-    let announcement = old_key.announcement(99, &[node_id(50)]);
-    assert_eq!(
-        rejection(storage.cache_announcement(&announcement).await),
-        Rejection::StaleDelegation
-    );
-    assert_eq!(
-        storage
-            .get_signing_pubkey(&new_key.master_pubkey)
-            .await
-            .unwrap(),
-        stored_key
-    );
-    assert_eq!(storage.registration_count().await.unwrap(), 1);
-
-    // The key index floor is kept while the registration is inactive.
-    unregister(&storage, &new_key, 4_000).await.unwrap();
-    assert_eq!(
-        rejection(register(&storage, &old_key, 5_000, Visibility::Public).await),
-        Rejection::StaleDelegation
-    );
-    register(&storage, &new_key, 5_000, Visibility::Public)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn lower_dm_key_index_is_rejected() {
-    let storage = storage().await;
-    let user = TestUser::new(1);
-    register(&storage, &user, 1_000, Visibility::Public)
-        .await
-        .unwrap();
-
-    let newer = user.delegation_with_dm_index(3);
-    storage.cache_delegation(&newer).await.unwrap();
-    // The registration delegation has dm_key_index 0.
-    assert_eq!(
-        rejection(register(&storage, &user, 2_000, Visibility::Public).await),
-        Rejection::StaleDelegation
-    );
-    assert_eq!(
-        rejection(storage.cache_delegation(&user.delegation).await),
-        Rejection::StaleDelegation
-    );
 }
 
 #[tokio::test]
@@ -413,7 +320,6 @@ async fn unregister_requires_active_registration_and_clears_identifying_columns(
             "SELECT COUNT(*) FROM registrations WHERE pubkey = ?1 AND is_active = 0
                AND display_name IS NULL AND bio IS NULL AND avatar_hash IS NULL
                AND profile_visibility IS NULL AND transport_node_id IS NULL
-               AND signing_pubkey IS NULL AND delegation_json IS NULL
                AND device_node_ids_json IS NULL",
             pk
         )
@@ -422,7 +328,6 @@ async fn unregister_requires_active_registration_and_clears_identifying_columns(
     );
     assert!(storage.get_user_info(pk).await.unwrap().is_none());
     assert!(storage.get_device_node_ids(pk).await.unwrap().is_none());
-    assert!(storage.get_signing_pubkey(pk).await.unwrap().is_none());
     assert!(storage.get_subscription_target(pk).await.unwrap().is_none());
     assert_eq!(
         rejection(unregister(&storage, &user, 4_000).await),
@@ -629,7 +534,7 @@ async fn private_profile_deactivates_registration() {
     assert_eq!(storage.registration_count().await.unwrap(), 0);
 }
 
-// --- Delegations and announcements ---
+// --- Device announcements ---
 
 #[tokio::test]
 async fn announcement_device_list_is_replaced_only_by_higher_version() {
@@ -678,28 +583,6 @@ async fn announcement_device_list_is_replaced_only_by_higher_version() {
     assert_eq!(
         storage.get_device_node_ids(pk).await.unwrap(),
         Some(vec![transport, node_id(51)])
-    );
-}
-
-#[tokio::test]
-async fn announcement_with_newer_delegation_updates_signing_key() {
-    let storage = storage().await;
-    let user = TestUser::new(1);
-    let rotated = user.rotated(2);
-    register(&storage, &user, 1_000, Visibility::Public)
-        .await
-        .unwrap();
-
-    storage
-        .cache_announcement(&rotated.announcement(1, &[node_id(50)]))
-        .await
-        .unwrap();
-    assert_eq!(
-        storage
-            .get_signing_pubkey(&user.master_pubkey)
-            .await
-            .unwrap(),
-        Some(rotated.signing.public().to_string())
     );
 }
 

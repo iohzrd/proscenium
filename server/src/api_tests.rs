@@ -131,35 +131,23 @@ async fn registration_lifecycle_over_http() {
     let reply = app.send_json(Method::POST, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 
-    // A forged delegation: the attacker names the victim as master.
-    let attacker = TestUser::new(2);
-    let mut forged = attacker.registration(URL, now + 2, Visibility::Public, None);
-    forged.master_pubkey = pk.clone();
-    forged.delegation.master_pubkey = pk.clone();
-    forged.signature = attacker.sign_registration_request(&forged);
+    // Requests that name the user as master and are signed by the attacker's key.
+    let forger = TestUser::new(2).forging_as(&user);
+    let forged = forger.registration(URL, now + 2, Visibility::Public, None);
     let reply = app.send_json(Method::POST, REGISTER, &forged).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
     let unregister = Some(REGISTRATION_ACTION_UNREGISTER);
-    forged.action = unregister.map(str::to_string);
-    forged.signature = attacker.sign_registration_request(&forged);
+    let forged = forger.registration(URL, now + 2, Visibility::Public, unregister);
     let reply = app.send_json(Method::DELETE, REGISTER, &forged).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    let forged_profile = forger.profile("Mallory", Visibility::Public, now);
+    let forged = forger.profile_update(URL, now + 2, forged_profile);
+    let reply = app.send_json(Method::PUT, REGISTER, &forged).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
 
-    // A rotated-out signing key with its master-signed delegation.
-    let rotated = user.rotated(1);
-    let request = rotated.registration(URL, now + 3, Visibility::Public, None);
-    let reply = app.send_json(Method::POST, REGISTER, &request).await;
-    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
-    let request = user.registration(URL, now + 4, Visibility::Public, None);
-    let reply = app.send_json(Method::POST, REGISTER, &request).await;
-    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
-    let request = user.registration(URL, now + 4, Visibility::Public, unregister);
-    let reply = app.send_json(Method::DELETE, REGISTER, &request).await;
-    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
-
-    // Profile update with the current key.
-    let profile = rotated.profile("Alice", Visibility::Public, now);
-    let update = rotated.profile_update(URL, now + 5, profile.clone());
+    // Profile update signed by the user.
+    let profile = user.profile("Alice", Visibility::Public, now);
+    let update = user.profile_update(URL, now + 3, profile.clone());
     let reply = app.send_json(Method::PUT, REGISTER, &update).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let reply = app.get(&format!("/api/v1/users/{pk}")).await;
@@ -170,7 +158,7 @@ async fn registration_lifecycle_over_http() {
     // The same update again is a replay; one with a changed field fails verification.
     let reply = app.send_json(Method::PUT, REGISTER, &update).await;
     assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
-    let mut altered = rotated.profile_update(URL, now + 6, profile);
+    let mut altered = user.profile_update(URL, now + 4, profile);
     altered.profile.display_name = "Mallory".to_string();
     let reply = app.send_json(Method::PUT, REGISTER, &altered).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
@@ -184,16 +172,16 @@ async fn registration_lifecycle_over_http() {
     );
 
     // Private visibility: rejected on POST; on PUT the registration is removed.
-    let request = rotated.registration(URL, now + 7, Visibility::Private, None);
+    let request = user.registration(URL, now + 5, Visibility::Private, None);
     let reply = app.send_json(Method::POST, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
     assert_eq!(app.storage.registration_count().await.unwrap(), 1);
 
     // DELETE without the unregister action, then a valid DELETE.
-    let request = rotated.registration(URL, now + 8, Visibility::Public, None);
+    let request = user.registration(URL, now + 6, Visibility::Public, None);
     let reply = app.send_json(Method::DELETE, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
-    let request = rotated.registration(URL, now + 8, Visibility::Public, unregister);
+    let request = user.registration(URL, now + 6, Visibility::Public, unregister);
     let reply = app.send_json(Method::DELETE, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert!(!app.manager.has_subscription(pk).await);
@@ -209,12 +197,12 @@ async fn registration_lifecycle_over_http() {
     // succeeds without a change; a profile update for it is a 404.
     let reply = app.send_json(Method::DELETE, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
-    let request = rotated.registration(URL, now + 9, Visibility::Public, unregister);
+    let request = user.registration(URL, now + 7, Visibility::Public, unregister);
     let reply = app.send_json(Method::DELETE, REGISTER, &request).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert_eq!(reply.json()["message"], "not registered");
-    let profile = rotated.profile("Alice", Visibility::Public, now);
-    let update = rotated.profile_update(URL, now + 10, profile);
+    let profile = user.profile("Alice", Visibility::Public, now);
+    let update = user.profile_update(URL, now + 8, profile);
     let reply = app.send_json(Method::PUT, REGISTER, &update).await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
 

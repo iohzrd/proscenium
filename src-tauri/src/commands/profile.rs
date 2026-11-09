@@ -1,6 +1,5 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
-use iroh::SecretKey;
 use proscenium_types::{
     NodeStatus, Profile, Visibility, now_millis, sign_profile, validate_profile,
 };
@@ -32,9 +31,9 @@ pub async fn save_my_profile(
     avatar_ticket: Option<String>,
     visibility: String,
 ) -> CmdResult<()> {
-    let (node_id, signing_key_bytes) = {
+    let (node_id, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let new_visibility: Visibility = visibility.parse()?;
     // `save_profile` only replaces a row with an equal or greater `updated_at`, so the new
@@ -54,11 +53,7 @@ pub async fn save_my_profile(
         signature: String::new(),
     };
     validate_profile(&profile)?;
-    sign_profile(
-        &mut profile,
-        &node_id,
-        &SecretKey::from_bytes(&signing_key_bytes),
-    );
+    sign_profile(&mut profile, &node_id, &master_key);
 
     let old_visibility = state.storage.get_visibility(&node_id).await?;
 

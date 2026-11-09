@@ -9,7 +9,7 @@ use crate::stage::pipeline::{self, ListenerConfig, SpeakerConfig};
 use crate::stage::speaker_mixer::spawn_speaker_mixer;
 use crate::stage::state::{
     ActiveStage, HostState, LISTENER_CAPACITY, LISTENER_CAPACITY_RESERVE, MixedStreamServer,
-    Participant, RoomRoles, SignerTable, SpeakerSession, StageRuntime,
+    Participant, RoomRoles, SenderTable, SpeakerSession, StageRuntime,
 };
 use crate::stage::topology::TopologyManager;
 use iroh::EndpointId;
@@ -68,32 +68,19 @@ fn spawn_control_forwarder(cmd_tx: ActorSender, mut ctrl_rx: mpsc::Receiver<Veri
 
 impl StageActor {
     /// Identity values a stage session needs: master pubkey and a `ControlSigner`
-    /// built from the current signing key and delegation.
-    async fn session_identity(
-        &self,
-        stage_id: &str,
-    ) -> Result<(String, Arc<ControlSigner>), AppError> {
-        let id = self.identity.read().await;
-        let my_pubkey = id.master_pubkey.clone();
-        let signing_key = id.signing_key.clone();
-        let delegation = id.delegation.clone();
-        drop(id);
-
-        if delegation.signing_pubkey != signing_key.public().to_string()
-            || delegation.master_pubkey != my_pubkey
-        {
-            return Err(AppError::Other(
-                "identity delegation does not match the signing key".into(),
-            ));
-        }
+    /// that signs with the master key.
+    async fn session_identity(&self, stage_id: &str) -> (String, Arc<ControlSigner>) {
+        let (my_pubkey, master_key) = {
+            let id = self.identity.read().await;
+            (id.master_pubkey.clone(), id.master_key.clone())
+        };
         let node_id = self.endpoint.id().to_string();
         let signer = Arc::new(ControlSigner::new(
             stage_id.to_string(),
-            signing_key,
-            delegation,
+            master_key,
             node_id,
         ));
-        Ok((my_pubkey, signer))
+        (my_pubkey, signer)
     }
 
     fn runtime(&self) -> StageRuntime {
@@ -116,13 +103,12 @@ impl StageActor {
         }
 
         let stage_id = crate::util::generate_id();
-        let (my_pubkey, signer) = self.session_identity(&stage_id).await?;
+        let (my_pubkey, signer) = self.session_identity(&stage_id).await;
         let node_id = self.endpoint.id().to_string();
 
         let ticket = StageTicket {
             stage_id: stage_id.clone(),
             host_pubkey: my_pubkey.clone(),
-            host_delegation: signer.delegation().clone(),
             host_node_id: node_id.clone(),
             title: title.clone(),
         };
@@ -148,7 +134,7 @@ impl StageActor {
 
         // Start the host audio mixer (owns encoders, auth state, per-speaker PCM buffers)
         let (mixer, fanout) = spawn_mixer(
-            signer.signing_key().clone(),
+            signer.master_key().clone(),
             stage_id.clone(),
             host_sfu_fanout.clone(),
             cancel.child_token(),
@@ -190,8 +176,8 @@ impl StageActor {
         let now = now_millis();
         let mut participants = HashMap::new();
         participants.insert(my_pubkey.clone(), Participant::new(my_pubkey.clone(), now));
-        let mut signers = SignerTable::default();
-        signers.bind(&signer.signing_pubkey().to_string(), &my_pubkey);
+        let mut senders = SenderTable::default();
+        senders.admit(&my_pubkey);
 
         self.active = Some(ActiveStage {
             rt: self.runtime(),
@@ -201,13 +187,13 @@ impl StageActor {
             my_node_id: node_id.clone(),
             my_role: StageRole::Host,
             roles: RoomRoles::new(my_pubkey.clone()),
-            host_signing_pubkey: signer.signing_pubkey(),
+            host_key: signer.master_key().public(),
             host_node_id: node_id.clone(),
             self_muted,
             hand_raised: false,
             started_at: now,
             participants,
-            signers,
+            senders,
             signer,
             control_plane,
             cancel: cancel.clone(),
@@ -292,11 +278,11 @@ impl StageActor {
             return Err(AppError::Other("already in a stage".into()));
         }
 
-        // Checks the host delegation; the returned key signs the host's control
-        // messages and audio checkpoints.
-        let host_signing_pubkey = ticket.verify().map_err(AppError::Other)?;
+        // Checks the ticket fields; the returned key is the host's master key, which signs
+        // the host's control messages and audio checkpoints.
+        let host_key = ticket.verify().map_err(AppError::Other)?;
         let stage_id = ticket.stage_id.clone();
-        let (my_pubkey, signer) = self.session_identity(&stage_id).await?;
+        let (my_pubkey, signer) = self.session_identity(&stage_id).await;
         let my_node_id = self.endpoint.id().to_string();
         if ticket.host_pubkey == my_pubkey || ticket.host_node_id == my_node_id {
             return Err(AppError::Other(
@@ -330,11 +316,11 @@ impl StageActor {
             ticket.host_pubkey.clone(),
             Participant::new(ticket.host_pubkey.clone(), now),
         );
-        // The ticket binds the host's signing key, so host messages are accepted
-        // before the host's Presence arrives.
-        let mut signers = SignerTable::default();
-        signers.bind(&ticket.host_delegation.signing_pubkey, &ticket.host_pubkey);
-        signers.bind(&signer.signing_pubkey().to_string(), &my_pubkey);
+        // The ticket names the host, so host messages are accepted before the host's
+        // Presence arrives.
+        let mut senders = SenderTable::default();
+        senders.admit(&ticket.host_pubkey);
+        senders.admit(&my_pubkey);
 
         let mut stage = ActiveStage {
             rt: self.runtime(),
@@ -344,13 +330,13 @@ impl StageActor {
             my_node_id,
             my_role: StageRole::Listener,
             roles: RoomRoles::new(ticket.host_pubkey.clone()),
-            host_signing_pubkey,
+            host_key,
             host_node_id: ticket.host_node_id.clone(),
             self_muted: Arc::new(AtomicBool::new(false)),
             hand_raised: false,
             started_at: now,
             participants,
-            signers,
+            senders,
             signer,
             control_plane,
             cancel: cancel.clone(),
@@ -438,7 +424,7 @@ impl ActiveStage {
             stage_id: self.stage_id.clone(),
             upstream_node_id,
             host_node_id: self.host_node_id.clone(),
-            host_signing_pubkey: self.host_signing_pubkey,
+            host_key: self.host_key,
             signer: self.signer.clone(),
             checkpoint_floor: self.checkpoint_floor.clone(),
             app_handle: self.rt.app_handle.clone(),

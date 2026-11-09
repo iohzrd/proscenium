@@ -27,8 +27,8 @@ impl PeerHandler {
     ) -> Result<(), AcceptError> {
         let my_pubkey = self.identity.read().await.master_pubkey.clone();
 
-        // Checks: addressed to this user, recent timestamp, master-signed delegation,
-        // signed device list containing the sending NodeId, request signature.
+        // Checks: addressed to this user, recent timestamp, signed device list containing
+        // the sending NodeId, request signature by the requester's master key.
         let verified = match verify_follow_request(&req, remote_str, &my_pubkey) {
             Ok(identity) => identity,
             Err(reason) => {
@@ -150,7 +150,7 @@ impl PeerHandler {
     }
 
     /// Store the verified identity of a follow requester.
-    /// Returns an error if its delegation is older than the cached one.
+    /// Returns an error if storing fails.
     async fn cache_requester(&self, verified: &VerifiedIdentity) -> Result<(), AcceptError> {
         self.storage
             .cache_peer_identity(verified)
@@ -160,7 +160,7 @@ impl PeerHandler {
                     "[follow-req] not caching identity of {}: {e}",
                     short_id(&verified.master_pubkey)
                 );
-                reject("identity is older than the cached one")
+                reject("identity could not be stored")
             })
     }
 }

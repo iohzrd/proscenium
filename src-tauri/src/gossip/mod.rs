@@ -165,8 +165,8 @@ impl GossipService {
     /// Send `msg` directly to every push recipient (see `Storage::get_push_recipients`).
     ///
     /// Returns after spawning the delivery task. If `msg.announcement` is empty it is set
-    /// to the local user's signed device list, so recipients hold the current delegation
-    /// before they verify the content. At most `PUSH_CONCURRENCY` connections are open at
+    /// to the local user's signed device list, so recipients hold the current NodeIds and
+    /// DM pubkey. At most `PUSH_CONCURRENCY` connections are open at
     /// once over all pending pushes, and at most `MAX_NODE_IDS_TRIED` NodeIds are tried
     /// per recipient. A recipient that does not acknowledge receives the content at its next sync.
     pub(crate) async fn attempt_push(&self, mut msg: PushMessage) {

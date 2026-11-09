@@ -4,20 +4,16 @@ use iroh::endpoint::presets;
 use iroh::{Endpoint, SecretKey};
 use proscenium_types::{
     DeviceEntry, Interaction, InteractionKind, LinkedDevicesAnnouncement, Post, Profile,
-    ProfileUpdateRequest, RegistrationPayload, RegistrationRequest, SigningKeyDelegation,
-    Visibility, derive_signing_key, sign_delegation, sign_interaction,
+    ProfileUpdateRequest, RegistrationPayload, RegistrationRequest, Visibility, sign_interaction,
     sign_linked_devices_announcement, sign_post, sign_profile, sign_profile_update,
     sign_registration,
 };
 
-/// An identity with a master key derived from `seed` and a delegated signing key.
+/// A test identity. Its methods sign with `key` and name `master_pubkey` as the author.
 pub struct TestUser {
-    master: SecretKey,
-    master_bytes: [u8; 32],
-    pub signing: SecretKey,
+    pub key: SecretKey,
     pub master_pubkey: String,
     pub transport_node_id: String,
-    pub delegation: SigningKeyDelegation,
 }
 
 /// An endpoint with one UDP socket on 127.0.0.1 (port chosen by the OS), no relay and
@@ -39,64 +35,25 @@ pub fn node_id(seed: u8) -> String {
 }
 
 impl TestUser {
-    /// Identity `seed` with signing key index 0.
+    /// The identity whose master key has the bytes `[seed; 32]`.
     pub fn new(seed: u8) -> Self {
-        Self::with_key_index(seed, 0)
-    }
-
-    /// Identity `seed` with the signing key and delegation of `key_index`.
-    pub fn with_key_index(seed: u8, key_index: u32) -> Self {
-        let master_bytes = [seed; 32];
-        let master = SecretKey::from_bytes(&master_bytes);
-        let signing = SecretKey::from_bytes(&derive_signing_key(&master_bytes, key_index));
-        let delegation = sign_delegation(
-            &master,
-            &signing.public(),
-            key_index,
-            &"ab".repeat(32),
-            0,
-            1_000 + u64::from(key_index),
-        );
+        let key = SecretKey::from_bytes(&[seed; 32]);
         Self {
-            master_pubkey: master.public().to_string(),
-            // Distinct from every master and signing key used in tests.
+            master_pubkey: key.public().to_string(),
+            // Distinct from every master key used in tests.
             transport_node_id: node_id(seed.wrapping_add(100)),
-            master,
-            master_bytes,
-            signing,
-            delegation,
+            key,
         }
     }
 
-    /// The same identity after a signing key rotation to `key_index`.
-    pub fn rotated(&self, key_index: u32) -> Self {
-        let mut rotated = Self::with_key_index(self.master_bytes[0], key_index);
-        rotated.transport_node_id = self.transport_node_id.clone();
-        rotated
-    }
-
-    /// A delegation for the current signing key with another DM key index.
-    pub fn delegation_with_dm_index(&self, dm_key_index: u32) -> SigningKeyDelegation {
-        sign_delegation(
-            &self.master,
-            &self.signing.public(),
-            self.delegation.key_index,
-            &"cd".repeat(32),
-            dm_key_index,
-            2_000,
-        )
-    }
-
-    pub fn sign_registration_request(&self, req: &RegistrationRequest) -> String {
-        let payload = RegistrationPayload {
-            master_pubkey: req.master_pubkey.clone(),
-            transport_node_id: req.transport_node_id.clone(),
-            server_url: req.server_url.clone(),
-            timestamp: req.timestamp,
-            visibility: req.visibility,
-            action: req.action.clone(),
-        };
-        sign_registration(&payload, &self.signing)
+    /// A user that names `victim.master_pubkey` as the author and signs with the key of
+    /// `self`, so its signatures fail verification.
+    pub fn forging_as(&self, victim: &TestUser) -> Self {
+        Self {
+            key: self.key.clone(),
+            master_pubkey: victim.master_pubkey.clone(),
+            transport_node_id: self.transport_node_id.clone(),
+        }
     }
 
     pub fn registration(
@@ -106,18 +63,24 @@ impl TestUser {
         visibility: Visibility,
         action: Option<&str>,
     ) -> RegistrationRequest {
-        let mut req = RegistrationRequest {
+        let payload = RegistrationPayload {
             master_pubkey: self.master_pubkey.clone(),
             transport_node_id: self.transport_node_id.clone(),
             server_url: server_url.to_string(),
             timestamp,
             visibility,
             action: action.map(str::to_string),
-            signature: String::new(),
-            delegation: self.delegation.clone(),
         };
-        req.signature = self.sign_registration_request(&req);
-        req
+        let signature = sign_registration(&payload, &self.key);
+        RegistrationRequest {
+            master_pubkey: payload.master_pubkey,
+            transport_node_id: payload.transport_node_id,
+            server_url: payload.server_url,
+            timestamp: payload.timestamp,
+            visibility: payload.visibility,
+            action: payload.action,
+            signature,
+        }
     }
 
     pub fn profile(&self, display_name: &str, visibility: Visibility, updated_at: u64) -> Profile {
@@ -130,7 +93,7 @@ impl TestUser {
             updated_at,
             signature: String::new(),
         };
-        sign_profile(&mut profile, &self.master_pubkey, &self.signing);
+        sign_profile(&mut profile, &self.master_pubkey, &self.key);
         profile
     }
 
@@ -145,7 +108,7 @@ impl TestUser {
             server_url,
             timestamp,
             &profile,
-            &self.signing,
+            &self.key,
         );
         ProfileUpdateRequest {
             master_pubkey: self.master_pubkey.clone(),
@@ -153,7 +116,6 @@ impl TestUser {
             timestamp,
             profile,
             signature,
-            delegation: self.delegation.clone(),
         }
     }
 
@@ -181,7 +143,7 @@ impl TestUser {
             quote_of_author: quote_of.map(|p| p.author.clone()),
             signature: String::new(),
         };
-        sign_post(&mut post, &self.signing);
+        sign_post(&mut post, &self.key);
         post
     }
 
@@ -196,14 +158,14 @@ impl TestUser {
             timestamp,
             signature: String::new(),
         };
-        sign_interaction(&mut interaction, &self.signing);
+        sign_interaction(&mut interaction, &self.key);
         interaction
     }
 
     pub fn announcement(&self, version: u64, node_ids: &[String]) -> LinkedDevicesAnnouncement {
         let mut announcement = LinkedDevicesAnnouncement {
             master_pubkey: self.master_pubkey.clone(),
-            delegation: self.delegation.clone(),
+            dm_pubkey: "ab".repeat(32),
             devices: node_ids
                 .iter()
                 .map(|node_id| DeviceEntry {
@@ -217,7 +179,7 @@ impl TestUser {
             timestamp: version,
             signature: String::new(),
         };
-        sign_linked_devices_announcement(&mut announcement, &self.signing);
+        sign_linked_devices_announcement(&mut announcement, &self.key);
         announcement
     }
 }

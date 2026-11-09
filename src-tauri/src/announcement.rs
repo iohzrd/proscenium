@@ -1,7 +1,6 @@
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
-use iroh::SecretKey;
 use proscenium_types::{
     DeviceEntry, IdentityResponse, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN,
     MAX_LINKED_DEVICES, now_millis, sign_linked_devices_announcement, sign_profile, truncate_chars,
@@ -58,36 +57,35 @@ pub async fn build_own_announcement(
 
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: id.master_pubkey.clone(),
-        delegation: id.delegation.clone(),
+        dm_pubkey: id.dm_pubkey.clone(),
         devices,
         version: now,
         timestamp: now,
         signature: String::new(),
     };
-    sign_linked_devices_announcement(&mut announcement, &id.signing_key);
+    sign_linked_devices_announcement(&mut announcement, &id.master_key);
     Ok(announcement)
 }
 
 /// Build the local user's `IdentityResponse`: the signed device list and the stored profile.
 ///
-/// If the stored profile's signature does not verify under the current signing key
-/// (for example after a signing key rotation), the profile is signed again and saved.
+/// If the stored profile's signature does not verify under the master key, the profile
+/// is signed again and saved.
 pub async fn build_own_identity_response(
     storage: &Storage,
     identity: &SharedIdentity,
 ) -> Result<IdentityResponse, AppError> {
     let announcement = build_own_announcement(storage, identity).await?;
-    let (master_pubkey, signing_secret_key_bytes) = {
+    let (master_pubkey, master_key) = {
         let id = identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
-    let signing_key = SecretKey::from_bytes(&signing_secret_key_bytes);
 
     let mut profile = storage.get_profile(&master_pubkey).await?;
     if let Some(p) = profile.as_mut()
-        && verify_profile_signature(p, &master_pubkey, &signing_key.public()).is_err()
+        && verify_profile_signature(p, &master_pubkey).is_err()
     {
-        sign_profile(p, &master_pubkey, &signing_key);
+        sign_profile(p, &master_pubkey, &master_key);
         storage.save_profile(&master_pubkey, p).await?;
     }
 
@@ -108,8 +106,6 @@ mod tests {
         Arc::new(tokio::sync::RwLock::new(Identity::derive(
             master,
             device_index,
-            0,
-            0,
         )))
     }
 

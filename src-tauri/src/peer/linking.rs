@@ -206,8 +206,6 @@ fn validate_link_bundle(
     Ok(IdentityKeys {
         master_secret_key: master,
         device_index: bundle.device_index,
-        signing_key_index: bundle.signing_key_index,
-        dm_key_index: bundle.dm_key_index,
     })
 }
 
@@ -413,14 +411,12 @@ impl PeerHandler {
             begin_link_attempt(&mut slot, now_millis())?
         };
 
-        let (master_secret_key_bytes, master_pubkey, device_index, signing_key_index, dm_key_index) = {
+        let (master_secret_key_bytes, master_pubkey, device_index) = {
             let id = self.identity.read().await;
             (
                 id.master_secret_key_bytes,
                 id.master_pubkey.clone(),
                 id.device_index,
-                id.signing_key_index,
-                id.dm_key_index,
             )
         };
 
@@ -452,8 +448,6 @@ impl PeerHandler {
             master_secret_key: base64::engine::general_purpose::STANDARD
                 .encode(master_secret_key_bytes),
             device_index: new_device_index,
-            signing_key_index,
-            dm_key_index,
             devices,
             profile: self.storage.get_profile(&master_pubkey).await?,
             follows: lww.follows,
@@ -649,8 +643,6 @@ mod tests {
         LinkBundleData {
             master_secret_key: base64::engine::general_purpose::STANDARD.encode(master),
             device_index,
-            signing_key_index: 3,
-            dm_key_index: 0,
             devices,
             profile: None,
             follows: vec![],
@@ -789,7 +781,6 @@ mod tests {
         };
         assert_eq!(keys.master_secret_key, EXISTING_MASTER);
         assert_eq!(keys.device_index, 1);
-        assert_eq!(keys.signing_key_index, 3);
         assert_eq!(received.follows.len(), 2_000);
         assert_eq!(received.devices.len(), 1);
         assert!(received.master_secret_key.is_empty());
@@ -926,7 +917,6 @@ mod tests {
         let keys = validate_link_bundle(&mut ok, &responder).unwrap();
         assert_eq!(keys.master_secret_key, master);
         assert_eq!(keys.device_index, 2);
-        assert_eq!(keys.signing_key_index, 3);
         assert!(ok.master_secret_key.is_empty());
         // The foreign entry is dropped and index 0 is marked as primary.
         assert_eq!(ok.devices.len(), 1);

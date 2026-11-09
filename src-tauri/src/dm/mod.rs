@@ -106,7 +106,7 @@ struct DmKeys {
     ratchet_storage_key: Zeroizing<[u8; 32]>,
 }
 
-/// A peer's DM key and transport NodeIds from the delegation cache.
+/// A peer's DM key and transport NodeIds from its cached device list.
 struct PeerRoute {
     master_pubkey: String,
     /// Hex-encoded `x25519_public`.
@@ -173,8 +173,8 @@ impl DmHandler {
         }
     }
 
-    /// Read the DM pubkey and the transport NodeIds of `peer_master_pubkey` from the
-    /// delegation cache. Returns an error if either is missing or malformed.
+    /// Read the DM pubkey and the transport NodeIds of `peer_master_pubkey` from its
+    /// cached device list. Returns an error if either is missing or malformed.
     async fn resolve_peer(&self, peer_master_pubkey: &str) -> Result<PeerRoute, AppError> {
         let dm_pubkey = self
             .storage

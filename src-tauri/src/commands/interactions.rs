@@ -2,7 +2,6 @@ use super::{require_id, require_pubkey};
 use crate::error::CmdResult;
 use crate::state::AppState;
 use crate::util::generate_id;
-use iroh::SecretKey;
 use proscenium_types::{
     Interaction, InteractionKind, PostCounts, now_millis, sign_delete_interaction, sign_interaction,
 };
@@ -24,9 +23,9 @@ pub async fn like_post(
 ) -> CmdResult<Interaction> {
     require_id(&target_post_id)?;
     require_pubkey(&target_author)?;
-    let (my_id, signing_key_bytes) = {
+    let (my_id, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let existing = state
         .storage
@@ -44,7 +43,7 @@ pub async fn like_post(
                 timestamp: now_millis(),
                 signature: String::new(),
             };
-            sign_interaction(&mut interaction, &SecretKey::from_bytes(&signing_key_bytes));
+            sign_interaction(&mut interaction, &master_key);
             if state.storage.save_interaction(&interaction).await? {
                 interaction
             } else {
@@ -64,17 +63,16 @@ pub async fn like_post(
 #[tauri::command]
 pub async fn unlike_post(state: State<'_, Arc<AppState>>, target_post_id: String) -> CmdResult<()> {
     require_id(&target_post_id)?;
-    let (my_id, signing_key_bytes) = {
+    let (my_id, master_key) = {
         let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let id = state
         .storage
         .delete_interaction_by_target(&my_id, KIND_LIKE, &target_post_id)
         .await?;
     if let Some(id) = id {
-        let signature =
-            sign_delete_interaction(&id, &my_id, &SecretKey::from_bytes(&signing_key_bytes));
+        let signature = sign_delete_interaction(&id, &my_id, &master_key);
         state
             .gossip()
             .broadcast_delete_interaction(&id, &my_id, &signature)

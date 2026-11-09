@@ -96,14 +96,13 @@ pub async fn send_follow_request(
     target_master_pubkey: &str,
 ) -> Result<FollowResponse, AppError> {
     let own_identity = crate::announcement::build_own_identity_response(storage, identity).await?;
-    let (master_pubkey, signing_secret_key_bytes) = {
+    let (master_pubkey, master_key) = {
         let id = identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let timestamp = now_millis();
-    let secret_key = iroh::SecretKey::from_bytes(&signing_secret_key_bytes);
     let signature =
-        sign_follow_request(&master_pubkey, target_master_pubkey, timestamp, &secret_key);
+        sign_follow_request(&master_pubkey, target_master_pubkey, timestamp, &master_key);
 
     let request = PeerRequest::FollowRequest(Box::new(FollowRequest {
         requester: master_pubkey,
@@ -131,8 +130,8 @@ pub async fn send_follow_request(
 
 /// Client: ask the node `target` for its identity and verify the answer.
 ///
-/// The returned identity has a master-signed delegation and a signed device list that
-/// contains `target`. Nothing is written to storage.
+/// The returned identity has a device list signed by its master key that contains
+/// `target`. Nothing is written to storage.
 pub async fn query_identity(
     endpoint: &Endpoint,
     target: EndpointId,

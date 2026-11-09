@@ -1,23 +1,20 @@
 use crate::ingest::{
-    process_incoming_interaction, process_incoming_post, resolve_signer,
-    verify_and_apply_post_tombstones, verify_and_store_profile,
+    InteractionOutcome, verify_and_apply_post_tombstones, verify_and_store_interaction,
+    verify_and_store_post, verify_and_store_profile,
 };
 use crate::storage::Storage;
 use bytes::Bytes;
 use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
-    SigningKeyRotation, StageTicket, is_valid_id, now_millis, short_id,
-    verify_delete_interaction_signature, verify_linked_devices_announcement, verify_rotation,
-    verify_stage_announcement, verify_stage_ended,
+    StageTicket, is_valid_id, now_millis, short_id, verify_delete_interaction_signature,
+    verify_linked_devices_announcement, verify_stage_announcement, verify_stage_ended,
 };
 use tauri::{AppHandle, Emitter};
 
 impl super::GossipService {
     /// Handle one message received on the feed topic of the followed user `pk`.
     ///
-    /// Every message type must carry `pk` as its author and, except the two types signed by
-    /// the master key, must verify against the signing key cached for `pk`. A message for
-    /// which no signing key is cached is discarded.
+    /// Every message type must carry `pk` as its author and must be signed by the key `pk`.
     pub(super) async fn handle_follow_message(
         storage: &Storage,
         pk: &str,
@@ -58,9 +55,6 @@ impl super::GossipService {
             Ok(GossipMessage::LinkedDevices(announcement)) => {
                 Self::handle_linked_devices(storage, pk, announcement).await;
             }
-            Ok(GossipMessage::SigningKeyRotation(rotation)) => {
-                Self::handle_signing_key_rotation(storage, pk, rotation).await;
-            }
             // Not sent by this version; ignored when received.
             Ok(GossipMessage::Heartbeat) => {}
             Ok(GossipMessage::StageAnnouncement {
@@ -72,7 +66,6 @@ impl super::GossipService {
                 signature,
             }) => {
                 Self::handle_stage_announcement(
-                    storage,
                     pk,
                     app_handle,
                     &stage_id,
@@ -81,8 +74,7 @@ impl super::GossipService {
                     &host_pubkey,
                     started_at,
                     &signature,
-                )
-                .await;
+                );
             }
             Ok(GossipMessage::StageEnded {
                 stage_id,
@@ -92,12 +84,7 @@ impl super::GossipService {
                 if host_pubkey != pk {
                     return;
                 }
-                let Some(signer) = resolve_signer(storage, pk).await else {
-                    return;
-                };
-                if let Err(reason) =
-                    verify_stage_ended(&stage_id, &host_pubkey, &signature, &signer)
-                {
+                if let Err(reason) = verify_stage_ended(&stage_id, &host_pubkey, &signature) {
                     log::warn!(
                         "[gossip-rx] bad stage-ended from {}: {reason}",
                         short_id(pk)
@@ -117,8 +104,7 @@ impl super::GossipService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn handle_stage_announcement(
-        storage: &Storage,
+    fn handle_stage_announcement(
         pk: &str,
         app_handle: &AppHandle,
         stage_id: &str,
@@ -132,18 +118,9 @@ impl super::GossipService {
         if host_pubkey != pk {
             return;
         }
-        let Some(signer) = resolve_signer(storage, pk).await else {
-            return;
-        };
-        if let Err(reason) = verify_stage_announcement(
-            stage_id,
-            title,
-            ticket,
-            host_pubkey,
-            started_at,
-            signature,
-            &signer,
-        ) {
+        if let Err(reason) =
+            verify_stage_announcement(stage_id, title, ticket, host_pubkey, started_at, signature)
+        {
             log::warn!(
                 "[gossip-rx] bad stage announcement from {}: {reason}",
                 short_id(pk)
@@ -185,7 +162,7 @@ impl super::GossipService {
         if post.author != pk || Self::is_hidden_or_unknown(storage, pk).await {
             return;
         }
-        if process_incoming_post(storage, &post, "gossip-rx", my_id, app_handle).await {
+        if verify_and_store_post(storage, &post, "gossip-rx", my_id, app_handle).await {
             let _ = app_handle.emit("feed-updated", ());
         }
     }
@@ -201,10 +178,6 @@ impl super::GossipService {
         if author != pk {
             return;
         }
-        let Some(signer) = resolve_signer(storage, pk).await else {
-            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
-            return;
-        };
         let tombstone = PostTombstone {
             id,
             author,
@@ -216,7 +189,6 @@ impl super::GossipService {
             storage,
             pk,
             std::slice::from_ref(&tombstone),
-            &signer,
             "gossip-rx",
         )
         .await
@@ -237,11 +209,7 @@ impl super::GossipService {
         app_handle: &AppHandle,
         profile: Profile,
     ) {
-        let Some(signer) = resolve_signer(storage, pk).await else {
-            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
-            return;
-        };
-        match verify_and_store_profile(storage, pk, &profile, &signer).await {
+        match verify_and_store_profile(storage, pk, &profile).await {
             Ok(true) => {
                 log::info!("[gossip-rx] stored profile of {}", short_id(pk));
                 let _ = app_handle.emit("profile-updated", pk);
@@ -261,8 +229,9 @@ impl super::GossipService {
         if interaction.author != pk || Self::is_hidden_or_unknown(storage, pk).await {
             return;
         }
-        if process_incoming_interaction(storage, &interaction, pk, "gossip-rx", my_id, app_handle)
+        if verify_and_store_interaction(storage, &interaction, pk, "gossip-rx", my_id, app_handle)
             .await
+            == InteractionOutcome::Stored
         {
             let _ = app_handle.emit("interaction-received", &interaction);
         }
@@ -279,11 +248,7 @@ impl super::GossipService {
         if author != pk || !is_valid_id(id) {
             return;
         }
-        let Some(signer) = resolve_signer(storage, pk).await else {
-            log::warn!("[gossip-rx] no cached signing key for {}", short_id(pk));
-            return;
-        };
-        if let Err(reason) = verify_delete_interaction_signature(id, author, signature, &signer) {
+        if let Err(reason) = verify_delete_interaction_signature(id, author, signature) {
             log::warn!(
                 "[gossip-rx] bad delete-interaction signature from {}: {reason}",
                 short_id(pk)
@@ -351,43 +316,6 @@ impl super::GossipService {
                     short_id(pk)
                 );
             }
-        }
-    }
-
-    async fn handle_signing_key_rotation(
-        storage: &Storage,
-        pk: &str,
-        rotation: SigningKeyRotation,
-    ) {
-        if rotation.master_pubkey != pk {
-            log::warn!(
-                "[gossip-rx] ignoring key rotation from {} (expected {})",
-                short_id(&rotation.master_pubkey),
-                short_id(pk)
-            );
-            return;
-        }
-        if let Err(reason) = verify_rotation(&rotation) {
-            log::warn!(
-                "[gossip-rx] bad key rotation from {}: {reason}",
-                short_id(pk)
-            );
-            return;
-        }
-        // `cache_peer_delegation` rejects a delegation older than the cached one.
-        match storage
-            .cache_peer_delegation(&rotation.new_delegation)
-            .await
-        {
-            Ok(()) => log::info!(
-                "[gossip-rx] signing key rotation from {} to index {}",
-                short_id(pk),
-                rotation.new_key_index
-            ),
-            Err(e) => log::warn!(
-                "[gossip-rx] rejected key rotation from {}: {e}",
-                short_id(pk)
-            ),
         }
     }
 }

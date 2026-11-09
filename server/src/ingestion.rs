@@ -5,7 +5,7 @@ use crate::storage::{
     Storage,
 };
 use futures_lite::StreamExt;
-use iroh::{Endpoint, EndpointId, PublicKey};
+use iroh::{Endpoint, EndpointId};
 use iroh_gossip::Gossip;
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use proscenium_types::{
@@ -13,7 +13,7 @@ use proscenium_types::{
     truncate_chars, user_feed_topic, validate_interaction, validate_post, validate_profile,
     verify_delete_interaction_signature, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
-    verify_profile_signature, verify_rotation,
+    verify_profile_signature,
 };
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -370,25 +370,6 @@ impl IngestionManager {
         Box::pin(async move { self.sync_user(&pubkey).await })
     }
 
-    /// The key that signs content of `master_pubkey`, from the stored delegation.
-    /// Fails if no active registration, no stored key, an unparseable key, or a storage
-    /// error: content of a user is accepted only with a known signing key.
-    pub(crate) async fn resolve_signer(&self, master_pubkey: &str) -> Result<PublicKey, String> {
-        match self.storage.get_signing_pubkey(master_pubkey).await {
-            Ok(Some(signing_pubkey)) => signing_pubkey
-                .parse()
-                .map_err(|e| format!("stored signing key is invalid: {e}")),
-            Ok(None) => Err("no signing key stored".to_string()),
-            Err(e) => {
-                tracing::error!(
-                    "[ingestion] signing key lookup failed for {}: {e}",
-                    short_id(master_pubkey)
-                );
-                Err("signing key lookup failed".to_string())
-            }
-        }
-    }
-
     /// Lowest timestamp of content that is stored, from the retention setting.
     fn min_timestamp(&self) -> u64 {
         self.limits
@@ -427,7 +408,8 @@ impl IngestionManager {
     }
 
     /// Verify one message received on the feed topic of `topic_owner` and apply it.
-    /// Returns the reason if the message was rejected.
+    /// Content is applied only if its author is `topic_owner` and its signature was made
+    /// by the key `topic_owner`. Returns the reason if the message was rejected.
     async fn handle_gossip_message(
         self: &Arc<Self>,
         topic_owner: &str,
@@ -444,10 +426,8 @@ impl IngestionManager {
 
         match message {
             GossipMessage::NewPost(post) => {
-                // Field checks run before the signing key is read from storage.
                 self.check_post_fields(&post, topic_owner)?;
-                let signer = self.resolve_signer(topic_owner).await?;
-                verify_post_signature(&post, &signer)?;
+                verify_post_signature(&post)?;
                 match self
                     .storage
                     .insert_posts(
@@ -480,8 +460,7 @@ impl IngestionManager {
                 if !is_valid_id(&id) {
                     return Err("invalid post id in delete-post".to_string());
                 }
-                let signer = self.resolve_signer(topic_owner).await?;
-                verify_delete_post_signature(&id, &author, &signature, &signer)?;
+                verify_delete_post_signature(&id, &author, &signature)?;
                 match self.storage.apply_tombstones(topic_owner, &[&id]).await {
                     Ok(0) => {}
                     Ok(_) => tracing::info!(
@@ -493,8 +472,7 @@ impl IngestionManager {
             }
             GossipMessage::ProfileUpdate(profile) => {
                 validate_profile(&profile)?;
-                let signer = self.resolve_signer(topic_owner).await?;
-                verify_profile_signature(&profile, topic_owner, &signer)?;
+                verify_profile_signature(&profile, topic_owner)?;
                 let change = RegistrationChange::PeerProfile {
                     master_pubkey: topic_owner,
                     profile: &profile,
@@ -515,8 +493,7 @@ impl IngestionManager {
             }
             GossipMessage::NewInteraction(interaction) => {
                 self.check_interaction_fields(&interaction, topic_owner)?;
-                let signer = self.resolve_signer(topic_owner).await?;
-                verify_interaction_signature(&interaction, &signer)?;
+                verify_interaction_signature(&interaction)?;
                 match self
                     .storage
                     .insert_interactions(
@@ -544,8 +521,7 @@ impl IngestionManager {
                 if !is_valid_id(&id) {
                     return Err("invalid interaction id in delete-interaction".to_string());
                 }
-                let signer = self.resolve_signer(topic_owner).await?;
-                verify_delete_interaction_signature(&id, &author, &signature, &signer)?;
+                verify_delete_interaction_signature(&id, &author, &signature)?;
                 if let Err(e) = self.storage.delete_interaction(&id, &author).await {
                     storage_error(e);
                 }
@@ -563,25 +539,6 @@ impl IngestionManager {
                         announcement.devices.len()
                     ),
                     Ok(AnnouncementOutcome::NotNewer) => {}
-                    Err(ChangeError::Rejected(rejection)) => return Err(rejection.to_string()),
-                    Err(ChangeError::Storage(e)) => storage_error(e),
-                }
-            }
-            GossipMessage::SigningKeyRotation(rotation) => {
-                if rotation.master_pubkey != topic_owner {
-                    return Err("key rotation is not from the topic owner".to_string());
-                }
-                verify_rotation(&rotation)?;
-                match self
-                    .storage
-                    .cache_delegation(&rotation.new_delegation)
-                    .await
-                {
-                    Ok(()) => tracing::info!(
-                        "[ingestion] stored delegation of {} with key index {}",
-                        short_id(topic_owner),
-                        rotation.new_key_index
-                    ),
                     Err(ChangeError::Rejected(rejection)) => return Err(rejection.to_string()),
                     Err(ChangeError::Storage(e)) => storage_error(e),
                 }

@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::ingestion::IngestionManager;
 use crate::node::{GOSSIP_MAX_MESSAGE_SIZE, Node};
 use crate::storage::{RegistrationChange, Storage};
-use crate::test_util::{TestUser, loopback_endpoint};
+use crate::test_util::{TestUser, loopback_endpoint, node_id};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
@@ -359,7 +359,7 @@ async fn sync_follows_the_protocol_against_a_peer() {
         content.tombstones.push(PostTombstone {
             id: p2.id.clone(),
             author: pk.clone(),
-            signature: sign_delete_post(&p2.id, &pk, &user.signing),
+            signature: sign_delete_post(&p2.id, &pk, &user.key),
         });
     }
     harness
@@ -392,7 +392,7 @@ async fn sync_follows_the_protocol_against_a_peer() {
     let mut altered = user.post("original", now - 1_800);
     altered.content = "altered".to_string();
     let mut wrong_key = user.post("signed by another key", now - 1_700);
-    sign_post(&mut wrong_key, &other.signing);
+    sign_post(&mut wrong_key, &other.key);
     let p5 = user.post("fifth", now - 1_600);
     {
         let mut content = harness.content.lock().unwrap();
@@ -405,7 +405,7 @@ async fn sync_follows_the_protocol_against_a_peer() {
         content.tombstones.push(PostTombstone {
             id: p1.id.clone(),
             author: pk.clone(),
-            signature: sign_delete_post(&p3.id, &pk, &user.signing),
+            signature: sign_delete_post(&p3.id, &pk, &user.key),
         });
         content.interactions.push(other.like(&p1, 2, now - 1_500));
     }
@@ -417,29 +417,42 @@ async fn sync_follows_the_protocol_against_a_peer() {
     assert_eq!(cursor.tombstone_count, 1);
     assert_eq!(harness.storage.total_post_count().await.unwrap(), 4);
 
-    // Signing key rotation: the summary carries the new delegation in the device
-    // announcement. A post signed with the new key is stored; a post signed with the
-    // rotated-out key is not.
-    let rotated = user.rotated(1);
-    let p6 = rotated.post("after rotation", now - 1_000);
-    let old_key_post = user.post("signed with the old key", now - 900);
+    // A device announcement with a higher version in the summary replaces the stored
+    // device NodeIds.
+    let devices = vec![peer_node_id.clone(), node_id(60)];
+    harness.content.lock().unwrap().announcement = Some(user.announcement(2, &devices));
+    wait_for("device announcement from the summary", || async {
+        harness.manager.sync_user(&pk).await;
+        harness.storage.get_device_node_ids(&pk).await.unwrap() == Some(devices.clone())
+    })
+    .await;
+
+    // A device announcement signed by another key is not stored. A sync handles the
+    // announcement in the summary before the posts, so once p6 is stored, at least one
+    // sync has handled the forged announcement.
+    let forged = other
+        .forging_as(user)
+        .announcement(3, std::slice::from_ref(&peer_node_id));
+    let p6 = user.post("sixth", now - 1_000);
     {
         let mut content = harness.content.lock().unwrap();
-        content.posts.extend([old_key_post.clone(), p6.clone()]);
-        content.announcement = Some(rotated.announcement(2, std::slice::from_ref(&peer_node_id)));
+        content.announcement = Some(forged);
+        content.posts.push(p6.clone());
     }
     harness
-        .sync_until_posts("post signed with the new key", &[&p1, &p3, &p4, &p5, &p6])
+        .sync_until_posts(
+            "post after a forged announcement",
+            &[&p1, &p3, &p4, &p5, &p6],
+        )
         .await;
     assert_eq!(
-        harness.storage.get_signing_pubkey(&pk).await.unwrap(),
-        Some(rotated.signing.public().to_string())
+        harness.storage.get_device_node_ids(&pk).await.unwrap(),
+        Some(devices)
     );
 
     // A listed profile in the summary ends the public registration: stored content is
     // deleted and the gossip task is stopped.
-    harness.content.lock().unwrap().profile =
-        Some(rotated.profile("Alice", Visibility::Listed, now));
+    harness.content.lock().unwrap().profile = Some(user.profile("Alice", Visibility::Listed, now));
     wait_for("listed profile applied", || async {
         harness.manager.sync_user(&pk).await;
         harness
@@ -495,7 +508,7 @@ async fn gossip_messages_are_verified_and_applied() {
     let other = TestUser::new(2);
     let foreign = other.post("from another author", now - 4_000);
     let mut wrong_key = user.post("signed by another key", now - 3_900);
-    sign_post(&mut wrong_key, &other.signing);
+    sign_post(&mut wrong_key, &other.key);
     let p2 = user.post("second over gossip", now - 3_800);
     broadcast(&mut topic, &GossipMessage::NewPost(foreign)).await;
     broadcast(&mut topic, &GossipMessage::NewPost(wrong_key)).await;
@@ -504,7 +517,7 @@ async fn gossip_messages_are_verified_and_applied() {
         &GossipMessage::DeletePost {
             id: p1.id.clone(),
             author: pk.clone(),
-            signature: sign_delete_post(&p2.id, &pk, &user.signing),
+            signature: sign_delete_post(&p2.id, &pk, &user.key),
         },
     )
     .await;
@@ -536,7 +549,7 @@ async fn gossip_messages_are_verified_and_applied() {
         quote_of_author: None,
         signature: String::new(),
     };
-    sign_post(&mut large, &user.signing);
+    sign_post(&mut large, &user.key);
     assert!(
         serde_json::to_vec(&GossipMessage::NewPost(large.clone()))
             .unwrap()
@@ -555,7 +568,7 @@ async fn gossip_messages_are_verified_and_applied() {
         &GossipMessage::DeletePost {
             id: p1.id.clone(),
             author: pk.clone(),
-            signature: sign_delete_post(&p1.id, &pk, &user.signing),
+            signature: sign_delete_post(&p1.id, &pk, &user.key),
         },
     )
     .await;

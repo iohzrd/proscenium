@@ -15,7 +15,7 @@ use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use proscenium_types::{
     CALL_ALPN, DM_ALPN, DeviceEntry, LinkBundleData, MAX_LINKED_DEVICES, PEER_ALPN, STAGE_ALPN,
-    SigningKeyDelegation, now_millis,
+    now_millis,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -28,8 +28,6 @@ use zeroize::Zeroize;
 
 const MASTER_KEY_FILE: &str = "master_key.key";
 const DEVICE_INDEX_FILE: &str = "device_index";
-const SIGNING_KEY_INDEX_FILE: &str = "signing_key_index";
-const DM_KEY_INDEX_FILE: &str = "dm_key_index";
 /// Marker file. While it exists, `get_seed_phrase` asks for native confirmation.
 pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
 /// Suffix of the temporary files created by `write_secret_file`.
@@ -40,13 +38,11 @@ const EXIT_SHUTDOWN_LIMIT: Duration = Duration::from_secs(3);
 /// Time limit for the network shutdown before the local identity is replaced.
 const REPLACE_SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
 
-/// The master key and derivation indexes that define the identity of a device.
-/// The master key bytes are overwritten with zeros when the value is dropped.
+/// The master key and transport key derivation index that define the identity of a
+/// device. The master key bytes are overwritten with zeros when the value is dropped.
 pub struct IdentityKeys {
     pub master_secret_key: [u8; 32],
     pub device_index: u32,
-    pub signing_key_index: u32,
-    pub dm_key_index: u32,
 }
 
 impl Drop for IdentityKeys {
@@ -110,15 +106,9 @@ fn remove_stale_temp_files(data_dir: &Path) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_temp = name.ends_with(TEMP_FILE_SUFFIX)
-            && [
-                MASTER_KEY_FILE,
-                DEVICE_INDEX_FILE,
-                SIGNING_KEY_INDEX_FILE,
-                DM_KEY_INDEX_FILE,
-                SEED_BACKED_UP_FILE,
-            ]
-            .iter()
-            .any(|prefix| name.starts_with(&format!("{prefix}.")));
+            && [MASTER_KEY_FILE, DEVICE_INDEX_FILE, SEED_BACKED_UP_FILE]
+                .iter()
+                .any(|prefix| name.starts_with(&format!("{prefix}.")));
         if is_temp && let Err(e) = std::fs::remove_file(entry.path()) {
             log::warn!("[setup] failed to delete temporary file {name}: {e}");
         }
@@ -219,7 +209,7 @@ async fn ensure_master_key(data_dir: &Path, storage: &Storage) -> Result<(), App
     Ok(())
 }
 
-/// Read a derivation index file. A missing file means index 0.
+/// Read the device index file. A missing file means index 0.
 /// Returns an error if the file exists and does not hold a decimal `u32`.
 fn read_index_file(data_dir: &Path, name: &str) -> Result<u32, AppError> {
     let path = data_dir.join(name);
@@ -238,7 +228,7 @@ fn read_index_file(data_dir: &Path, name: &str) -> Result<u32, AppError> {
     }
 }
 
-/// Read the master key and the derivation index files in `data_dir` and derive the identity.
+/// Read the master key and device index files in `data_dir` and derive the identity.
 fn load_identity(data_dir: &Path) -> Result<Identity, AppError> {
     let path = data_dir.join(MASTER_KEY_FILE);
     let master_secret_key_bytes = read_master_key(&path)?
@@ -249,17 +239,10 @@ fn load_identity(data_dir: &Path) -> Result<Identity, AppError> {
             "device index {device_index} is out of range (0..{MAX_LINKED_DEVICES})"
         )));
     }
-    let signing_key_index = read_index_file(data_dir, SIGNING_KEY_INDEX_FILE)?;
-    let dm_key_index = read_index_file(data_dir, DM_KEY_INDEX_FILE)?;
-    Ok(Identity::derive(
-        master_secret_key_bytes,
-        device_index,
-        signing_key_index,
-        dm_key_index,
-    ))
+    Ok(Identity::derive(master_secret_key_bytes, device_index))
 }
 
-/// Write the three index files, then the master key file.
+/// Write the device index file, then the master key file.
 ///
 /// The master key is written last: if a step fails, the previous master key is still on
 /// disk and the new key is never combined with the previous device index.
@@ -267,14 +250,6 @@ fn write_identity_files(data_dir: &Path, keys: &IdentityKeys) -> std::io::Result
     write_secret_file(
         &data_dir.join(DEVICE_INDEX_FILE),
         keys.device_index.to_string().as_bytes(),
-    )?;
-    write_secret_file(
-        &data_dir.join(SIGNING_KEY_INDEX_FILE),
-        keys.signing_key_index.to_string().as_bytes(),
-    )?;
-    write_secret_file(
-        &data_dir.join(DM_KEY_INDEX_FILE),
-        keys.dm_key_index.to_string().as_bytes(),
     )?;
     write_secret_file(&data_dir.join(MASTER_KEY_FILE), &keys.master_secret_key)
 }
@@ -288,35 +263,6 @@ where
         .await
         .map_err(|e| AppError::Other(format!("file write task failed: {e}")))?
         .map_err(AppError::from)
-}
-
-/// Raise the signing key index to `new_index`: write the index file, then replace the
-/// in-memory identity with one derived for that index. Returns the new delegation.
-///
-/// Returns an error if `new_index` is not greater than the current index. The identity
-/// write lock is held from the comparison to the update, so concurrent calls are applied
-/// one after the other.
-pub async fn raise_signing_key_index(
-    app: &tauri::AppHandle,
-    identity: &SharedIdentity,
-    new_index: u32,
-) -> Result<SigningKeyDelegation, AppError> {
-    let path = app.path().app_data_dir()?.join(SIGNING_KEY_INDEX_FILE);
-    let mut id = identity.write().await;
-    if new_index <= id.signing_key_index {
-        return Err(AppError::Other(format!(
-            "signing key index is already {}",
-            id.signing_key_index
-        )));
-    }
-    run_blocking_io(move || write_secret_file(&path, new_index.to_string().as_bytes())).await?;
-    *id = Identity::derive(
-        id.master_secret_key_bytes,
-        id.device_index,
-        new_index,
-        id.dm_key_index,
-    );
-    Ok(id.delegation.clone())
 }
 
 /// Serves the blobs ALPN from the blob store that every network stack shares.
@@ -538,8 +484,8 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         log::error!("[setup] failed to register own device: {e}");
     }
 
-    // Signs the stored profile again if its signature does not match the current
-    // signing key, then broadcasts the profile and the device list.
+    // Signs the stored profile again if its signature does not verify under the master
+    // key, then broadcasts the profile and the device list.
     match crate::announcement::build_own_identity_response(&state.storage, &state.identity).await {
         Ok(identity) => {
             if let Some(profile) = &identity.profile {
@@ -801,10 +747,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     log::info!("[setup] blob store opened at {}", blobs_dir.display());
 
     log::info!("[setup] master pubkey: {}", identity_data.master_pubkey);
-    log::info!(
-        "[setup] signing pubkey: {}",
-        identity_data.signing_key.public()
-    );
     log::info!("[setup] DM pubkey: {}", identity_data.dm_pubkey);
     log::info!(
         "[setup] Transport NodeId: {} (device index {})",
@@ -934,15 +876,11 @@ mod tests {
             &IdentityKeys {
                 master_secret_key: master,
                 device_index: 2,
-                signing_key_index: 4,
-                dm_key_index: 1,
             },
         )
         .unwrap();
         let identity = load_identity(&dir.0).unwrap();
         assert_eq!(identity.device_index, 2);
-        assert_eq!(identity.signing_key_index, 4);
-        assert_eq!(identity.dm_key_index, 1);
         assert_eq!(identity.transport_node_id, device_node_id(&master, 2));
         assert_ne!(identity.transport_node_id, device_node_id(&master, 0));
         assert_eq!(
@@ -1004,13 +942,12 @@ mod tests {
     #[test]
     fn identity_debug_output_holds_no_secret_bytes() {
         let master = [0xABu8; 32];
-        let identity = Identity::derive(master, 0, 0, 0);
+        let identity = Identity::derive(master, 0);
         let debug = format!("{identity:?}");
         assert!(debug.contains(&identity.master_pubkey));
         for secret in [
             identity.master_secret_key_bytes,
-            identity.signing_secret_key_bytes,
-            identity.dm_secret_key_bytes,
+            proscenium_types::derive_dm_key(&master),
             identity.dm_x25519_private,
             identity.ratchet_storage_key,
         ] {

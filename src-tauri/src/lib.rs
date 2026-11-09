@@ -211,7 +211,6 @@ pub fn run() {
             is_seed_phrase_backed_up,
             mark_seed_phrase_backed_up,
             verify_seed_phrase_words,
-            rotate_signing_key,
             recover_from_seed_phrase,
             start_device_link,
             cancel_device_link,

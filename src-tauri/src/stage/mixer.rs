@@ -79,11 +79,12 @@ impl MixerHandle {
 /// contribution separately and sends to this fanout each tick so connected speakers
 /// can receive the host's voice via uni-streams.
 ///
-/// `signing_key` and `stage_id` are used to sign the checkpoints of the listener mix.
+/// `master_key` (the host's) and `stage_id` are used to sign the checkpoints of the
+/// listener mix.
 ///
 /// The actor owns the encoders, auth state, and all per-speaker buffers exclusively.
 pub fn spawn_mixer(
-    signing_key: SecretKey,
+    master_key: SecretKey,
     stage_id: String,
     host_sfu_fanout: Arc<Fanout>,
     cancel: CancellationToken,
@@ -96,7 +97,7 @@ pub fn spawn_mixer(
         cmd_rx,
         actor_fanout,
         host_sfu_fanout,
-        HostAuthState::new(signing_key, stage_id),
+        HostAuthState::new(master_key, stage_id),
         cancel,
     ));
 

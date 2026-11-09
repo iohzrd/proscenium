@@ -1,6 +1,7 @@
--- Protocol version 2: signed bytes carry a `proscenium/<type>/2` tag and post ids are
--- derived from post content. Rows stored under version 1 cannot be verified or matched
--- by id, so every table is dropped and created again.
+-- Protocol version 2: the author's master key signs all content, signed bytes carry a
+-- `proscenium/<type>/2` tag and post ids are derived from post content. Rows stored
+-- under version 1 cannot be verified or matched by id, so every table is dropped and
+-- created again.
 
 DROP TRIGGER IF EXISTS posts_ai;
 DROP TRIGGER IF EXISTS posts_ad;
@@ -15,7 +16,7 @@ DROP TABLE IF EXISTS registrations;
 
 -- One row per master pubkey that ever registered. A row is never deleted:
 -- unregistration sets is_active = 0 and clears every column except the pubkey, the
--- timestamps and the five replay/downgrade floors at the end of the table.
+-- timestamps and the three replay/downgrade floors at the end of the table.
 CREATE TABLE registrations (
     pubkey TEXT PRIMARY KEY,
     registered_at INTEGER NOT NULL,
@@ -33,16 +34,10 @@ CREATE TABLE registrations (
     avatar_hash TEXT,
     -- NodeId of the device that sent the registration request.
     transport_node_id TEXT,
-    -- Key that signs the user's content, from the newest accepted delegation.
-    signing_pubkey TEXT,
-    delegation_json TEXT,
     -- JSON array of the NodeIds in the newest accepted device announcement.
     device_node_ids_json TEXT,
     -- Greatest `timestamp` of an accepted signed HTTP request.
     last_request_timestamp INTEGER NOT NULL DEFAULT 0,
-    -- Indexes of the newest accepted delegation.
-    key_index INTEGER NOT NULL DEFAULT 0,
-    dm_key_index INTEGER NOT NULL DEFAULT 0,
     -- `updated_at` of the newest accepted profile.
     profile_updated_at INTEGER NOT NULL DEFAULT 0,
     -- `version` of the newest accepted device announcement.

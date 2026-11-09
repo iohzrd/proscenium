@@ -343,13 +343,6 @@
               >
                 {shortId(post.author)}
               </a>
-              {#if !post.verified}
-                <span
-                  class="unverified-badge"
-                  title="The signature of this post was not verified on this device"
-                  >Unverified</span
-                >
-              {/if}
               <span class="post-time">{formatTime(post.timestamp)}</span>
             </div>
             <p class="post-content">{post.content}</p>
@@ -740,13 +733,6 @@
 
   .post-author:hover {
     text-decoration: underline;
-  }
-
-  .unverified-badge {
-    color: var(--color-warning);
-    font-size: var(--text-xs);
-    font-weight: 600;
-    margin: 0 auto 0 0.5rem;
   }
 
   .post-time {

@@ -6,14 +6,12 @@ use crate::stage::StageHandler;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
-use proscenium_types::{
-    DeviceEntry, MAX_LINKED_DEVICES, derive_dm_key, derive_signing_key, derive_transport_key,
-    now_millis, sign_delegation,
-};
+use proscenium_types::{DeviceEntry, MAX_LINKED_DEVICES, derive_dm_key, derive_transport_key};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
 /// Commands sent to the peer sync task to trigger on-demand syncs.
 pub enum SyncCommand {
@@ -24,83 +22,49 @@ pub enum SyncCommand {
 }
 
 /// Cryptographic identity and key material for this node.
-/// Wrapped in `SharedIdentity` (Arc<RwLock<Identity>>) so key material can be
-/// updated in place when signing keys or DM keys are rotated at runtime.
+/// Wrapped in `SharedIdentity` (Arc<RwLock<Identity>>) so `setup::replace_identity` can
+/// replace it in place.
 pub struct Identity {
-    /// Master key secret bytes (permanent identity, cold storage).
+    /// Master key secret bytes. Every device of the user holds the master key.
     pub master_secret_key_bytes: [u8; 32],
-    /// Master public key string (the permanent, unforgeable identity).
+    /// The master key. It is the user's identity and signs all of the user's content.
+    pub master_key: SecretKey,
+    /// Master public key string (the user ID).
     pub master_pubkey: String,
-    /// Signing key secret bytes (derived from master, signs content).
-    pub signing_secret_key_bytes: [u8; 32],
-    /// Pre-constructed signing SecretKey (avoids repeated from_bytes).
-    pub signing_key: SecretKey,
-    /// Signing key derivation index (0 for initial, incremented on rotation).
-    pub signing_key_index: u32,
-    /// DM key secret bytes (derived from master, used for Noise IK + Double Ratchet).
-    /// No code outside tests reads this field at present; `dm_x25519_private` is the
-    /// clamped form in use.
-    #[allow(dead_code)]
-    pub dm_secret_key_bytes: [u8; 32],
     /// DM public key string (hex-encoded X25519).
     pub dm_pubkey: String,
-    /// DM key derivation index.
-    pub dm_key_index: u32,
-    /// X25519 private key bytes (derived from dm_secret_key_bytes).
+    /// X25519 private key bytes (the clamped DM key).
     pub dm_x25519_private: [u8; 32],
-    /// X25519 public key bytes (derived from dm_secret_key_bytes).
+    /// X25519 public key bytes.
     pub dm_x25519_public: [u8; 32],
-    /// Key for encrypting ratchet state at rest (derived from dm_secret_key_bytes).
+    /// Key for encrypting ratchet state at rest (derived from the DM key).
     pub ratchet_storage_key: [u8; 32],
     /// Transport key derivation index of this device (0 for the primary device).
     pub device_index: u32,
     /// Transport NodeId string (iroh's own key, for QUIC networking).
     pub transport_node_id: String,
-    /// The current signing key delegation (signed by master key).
-    pub delegation: proscenium_types::SigningKeyDelegation,
 }
 
 impl Identity {
-    /// Derive every key from the master secret key and the three derivation indexes,
-    /// and sign a delegation for the signing and DM keys with the current time.
-    pub fn derive(
-        master_secret_key_bytes: [u8; 32],
-        device_index: u32,
-        signing_key_index: u32,
-        dm_key_index: u32,
-    ) -> Self {
-        let master_secret = SecretKey::from_bytes(&master_secret_key_bytes);
-        let signing_secret_key_bytes =
-            derive_signing_key(&master_secret_key_bytes, signing_key_index);
-        let signing_key = SecretKey::from_bytes(&signing_secret_key_bytes);
-        let dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes, dm_key_index);
+    /// Derive the DM key and the transport key of `device_index` from the master key.
+    pub fn derive(master_secret_key_bytes: [u8; 32], device_index: u32) -> Self {
+        let master_key = SecretKey::from_bytes(&master_secret_key_bytes);
+        let mut dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes);
         let (dm_x25519_private, dm_x25519_public) =
             crate::crypto::x25519_keypair_from_raw(&dm_secret_key_bytes);
-        let dm_pubkey = hex::encode(dm_x25519_public);
-        let delegation = sign_delegation(
-            &master_secret,
-            &signing_key.public(),
-            signing_key_index,
-            &dm_pubkey,
-            dm_key_index,
-            now_millis(),
-        );
+        let ratchet_storage_key = crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes);
+        dm_secret_key_bytes.zeroize();
 
         Self {
             master_secret_key_bytes,
-            master_pubkey: master_secret.public().to_string(),
-            signing_secret_key_bytes,
-            signing_key,
-            signing_key_index,
-            dm_secret_key_bytes,
-            dm_pubkey,
-            dm_key_index,
+            master_pubkey: master_key.public().to_string(),
+            master_key,
+            dm_pubkey: hex::encode(dm_x25519_public),
             dm_x25519_private,
             dm_x25519_public,
-            ratchet_storage_key: crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes),
+            ratchet_storage_key,
             device_index,
             transport_node_id: device_node_id(&master_secret_key_bytes, device_index),
-            delegation,
         }
     }
 
@@ -130,10 +94,7 @@ impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
             .field("master_pubkey", &self.master_pubkey)
-            .field("signing_pubkey", &self.signing_key.public())
-            .field("signing_key_index", &self.signing_key_index)
             .field("dm_pubkey", &self.dm_pubkey)
-            .field("dm_key_index", &self.dm_key_index)
             .field("device_index", &self.device_index)
             .field("transport_node_id", &self.transport_node_id)
             .finish_non_exhaustive()
@@ -320,7 +281,7 @@ mod tests {
     #[test]
     fn device_index_is_found_only_for_derived_node_ids() {
         let master = [1u8; 32];
-        let identity = Identity::derive(master, 3, 0, 0);
+        let identity = Identity::derive(master, 3);
         assert_eq!(identity.transport_node_id, device_node_id(&master, 3));
         assert_eq!(
             identity.device_index_of(&identity.transport_node_id),

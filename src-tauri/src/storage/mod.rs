@@ -6,7 +6,7 @@ mod linked_devices;
 mod messaging;
 mod moderation;
 mod notifications;
-mod peer_delegations;
+mod peer_identities;
 mod posts;
 mod preferences;
 mod profiles;
@@ -18,7 +18,7 @@ mod sync;
 mod tests;
 
 pub use follow_requests::FollowRequestOutcome;
-pub use peer_delegations::AnnouncementOutcome;
+pub use peer_identities::AnnouncementOutcome;
 pub use social::RemoteListKind;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -122,6 +122,10 @@ impl Storage {
         (
             "016_devices",
             include_str!("../../migrations/016_devices.sql"),
+        ),
+        (
+            "017_master_key_signing",
+            include_str!("../../migrations/017_master_key_signing.sql"),
         ),
     ];
 

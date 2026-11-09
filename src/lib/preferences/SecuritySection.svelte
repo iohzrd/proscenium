@@ -5,10 +5,6 @@
   import SeedVerification from "$lib/welcome/SeedVerification.svelte";
   import SeedWordGrid from "$lib/welcome/SeedWordGrid.svelte";
 
-  let rotating = $state(false);
-  let rotateStatus = $state("");
-  let showRotateConfirm = $state(false);
-
   // null until `is_seed_phrase_backed_up` returned.
   let backedUp = $state<boolean | null>(null);
   let loadingPhrase = $state(false);
@@ -50,19 +46,6 @@
     phraseWords = [];
     phraseDialog = "verify";
   }
-
-  async function rotateKey() {
-    rotating = true;
-    rotateStatus = "";
-    try {
-      const msg: string = await invoke("rotate_signing_key");
-      rotateStatus = msg;
-      showRotateConfirm = false;
-    } catch (e) {
-      rotateStatus = `Error: ${e}`;
-    }
-    rotating = false;
-  }
 </script>
 
 <section class="settings-section">
@@ -86,23 +69,6 @@
   {/if}
   <button class="section-btn" onclick={showPhrase} disabled={loadingPhrase}>
     {loadingPhrase ? "Waiting for confirmation..." : "Show recovery phrase"}
-  </button>
-
-  <h4>Signing key</h4>
-  <p class="section-desc">
-    Rotate your signing key if you suspect a device has been compromised. This
-    derives a new signing key, notifies peers, and re-registers with servers.
-    The app will need to restart after rotation.
-  </p>
-  {#if rotateStatus}
-    <p class="section-status" role="status">{rotateStatus}</p>
-  {/if}
-  <button
-    class="section-btn danger"
-    onclick={() => (showRotateConfirm = true)}
-    disabled={rotating}
-  >
-    {rotating ? "Rotating..." : "Rotate signing key"}
   </button>
 </section>
 
@@ -134,31 +100,6 @@
   </Modal>
 {/if}
 
-{#if showRotateConfirm}
-  <Modal
-    label="Confirm key rotation"
-    onclose={() => {
-      if (!rotating) showRotateConfirm = false;
-    }}
-  >
-    <p>
-      Rotate your signing key? This will invalidate the current signing key and
-      derive a new one. All peers will be notified and DM sessions will need to
-      be re-established. The app must restart after rotation.
-    </p>
-    <div class="modal-actions">
-      <button
-        class="modal-cancel"
-        onclick={() => (showRotateConfirm = false)}
-        disabled={rotating}>Cancel</button
-      >
-      <button class="modal-confirm" onclick={rotateKey} disabled={rotating}
-        >{rotating ? "Rotating..." : "Rotate"}</button
-      >
-    </div>
-  </Modal>
-{/if}
-
 <style>
   .settings-section {
     background: var(--bg-surface);
@@ -178,10 +119,6 @@
     font-size: var(--text-sm);
     font-weight: 600;
     color: var(--text-primary);
-  }
-
-  .section-btn + h4 {
-    margin-top: 1.25rem;
   }
 
   .section-desc {
@@ -217,11 +154,6 @@
   .section-btn:hover:not(:disabled) {
     border-color: var(--accent-medium);
     color: var(--accent-light);
-  }
-
-  .section-btn.danger:hover:not(:disabled) {
-    border-color: var(--color-error);
-    color: var(--color-error);
   }
 
   .section-btn:disabled {

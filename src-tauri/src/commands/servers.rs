@@ -1,7 +1,6 @@
 use crate::error::CmdResult;
 use crate::state::AppState;
 use crate::storage::Storage;
-use iroh::{PublicKey, SecretKey};
 use proscenium_types::{
     Post, PostSearchResponse, ProfileUpdateRequest, REGISTRATION_ACTION_UNREGISTER,
     RegistrationPayload, RegistrationRequest, ServerEntry, ServerFeedPost, ServerFeedResponse,
@@ -12,7 +11,7 @@ use proscenium_types::{
 use reqwest::Url;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tauri::State;
 
@@ -185,59 +184,24 @@ fn check_server_users(users: Vec<ServerUser>) -> Vec<ServerUser> {
         .collect()
 }
 
-/// Rebuild the signed `Post` from a server row and run `validate_post` on it.
-/// Returns `None` if the row cannot be rebuilt or the post is invalid.
-fn validated_post(server_post: &ServerFeedPost) -> Option<Post> {
+/// Rebuild the signed `Post` from a server row. Returns `None` if the row cannot be
+/// rebuilt, the post fails `validate_post` (which requires the id to be the hash of the
+/// content and author), or its author did not sign it.
+fn verified_post(server_post: &ServerFeedPost) -> Option<Post> {
     let post = server_post.to_post()?;
     validate_post(&post).ok()?;
+    verify_post_signature(&post).ok()?;
     Some(post)
 }
 
-/// Check server-supplied posts before they reach the webview.
-///
-/// A post is dropped if it cannot be rebuilt as a `Post`, fails `validate_post` (which
-/// requires the id to be the hash of the content and author), or repeats an earlier id.
-/// `verified` is set to whether the signature verifies under the signing key held for the
-/// author: the local signing key for the local user, otherwise the key of the cached
-/// delegation. It is false if no delegation is cached.
-async fn check_server_posts(state: &AppState, posts: Vec<ServerFeedPost>) -> Vec<ServerFeedPost> {
-    let (my_id, my_signing_pubkey) = {
-        let id = state.identity.read().await;
-        (id.master_pubkey.clone(), id.signing_key.public())
-    };
-    let mut signers: HashMap<String, Option<PublicKey>> = HashMap::new();
+/// Check server-supplied posts before they reach the webview. A post is dropped if
+/// `verified_post` rejects it or it repeats an earlier id.
+fn check_server_posts(posts: Vec<ServerFeedPost>) -> Vec<ServerFeedPost> {
     let mut seen = HashSet::new();
-    let mut checked = Vec::with_capacity(posts.len());
-    for mut server_post in posts {
-        let Some(post) = validated_post(&server_post) else {
-            continue;
-        };
-        if !seen.insert(post.id.clone()) {
-            continue;
-        }
-        let signer = match signers.get(&post.author) {
-            Some(signer) => *signer,
-            None => {
-                let signer = if post.author == my_id {
-                    Some(my_signing_pubkey)
-                } else {
-                    state
-                        .storage
-                        .get_peer_signing_pubkey(&post.author)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|key| key.parse().ok())
-                };
-                signers.insert(post.author.clone(), signer);
-                signer
-            }
-        };
-        server_post.verified =
-            signer.is_some_and(|signer| verify_post_signature(&post, &signer).is_ok());
-        checked.push(server_post);
-    }
-    checked
+    posts
+        .into_iter()
+        .filter(|server_post| verified_post(server_post).is_some_and(|post| seen.insert(post.id)))
+        .collect()
 }
 
 /// Add a discovery server. The row is stored only after the server answered
@@ -296,13 +260,12 @@ async fn build_registration_request(
     visibility: Visibility,
     action: Option<&str>,
 ) -> RegistrationRequest {
-    let (master_pubkey, transport_node_id, signing_key_bytes, delegation) = {
+    let (master_pubkey, transport_node_id, master_key) = {
         let id = state.identity.read().await;
         (
             id.master_pubkey.clone(),
             id.transport_node_id.clone(),
-            id.signing_secret_key_bytes,
-            id.delegation.clone(),
+            id.master_key.clone(),
         )
     };
     let payload = RegistrationPayload {
@@ -313,7 +276,7 @@ async fn build_registration_request(
         visibility,
         action: action.map(str::to_string),
     };
-    let signature = sign_registration(&payload, &SecretKey::from_bytes(&signing_key_bytes));
+    let signature = sign_registration(&payload, &master_key);
     RegistrationRequest {
         master_pubkey: payload.master_pubkey,
         transport_node_id: payload.transport_node_id,
@@ -322,7 +285,6 @@ async fn build_registration_request(
         visibility: payload.visibility,
         action: payload.action,
         signature,
-        delegation,
     }
 }
 
@@ -381,8 +343,7 @@ pub async fn unregister_from_server(state: State<'_, Arc<AppState>>, url: String
     state.storage.mark_server_unregistered(&url).await
 }
 
-/// Posts from the server's feed. Each post has passed `validate_post`; `verified` tells
-/// whether its signature was checked against a signing key held for its author.
+/// Posts from the server's feed. Each post has passed `verified_post`.
 #[tauri::command]
 pub async fn server_get_feed(
     state: State<'_, Arc<AppState>>,
@@ -401,7 +362,7 @@ pub async fn server_get_feed(
     let response: ServerFeedResponse =
         get_json(&state.http_client, endpoint, "feed request").await?;
     Ok(ServerFeedResponse {
-        posts: check_server_posts(&state, response.posts).await,
+        posts: check_server_posts(response.posts),
     })
 }
 
@@ -451,8 +412,7 @@ pub async fn server_search_users(
     })
 }
 
-/// Posts matching `query` on the server. Each post has passed `validate_post`; `verified`
-/// tells whether its signature was checked against a signing key held for its author.
+/// Posts matching `query` on the server. Each post has passed `verified_post`.
 #[tauri::command]
 pub async fn server_search_posts(
     state: State<'_, Arc<AppState>>,
@@ -472,7 +432,7 @@ pub async fn server_search_posts(
     let response: PostSearchResponse =
         get_json(&state.http_client, endpoint, "post search").await?;
     Ok(PostSearchResponse {
-        posts: check_server_posts(&state, response.posts).await,
+        posts: check_server_posts(response.posts),
         total: response.total.max(0),
         query,
     })
@@ -526,35 +486,24 @@ pub(crate) async fn sync_profile_to_server_inner(
     url: &str,
 ) -> CmdResult<()> {
     let url = stored_server_url(storage, url).await?;
-    // Signs the stored profile again if its signature does not verify under the current
-    // signing key; the server verifies it under the key of `delegation`.
+    // Signs the stored profile again if its signature does not verify under the master
+    // key.
     let profile = crate::announcement::build_own_identity_response(storage, identity)
         .await?
         .profile
         .ok_or("no profile to sync")?;
-    let (master_pubkey, signing_key_bytes, delegation) = {
+    let (master_pubkey, master_key) = {
         let id = identity.read().await;
-        (
-            id.master_pubkey.clone(),
-            id.signing_secret_key_bytes,
-            id.delegation.clone(),
-        )
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
     let timestamp = now_millis();
-    let signature = sign_profile_update(
-        &master_pubkey,
-        &url,
-        timestamp,
-        &profile,
-        &SecretKey::from_bytes(&signing_key_bytes),
-    );
+    let signature = sign_profile_update(&master_pubkey, &url, timestamp, &profile, &master_key);
     let request = ProfileUpdateRequest {
         master_pubkey,
         server_url: url.clone(),
         timestamp,
         profile,
         signature,
-        delegation,
     };
 
     let resp = http_client
@@ -571,6 +520,7 @@ pub(crate) async fn sync_profile_to_server_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
 
     #[test]
     fn server_url_is_normalized() {
@@ -649,20 +599,24 @@ mod tests {
             quote_of_author: None,
             signature: post.signature,
             indexed_at: 0,
-            verified: false,
         }
     }
 
     #[test]
-    fn server_post_is_rebuilt_validated_and_verifiable() {
+    fn server_post_is_rebuilt_and_verified() {
         let key = SecretKey::from_bytes(&[4u8; 32]);
         let server_post = signed_server_post(&key, "hello");
+        assert!(verified_post(&server_post).is_some());
 
-        let post = validated_post(&server_post).unwrap();
-        assert!(verify_post_signature(&post, &key.public()).is_ok());
-        // Another key does not verify, which leaves `verified` false.
-        let other = SecretKey::from_bytes(&[5u8; 32]).public();
-        assert!(verify_post_signature(&post, &other).is_err());
+        // A signature that its author did not make.
+        let mut forged = signed_server_post(&key, "hello");
+        forged.signature =
+            signed_server_post(&SecretKey::from_bytes(&[5u8; 32]), "hello").signature;
+        assert!(verified_post(&forged).is_none());
+
+        // Repeated ids are dropped.
+        let checked = check_server_posts(vec![server_post.clone(), server_post, forged]);
+        assert_eq!(checked.len(), 1);
     }
 
     #[test]
@@ -672,26 +626,26 @@ mod tests {
         // Content that the id does not cover.
         let mut changed = signed_server_post(&key, "hello");
         changed.content = "other text".to_string();
-        assert!(validated_post(&changed).is_none());
+        assert!(verified_post(&changed).is_none());
 
         // Author replaced by another identity.
         let mut reattributed = signed_server_post(&key, "hello");
         reattributed.author = SecretKey::from_bytes(&[5u8; 32]).public().to_string();
-        assert!(validated_post(&reattributed).is_none());
+        assert!(verified_post(&reattributed).is_none());
 
         let mut negative_time = signed_server_post(&key, "hello");
         negative_time.timestamp = -1;
-        assert!(validated_post(&negative_time).is_none());
+        assert!(verified_post(&negative_time).is_none());
 
         let mut bad_media = signed_server_post(&key, "hello");
         bad_media.media_json = Some("{not json".to_string());
-        assert!(validated_post(&bad_media).is_none());
+        assert!(verified_post(&bad_media).is_none());
 
         // The server stores no `media_json` for a post without media; here the signed
         // post had one attachment, so the rebuilt post has a different id.
         let mut dropped_media = signed_server_post(&key, "hello");
         dropped_media.media_json = None;
-        assert!(validated_post(&dropped_media).is_none());
+        assert!(verified_post(&dropped_media).is_none());
     }
 
     /// Serve `response` (a complete HTTP/1.1 response) to every connection on an ephemeral

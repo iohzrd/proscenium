@@ -118,16 +118,6 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn get_registered_servers(&self) -> Result<Vec<ServerEntry>, AppError> {
-        let sql = format!(
-            "SELECT {SERVER_COLUMNS} FROM servers WHERE registered_at IS NOT NULL ORDER BY added_at DESC, url"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(row_to_server).collect())
-    }
-
     /// Record that the local user is not registered with the server.
     /// Returns an error if no row has this URL.
     pub async fn mark_server_unregistered(&self, url: &str) -> Result<(), AppError> {

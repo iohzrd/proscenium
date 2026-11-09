@@ -5,9 +5,9 @@ use crate::constants::{
 };
 use crate::error::AppError;
 use crate::framing::{read_frame_limited, read_to_end_timeout, write_all_timeout};
-use crate::ingest::{resolve_signer, verify_and_store_profile};
+use crate::ingest::verify_and_store_profile;
 use crate::storage::Storage;
-use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use proscenium_types::{
     MAX_SYNC_IDS, PEER_ALPN, PeerRequest, StageAnnouncement, SyncFrame, SyncMode, SyncRequest,
     SyncSummary, post_ids_digest, short_id, verify_linked_devices_announcement,
@@ -79,8 +79,7 @@ pub(super) async fn sync_from_peer(
         read_to_end_timeout(&mut recv, SYNC_MAX_SUMMARY_BYTES, SYNC_STEP_TIMEOUT).await?;
     let summary: SyncSummary = serde_json::from_slice(&summary_bytes)?;
 
-    // The responder's signed device list carries its current delegation. It is stored
-    // before any content is verified, so content signed after a key rotation verifies.
+    // The responder's signed device list: current NodeIds and DM pubkey of the author.
     if let Some(announcement) = &summary.announcement {
         if announcement.master_pubkey != author {
             log::warn!("[{label}] sync summary carries a device list of another user");
@@ -91,16 +90,8 @@ pub(super) async fn sync_from_peer(
         }
     }
 
-    let Some(signer) = resolve_signer(storage, author).await else {
-        conn.close(0u32.into(), b"done");
-        return Err(AppError::Other(format!(
-            "no cached signing key for {}",
-            short_id(author)
-        )));
-    };
-
     if let Some(profile) = &summary.profile {
-        match verify_and_store_profile(storage, author, profile, &signer).await {
+        match verify_and_store_profile(storage, author, profile).await {
             Ok(true) => {
                 let _ = app_handle.emit("profile-updated", author);
             }
@@ -110,7 +101,7 @@ pub(super) async fn sync_from_peer(
     }
 
     if let Some(stage) = &summary.active_stage {
-        emit_verified_stage(stage, author, &signer, app_handle, label);
+        emit_verified_stage(stage, author, app_handle, label);
     }
 
     log::info!(
@@ -143,7 +134,6 @@ pub(super) async fn sync_from_peer(
     let mut ingest = FrameIngest::new(
         storage,
         author,
-        signer,
         label,
         my_id,
         app_handle,
@@ -271,11 +261,10 @@ async fn receive_frames(
 }
 
 /// Emit `stage-announced` for a stage announcement from a sync summary, only if
-/// `author` is its host and its signature verifies against `signer`.
+/// `author` is its host and signed it.
 fn emit_verified_stage(
     stage: &StageAnnouncement,
     author: &str,
-    signer: &PublicKey,
     app_handle: &AppHandle,
     label: &str,
 ) {
@@ -290,7 +279,6 @@ fn emit_verified_stage(
         &stage.host_pubkey,
         stage.started_at,
         &stage.signature,
-        signer,
     ) {
         log::warn!(
             "[{label}] bad stage announcement from {}: {reason}",

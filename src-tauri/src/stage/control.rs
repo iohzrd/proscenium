@@ -1,15 +1,15 @@
 use crate::error::AppError;
 use bytes::Bytes;
 use futures_lite::StreamExt;
-use iroh::{EndpointId, PublicKey, SecretKey};
+use iroh::{EndpointId, SecretKey};
 use iroh_gossip::{
     Gossip,
     api::{Event, GossipReceiver, GossipSender},
 };
 use proscenium_types::{
-    SignedStageControl, SigningKeyDelegation, StageControl, VerifiedPresence, is_recent_timestamp,
-    now_millis, short_id, sign_stage_control, stage_control_topic, validate_stage_control,
-    verify_presence, verify_stage_control,
+    SignedStageControl, StageControl, VerifiedPresence, is_recent_timestamp, now_millis, short_id,
+    sign_stage_control, stage_control_topic, validate_stage_control, verify_presence,
+    verify_stage_control,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,14 +25,10 @@ pub const PRESENCE_EXPIRY: std::time::Duration = std::time::Duration::from_secs(
 /// Minimum time between two Presence broadcasts caused by new gossip neighbors.
 const PRESENCE_MIN_SPACING: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Signs this node's control messages for one stage.
-///
-/// Holds the signing key and delegation read at the time the stage was created or
-/// joined, so every message of the session is signed by the key named in `Presence`.
+/// Signs this node's control messages for one stage with the master key.
 pub struct ControlSigner {
     stage_id: String,
-    signing_key: SecretKey,
-    delegation: SigningKeyDelegation,
+    master_key: SecretKey,
     node_id: String,
     /// Timestamp of the last signed message. Receivers require timestamps of one signer
     /// to increase, so two messages never carry the same value.
@@ -40,16 +36,10 @@ pub struct ControlSigner {
 }
 
 impl ControlSigner {
-    pub fn new(
-        stage_id: String,
-        signing_key: SecretKey,
-        delegation: SigningKeyDelegation,
-        node_id: String,
-    ) -> Self {
+    pub fn new(stage_id: String, master_key: SecretKey, node_id: String) -> Self {
         Self {
             stage_id,
-            signing_key,
-            delegation,
+            master_key,
             node_id,
             last_timestamp: AtomicU64::new(0),
         }
@@ -68,39 +58,30 @@ impl ControlSigner {
     /// Sign a control message for this stage.
     pub fn sign(&self, control: StageControl) -> SignedStageControl {
         let timestamp = self.next_timestamp(now_millis());
-        sign_stage_control(&self.stage_id, control, &self.signing_key, timestamp)
+        sign_stage_control(&self.stage_id, control, &self.master_key, timestamp)
     }
 
-    /// Sign a `Presence` that proves this node's master pubkey and names its NodeId.
+    /// Sign a `Presence` that names this node's NodeId.
     pub fn presence(&self) -> SignedStageControl {
         self.sign(StageControl::Presence {
-            delegation: self.delegation.clone(),
             node_id: self.node_id.clone(),
         })
     }
 
-    pub fn signing_key(&self) -> &SecretKey {
-        &self.signing_key
-    }
-
-    pub fn signing_pubkey(&self) -> PublicKey {
-        self.signing_key.public()
-    }
-
-    pub fn delegation(&self) -> &SigningKeyDelegation {
-        &self.delegation
+    pub fn master_key(&self) -> &SecretKey {
+        &self.master_key
     }
 }
 
 /// A control message whose signature, size limits and timestamp window were checked.
 pub struct VerifiedControl {
     pub signed: SignedStageControl,
-    /// Set for a `Presence` whose delegation was verified.
+    /// Set for a verified `Presence`.
     pub presence: Option<VerifiedPresence>,
 }
 
-/// Check a received control message: stage id, payload limits, signature, timestamp
-/// window and, for a `Presence`, the delegation.
+/// Check a received control message: stage id, payload limits, signature and timestamp
+/// window.
 pub fn verify_control(
     signed: SignedStageControl,
     stage_id: &str,
@@ -121,10 +102,10 @@ pub fn verify_control(
     Ok(VerifiedControl { signed, presence })
 }
 
-/// Check the hello of an audio connection: a signed `Presence` for `stage_id` with a
-/// valid delegation. The timestamp is not checked: the caller requires the named NodeId
-/// to equal the NodeId QUIC authenticated, so a copy sent by another node is rejected,
-/// and a node with a wrong clock can still connect.
+/// Check the hello of an audio connection: a signed `Presence` for `stage_id`. The
+/// timestamp is not checked: the caller requires the named NodeId to equal the NodeId
+/// QUIC authenticated, so a copy sent by another node is rejected, and a node with a
+/// wrong clock can still connect.
 pub fn verify_hello(
     signed: &SignedStageControl,
     stage_id: &str,
@@ -301,26 +282,18 @@ async fn heartbeat_loop(plane: ControlPlane, neighbor_up: Arc<Notify>, cancel: C
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proscenium_types::{derive_signing_key, sign_delegation};
 
     const STAGE_ID: &str = "000102030405060708090a0b0c0d0e0f";
 
     fn signer(seed: u8) -> ControlSigner {
-        let master_bytes = [seed; 32];
-        let master = SecretKey::from_bytes(&master_bytes);
-        let signing = SecretKey::from_bytes(&derive_signing_key(&master_bytes, 0));
-        let delegation = sign_delegation(
-            &master,
-            &signing.public(),
-            0,
-            &"ab".repeat(32),
-            0,
-            now_millis(),
-        );
         let node_id = SecretKey::from_bytes(&[seed.wrapping_add(100); 32])
             .public()
             .to_string();
-        ControlSigner::new(STAGE_ID.to_string(), signing, delegation, node_id)
+        ControlSigner::new(
+            STAGE_ID.to_string(),
+            SecretKey::from_bytes(&[seed; 32]),
+            node_id,
+        )
     }
 
     #[test]
@@ -342,8 +315,11 @@ mod tests {
         let signer = signer(2);
         let verified = verify_control(signer.presence(), STAGE_ID).unwrap();
         let presence = verified.presence.unwrap();
-        assert_eq!(presence.master_pubkey, signer.delegation().master_pubkey);
-        assert_eq!(presence.signing_pubkey, signer.signing_pubkey().to_string());
+        assert_eq!(
+            presence.master_pubkey,
+            signer.master_key().public().to_string()
+        );
+        assert_eq!(presence.node_id, signer.node_id);
 
         assert!(verify_control(signer.presence(), "ff0102030405060708090a0b0c0d0e0f").is_err());
     }
@@ -354,7 +330,7 @@ mod tests {
         let hello = signer.presence();
         assert_eq!(
             verify_hello(&hello, STAGE_ID).unwrap().master_pubkey,
-            signer.delegation().master_pubkey
+            signer.master_key().public().to_string()
         );
         assert!(verify_hello(&hello, "ff0102030405060708090a0b0c0d0e0f").is_err());
         assert!(verify_hello(&signer.sign(StageControl::RaiseHand), STAGE_ID).is_err());
@@ -362,10 +338,9 @@ mod tests {
         let old = sign_stage_control(
             STAGE_ID,
             StageControl::Presence {
-                delegation: signer.delegation().clone(),
                 node_id: signer.node_id.clone(),
             },
-            signer.signing_key(),
+            signer.master_key(),
             1,
         );
         assert!(verify_hello(&old, STAGE_ID).is_ok());
@@ -378,7 +353,7 @@ mod tests {
         let stale = sign_stage_control(
             STAGE_ID,
             StageControl::RaiseHand,
-            signer.signing_key(),
+            signer.master_key(),
             now_millis() - 2 * proscenium_types::MAX_TIMESTAMP_DRIFT_MS,
         );
         assert!(verify_control(stale, STAGE_ID).is_err());

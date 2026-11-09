@@ -50,29 +50,14 @@ fn make_profile(name: &str) -> Profile {
     }
 }
 
-/// A `VerifiedIdentity` with the given delegation indexes, device NodeIds and version.
+/// A `VerifiedIdentity` with the given DM pubkey, device NodeIds and version.
 /// Storage does not check signatures, so the signature fields are placeholders.
-fn make_identity(
-    master: &str,
-    signing: &str,
-    dm: &str,
-    key_index: u32,
-    nodes: &[&str],
-    version: u64,
-) -> VerifiedIdentity {
+fn make_identity(master: &str, dm: &str, nodes: &[&str], version: u64) -> VerifiedIdentity {
     VerifiedIdentity {
         master_pubkey: master.to_string(),
         announcement: LinkedDevicesAnnouncement {
             master_pubkey: master.to_string(),
-            delegation: SigningKeyDelegation {
-                master_pubkey: master.to_string(),
-                signing_pubkey: signing.to_string(),
-                key_index,
-                dm_pubkey: dm.to_string(),
-                dm_key_index: 0,
-                issued_at: 1000,
-                signature: "sig".to_string(),
-            },
+            dm_pubkey: dm.to_string(),
             devices: nodes
                 .iter()
                 .map(|n| DeviceEntry {
@@ -1042,6 +1027,11 @@ async fn social_migration_removes_rows_written_from_remote_lists() {
         .await
         .unwrap();
 
+    // 014 reads `peer_delegations`, which 002 creates and 017 drops.
+    sqlx::raw_sql(include_str!("../../migrations/002_peer_delegations.sql"))
+        .execute(&s.pool)
+        .await
+        .unwrap();
     sqlx::raw_sql(include_str!("../../migrations/014_social.sql"))
         .execute(&s.pool)
         .await
@@ -1932,90 +1922,47 @@ async fn messaging_outbox_expiry() {
     );
 }
 
-// ── Peer Delegations ─────────────────────────────────────────────────────────
+// ── Peer Identities ──────────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn peer_delegation_cache_and_retrieve() {
+async fn peer_identity_cache_and_retrieve() {
     let s = test_storage().await;
-    let response = make_identity(
-        "master_pk",
-        "signing_pk",
-        "dm_pk",
-        0,
-        &["transport_1", "transport_2"],
-        1,
-    );
+    let response = make_identity("master_pk", "dm_pk", &["transport_1", "transport_2"], 1);
     s.cache_peer_identity(&response).await.unwrap();
 
-    // Signing pubkey
-    let signing = s
-        .get_peer_signing_pubkey("master_pk")
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(signing, "signing_pk");
-
-    // DM pubkey
     let dm = s.get_peer_dm_pubkey("master_pk").await.unwrap().unwrap();
     assert_eq!(dm, "dm_pk");
-
-    // Transport node IDs
     let ids = s.get_peer_transport_node_ids("master_pk").await.unwrap();
     assert_eq!(ids, vec!["transport_1", "transport_2"]);
-
-    // Delegation round-trip
-    let d = s.get_peer_delegation("master_pk").await.unwrap().unwrap();
-    assert_eq!(d.signing_pubkey, "signing_pk");
-    assert_eq!(d.key_index, 0);
-}
-
-#[tokio::test]
-async fn peer_delegation_rejects_older_key_index() {
-    let s = test_storage().await;
-    let newer = make_identity("master_pk", "signing_new", "dm_pk", 2, &["transport_1"], 10);
-    s.cache_peer_identity(&newer).await.unwrap();
-
-    // A delegation with a lower key index must not replace the cached one.
-    let older = make_identity("master_pk", "signing_old", "dm_pk", 1, &["attacker"], 20);
-    assert!(s.cache_peer_identity(&older).await.is_err());
-    assert_eq!(
-        s.get_peer_signing_pubkey("master_pk")
-            .await
-            .unwrap()
-            .unwrap(),
-        "signing_new"
-    );
-    assert_eq!(
-        s.get_peer_transport_node_ids("master_pk").await.unwrap(),
-        vec!["transport_1"]
-    );
-    assert!(
-        s.cache_peer_delegation(&older.announcement.delegation)
-            .await
-            .is_err()
-    );
 }
 
 #[tokio::test]
 async fn peer_announcement_keeps_device_list_unless_version_increases() {
     let s = test_storage().await;
-    let v10 = make_identity("master_pk", "signing_pk", "dm_pk", 0, &["transport_1"], 10);
+    let v10 = make_identity("master_pk", "dm_pk", &["transport_1"], 10);
     assert_eq!(
         s.cache_peer_announcement(&v10.announcement).await.unwrap(),
         AnnouncementOutcome::Stored
     );
 
-    let v5 = make_identity("master_pk", "signing_pk", "dm_pk", 0, &["old_device"], 5);
-    assert_eq!(
-        s.cache_peer_announcement(&v5.announcement).await.unwrap(),
-        AnnouncementOutcome::NotNewer
-    );
+    // Equal and lower versions change neither the NodeIds nor the DM pubkey.
+    for version in [10, 5] {
+        let old = make_identity("master_pk", "dm_old", &["old_device"], version);
+        assert_eq!(
+            s.cache_peer_announcement(&old.announcement).await.unwrap(),
+            AnnouncementOutcome::NotNewer
+        );
+    }
     assert_eq!(
         s.get_peer_transport_node_ids("master_pk").await.unwrap(),
         vec!["transport_1"]
     );
+    assert_eq!(
+        s.get_peer_dm_pubkey("master_pk").await.unwrap().unwrap(),
+        "dm_pk"
+    );
 
-    let v11 = make_identity("master_pk", "signing_pk", "dm_pk", 0, &["transport_2"], 11);
+    let v11 = make_identity("master_pk", "dm_new", &["transport_2"], 11);
     assert_eq!(
         s.cache_peer_announcement(&v11.announcement).await.unwrap(),
         AnnouncementOutcome::Stored
@@ -2023,6 +1970,10 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
     assert_eq!(
         s.get_peer_transport_node_ids("master_pk").await.unwrap(),
         vec!["transport_2"]
+    );
+    assert_eq!(
+        s.get_peer_dm_pubkey("master_pk").await.unwrap().unwrap(),
+        "dm_new"
     );
 }
 
@@ -2050,16 +2001,69 @@ async fn profile_is_replaced_only_by_equal_or_newer_version() {
 }
 
 #[tokio::test]
-async fn peer_delegation_reverse_lookups() {
+async fn announcement_row_without_dm_pubkey_keeps_its_node_ids() {
     let s = test_storage().await;
-    let response = make_identity(
-        "master_pk",
-        "signing_pk",
-        "dm_pk_hex",
-        0,
-        &["transport_node_1"],
-        1,
+    let master = pubkey(20);
+    // A row as stored before migration 017: the JSON carries a delegation and no DM pubkey.
+    let old_json = serde_json::json!({
+        "master_pubkey": master,
+        "delegation": {},
+        "devices": [{ "node_id": "node_1" }, { "node_id": "node_2" }],
+        "version": 3,
+    });
+    sqlx::query(
+        "INSERT INTO peer_device_announcements (master_pubkey, announcement_json, version, cached_at)
+         VALUES (?1, ?2, 3, 0)",
+    )
+    .bind(&master)
+    .bind(old_json.to_string())
+    .execute(&s.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        s.get_peer_transport_node_ids(&master).await.unwrap(),
+        vec!["node_1", "node_2"]
     );
+    assert!(s.get_peer_dm_pubkey(&master).await.unwrap().is_none());
+
+    // The row does not parse as a current announcement, so it is not exported.
+    let me = pubkey(1);
+    s.merge_follows_lww(&me, &[follow_entry(&master, "active", 1)])
+        .await
+        .unwrap();
+    assert!(s.is_following(&me, &master).await.unwrap());
+    assert!(
+        s.get_followed_peer_announcements(&me)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let newer = make_identity(&master, "dm_pk", &["node_3"], 4);
+    assert_eq!(
+        s.cache_peer_announcement(&newer.announcement)
+            .await
+            .unwrap(),
+        AnnouncementOutcome::Stored
+    );
+    assert_eq!(
+        s.get_peer_transport_node_ids(&master).await.unwrap(),
+        vec!["node_3"]
+    );
+    assert_eq!(
+        s.get_peer_dm_pubkey(&master).await.unwrap().unwrap(),
+        "dm_pk"
+    );
+    assert_eq!(
+        s.get_followed_peer_announcements(&me).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn peer_identity_reverse_lookups() {
+    let s = test_storage().await;
+    let response = make_identity("master_pk", "dm_pk_hex", &["transport_node_1"], 1);
     s.cache_peer_identity(&response).await.unwrap();
 
     // DM pubkey -> master pubkey
@@ -2090,10 +2094,8 @@ async fn peer_delegation_reverse_lookups() {
 }
 
 #[tokio::test]
-async fn peer_delegation_empty_returns() {
+async fn peer_identity_empty_returns() {
     let s = test_storage().await;
-    assert!(s.get_peer_delegation("nope").await.unwrap().is_none());
-    assert!(s.get_peer_signing_pubkey("nope").await.unwrap().is_none());
     assert!(s.get_peer_dm_pubkey("nope").await.unwrap().is_none());
     assert!(
         s.get_peer_transport_node_ids("nope")
@@ -2106,7 +2108,7 @@ async fn peer_delegation_empty_returns() {
 #[tokio::test]
 async fn peer_transport_lookup_follows_the_latest_device_list() {
     let s = test_storage().await;
-    let v1 = make_identity("master_a", "signing_a", "dm_a", 0, &["node_1", "node_2"], 1);
+    let v1 = make_identity("master_a", "dm_a", &["node_1", "node_2"], 1);
     s.cache_peer_identity(&v1).await.unwrap();
     assert_eq!(
         s.get_master_pubkey_for_transport("node_1").await.as_deref(),
@@ -2121,7 +2123,7 @@ async fn peer_transport_lookup_follows_the_latest_device_list() {
     );
 
     // A newer device list without node_1 removes its mapping.
-    let v2 = make_identity("master_a", "signing_a", "dm_a", 0, &["node_2", "node_3"], 2);
+    let v2 = make_identity("master_a", "dm_a", &["node_2", "node_3"], 2);
     s.cache_peer_identity(&v2).await.unwrap();
     assert!(s.get_master_pubkey_for_transport("node_1").await.is_none());
     assert_eq!(
@@ -2137,8 +2139,8 @@ async fn peer_transport_lookup_follows_the_latest_device_list() {
 #[tokio::test]
 async fn peer_transport_lookup_returns_one_master_per_node() {
     let s = test_storage().await;
-    let a = make_identity("master_a", "signing_a", "dm_a", 0, &["node_1"], 1);
-    let b = make_identity("master_b", "signing_b", "dm_b", 0, &["node_1", "node_9"], 1);
+    let a = make_identity("master_a", "dm_a", &["node_1"], 1);
+    let b = make_identity("master_b", "dm_b", &["node_1", "node_9"], 1);
     s.cache_peer_identity(&a).await.unwrap();
     s.cache_peer_identity(&b).await.unwrap();
     // The most recently stored announcement that lists the NodeId determines the result.
@@ -2147,7 +2149,7 @@ async fn peer_transport_lookup_returns_one_master_per_node() {
         Some("master_b")
     );
 
-    let a2 = make_identity("master_a", "signing_a", "dm_a", 0, &["node_1"], 2);
+    let a2 = make_identity("master_a", "dm_a", &["node_1"], 2);
     s.cache_peer_identity(&a2).await.unwrap();
     assert_eq!(
         s.get_master_pubkey_for_transport("node_1").await.as_deref(),
@@ -2161,9 +2163,9 @@ async fn peer_transport_lookup_returns_one_master_per_node() {
 }
 
 #[tokio::test]
-async fn peer_dm_pubkey_lookup_is_none_for_a_key_in_two_delegations() {
+async fn peer_dm_pubkey_lookup_is_none_for_a_key_in_two_device_lists() {
     let s = test_storage().await;
-    let a = make_identity("master_a", "signing_a", "shared_dm", 0, &["node_1"], 1);
+    let a = make_identity("master_a", "shared_dm", &["node_1"], 1);
     s.cache_peer_identity(&a).await.unwrap();
     assert_eq!(
         s.get_master_pubkey_for_dm_pubkey("shared_dm")
@@ -2172,7 +2174,7 @@ async fn peer_dm_pubkey_lookup_is_none_for_a_key_in_two_delegations() {
         Some("master_a")
     );
 
-    let b = make_identity("master_b", "signing_b", "shared_dm", 0, &["node_2"], 1);
+    let b = make_identity("master_b", "shared_dm", &["node_2"], 1);
     s.cache_peer_identity(&b).await.unwrap();
     assert!(
         s.get_master_pubkey_for_dm_pubkey("shared_dm")
@@ -2454,15 +2456,15 @@ async fn server_add_get_and_remove() {
 async fn server_registration_state() {
     let s = test_storage().await;
     s.add_server("https://a.test", "A", "", "").await.unwrap();
-    assert!(s.get_registered_servers().await.unwrap().is_empty());
+    let server = || async { s.get_server("https://a.test").await.unwrap().unwrap() };
+    assert!(server().await.registered_at.is_none());
 
     s.mark_server_registered("https://a.test", "listed")
         .await
         .unwrap();
-    let registered = s.get_registered_servers().await.unwrap();
-    assert_eq!(registered.len(), 1);
-    assert_eq!(registered[0].visibility, "listed");
-    assert!(registered[0].registered_at.is_some());
+    let registered = server().await;
+    assert_eq!(registered.visibility, "listed");
+    assert!(registered.registered_at.is_some());
 
     // Adding the same URL again replaces the description and keeps the registration.
     s.add_server("https://a.test", "A2", "new", "node")
@@ -2474,7 +2476,7 @@ async fn server_registration_state() {
     assert_eq!(a.visibility, "listed");
 
     s.mark_server_unregistered("https://a.test").await.unwrap();
-    assert!(s.get_registered_servers().await.unwrap().is_empty());
+    assert!(server().await.registered_at.is_none());
 }
 
 #[tokio::test]
@@ -2494,7 +2496,8 @@ async fn server_updates_fail_for_unknown_url() {
             .await
             .is_err()
     );
-    assert!(s.get_registered_servers().await.unwrap().is_empty());
+    let a = s.get_server("https://a.test").await.unwrap().unwrap();
+    assert!(a.registered_at.is_none());
 }
 
 // ── Preferences ──────────────────────────────────────────────────────────────
@@ -2780,19 +2783,16 @@ fn device_entry(node_id: &str, name: &str, is_primary: bool) -> DeviceEntry {
 /// A device announcement of the identity with master seed `master_seed`, signed so that
 /// `verify_linked_devices_announcement` accepts it.
 fn signed_announcement(master_seed: u8, node_seed: u8, version: u64) -> LinkedDevicesAnnouncement {
-    let master_bytes = [master_seed; 32];
-    let master = iroh::SecretKey::from_bytes(&master_bytes);
-    let signing = iroh::SecretKey::from_bytes(&derive_signing_key(&master_bytes, 0));
-    let delegation = sign_delegation(&master, &signing.public(), 0, &"ab".repeat(32), 0, 1000);
+    let master = iroh::SecretKey::from_bytes(&[master_seed; 32]);
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: master.public().to_string(),
-        delegation,
+        dm_pubkey: "ab".repeat(32),
         devices: vec![device_entry(&pubkey(node_seed), "device", true)],
         version,
         timestamp: version,
         signature: String::new(),
     };
-    sign_linked_devices_announcement(&mut announcement, &signing);
+    sign_linked_devices_announcement(&mut announcement, &master);
     announcement
 }
 
@@ -3060,19 +3060,18 @@ async fn device_sync_vector_summarizes_own_rows() {
         .unwrap();
 
     let lww = s.load_lww_state(&me).await.unwrap();
-    let vector = s.build_device_sync_vector(&me, &lww, 7).await.unwrap();
+    let vector = s.build_device_sync_vector(&me, &lww).await.unwrap();
     assert_eq!(vector.post_count, 2);
     assert_eq!(vector.newest_post_ts, 3000);
     assert_eq!(vector.interaction_count, 1);
     assert_eq!(vector.newest_interaction_ts, 2000);
-    assert_eq!(vector.signing_key_index, 7);
     assert_eq!(vector.devices.len(), 1);
     assert_eq!(vector.lww_digest, lww.digest());
 
     // An empty database yields zero counts and the digest of no rows.
     let empty = test_storage().await;
     let lww = empty.load_lww_state(&me).await.unwrap();
-    let vector = empty.build_device_sync_vector(&me, &lww, 0).await.unwrap();
+    let vector = empty.build_device_sync_vector(&me, &lww).await.unwrap();
     assert_eq!(vector.post_count, 0);
     assert_eq!(vector.newest_post_ts, 0);
     assert_ne!(
@@ -3122,8 +3121,6 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
     let bundle = LinkBundleData {
         master_secret_key: String::new(),
         device_index: 1,
-        signing_key_index: 0,
-        dm_key_index: 0,
         devices: vec![device_entry(&primary_node, "Primary Device", true)],
         profile: Some(make_profile("me")),
         follows: vec![

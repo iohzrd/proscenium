@@ -1,6 +1,5 @@
 use crate::error::AppError;
 use crate::storage::{Storage, TombstoneOutcome};
-use iroh::PublicKey;
 use proscenium_types::{
     Interaction, Post, PostTombstone, Profile, is_valid_id, now_millis, parse_mentions, short_id,
     validate_interaction, validate_post, validate_profile, verify_delete_post_signature,
@@ -19,53 +18,14 @@ pub enum InteractionOutcome {
     Stored,
 }
 
-/// The signing public key of `master_pubkey` from the delegation cache.
-///
-/// Returns `None` if no delegation is cached, the cached key does not parse, or the
-/// lookup fails. Callers reject the content in that case.
-pub async fn resolve_signer(storage: &Storage, master_pubkey: &str) -> Option<PublicKey> {
-    match storage.get_peer_signing_pubkey(master_pubkey).await {
-        Ok(Some(signing_pubkey)) => signing_pubkey.parse().ok(),
-        Ok(None) => None,
-        Err(e) => {
-            log::error!(
-                "[ingest] signing key lookup failed for {}: {e}",
-                short_id(master_pubkey)
-            );
-            None
-        }
-    }
-}
-
-/// Resolve the cached signing key of `post.author`, then run `verify_and_store_post`.
-/// Returns `true` if a new post row was inserted.
-pub async fn process_incoming_post(
-    storage: &Storage,
-    post: &Post,
-    label: &str,
-    my_id: &str,
-    app_handle: &AppHandle,
-) -> bool {
-    let Some(signer) = resolve_signer(storage, &post.author).await else {
-        log::error!(
-            "[{label}] rejected post {} (no cached signing key for {})",
-            short_id(&post.id),
-            short_id(&post.author),
-        );
-        return false;
-    };
-    verify_and_store_post(storage, post, &signer, label, my_id, app_handle).await
-}
-
-/// Validate a post, verify its signature against `signer`, and insert it unless a
-/// tombstone exists for its `(author, id)`.
+/// Validate a post, verify that its author signed it, and insert it unless a tombstone
+/// exists for its `(author, id)`.
 ///
 /// Returns `true` only if a new row was inserted. Mention, reply and quote notifications
 /// and their events are produced only in that case.
 pub async fn verify_and_store_post(
     storage: &Storage,
     post: &Post,
-    signer: &PublicKey,
     label: &str,
     my_id: &str,
     app_handle: &AppHandle,
@@ -74,7 +34,7 @@ pub async fn verify_and_store_post(
         log::error!("[{label}] rejected post {}: {reason}", short_id(&post.id));
         return false;
     }
-    if let Err(reason) = verify_post_signature(post, signer) {
+    if let Err(reason) = verify_post_signature(post) {
         log::error!(
             "[{label}] rejected post {} (bad sig): {reason}",
             short_id(&post.id)
@@ -157,39 +117,8 @@ pub async fn verify_and_store_post(
     true
 }
 
-/// Resolve the cached signing key of `expected_author`, then run
-/// `verify_and_store_interaction`. Returns `true` if a new interaction row was inserted.
-pub async fn process_incoming_interaction(
-    storage: &Storage,
-    interaction: &Interaction,
-    expected_author: &str,
-    label: &str,
-    my_id: &str,
-    app_handle: &AppHandle,
-) -> bool {
-    let Some(signer) = resolve_signer(storage, expected_author).await else {
-        log::error!(
-            "[{label}] rejected interaction {} (no cached signing key for {})",
-            short_id(&interaction.id),
-            short_id(expected_author),
-        );
-        return false;
-    };
-    verify_and_store_interaction(
-        storage,
-        interaction,
-        expected_author,
-        &signer,
-        label,
-        my_id,
-        app_handle,
-    )
-    .await
-        == InteractionOutcome::Stored
-}
-
-/// Validate an interaction, verify its signature against `signer`, and insert it unless a
-/// tombstone exists for its `(author, id)`.
+/// Validate an interaction of `expected_author`, verify that its author signed it, and
+/// insert it unless a tombstone exists for its `(author, id)`.
 ///
 /// A "like" notification is produced only for `InteractionOutcome::Stored` and only if
 /// the liked post is stored locally and authored by `my_id`.
@@ -197,7 +126,6 @@ pub async fn verify_and_store_interaction(
     storage: &Storage,
     interaction: &Interaction,
     expected_author: &str,
-    signer: &PublicKey,
     label: &str,
     my_id: &str,
     app_handle: &AppHandle,
@@ -212,7 +140,7 @@ pub async fn verify_and_store_interaction(
         );
         return InteractionOutcome::Rejected;
     }
-    if let Err(reason) = verify_interaction_signature(interaction, signer) {
+    if let Err(reason) = verify_interaction_signature(interaction) {
         log::error!(
             "[{label}] rejected interaction {} (bad sig): {reason}",
             short_id(&interaction.id)
@@ -267,18 +195,17 @@ pub async fn verify_and_store_interaction(
     InteractionOutcome::Stored
 }
 
-/// Validate a profile of `author`, verify its signature against `signer`, and store it if
-/// it differs from the stored profile and is not older.
+/// Validate a profile of `author`, verify that `author` signed it, and store it if it
+/// differs from the stored profile and is not older.
 ///
 /// Returns `Ok(true)` if the profile row changed.
 pub async fn verify_and_store_profile(
     storage: &Storage,
     author: &str,
     profile: &Profile,
-    signer: &PublicKey,
 ) -> Result<bool, AppError> {
     validate_profile(profile)?;
-    verify_profile_signature(profile, author, signer)?;
+    verify_profile_signature(profile, author)?;
     if let Some(stored) = storage.get_profile(author).await?
         && stored.updated_at == profile.updated_at
         && stored.signature == profile.signature
@@ -288,8 +215,8 @@ pub async fn verify_and_store_profile(
     storage.save_profile(author, profile).await
 }
 
-/// Verify signed post deletions by `author` against `signer`, store them as tombstones
-/// and delete the posts they identify.
+/// Verify signed post deletions by `author`, store them as tombstones and delete the
+/// posts they identify.
 ///
 /// Entries with another author, an invalid id or an invalid signature are skipped.
 /// Returns the number of post rows deleted and of tombstone rows inserted; both are 0
@@ -298,7 +225,6 @@ pub async fn verify_and_apply_post_tombstones(
     storage: &Storage,
     author: &str,
     tombstones: &[PostTombstone],
-    signer: &PublicKey,
     label: &str,
 ) -> TombstoneOutcome {
     let valid: Vec<PostTombstone> = tombstones
@@ -307,7 +233,7 @@ pub async fn verify_and_apply_post_tombstones(
             if t.author != author || !is_valid_id(&t.id) {
                 return false;
             }
-            match verify_delete_post_signature(&t.id, &t.author, &t.signature, signer) {
+            match verify_delete_post_signature(&t.id, &t.author, &t.signature) {
                 Ok(()) => true,
                 Err(reason) => {
                     log::warn!(

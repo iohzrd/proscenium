@@ -1,6 +1,5 @@
-use crate::delegation::{SigningKeyDelegation, SigningKeyRotation};
 use crate::signing::{
-    VerifiedIdentity, canonical_bytes, hex_to_signature, signature_to_hex, verify_identity_response,
+    VerifiedIdentity, canonical_bytes, signature_to_hex, verify_identity_response, verify_signed_by,
 };
 use crate::stage::StageTicket;
 use crate::types::{
@@ -8,7 +7,7 @@ use crate::types::{
     Profile, SocialGraphEntry,
 };
 use crate::validation::is_recent_timestamp;
-use iroh::{PublicKey, SecretKey};
+use iroh::SecretKey;
 use iroh_gossip::TopicId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -18,21 +17,20 @@ pub const MAX_LINKED_DEVICES: usize = 16;
 /// Maximum byte length of a device name in a `LinkedDevicesAnnouncement`.
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
 
-/// Signed announcement listing all of a user's linked devices.
-/// Signed by the signing key (NOT master key), verified via the included delegation.
+/// Signed announcement listing all of a user's linked devices and the user's DM key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedDevicesAnnouncement {
-    /// The user's permanent identity (master public key).
+    /// The user's identity (master public key).
     pub master_pubkey: String,
-    /// Current signing key delegation (signed by master key).
-    pub delegation: SigningKeyDelegation,
+    /// The user's DM public key (hex-encoded X25519, for Noise IK + Double Ratchet).
+    pub dm_pubkey: String,
     /// All currently active devices.
     pub devices: Vec<DeviceEntry>,
     /// Monotonically increasing version number.
     pub version: u64,
     /// When this announcement was created (Unix timestamp ms).
     pub timestamp: u64,
-    /// Ed25519 signature from signing key over canonical bytes.
+    /// Ed25519 signature by the master key over the canonical bytes.
     pub signature: String,
 }
 
@@ -52,12 +50,11 @@ pub enum GossipMessage {
         signature: String,
     },
     LinkedDevices(LinkedDevicesAnnouncement),
-    SigningKeyRotation(SigningKeyRotation),
     /// Lightweight keep-alive so followers know the connection is still
     /// active even when the publisher isn't posting.
     Heartbeat,
     /// Host announces a new live audio Stage room on their feed topic.
-    /// `signature` is made by the host's signing key; see `verify_stage_announcement`.
+    /// `signature` is made by the host's master key; see `verify_stage_announcement`.
     StageAnnouncement {
         stage_id: String,
         title: String,
@@ -67,7 +64,7 @@ pub enum GossipMessage {
         signature: String,
     },
     /// Host signals the Stage room has ended.
-    /// `signature` is made by the host's signing key; see `verify_stage_ended`.
+    /// `signature` is made by the host's master key; see `verify_stage_ended`.
     StageEnded {
         stage_id: String,
         host_pubkey: String,
@@ -78,11 +75,11 @@ pub enum GossipMessage {
 /// Response to an IdentityRequest.
 ///
 /// Unauthenticated until passed through `verify_identity_response`, which checks the
-/// delegation, the device list signature, that the sending NodeId is in the device list,
-/// and the profile signature.
+/// device list signature, that the sending NodeId is in the device list, and the profile
+/// signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityResponse {
-    /// Signed device list. Carries the master pubkey and the current delegation.
+    /// Signed device list. Carries the master pubkey and the DM pubkey.
     pub announcement: LinkedDevicesAnnouncement,
     /// The user's signed profile, if one exists.
     pub profile: Option<Profile>,
@@ -154,8 +151,8 @@ pub struct PushMessage {
     pub posts: Vec<Post>,
     pub interactions: Vec<Interaction>,
     pub profile: Option<Profile>,
-    /// The author's signed device list. Carries the current delegation, so a receiver
-    /// that missed a signing key rotation can verify the pushed content.
+    /// The author's signed device list, so a receiver that missed a device list change
+    /// learns the current NodeIds and DM pubkey.
     #[serde(default)]
     pub announcement: Option<LinkedDevicesAnnouncement>,
     /// Signed deletions of the author's posts.
@@ -190,7 +187,7 @@ pub struct FollowRequest {
     /// When the request was created (Unix ms). Signed; receivers reject values
     /// further than `MAX_TIMESTAMP_DRIFT_MS` from their clock.
     pub timestamp: u64,
-    /// Signed by the requester's signing key over `(requester, target, timestamp)`.
+    /// Signed by the requester's master key over `(requester, target, timestamp)`.
     pub signature: String,
     /// The requester's identity. Its signed device list must contain the sending NodeId.
     pub identity: IdentityResponse,
@@ -263,7 +260,7 @@ pub struct StageAnnouncement {
     pub ticket: StageTicket,
     pub host_pubkey: String,
     pub started_at: u64,
-    /// Signature by the host's signing key; see `verify_stage_announcement`.
+    /// Signature by the host's master key; see `verify_stage_announcement`.
     #[serde(default)]
     pub signature: String,
 }
@@ -288,21 +285,21 @@ fn stage_announcement_signing_bytes(
     ))
 }
 
-/// Sign a stage announcement with the host's signing key. `host_pubkey` is the host's master pubkey.
+/// Sign a stage announcement with the host's master key. `host_pubkey` is the host's
+/// master pubkey.
 pub fn sign_stage_announcement(
     stage_id: &str,
     title: &str,
     ticket: &StageTicket,
     host_pubkey: &str,
     started_at: u64,
-    secret_key: &SecretKey,
+    master_key: &SecretKey,
 ) -> String {
     let bytes = stage_announcement_signing_bytes(stage_id, title, ticket, host_pubkey, started_at);
-    signature_to_hex(&secret_key.sign(&bytes))
+    signature_to_hex(&master_key.sign(&bytes))
 }
 
-/// Verify a stage announcement against the host's signing key.
-/// The caller must also check that `host_pubkey` is the identity the signing key belongs to.
+/// Verify that a stage announcement `signature` was made by the key `host_pubkey`.
 pub fn verify_stage_announcement(
     stage_id: &str,
     title: &str,
@@ -310,33 +307,33 @@ pub fn verify_stage_announcement(
     host_pubkey: &str,
     started_at: u64,
     signature: &str,
-    signer_pubkey: &PublicKey,
 ) -> Result<(), String> {
-    let sig = hex_to_signature(signature)?;
-    let bytes = stage_announcement_signing_bytes(stage_id, title, ticket, host_pubkey, started_at);
-    signer_pubkey
-        .verify(&bytes, &sig)
-        .map_err(|_| "stage announcement signature verification failed".to_string())
+    verify_signed_by(
+        host_pubkey,
+        &stage_announcement_signing_bytes(stage_id, title, ticket, host_pubkey, started_at),
+        signature,
+        "stage announcement",
+    )
 }
 
-/// Sign a stage-ended message with the host's signing key.
-pub fn sign_stage_ended(stage_id: &str, host_pubkey: &str, secret_key: &SecretKey) -> String {
+/// Sign a stage-ended message with the host's master key.
+pub fn sign_stage_ended(stage_id: &str, host_pubkey: &str, master_key: &SecretKey) -> String {
     let bytes = canonical_bytes(&(STAGE_ENDED_TAG, stage_id, host_pubkey));
-    signature_to_hex(&secret_key.sign(&bytes))
+    signature_to_hex(&master_key.sign(&bytes))
 }
 
-/// Verify a stage-ended message against the host's signing key.
+/// Verify that a stage-ended `signature` was made by the key `host_pubkey`.
 pub fn verify_stage_ended(
     stage_id: &str,
     host_pubkey: &str,
     signature: &str,
-    signer_pubkey: &PublicKey,
 ) -> Result<(), String> {
-    let sig = hex_to_signature(signature)?;
-    let bytes = canonical_bytes(&(STAGE_ENDED_TAG, stage_id, host_pubkey));
-    signer_pubkey
-        .verify(&bytes, &sig)
-        .map_err(|_| "stage ended signature verification failed".to_string())
+    verify_signed_by(
+        host_pubkey,
+        &canonical_bytes(&(STAGE_ENDED_TAG, stage_id, host_pubkey)),
+        signature,
+        "stage ended",
+    )
 }
 
 /// Phase 1: Server responds with its counts and whether timestamp catch-up suffices.
@@ -354,8 +351,8 @@ pub struct SyncSummary {
     /// If the peer is currently hosting a live stage, included here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_stage: Option<StageAnnouncement>,
-    /// The responder's signed device list. Carries the current delegation, so a requester
-    /// that missed a signing key rotation can verify the synced content.
+    /// The responder's signed device list, so a requester that missed a device list change
+    /// learns the current NodeIds and DM pubkey.
     #[serde(default)]
     pub announcement: Option<LinkedDevicesAnnouncement>,
     /// Number of deletion records the responder stores for the requested author.
@@ -404,15 +401,16 @@ fn follow_request_signing_bytes(requester: &str, target: &str, timestamp: u64) -
     canonical_bytes(&(FOLLOW_REQUEST_TAG, requester, target, timestamp))
 }
 
-/// Sign a follow request from `requester` to `target` (both master pubkeys).
+/// Sign a follow request from `requester` to `target` (both master pubkeys) with the
+/// requester's master key.
 pub fn sign_follow_request(
     requester: &str,
     target: &str,
     timestamp: u64,
-    secret_key: &SecretKey,
+    master_key: &SecretKey,
 ) -> String {
     let bytes = follow_request_signing_bytes(requester, target, timestamp);
-    let sig = secret_key.sign(&bytes);
+    let sig = master_key.sign(&bytes);
     signature_to_hex(&sig)
 }
 
@@ -421,7 +419,7 @@ pub fn sign_follow_request(
 /// Fails unless: `target` is `my_master_pubkey`, the timestamp is within
 /// `MAX_TIMESTAMP_DRIFT_MS` of the local clock, the embedded identity verifies and lists
 /// `remote_node_id`, the identity's master pubkey equals `requester`, and the request
-/// signature was made by the delegated signing key.
+/// signature was made by the key `requester`.
 pub fn verify_follow_request(
     req: &FollowRequest,
     remote_node_id: &str,
@@ -437,15 +435,11 @@ pub fn verify_follow_request(
     if identity.master_pubkey != req.requester {
         return Err("follow request requester does not match its identity".to_string());
     }
-    let signer: PublicKey = identity
-        .delegation()
-        .signing_pubkey
-        .parse()
-        .map_err(|e| format!("invalid signing pubkey in delegation: {e}"))?;
-    let sig = hex_to_signature(&req.signature)?;
-    let bytes = follow_request_signing_bytes(&req.requester, &req.target, req.timestamp);
-    signer
-        .verify(&bytes, &sig)
-        .map_err(|_| "follow request signature verification failed".to_string())?;
+    verify_signed_by(
+        &req.requester,
+        &follow_request_signing_bytes(&req.requester, &req.target, req.timestamp),
+        &req.signature,
+        "follow request",
+    )?;
     Ok(identity)
 }

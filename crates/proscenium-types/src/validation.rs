@@ -46,7 +46,17 @@ pub fn is_valid_id(s: &str) -> bool {
 /// True if `s` is the canonical string form of an Ed25519 public key.
 /// Rejects alternate encodings of the same key, so string equality equals key equality.
 pub fn is_valid_pubkey(s: &str) -> bool {
-    s.parse::<PublicKey>().is_ok_and(|key| key.to_string() == s)
+    parse_pubkey(s).is_ok()
+}
+
+/// Parse `s` as an Ed25519 public key. Returns an error unless `s` is the canonical
+/// string form of the key (see `is_valid_pubkey`).
+pub fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
+    let key: PublicKey = s.parse().map_err(|e| format!("invalid pubkey: {e}"))?;
+    if key.to_string() != s {
+        return Err("pubkey is not in canonical form".to_string());
+    }
+    Ok(key)
 }
 
 /// True if `s` is 64 lowercase hex digits (an X25519 public key).

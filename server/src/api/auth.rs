@@ -113,7 +113,7 @@ fn change_error(e: ChangeError) -> ApiError {
     match e {
         ChangeError::Rejected(rejection) => {
             let status = match rejection {
-                Rejection::Replayed | Rejection::StaleDelegation => StatusCode::CONFLICT,
+                Rejection::Replayed => StatusCode::CONFLICT,
                 Rejection::NotRegistered => StatusCode::NOT_FOUND,
                 Rejection::RegistrationClosed
                 | Rejection::UserLimitReached
@@ -275,43 +275,35 @@ mod tests {
     }
 
     #[test]
-    fn forged_delegation_is_rejected_on_every_method() {
+    fn request_signed_by_another_key_is_rejected_on_every_method() {
         let victim = TestUser::new(1);
-        let attacker = TestUser::new(2);
+        // Names the victim as master and signs with the attacker's key.
+        let forger = TestUser::new(2).forging_as(&victim);
 
-        // The attacker signs with its own key and a self-made delegation naming the victim.
-        let mut forged_delegation = attacker.delegation.clone();
-        forged_delegation.master_pubkey = victim.master_pubkey.clone();
-
-        let mut req = attacker.registration(URL, now_millis(), Visibility::Public, None);
-        req.master_pubkey = victim.master_pubkey.clone();
-        req.delegation = forged_delegation.clone();
-        req.signature = attacker.sign_registration_request(&req);
+        let req = forger.registration(URL, now_millis(), Visibility::Public, None);
         assert_eq!(
             status(check_register_request(&req, URL)),
             Some(StatusCode::BAD_REQUEST)
         );
 
-        req.action = Some(REGISTRATION_ACTION_UNREGISTER.to_string());
-        req.signature = attacker.sign_registration_request(&req);
+        let unregister = Some(REGISTRATION_ACTION_UNREGISTER);
+        let req = forger.registration(URL, now_millis(), Visibility::Public, unregister);
         assert_eq!(
             status(check_unregister_request(&req, URL)),
             Some(StatusCode::BAD_REQUEST)
         );
 
-        // The attacker's valid delegation does not name the victim either.
-        let mut req = attacker.registration(URL, now_millis(), Visibility::Public, None);
-        req.master_pubkey = victim.master_pubkey.clone();
-        req.signature = attacker.sign_registration_request(&req);
+        let profile = forger.profile("name", Visibility::Public, 5);
+        let update = forger.profile_update(URL, now_millis(), profile);
         assert_eq!(
-            status(check_register_request(&req, URL)),
+            status(check_profile_update_request(&update, URL)),
             Some(StatusCode::BAD_REQUEST)
         );
 
-        let profile = attacker.profile("name", Visibility::Public, 5);
-        let mut update = attacker.profile_update(URL, now_millis(), profile);
-        update.master_pubkey = victim.master_pubkey.clone();
-        update.delegation = forged_delegation;
+        // A profile signed by the victim, as published over gossip, in a request signed
+        // by the attacker.
+        let profile = victim.profile("name", Visibility::Public, 5);
+        let update = forger.profile_update(URL, now_millis(), profile);
         assert_eq!(
             status(check_profile_update_request(&update, URL)),
             Some(StatusCode::BAD_REQUEST)
@@ -411,8 +403,6 @@ mod tests {
         assert_eq!(body.message, "internal error");
 
         let (status, _) = change_error(ChangeError::Rejected(Rejection::Replayed));
-        assert_eq!(status, StatusCode::CONFLICT);
-        let (status, _) = change_error(ChangeError::Rejected(Rejection::StaleDelegation));
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = change_error(ChangeError::Rejected(Rejection::NotRegistered));
         assert_eq!(status, StatusCode::NOT_FOUND);

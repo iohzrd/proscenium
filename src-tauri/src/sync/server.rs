@@ -38,9 +38,9 @@ pub async fn handle_sync(
     req: SyncRequest,
     stage_handle: &crate::stage::StageActorHandle,
 ) -> Result<(), AcceptError> {
-    let (my_pubkey, signing_secret_key_bytes) = {
+    let (my_pubkey, master_key) = {
         let id = identity.read().await;
-        (id.master_pubkey.clone(), id.signing_secret_key_bytes)
+        (id.master_pubkey.clone(), id.master_key.clone())
     };
 
     // Posts of other authors stored on this node are never served.
@@ -92,13 +92,7 @@ pub async fn handle_sync(
     let active_stage = stage_handle
         .get_active_announcement()
         .await
-        .and_then(|stage| {
-            sign_own_stage(
-                stage,
-                &my_pubkey,
-                &SecretKey::from_bytes(&signing_secret_key_bytes),
-            )
-        });
+        .and_then(|stage| sign_own_stage(stage, &my_pubkey, &master_key));
 
     log::info!(
         "[sync-server] requester={}, client=({}/{}/{}), server=({server_post_count}/{server_interaction_count}/{server_tombstone_count}), mode={mode:?}",
@@ -314,12 +308,12 @@ async fn authorize_requester(
     Ok(())
 }
 
-/// Sign the active stage announcement with the local signing key.
+/// Sign the active stage announcement with the local master key.
 /// Returns `None` if the local user is not the host in the announcement.
 fn sign_own_stage(
     mut stage: StageAnnouncement,
     my_pubkey: &str,
-    signing_key: &SecretKey,
+    master_key: &SecretKey,
 ) -> Option<StageAnnouncement> {
     if stage.host_pubkey != my_pubkey {
         return None;
@@ -330,7 +324,7 @@ fn sign_own_stage(
         &stage.ticket,
         &stage.host_pubkey,
         stage.started_at,
-        signing_key,
+        master_key,
     );
     Some(stage)
 }

@@ -3,8 +3,7 @@ use crate::error::AppError;
 use bytes::Bytes;
 use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
-    PushMessage, SigningKeyRotation, StageTicket, now_millis, short_id, sign_stage_announcement,
-    sign_stage_ended,
+    PushMessage, StageTicket, now_millis, short_id, sign_stage_announcement, sign_stage_ended,
 };
 
 /// A `PushMessage` of `author` without content.
@@ -168,7 +167,7 @@ impl super::GossipService {
     }
 
     /// Send the signed device list to followers: on the own feed topic, or by push if no
-    /// topic is open. The announcement carries the current delegation.
+    /// topic is open.
     pub async fn broadcast_linked_devices(
         &self,
         announcement: &LinkedDevicesAnnouncement,
@@ -190,45 +189,8 @@ impl super::GossipService {
         Ok(())
     }
 
-    /// Send a signing key rotation to followers.
-    ///
-    /// With an own feed topic the rotation message is broadcast. Without one, a
-    /// `PushMessage` without content is pushed; `attempt_push` attaches the signed device
-    /// list, which carries the delegation. That push is skipped while the local identity
-    /// still holds the delegation that the rotation replaces, because the attached device
-    /// list would then carry the old delegation; the device announcement that follows a
-    /// rotation delivers the new one.
-    pub async fn broadcast_signing_key_rotation(
-        &self,
-        rotation: &SigningKeyRotation,
-    ) -> Result<(), AppError> {
-        let msg = GossipMessage::SigningKeyRotation(rotation.clone());
-        if self
-            .broadcast_msg(
-                &msg,
-                &format!("signing key rotation to index {}", rotation.new_key_index),
-            )
-            .await?
-        {
-            return Ok(());
-        }
-        let (my_id, local_key_index) = {
-            let id = self.identity.read().await;
-            (id.master_pubkey.clone(), id.delegation.key_index)
-        };
-        if local_key_index >= rotation.new_key_index {
-            self.attempt_push(empty_push(my_id)).await;
-        } else {
-            log::info!(
-                "[gossip] rotation to index {} not pushed: local delegation has index {local_key_index}",
-                rotation.new_key_index
-            );
-        }
-        Ok(())
-    }
-
     /// Announce a new Stage room on the host's own user-feed gossip topic so followers discover it.
-    /// The announcement is signed with the local signing key; `host_pubkey` must be the
+    /// The announcement is signed with the local master key; `host_pubkey` must be the
     /// local master pubkey or receivers reject it.
     pub async fn broadcast_stage_announcement(
         &self,
@@ -246,7 +208,7 @@ impl super::GossipService {
                 &ticket,
                 &host_pubkey,
                 started_at,
-                &id.signing_key,
+                &id.master_key,
             )
         };
         let msg = GossipMessage::StageAnnouncement {
@@ -262,13 +224,13 @@ impl super::GossipService {
     }
 
     /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic.
-    /// Signed with the local signing key.
+    /// Signed with the local master key.
     pub async fn broadcast_stage_ended(&self, stage_id: String) -> Result<(), AppError> {
         let (host_pubkey, signature) = {
             let id = self.identity.read().await;
             (
                 id.master_pubkey.clone(),
-                sign_stage_ended(&stage_id, &id.master_pubkey, &id.signing_key),
+                sign_stage_ended(&stage_id, &id.master_pubkey, &id.master_key),
             )
         };
         let msg = GossipMessage::StageEnded {

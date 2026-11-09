@@ -406,7 +406,7 @@ impl ActiveStage {
             &host.ticket,
             &self.roles.host_pubkey,
             self.started_at,
-            self.signer.signing_key(),
+            self.signer.master_key(),
         );
         Some(proscenium_types::StageAnnouncement {
             stage_id: self.stage_id.clone(),

@@ -1,6 +1,6 @@
 # Linked Devices - Design Document
 
-> **Status:** design document for an earlier design. The implementation differs: linking always transfers the master key, each device derives its transport key from a device index, DM ratchet sessions are not replicated, and device sync is served only to NodeIds derived from the own master key. See "Linked Devices" in the README.
+> **Status:** design document for an earlier design. The implementation differs: there is no signing key, delegation or key rotation (the master key signs all content, and the DM key is derived from it without an index), linking always transfers the master key, each device derives its transport key from a device index, DM ratchet sessions are not replicated, and device sync is served only to NodeIds derived from the own master key. See "Identity and Key Architecture" and "Linked Devices" in the README.
 
 Link multiple devices (phone, desktop, tablet) to a single identity. A three-tier key hierarchy separates concerns: a **master key** (permanent identity, cold storage), a **signing key** (derived from master, shared across devices for signing and DM), and per-device **transport keys** (iroh networking). The master key enables secure signing key rotation if a device is compromised, without losing the identity.
 
