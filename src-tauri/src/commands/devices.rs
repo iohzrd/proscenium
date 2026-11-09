@@ -28,10 +28,10 @@ pub async fn cancel_device_link(state: State<'_, Arc<AppState>>) -> CmdResult<()
 /// `qr_payload`.
 ///
 /// Asks for confirmation in a native dialog and returns the error `"cancelled"` if it is
-/// declined. Nothing is changed locally until the other device acknowledged the key
-/// confirmation. Then all local rows are deleted, the key files are replaced, the link
-/// bundle is imported and the network stack is rebuilt. The caller reloads the webview
-/// after `Ok`.
+/// declined. Nothing is changed locally until the link bundle was received and
+/// validated. Then all local rows and media are deleted, the key files are replaced, the
+/// link bundle is imported and the network stack is rebuilt. The caller reloads the
+/// webview after `Ok`.
 #[tauri::command]
 pub async fn link_with_device(
     state: State<'_, Arc<AppState>>,
@@ -44,8 +44,8 @@ pub async fn link_with_device(
         "Link this device",
         &format!(
             "Replace the identity on this device with the identity of device {}?\n\n\
-             The keys, posts, messages, follows and settings stored on this device are \
-             deleted. This cannot be undone.",
+             The keys, posts, messages, follows, media and settings stored on this device \
+             are deleted. This cannot be undone.",
             short_id(&qr_payload.node_id)
         ),
         "Replace identity",

@@ -35,7 +35,7 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     if !confirmed {
         return Err("cancelled".into());
     }
-    let blobs_dir = app.path().app_data_dir()?.join("blobs");
+    let blobs_dir = app.path().app_data_dir()?.join(crate::setup::BLOBS_DIR);
 
     if tokio::time::timeout(WIPE_SHUTDOWN_TIMEOUT, crate::setup::stop_network(&state))
         .await
@@ -53,13 +53,9 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     }
     log::info!("[wipe] database rows deleted");
 
-    // iroh-blobs has no public call that deletes blobs from an open store, so the store
-    // is shut down and its directory removed. `FsStore::load` creates it again at startup.
-    match tokio::time::timeout(WIPE_SHUTDOWN_TIMEOUT, state.blob_store.shutdown()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => log::warn!("[wipe] blob store shutdown failed: {e}"),
-        Err(_) => log::warn!("[wipe] blob store shutdown timed out"),
-    }
+    // iroh-blobs has no public call that deletes blobs from an open store. Stopping the
+    // network stack closed the store, so its directory is removed; `FsStore::load`
+    // creates it again at startup.
     match tokio::fs::remove_dir_all(&blobs_dir).await {
         Ok(()) => log::info!("[wipe] blob store removed"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

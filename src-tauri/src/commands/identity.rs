@@ -106,8 +106,8 @@ fn seed_words_match(words: &[&str], checks: &[(usize, String)]) -> bool {
 ///
 /// Validates the phrase, asks for confirmation in a native dialog (error `"cancelled"` if
 /// declined), then replaces the local identity: the network stack is stopped, all rows
-/// are deleted, the device index is set to 0, the master key file is written last, and
-/// the network stack is rebuilt in place. The caller reloads the webview after
+/// and media are deleted, the device index is set to 0, the master key file is written
+/// last, and the network stack is rebuilt in place. The caller reloads the webview after
 /// `Ok`. An error after the network stop states that a restart is required.
 #[tauri::command]
 pub async fn recover_from_seed_phrase(
@@ -133,8 +133,8 @@ pub async fn recover_from_seed_phrase(
         &state.app_handle,
         "Recover identity",
         "Replace the identity on this device with the identity of the recovery phrase?\n\n\
-         The keys, posts, messages, follows and settings stored on this device are deleted. \
-         This cannot be undone.",
+         The keys, posts, messages, follows, media and settings stored on this device are \
+         deleted. This cannot be undone.",
         "Replace identity",
     )
     .await;

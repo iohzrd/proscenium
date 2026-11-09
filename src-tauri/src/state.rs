@@ -123,8 +123,10 @@ pub fn own_devices(
 /// Shared, mutable identity -- the canonical source for all key material.
 pub type SharedIdentity = Arc<tokio::sync::RwLock<Identity>>;
 
-/// Networking and protocol state that gets rebuilt during identity recovery.
+/// Networking and protocol state that gets rebuilt when the identity is replaced.
 pub struct NetworkStack {
+    /// The blob store. `router` closes it when it shuts down.
+    pub(crate) blob_store: FsStore,
     pub(crate) endpoint: Endpoint,
     pub(crate) gossip: GossipService,
     pub(crate) dm: DmHandler,
@@ -141,7 +143,6 @@ pub struct AppState {
     pub(crate) app_handle: tauri::AppHandle,
     pub(crate) identity: SharedIdentity,
     pub(crate) storage: Arc<Storage>,
-    pub(crate) blob_store: FsStore,
     pub(crate) http_client: reqwest::Client,
     pub(crate) net: std::sync::RwLock<NetworkStack>,
     /// Set when the exit path has started shutting the network down.
@@ -190,6 +191,10 @@ impl AppState {
         self.net().blobs.clone()
     }
 
+    pub fn blob_store(&self) -> FsStore {
+        self.net().blob_store.clone()
+    }
+
     pub fn sync_tx(&self) -> mpsc::Sender<SyncCommand> {
         self.net().sync_tx.clone()
     }
@@ -219,7 +224,6 @@ impl AppState {
         app_handle: tauri::AppHandle,
         identity: SharedIdentity,
         storage: Arc<Storage>,
-        blob_store: FsStore,
         http_client: reqwest::Client,
         net: NetworkStack,
     ) -> Self {
@@ -227,7 +231,6 @@ impl AppState {
             app_handle,
             identity,
             storage,
-            blob_store,
             http_client,
             net: std::sync::RwLock::new(net),
             exit_started: AtomicBool::new(false),

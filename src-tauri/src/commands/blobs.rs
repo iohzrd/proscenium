@@ -125,7 +125,7 @@ async fn add_named_blob(
     mime_type: &str,
 ) -> CmdResult<serde_json::Value> {
     let size = data.len();
-    let mut result = add_blob_data(&state.blob_store, &state.endpoint(), data).await?;
+    let mut result = add_blob_data(&state.blob_store(), &state.endpoint(), data).await?;
     if let Some(fields) = result.as_object_mut() {
         fields.insert("filename".into(), filename.into());
         fields.insert("size".into(), size.into());
@@ -225,7 +225,7 @@ pub async fn add_blob_bytes(
     state: State<'_, Arc<AppState>>,
     data: Vec<u8>,
 ) -> CmdResult<serde_json::Value> {
-    add_blob_data(&state.blob_store, &state.endpoint(), data).await
+    add_blob_data(&state.blob_store(), &state.endpoint(), data).await
 }
 
 /// Add a blob from RGBA pixel data (used by clipboard paste).
@@ -326,14 +326,14 @@ pub async fn fetch_blob_bytes(
 ) -> CmdResult<Response> {
     let ticket = parse_ticket(&ticket)?;
     let hash = ticket.hash();
-    if let Some(bytes) = read_local_blob(&state.blob_store, hash).await? {
+    if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
         return Ok(Response::new(bytes));
     }
     log::info!("[blob] fetching {hash} from remote...");
     let (conn, size) =
         connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
     download_to_store(state.blobs().remote(), conn, hash, size).await?;
-    let bytes = read_local_blob(&state.blob_store, hash)
+    let bytes = read_local_blob(&state.blob_store(), hash)
         .await?
         .ok_or("blob is incomplete after download")?;
     log::info!("[blob] fetched {hash} from remote ({} bytes)", bytes.len());

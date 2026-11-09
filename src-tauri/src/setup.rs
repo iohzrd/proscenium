@@ -6,11 +6,7 @@ use crate::peer::PeerHandler;
 use crate::stage::StageHandler;
 use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand, device_node_id};
 use crate::storage::Storage;
-use iroh::{
-    Endpoint, SecretKey,
-    endpoint::Connection,
-    protocol::{AcceptError, ProtocolHandler, Router},
-};
+use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use proscenium_types::{
@@ -27,6 +23,8 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
 const MASTER_KEY_FILE: &str = "master_key.key";
+/// Directory of the blob store inside the data directory.
+pub(crate) const BLOBS_DIR: &str = "blobs";
 const DEVICE_INDEX_FILE: &str = "device_index";
 /// Marker file. While it exists, `get_seed_phrase` asks for native confirmation.
 pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
@@ -265,28 +263,15 @@ where
         .map_err(AppError::from)
 }
 
-/// Serves the blobs ALPN from the blob store that every network stack shares.
-///
-/// `BlobsProtocol::shutdown` closes the store. This wrapper keeps the default
-/// `ProtocolHandler::shutdown`, which does nothing, so `Router::shutdown` leaves the store
-/// open and a rebuilt network stack can serve from it. `shutdown_for_exit` closes the store.
-#[derive(Debug, Clone)]
-struct SharedStoreBlobs(BlobsProtocol);
-
-impl ProtocolHandler for SharedStoreBlobs {
-    async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
-        self.0.accept(conn).await
-    }
-}
-
-/// Build the networking stack: endpoint, gossip, handlers, router.
-/// The endpoint key is the transport key of `identity`.
+/// Build the networking stack: blob store, endpoint, gossip, handlers, router.
+/// The blob store is opened at `blobs_dir`; `Router::shutdown` closes it. The endpoint key
+/// is the transport key of `identity`.
 /// Returns the stack plus channel receivers needed by background tasks.
 async fn build_network_stack(
     handle: &tauri::AppHandle,
     identity: SharedIdentity,
     storage: Arc<Storage>,
-    blob_store: &FsStore,
+    blobs_dir: &Path,
 ) -> Result<
     (
         NetworkStack,
@@ -295,6 +280,11 @@ async fn build_network_stack(
     ),
     AppError,
 > {
+    let blob_store = FsStore::load(blobs_dir)
+        .await
+        .map_err(|e| AppError::Other(format!("failed to open blob store: {e}")))?;
+    log::info!("[setup] blob store opened at {}", blobs_dir.display());
+
     let mdns_enabled = crate::preferences::get_mdns_discovery(&storage).await;
     let dht_enabled = crate::preferences::get_dht_discovery(&storage).await;
     log::info!(
@@ -328,7 +318,7 @@ async fn build_network_stack(
         .await
         .map_err(|e| AppError::Other(format!("failed to bind iroh endpoint: {e}")))?;
 
-    let blobs = BlobsProtocol::new(blob_store, None);
+    let blobs = BlobsProtocol::new(&blob_store, None);
     let gossip = Gossip::builder()
         .max_message_size(crate::constants::GOSSIP_MAX_MESSAGE_SIZE)
         .spawn(endpoint.clone());
@@ -377,7 +367,7 @@ async fn build_network_stack(
     );
 
     let router = Router::builder(endpoint.clone())
-        .accept(iroh_blobs::ALPN, SharedStoreBlobs(blobs.clone()))
+        .accept(iroh_blobs::ALPN, blobs.clone())
         .accept(iroh_gossip::ALPN, gossip)
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
@@ -390,6 +380,7 @@ async fn build_network_stack(
     let (sync_tx, sync_rx) = mpsc::channel::<SyncCommand>(64);
 
     let net = NetworkStack {
+        blob_store,
         endpoint,
         gossip: gossip_service,
         dm: dm_handler,
@@ -564,7 +555,7 @@ async fn start_network(state: &Arc<AppState>, data_dir: &Path) -> Result<(), App
         &state.app_handle,
         state.identity.clone(),
         state.storage.clone(),
-        &state.blob_store,
+        &data_dir.join(BLOBS_DIR),
     )
     .await?;
     state.replace_net(net);
@@ -593,6 +584,12 @@ async fn install_identity(
     };
 
     state.storage.wipe_all_data().await?;
+    // The stopped network stack closed the blob store; the next stack opens an empty one.
+    match tokio::fs::remove_dir_all(data_dir.join(BLOBS_DIR)).await {
+        Ok(()) => log::info!("[identity] blob store removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
 
     let dir = data_dir.clone();
     run_blocking_io(move || {
@@ -637,10 +634,12 @@ impl Drop for ReplacementInProgress<'_> {
 /// Replace the local identity with the one defined by `keys` and rebuild the network
 /// stack in place. Used by seed phrase recovery (`bundle` is `None`) and device linking.
 ///
-/// Order: stop the network stack, delete all rows, write the index files and then the
-/// master key file, import `bundle`, derive the identity from disk, build and start a
-/// new network stack. The returned error of any step after the network stop states that
-/// a restart is required. Returns an error at once if another call is in progress.
+/// Order: stop the network stack (which closes the blob store), delete all rows and the
+/// blob store, write the index files and then the master key file, import `bundle`,
+/// derive the identity from disk, build and start a new network stack. Returns an error,
+/// and changes nothing, if the network stack does not stop within
+/// `REPLACE_SHUTDOWN_LIMIT`. The returned error of any later step states that a restart
+/// is required. Returns an error at once if another call is in progress.
 pub async fn replace_identity(
     state: &Arc<AppState>,
     keys: IdentityKeys,
@@ -655,10 +654,14 @@ pub async fn replace_identity(
         .await
         .is_err()
     {
-        log::warn!(
+        log::error!(
             "[identity] network stack did not stop within {}s",
             REPLACE_SHUTDOWN_LIMIT.as_secs()
         );
+        return Err(AppError::Other(
+            "The network did not stop in time; nothing was changed. Restart the app and try again."
+                .into(),
+        ));
     }
 
     install_identity(state, keys, bundle).await.map_err(|e| {
@@ -672,8 +675,8 @@ pub async fn replace_identity(
     Ok(())
 }
 
-/// Stop the network stack and close the blob store before the process exits, waiting at
-/// most `EXIT_SHUTDOWN_LIMIT`. Peers then receive a QUIC close instead of running into
+/// Stop the network stack, which closes the blob store, before the process exits, waiting
+/// at most `EXIT_SHUTDOWN_LIMIT`. Peers then receive a QUIC close instead of running into
 /// their idle timeout. Only the first call does anything.
 ///
 /// Blocks the calling thread. Must not be called from a Tokio worker thread.
@@ -687,13 +690,7 @@ pub fn shutdown_for_exit(app: &tauri::AppHandle) {
     }
 
     tauri::async_runtime::block_on(async move {
-        let stop = async {
-            stop_network(&state).await;
-            if let Err(e) = state.blob_store.shutdown().await {
-                log::warn!("[exit] failed to close blob store: {e}");
-            }
-        };
-        if tokio::time::timeout(EXIT_SHUTDOWN_LIMIT, stop)
+        if tokio::time::timeout(EXIT_SHUTDOWN_LIMIT, stop_network(&state))
             .await
             .is_err()
         {
@@ -742,12 +739,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     ensure_master_key(&data_dir, &storage).await?;
     let identity_data = load_identity(&data_dir)?;
 
-    let blobs_dir = data_dir.join("blobs");
-    let blob_store = FsStore::load(&blobs_dir)
-        .await
-        .map_err(|e| format!("failed to open blob store: {e}"))?;
-    log::info!("[setup] blob store opened at {}", blobs_dir.display());
-
     log::info!("[setup] master pubkey: {}", identity_data.master_pubkey);
     log::info!(
         "[setup] Transport NodeId: {} (device index {})",
@@ -758,8 +749,13 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     // The handlers of the network stack hold the shared identity, so it is created first.
     let identity: SharedIdentity = Arc::new(tokio::sync::RwLock::new(identity_data));
 
-    let (net, sync_rx, call_signal_rx) =
-        build_network_stack(&handle, identity.clone(), storage.clone(), &blob_store).await?;
+    let (net, sync_rx, call_signal_rx) = build_network_stack(
+        &handle,
+        identity.clone(),
+        storage.clone(),
+        &data_dir.join(BLOBS_DIR),
+    )
+    .await?;
 
     log::info!("[setup] addr (immediate): {:?}", net.endpoint.addr());
 
@@ -776,7 +772,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
         handle.clone(),
         identity,
         storage,
-        blob_store,
         http_client,
         net,
     ));
