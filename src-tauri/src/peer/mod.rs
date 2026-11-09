@@ -351,8 +351,8 @@ impl ProtocolHandler for PeerHandler {
                 )
                 .await
             }
-            PeerRequest::LinkRequest { noise_init } => {
-                self.handle_link_request(send, noise_init, &conn).await
+            PeerRequest::LinkRequest { secret } => {
+                self.handle_link_request(send, secret, &conn).await
             }
             PeerRequest::DeviceSyncRequest => {
                 // The exchange runs on a second stream that the requester opens.
@@ -415,7 +415,7 @@ mod tests {
             Some(PEER_MAX_FOLLOW_REQUEST_BYTES)
         );
         assert_eq!(
-            request_size_limit(br#"{"LinkRequest":{"noise_init":[1"#),
+            request_size_limit(br#"{"LinkRequest":{"secret":"a"#),
             Some(PEER_MAX_LINK_REQUEST_BYTES)
         );
         assert_eq!(

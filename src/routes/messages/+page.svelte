@@ -84,6 +84,10 @@
       "dm-received": () => {
         loadConversations();
       },
+      // Messages that another device of this user received or sent.
+      "dm-synced": () => {
+        loadConversations();
+      },
     });
     return () => {
       if (errorTimer) clearTimeout(errorTimer);

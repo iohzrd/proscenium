@@ -41,7 +41,7 @@ pub const PEER_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// Request body limits per request type.
 pub const PEER_MAX_SMALL_REQUEST_BYTES: usize = 2 * 1024;
 pub const PEER_MAX_FOLLOW_REQUEST_BYTES: usize = 64 * 1024;
-pub const PEER_MAX_LINK_REQUEST_BYTES: usize = 16 * 1024;
+pub const PEER_MAX_LINK_REQUEST_BYTES: usize = 1024;
 pub const PEER_MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
 pub const PEER_MAX_DEVICE_SYNC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 
@@ -92,8 +92,8 @@ pub const OUTBOX_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 pub const OUTBOX_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Maximum number of queued messages one flush pass attempts.
 pub const OUTBOX_PASS_LIMIT: u32 = 200;
-/// Time allowed for one delivery of a DM payload: a handshake if needed, connect, write
-/// and acknowledgement, and one repetition of all of these after a new handshake.
+/// Time allowed for one delivery of a DM payload to the devices of the recipient: connect,
+/// write and acknowledgement for each device.
 pub const DM_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Time `send_dm` waits for the first delivery attempt before it returns
 /// `delivered: false`. The attempt continues after that.

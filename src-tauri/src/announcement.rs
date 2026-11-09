@@ -57,7 +57,6 @@ pub async fn build_own_announcement(
 
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: id.master_pubkey.clone(),
-        dm_pubkey: id.dm_pubkey.clone(),
         devices,
         version: now,
         timestamp: now,

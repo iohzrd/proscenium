@@ -4,25 +4,36 @@ use crate::constants::{
 };
 use crate::error::AppError;
 use crate::storage::Storage;
-use proscenium_types::{
-    DirectMessage, DmAck, DmMessage, DmNack, DmPayload, EncryptedEnvelope, StoredMessage,
-    now_millis, short_id,
-};
+use iroh::EndpointId;
+use proscenium_types::{DirectMessage, DmAck, DmPayload, StoredMessage, now_millis, short_id};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::Emitter;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{ACK_TIMEOUT, DmHandler, MAX_DM_PAYLOAD_LEN, PeerRoute};
+use super::{ACK_TIMEOUT, DmHandler, MAX_DM_PAYLOAD_LEN, envelope};
 
 /// Answer of a peer that ends the delivery of a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Delivery {
-    /// The peer answered `DmAck::Ok`.
+    /// A device answered `DmAck::Ok`.
     Acknowledged,
-    /// The peer answered `DmNack::Rejected`. Sending again gives the same answer.
+    /// No device answered `DmAck::Ok` and one answered `DmAck::Rejected`. Sending again
+    /// gives the same answer.
     Rejected,
+}
+
+/// Devices of the recipient a payload is sent to.
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    /// Every device of the cached device list, at the same time.
+    AllDevices,
+    /// The devices of the cached device list in order, until one answers.
+    FirstDevice,
+    /// One device.
+    Device(EndpointId),
 }
 
 /// Result of one delivery attempt of an outbox entry.
@@ -170,16 +181,34 @@ impl DmHandler {
         ))
     }
 
-    /// Send a DM signal (typing, read receipt, call signal) without storing or queueing it.
-    /// Returns an error unless the peer answered `DmAck::Ok`.
-    /// A typing signal does not start a handshake.
+    /// Send a typing signal or read receipt to every device of `peer_pubkey` without
+    /// storing or queueing it. Returns an error unless a device answered `DmAck::Ok`.
     pub async fn send_signal(&self, peer_pubkey: &str, payload: DmPayload) -> Result<(), AppError> {
-        let allow_handshake = !matches!(payload, DmPayload::Typing);
-        let plaintext = serde_json::to_vec(&payload)?;
-        match self
-            .deliver(peer_pubkey, &plaintext, allow_handshake)
-            .await?
-        {
+        self.send_unqueued(peer_pubkey, Target::AllDevices, &payload)
+            .await
+    }
+
+    /// Send a call signal to `device` of `peer_pubkey`, or with `device` `None` to the
+    /// first device of its device list that answers. Returns an error unless that device
+    /// answered `DmAck::Ok`.
+    pub async fn send_call_signal(
+        &self,
+        peer_pubkey: &str,
+        device: Option<EndpointId>,
+        payload: DmPayload,
+    ) -> Result<(), AppError> {
+        let target = device.map_or(Target::FirstDevice, Target::Device);
+        self.send_unqueued(peer_pubkey, target, &payload).await
+    }
+
+    async fn send_unqueued(
+        &self,
+        peer_pubkey: &str,
+        target: Target,
+        payload: &DmPayload,
+    ) -> Result<(), AppError> {
+        let plaintext = serde_json::to_vec(payload)?;
+        match self.deliver(peer_pubkey, target, &plaintext).await? {
             Delivery::Acknowledged => Ok(()),
             Delivery::Rejected => Err(AppError::Other(format!(
                 "{} rejected the signal",
@@ -211,7 +240,7 @@ impl DmHandler {
         };
 
         match self
-            .deliver(peer_pubkey, payload_json.as_bytes(), true)
+            .deliver(peer_pubkey, Target::AllDevices, payload_json.as_bytes())
             .await
         {
             Ok(Delivery::Acknowledged) => {
@@ -302,84 +331,102 @@ impl DmHandler {
         }
     }
 
-    /// Encrypt `plaintext` (a serialized `DmPayload`) for `peer_master_pubkey` and send it,
-    /// within `DM_SEND_TIMEOUT` in total.
+    /// Encrypt `plaintext` (a serialized `DmPayload`) for each device `target` names and
+    /// send it, within `DM_SEND_TIMEOUT` in total. Every envelope carries the local signed
+    /// device list.
     ///
-    /// If the peer answers `NoSession` or `DecryptFailed`, the session that produced the
-    /// envelope is deleted, a new handshake runs, and the payload is encrypted and sent
-    /// once more. Returns an error if no `DmAck::Ok` or `DmNack::Rejected` was received.
+    /// Returns `Acknowledged` as soon as a device answers `DmAck::Ok`; the sends to the
+    /// other devices continue in the background. Returns `Rejected` if no device answered
+    /// `DmAck::Ok` and one answered `DmAck::Rejected`, and the last error if no device
+    /// answered.
     async fn deliver(
         &self,
         peer_master_pubkey: &str,
+        target: Target,
         plaintext: &[u8],
-        allow_handshake: bool,
     ) -> Result<Delivery, AppError> {
         tokio::time::timeout(DM_SEND_TIMEOUT, async {
             let keys = self.dm_keys().await;
-            let mut peer = self.resolve_peer(peer_master_pubkey).await?;
-            // Ratchet key of the envelope the peer could not decrypt, once that happened.
-            let mut refused_ratchet_key: Option<String> = None;
-            loop {
-                let envelope = self
-                    .encrypt_for_peer(
-                        &keys,
-                        &mut peer,
-                        plaintext,
-                        refused_ratchet_key.as_deref(),
-                        allow_handshake,
-                    )
-                    .await?;
-                let ratchet_key = envelope.ratchet_header.dh_public.clone();
-                match self.send_envelope(&peer, envelope).await? {
-                    DmAck::Ok => return Ok(Delivery::Acknowledged),
-                    DmAck::Failed(DmNack::Rejected) => return Ok(Delivery::Rejected),
-                    DmAck::Failed(nack) if allow_handshake && refused_ratchet_key.is_none() => {
-                        log::info!(
-                            "[dm] {} answered {nack:?}; encrypting again with a new session",
-                            short_id(peer_master_pubkey)
-                        );
-                        refused_ratchet_key = Some(ratchet_key);
-                    }
-                    DmAck::Failed(nack) => {
-                        return Err(AppError::Other(format!("peer answered {nack:?}")));
+            let own_devices =
+                crate::announcement::build_own_announcement(&self.storage, &self.identity).await?;
+            let devices = match target {
+                Target::Device(device) => vec![device],
+                Target::AllDevices | Target::FirstDevice => {
+                    self.peer_devices(peer_master_pubkey).await?
+                }
+            };
+            let seal = |device: &EndpointId| -> Result<Vec<u8>, AppError> {
+                let envelope = envelope::seal(
+                    &keys.device_key,
+                    &keys.master_pubkey,
+                    &own_devices,
+                    peer_master_pubkey,
+                    device,
+                    plaintext,
+                )?;
+                Ok(serde_json::to_vec(&envelope)?)
+            };
+
+            let mut rejected = false;
+            let mut last_error = None;
+            match target {
+                Target::FirstDevice => {
+                    for device in &devices {
+                        match self.send_frame(*device, &seal(device)?).await {
+                            Ok(DmAck::Ok) => return Ok(Delivery::Acknowledged),
+                            Ok(DmAck::Rejected) => return Ok(Delivery::Rejected),
+                            Err(e) => last_error = Some(e),
+                        }
                     }
                 }
+                Target::AllDevices | Target::Device(_) => {
+                    let mut sends = JoinSet::new();
+                    for device in &devices {
+                        let handler = self.clone();
+                        let (device, frame) = (*device, seal(device)?);
+                        sends.spawn(async move { handler.send_frame(device, &frame).await });
+                    }
+                    while let Some(sent) = sends.join_next().await {
+                        match sent {
+                            Ok(Ok(DmAck::Ok)) => {
+                                // The other devices receive their envelopes in the
+                                // background; each send has its own timeouts.
+                                sends.detach_all();
+                                return Ok(Delivery::Acknowledged);
+                            }
+                            Ok(Ok(DmAck::Rejected)) => rejected = true,
+                            Ok(Err(e)) => last_error = Some(e),
+                            Err(e) => last_error = Some(AppError::Other(e.to_string())),
+                        }
+                    }
+                }
+            }
+            if rejected {
+                Ok(Delivery::Rejected)
+            } else {
+                Err(last_error.unwrap_or_else(|| {
+                    AppError::Other(format!(
+                        "no device of {} answered",
+                        short_id(peer_master_pubkey)
+                    ))
+                }))
             }
         })
         .await
         .map_err(|_| AppError::Other("send timed out".into()))?
     }
 
-    /// Send an envelope to the NodeIds of `peer`, in order, until one answers with a
-    /// `DmAck`. Returns that answer, or the last error if no NodeId answered.
-    async fn send_envelope(
-        &self,
-        peer: &PeerRoute,
-        envelope: EncryptedEnvelope,
-    ) -> Result<DmAck, AppError> {
-        let frame = serde_json::to_vec(&DmMessage::Envelope(envelope))?;
-        let mut last_error = AppError::Other(format!(
-            "no transport NodeId for {}",
-            short_id(&peer.master_pubkey)
-        ));
-        for node in &peer.node_ids {
-            let answer = match self.exchange(*node, &frame, ACK_TIMEOUT).await {
-                Ok(answer) => serde_json::from_slice::<DmAck>(&answer).map_err(AppError::from),
-                Err(e) => Err(e),
-            };
-            match answer {
-                Ok(ack) => return Ok(ack),
-                Err(e) => {
-                    log::debug!(
-                        "[dm] no acknowledgement from {} at node {}: {e}",
-                        short_id(&peer.master_pubkey),
-                        short_id(&node.to_string())
-                    );
-                    last_error = e;
-                }
-            }
+    /// Send one envelope `frame` to `device` and return its answer.
+    async fn send_frame(&self, device: EndpointId, frame: &[u8]) -> Result<DmAck, AppError> {
+        let answer = self.exchange(device, frame, ACK_TIMEOUT).await;
+        let ack = answer.and_then(|answer| Ok(serde_json::from_slice::<DmAck>(&answer)?));
+        if let Err(e) = &ack {
+            log::debug!(
+                "[dm] no acknowledgement from node {}: {e}",
+                short_id(&device.to_string())
+            );
         }
-        Err(last_error)
+        ack
     }
 }
 

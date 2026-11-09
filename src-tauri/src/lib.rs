@@ -4,7 +4,6 @@ mod call;
 mod commands;
 mod confirm;
 mod constants;
-mod crypto;
 mod device_sync;
 mod dm;
 mod error;

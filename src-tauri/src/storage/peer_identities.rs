@@ -5,7 +5,7 @@ use proscenium_types::{LinkedDevicesAnnouncement, VerifiedIdentity, now_millis};
 /// Result of offering a peer's device announcement to the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnnouncementOutcome {
-    /// The device list, the DM pubkey and the transport NodeIds were replaced.
+    /// The device list and the transport NodeIds were replaced.
     Stored,
     /// The cached announcement has an equal or higher version; nothing was changed.
     NotNewer,
@@ -14,9 +14,9 @@ pub enum AnnouncementOutcome {
 impl Storage {
     /// Store a device announcement that passed `verify_linked_devices_announcement`.
     ///
-    /// The announcement, its DM pubkey and the `peer_transports` rows of its master pubkey
-    /// are replaced only if `announcement.version` is greater than the cached version;
-    /// otherwise `AnnouncementOutcome::NotNewer` is returned.
+    /// The announcement and the `peer_transports` rows of its master pubkey are replaced
+    /// only if `announcement.version` is greater than the cached version; otherwise
+    /// `AnnouncementOutcome::NotNewer` is returned.
     pub async fn cache_peer_announcement(
         &self,
         announcement: &LinkedDevicesAnnouncement,
@@ -27,19 +27,17 @@ impl Storage {
         // writer can store an announcement between the comparison and the update.
         let stored = sqlx::query(
             "INSERT INTO peer_device_announcements
-                (master_pubkey, announcement_json, version, dm_pubkey, cached_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+                (master_pubkey, announcement_json, version, cached_at)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(master_pubkey) DO UPDATE SET
                 announcement_json = excluded.announcement_json,
                 version = excluded.version,
-                dm_pubkey = excluded.dm_pubkey,
                 cached_at = excluded.cached_at
              WHERE excluded.version > peer_device_announcements.version",
         )
         .bind(&announcement.master_pubkey)
         .bind(&json)
         .bind(i64::try_from(announcement.version).unwrap_or(i64::MAX))
-        .bind(&announcement.dm_pubkey)
         .bind(now_millis() as i64)
         .execute(&mut *tx)
         .await?
@@ -104,31 +102,6 @@ impl Storage {
         Ok(node_ids)
     }
 
-    /// Master pubkey whose cached device list contains `dm_pubkey`.
-    ///
-    /// A device list carries no proof that its owner holds the DM key, so two cached
-    /// identities can contain the same key. In that case the owner cannot be determined and
-    /// `None` is returned. `None` is also returned on a database error.
-    pub async fn get_master_pubkey_for_dm_pubkey(&self, dm_pubkey: &str) -> Option<String> {
-        if dm_pubkey.is_empty() {
-            return None;
-        }
-        let rows = sqlx::query_scalar::<_, String>(
-            "SELECT master_pubkey FROM peer_device_announcements WHERE dm_pubkey = ?1 LIMIT 2",
-        )
-        .bind(dm_pubkey)
-        .fetch_all(&self.pool)
-        .await;
-        match rows {
-            Ok(mut masters) if masters.len() == 1 => masters.pop(),
-            Ok(_) => None,
-            Err(e) => {
-                log::error!("[storage] DM pubkey lookup failed: {e}");
-                None
-            }
-        }
-    }
-
     /// Master pubkey that the transport NodeId `transport_id` is mapped to, from the
     /// `peer_transports` index. `Ok(None)` if no stored device list contains the NodeId.
     pub async fn try_get_master_pubkey_for_transport(
@@ -153,19 +126,5 @@ impl Storage {
                 None
             }
         }
-    }
-
-    /// DM pubkey from the cached device list of `master_pubkey`.
-    pub async fn get_peer_dm_pubkey(
-        &self,
-        master_pubkey: &str,
-    ) -> Result<Option<String>, AppError> {
-        let result: Option<String> = sqlx::query_scalar(
-            "SELECT dm_pubkey FROM peer_device_announcements WHERE master_pubkey = ?1",
-        )
-        .bind(master_pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(result.filter(|pubkey| !pubkey.is_empty()))
     }
 }

@@ -1,6 +1,7 @@
 use crate::audio::{SharedCapture, SharedPlayback, android, lock};
 use crate::error::AppError;
 use crate::preferences;
+use iroh::EndpointId;
 use proscenium_types::{CallState, DmPayload, short_id};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -47,6 +48,10 @@ pub(super) enum PeerNotice {
 pub(crate) struct ActiveCall {
     pub(super) call_id: String,
     pub(super) peer_pubkey: String,
+    /// The peer's device in this call: for an incoming call the device that sent the
+    /// offer, for an outgoing call the device that answered. Call signals go to this
+    /// device, and the audio connection runs between it and this device.
+    pub(super) peer_device: Option<EndpointId>,
     /// True if the local user placed the call.
     pub(super) outgoing: bool,
     pub(super) phase: CallPhase,
@@ -62,12 +67,18 @@ pub(crate) struct ActiveCall {
 }
 
 impl ActiveCall {
-    pub(super) fn new(call_id: &str, peer_pubkey: &str, outgoing: bool) -> Self {
+    pub(super) fn new(
+        call_id: &str,
+        peer_pubkey: &str,
+        peer_device: Option<EndpointId>,
+        outgoing: bool,
+    ) -> Self {
         let cancel = CancellationToken::new();
         let phase_timeout = cancel.child_token();
         Self {
             call_id: call_id.to_string(),
             peer_pubkey: peer_pubkey.to_string(),
+            peer_device,
             outgoing,
             phase: if outgoing {
                 CallPhase::Ringing
@@ -133,16 +144,21 @@ impl super::CallHandler {
         (input, output)
     }
 
-    /// Send a call signal over the DM channel with a total timeout.
-    /// The `active_call` lock must not be held by the caller.
+    /// Send a call signal over the DM channel with a total timeout: to `device` of
+    /// `peer_pubkey`, or with `device` `None` to the first device of its device list that
+    /// answers. The `active_call` lock must not be held by the caller.
     pub(super) async fn send_signal(
         &self,
         peer_pubkey: &str,
+        device: Option<EndpointId>,
         payload: DmPayload,
     ) -> Result<(), AppError> {
-        tokio::time::timeout(SIGNAL_TIMEOUT, self.dm.send_signal(peer_pubkey, payload))
-            .await
-            .map_err(|_| AppError::Other("call signal timed out".into()))?
+        tokio::time::timeout(
+            SIGNAL_TIMEOUT,
+            self.dm.send_call_signal(peer_pubkey, device, payload),
+        )
+        .await
+        .map_err(|_| AppError::Other("call signal timed out".into()))?
     }
 
     /// End the call `call_id` if it is the active call and `condition` holds for it.
@@ -211,7 +227,10 @@ impl super::CallHandler {
                 call_id: call.call_id.clone(),
             },
         };
-        if let Err(e) = self.send_signal(&call.peer_pubkey, payload).await {
+        if let Err(e) = self
+            .send_signal(&call.peer_pubkey, call.peer_device, payload)
+            .await
+        {
             log::warn!(
                 "[call] failed to tell {} that the call ended: {e}",
                 short_id(&call.peer_pubkey)
@@ -352,9 +371,9 @@ mod tests {
 
     #[test]
     fn new_call_phase_follows_direction_and_enter_phase_replaces_timeout() {
-        let mut outgoing = ActiveCall::new("id", "peer", true);
+        let mut outgoing = ActiveCall::new("id", "peer", None, true);
         assert_eq!(outgoing.phase, CallPhase::Ringing);
-        let incoming = ActiveCall::new("id", "peer", false);
+        let incoming = ActiveCall::new("id", "peer", None, false);
         assert_eq!(incoming.phase, CallPhase::Incoming);
 
         let ring_timeout = outgoing.phase_timeout.clone();

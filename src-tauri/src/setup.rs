@@ -435,10 +435,12 @@ async fn start_services(
             };
             match signal.payload {
                 proscenium_types::DmPayload::CallOffer { call_id, .. } => {
-                    call.on_call_offer(&call_id, &signal.peer_pubkey).await;
+                    call.on_call_offer(&call_id, &signal.peer_pubkey, signal.peer_device)
+                        .await;
                 }
                 proscenium_types::DmPayload::CallAnswer { call_id } => {
-                    call.on_call_answered(&call_id, &signal.peer_pubkey).await;
+                    call.on_call_answered(&call_id, &signal.peer_pubkey, signal.peer_device)
+                        .await;
                 }
                 proscenium_types::DmPayload::CallReject { call_id }
                 | proscenium_types::DmPayload::CallHangup { call_id } => {
@@ -747,7 +749,6 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     log::info!("[setup] blob store opened at {}", blobs_dir.display());
 
     log::info!("[setup] master pubkey: {}", identity_data.master_pubkey);
-    log::info!("[setup] DM pubkey: {}", identity_data.dm_pubkey);
     log::info!(
         "[setup] Transport NodeId: {} (device index {})",
         identity_data.transport_node_id,
@@ -947,9 +948,7 @@ mod tests {
         assert!(debug.contains(&identity.master_pubkey));
         for secret in [
             identity.master_secret_key_bytes,
-            proscenium_types::derive_dm_key(&master),
-            identity.dm_x25519_private,
-            identity.ratchet_storage_key,
+            identity.transport_secret_key().to_bytes(),
         ] {
             assert!(!debug.contains(&hex::encode(secret)));
             assert!(!debug.contains(&format!("{secret:?}")));

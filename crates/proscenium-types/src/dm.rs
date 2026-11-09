@@ -1,3 +1,4 @@
+use crate::protocol::LinkedDevicesAnnouncement;
 use crate::types::MediaAttachment;
 use serde::{Deserialize, Serialize};
 
@@ -20,65 +21,40 @@ mod hex_bytes {
     }
 }
 
-/// Frame sent by the initiator of a DM connection.
-/// One JSON value (write_all + finish) on a QUIC bi-stream.
+/// A DM payload encrypted to one device of the recipient. Sent as one JSON value on a
+/// QUIC bi-stream (write_all + finish); the receiver answers with a `DmAck`.
+///
+/// The ciphertext is HPKE (RFC 9180) in Auth mode with DHKEM(X25519, HKDF-SHA256),
+/// HKDF-SHA256 and ChaCha20-Poly1305. The sender and recipient keys are the X25519 forms
+/// of the two devices' transport keys (their NodeIds).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DmMessage {
-    Handshake(DmHandshake),
-    Envelope(EncryptedEnvelope),
-}
-
-/// Answer of the acceptor to a `DmMessage::Envelope`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DmAck {
-    /// The envelope was decrypted and its payload was applied.
-    Ok,
-    /// The envelope was not applied.
-    Failed(DmNack),
-}
-
-/// Reason an envelope was not applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DmNack {
-    /// The acceptor has no usable ratchet session for the sender. A new handshake is required.
-    NoSession,
-    /// The acceptor's session could not decrypt the envelope. A new handshake is required.
-    DecryptFailed,
-    /// The sender is blocked, or the envelope or its payload is invalid. Sending again
-    /// gives the same answer.
-    Rejected,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DmHandshake {
-    Init {
-        /// Noise IK message 1.
-        #[serde(with = "hex_bytes")]
-        noise_message: Vec<u8>,
-        /// Sender's DM public key (hex-encoded X25519).
-        sender: String,
-    },
-    Response {
-        /// Noise IK message 2.
-        #[serde(with = "hex_bytes")]
-        noise_message: Vec<u8>,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncryptedEnvelope {
-    /// Sender's DM public key (hex-encoded X25519).
+pub struct DmEnvelope {
+    /// Master pubkey of the sender.
     pub sender: String,
-    pub ratchet_header: RatchetHeaderWire,
+    /// NodeId of the sending device.
+    pub sender_device: String,
+    /// Master pubkey of the recipient.
+    pub recipient: String,
+    /// NodeId of the device the payload is encrypted to.
+    pub recipient_device: String,
+    /// The sender's signed device list. Must list `sender_device`.
+    pub sender_devices: LinkedDevicesAnnouncement,
+    /// HPKE encapsulated key (32 bytes).
+    #[serde(with = "hex_bytes")]
+    pub encapped_key: Vec<u8>,
+    /// HPKE ciphertext of a JSON-serialized `DmPayload`.
     #[serde(with = "hex_bytes")]
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RatchetHeaderWire {
-    pub dh_public: String,
-    pub message_number: u32,
-    pub previous_chain_length: u32,
+/// Answer of the receiving device to a `DmEnvelope`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DmAck {
+    /// The payload was decrypted and applied.
+    Ok,
+    /// The payload was not applied: the sender is blocked, or the envelope or its payload
+    /// is invalid. Sending again gives the same answer.
+    Rejected,
 }
 
 // -- Decrypted payload (inside ciphertext) --
@@ -189,56 +165,41 @@ pub struct StoredMessage {
 mod tests {
     use super::*;
 
-    #[test]
-    fn envelope_ciphertext_is_a_hex_string() {
-        let envelope = EncryptedEnvelope {
+    fn envelope(ciphertext: Vec<u8>) -> DmEnvelope {
+        DmEnvelope {
             sender: "aa".repeat(32),
-            ratchet_header: RatchetHeaderWire {
-                dh_public: "bb".repeat(32),
-                message_number: 7,
-                previous_chain_length: 3,
+            sender_device: "bb".repeat(32),
+            recipient: "cc".repeat(32),
+            recipient_device: "dd".repeat(32),
+            sender_devices: LinkedDevicesAnnouncement {
+                master_pubkey: "aa".repeat(32),
+                devices: vec![],
+                version: 1,
+                timestamp: 1,
+                signature: String::new(),
             },
-            ciphertext: vec![0x00, 0x0f, 0xff],
-        };
-        let json = serde_json::to_string(&DmMessage::Envelope(envelope)).unwrap();
+            encapped_key: vec![1; 32],
+            ciphertext,
+        }
+    }
+
+    #[test]
+    fn envelope_bytes_are_hex_strings() {
+        let json = serde_json::to_string(&envelope(vec![0x00, 0x0f, 0xff])).unwrap();
         assert!(json.contains(r#""ciphertext":"000fff""#));
-        let DmMessage::Envelope(decoded) = serde_json::from_str(&json).unwrap() else {
-            panic!("expected an envelope");
-        };
+        assert!(json.contains(&format!(r#""encapped_key":"{}""#, "01".repeat(32))));
+        let decoded: DmEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.ciphertext, vec![0x00, 0x0f, 0xff]);
-        assert_eq!(decoded.ratchet_header.message_number, 7);
-    }
 
-    #[test]
-    fn handshake_noise_message_round_trips() {
-        let init = DmHandshake::Init {
-            noise_message: vec![1, 2, 3],
-            sender: "cc".repeat(32),
-        };
-        let json = serde_json::to_string(&init).unwrap();
-        assert!(json.contains(r#""noise_message":"010203""#));
-        let DmHandshake::Init { noise_message, .. } = serde_json::from_str(&json).unwrap() else {
-            panic!("expected Init");
-        };
-        assert_eq!(noise_message, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn non_hex_ciphertext_is_rejected() {
-        let json = r#"{"sender":"aa","ratchet_header":{"dh_public":"bb","message_number":0,"previous_chain_length":0},"ciphertext":[1,2,3]}"#;
-        assert!(serde_json::from_str::<EncryptedEnvelope>(json).is_err());
-        let json = r#"{"sender":"aa","ratchet_header":{"dh_public":"bb","message_number":0,"previous_chain_length":0},"ciphertext":"zz"}"#;
-        assert!(serde_json::from_str::<EncryptedEnvelope>(json).is_err());
+        let not_hex = json.replace("000fff", "zz");
+        assert!(serde_json::from_str::<DmEnvelope>(&not_hex).is_err());
+        let array = json.replace(r#""000fff""#, "[0,15,255]");
+        assert!(serde_json::from_str::<DmEnvelope>(&array).is_err());
     }
 
     #[test]
     fn ack_round_trips() {
-        for ack in [
-            DmAck::Ok,
-            DmAck::Failed(DmNack::NoSession),
-            DmAck::Failed(DmNack::DecryptFailed),
-            DmAck::Failed(DmNack::Rejected),
-        ] {
+        for ack in [DmAck::Ok, DmAck::Rejected] {
             let json = serde_json::to_vec(&ack).unwrap();
             assert!(json.len() <= 64);
             assert_eq!(serde_json::from_slice::<DmAck>(&json).unwrap(), ack);

@@ -1,3 +1,4 @@
+use crate::dm::StoredMessage;
 use crate::signing::{
     VerifiedIdentity, canonical_bytes, signature_to_hex, verify_identity_response, verify_signed_by,
 };
@@ -17,13 +18,11 @@ pub const MAX_LINKED_DEVICES: usize = 16;
 /// Maximum byte length of a device name in a `LinkedDevicesAnnouncement`.
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
 
-/// Signed announcement listing all of a user's linked devices and the user's DM key.
+/// Signed announcement listing all of a user's linked devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LinkedDevicesAnnouncement {
     /// The user's identity (master public key).
     pub master_pubkey: String,
-    /// The user's DM public key (hex-encoded X25519, for Noise IK + Double Ratchet).
-    pub dm_pubkey: String,
     /// All currently active devices.
     pub devices: Vec<DeviceEntry>,
     /// Monotonically increasing version number.
@@ -79,7 +78,7 @@ pub enum GossipMessage {
 /// signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityResponse {
-    /// Signed device list. Carries the master pubkey and the DM pubkey.
+    /// Signed device list. Carries the master pubkey.
     pub announcement: LinkedDevicesAnnouncement,
     /// The user's signed profile, if one exists.
     pub profile: Option<Profile>,
@@ -110,10 +109,11 @@ pub enum PeerRequest {
     FollowsListRequest,
     /// Request a peer's public followers list.
     FollowersListRequest,
-    /// Device linking: the new device sends the first Noise IKpsk2 handshake message.
+    /// Device linking: the new device sends the one-time secret of the link code. The
+    /// existing device answers with the `LinkBundleData` JSON on the same stream.
     LinkRequest {
-        /// Noise IKpsk2 handshake init message (opaque bytes).
-        noise_init: Vec<u8>,
+        /// `LinkQrPayload::secret` (URL-safe base64 without padding).
+        secret: String,
     },
     /// Sync between two devices of one user. The responder serves it only to a NodeId
     /// derived from its own master key. `DeviceSyncFrame`s follow on a second
@@ -131,13 +131,6 @@ pub enum PeerRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PeerResponse {
     Identity(IdentityResponse),
-    /// Device linking: the existing device's Noise IKpsk2 handshake response.
-    /// The `LinkBundleData`, encrypted as a sequence of Noise transport messages,
-    /// follows on the same stream.
-    LinkBundle {
-        /// Noise IKpsk2 handshake response message (opaque bytes).
-        noise_response: Vec<u8>,
-    },
     /// Response containing a peer's follows list.
     FollowsList(FollowsListResponse),
     /// Response containing a peer's followers list.
@@ -152,7 +145,7 @@ pub struct PushMessage {
     pub interactions: Vec<Interaction>,
     pub profile: Option<Profile>,
     /// The author's signed device list, so a receiver that missed a device list change
-    /// learns the current NodeIds and DM pubkey.
+    /// learns the current NodeIds.
     #[serde(default)]
     pub announcement: Option<LinkedDevicesAnnouncement>,
     /// Signed deletions of the author's posts.
@@ -352,7 +345,7 @@ pub struct SyncSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_stage: Option<StageAnnouncement>,
     /// The responder's signed device list, so a requester that missed a device list change
-    /// learns the current NodeIds and DM pubkey.
+    /// learns the current NodeIds.
     #[serde(default)]
     pub announcement: Option<LinkedDevicesAnnouncement>,
     /// Number of deletion records the responder stores for the requested author.
@@ -392,6 +385,8 @@ pub enum DeviceSyncFrame {
     Follows(Vec<FollowEntry>),
     Moderation(Vec<ModerationEntry>),
     Bookmarks(Vec<BookmarkEntry>),
+    /// Direct messages the receiver's vector does not list.
+    DirectMessages(Vec<StoredMessage>),
 }
 
 const FOLLOW_REQUEST_TAG: &str = "proscenium/follow-request/2";

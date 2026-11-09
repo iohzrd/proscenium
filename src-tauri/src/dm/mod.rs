@@ -1,27 +1,30 @@
-mod crypto;
+//! Direct messages over the DM ALPN.
+//!
+//! Every payload is encrypted to one device of the recipient (`envelope`) and sent to that
+//! device on its own QUIC connection. A message, receipt or typing signal goes to every
+//! device of the recipient; a call signal goes to one device. There is no session state.
+
 mod delivery;
-mod handshake;
+mod envelope;
 mod incoming;
 
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId,
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
 use proscenium_types::{
-    DM_ALPN, DirectMessage, DmHandshake, DmMessage, is_valid_dm_pubkey, is_valid_id, short_id,
-    validate_media_list,
+    DM_ALPN, DirectMessage, DmEnvelope, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES, is_valid_id,
+    short_id, validate_media_list,
 };
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tauri::AppHandle;
-use tokio::sync::{Notify, OwnedMutexGuard, mpsc};
-use zeroize::Zeroizing;
+use tokio::sync::{Notify, mpsc};
 
 /// Maximum byte length of `DirectMessage.content`.
 pub(crate) const MAX_DM_CONTENT_LEN: usize = 10_000;
@@ -32,88 +35,44 @@ pub(crate) const MAX_DM_CONTENT_LEN: usize = 10_000;
 pub(crate) const MAX_DM_PAYLOAD_LEN: usize = 64 * 1024;
 
 /// Maximum ciphertext length in an envelope: the payload plus the 16-byte
-/// ChaCha20Poly1305 tag.
+/// ChaCha20-Poly1305 tag.
 const MAX_DM_CIPHERTEXT_LEN: usize = MAX_DM_PAYLOAD_LEN + 16;
 
-/// Maximum byte length of the frame the acceptor reads. The largest valid frame is a
-/// `DmMessage::Envelope` whose ciphertext is `MAX_DM_CIPHERTEXT_LEN` bytes, encoded as
-/// two hex digits per byte. The other JSON fields take about 260 bytes.
-const MAX_DM_FRAME_LEN: usize = 2 * MAX_DM_CIPHERTEXT_LEN + 512;
+/// Maximum byte length of the envelope the acceptor reads: a ciphertext of
+/// `MAX_DM_CIPHERTEXT_LEN` bytes in hex, and a device list of `MAX_LINKED_DEVICES` entries
+/// whose names of `MAX_DEVICE_NAME_LEN` bytes are escaped as `\u00XX` (6 bytes per byte).
+/// The other fields take under 1 KiB.
+const MAX_DM_FRAME_LEN: usize =
+    2 * MAX_DM_CIPHERTEXT_LEN + MAX_LINKED_DEVICES * (6 * MAX_DEVICE_NAME_LEN + 256) + 1024;
 
-/// Maximum byte length of the answer the initiator reads: a `DmHandshake::Response`
-/// (about 130 bytes) or a `DmAck`.
-const MAX_DM_ANSWER_LEN: usize = 512;
+/// Maximum byte length of the answer the sender reads (a `DmAck`).
+const MAX_DM_ANSWER_LEN: usize = 64;
 
-/// Initiator: time allowed to open the QUIC connection.
+/// Sender: time allowed to open the QUIC connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Initiator: time allowed, once connected, to send a handshake and read the response.
-/// The responder may first query the initiator's identity (up to 15 s) and wait for the
-/// session lock (up to `SESSION_LOCK_TIMEOUT`).
-const HANDSHAKE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(25);
-
-/// Initiator: time allowed, once connected, to send an envelope and read the `DmAck`.
+/// Sender: time allowed, once connected, to send an envelope and read the `DmAck`.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Acceptor: time allowed for each of these steps: the peer opens the bi-stream, the
-/// frame arrives, the answer is written, the peer closes the connection.
+/// envelope arrives, the answer is written, the peer closes the connection.
 const ACCEPT_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Acceptor: time allowed to wait for the session lock of the connecting peer.
-const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Number of entries in `SessionLocks` at which unused entries are removed.
-const SESSION_LOCKS_PRUNE_LEN: usize = 256;
-
-/// A call signal received via the DM ratchet channel.
+/// A call signal received from the device `peer_device` of `peer_pubkey`.
 #[derive(Debug, Clone)]
 pub struct CallSignal {
     pub peer_pubkey: String,
+    pub peer_device: EndpointId,
     pub payload: proscenium_types::DmPayload,
 }
 
-/// One async mutex per peer DM pubkey. A task holds the mutex from loading a ratchet
-/// session to storing it, so two tasks cannot derive the same message key.
-#[derive(Default)]
-struct SessionLocks {
-    locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl SessionLocks {
-    /// Wait for the mutex of the session with `peer_dm_pubkey`.
-    /// The map mutex is released before the wait.
-    async fn lock(&self, peer_dm_pubkey: &str) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
-            if locks.len() >= SESSION_LOCKS_PRUNE_LEN {
-                // An entry referenced only by the map is neither held nor awaited.
-                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-            }
-            locks.entry(peer_dm_pubkey.to_string()).or_default().clone()
-        };
-        lock.lock_owned().await
-    }
-}
-
-/// Copy of the local identity fields one DM operation needs. Taken once so the identity
+/// Copy of the local identity values one DM operation needs. Taken once so the identity
 /// lock is not held across storage or network calls.
 struct DmKeys {
     master_pubkey: String,
-    /// Hex-encoded `x25519_public`.
-    dm_pubkey: String,
-    x25519_private: Zeroizing<[u8; 32]>,
-    x25519_public: [u8; 32],
-    ratchet_storage_key: Zeroizing<[u8; 32]>,
-}
-
-/// A peer's DM key and transport NodeIds from its cached device list.
-struct PeerRoute {
-    master_pubkey: String,
-    /// Hex-encoded `x25519_public`.
-    dm_pubkey: String,
-    x25519_public: [u8; 32],
-    /// Never empty. Delivery starts with the first NodeId.
-    node_ids: Vec<EndpointId>,
+    /// Transport key of this device. Its X25519 form decrypts the envelopes sent to it
+    /// and authenticates the envelopes it sends.
+    device_key: SecretKey,
 }
 
 #[derive(Clone)]
@@ -127,7 +86,6 @@ pub struct DmHandler {
     /// retry delay has not elapsed.
     outbox_ignore_delay: Arc<AtomicBool>,
     pub(crate) call_signal_tx: mpsc::UnboundedSender<CallSignal>,
-    session_locks: Arc<SessionLocks>,
 }
 
 impl std::fmt::Debug for DmHandler {
@@ -152,7 +110,6 @@ impl DmHandler {
             outbox_notify: Arc::new(Notify::new()),
             outbox_ignore_delay: Arc::new(AtomicBool::new(false)),
             call_signal_tx,
-            session_locks: Arc::new(SessionLocks::default()),
         }
     }
 
@@ -166,28 +123,13 @@ impl DmHandler {
         let id = self.identity.read().await;
         DmKeys {
             master_pubkey: id.master_pubkey.clone(),
-            dm_pubkey: id.dm_pubkey.clone(),
-            x25519_private: Zeroizing::new(id.dm_x25519_private),
-            x25519_public: id.dm_x25519_public,
-            ratchet_storage_key: Zeroizing::new(id.ratchet_storage_key),
+            device_key: id.transport_secret_key(),
         }
     }
 
-    /// Read the DM pubkey and the transport NodeIds of `peer_master_pubkey` from its
-    /// cached device list. Returns an error if either is missing or malformed.
-    async fn resolve_peer(&self, peer_master_pubkey: &str) -> Result<PeerRoute, AppError> {
-        let dm_pubkey = self
-            .storage
-            .get_peer_dm_pubkey(peer_master_pubkey)
-            .await?
-            .filter(|key| is_valid_dm_pubkey(key))
-            .ok_or_else(|| {
-                AppError::Other(format!(
-                    "no DM pubkey cached for {}",
-                    short_id(peer_master_pubkey)
-                ))
-            })?;
-        let x25519_public = crypto::dm_pubkey_to_x25519(&dm_pubkey)?;
+    /// NodeIds of the cached device list of `peer_master_pubkey`, in list order.
+    /// Returns an error if none is cached.
+    async fn peer_devices(&self, peer_master_pubkey: &str) -> Result<Vec<EndpointId>, AppError> {
         let node_ids: Vec<EndpointId> = self
             .storage
             .get_peer_transport_node_ids(peer_master_pubkey)
@@ -201,12 +143,7 @@ impl DmHandler {
                 short_id(peer_master_pubkey)
             )));
         }
-        Ok(PeerRoute {
-            master_pubkey: peer_master_pubkey.to_string(),
-            dm_pubkey,
-            x25519_public,
-            node_ids,
-        })
+        Ok(node_ids)
     }
 
     /// Connect to `node` on the DM ALPN, write `frame` on one bi-stream and return the
@@ -237,13 +174,13 @@ impl DmHandler {
         answer?
     }
 
-    /// Handle one incoming connection: read one `DmMessage`, process it, write the answer
-    /// and wait for the peer to close the connection.
+    /// Handle one incoming connection: read one `DmEnvelope`, process it, write the
+    /// answer and wait for the peer to close the connection.
     async fn serve(&self, conn: &Connection, remote: EndpointId) -> Result<(), AppError> {
         let remote_str = remote.to_string();
 
         // Refuse a NodeId that is blocked or belongs to a blocked user before reading
-        // anything. The DM key in the frame is checked again after it is authenticated.
+        // anything. The sender of the envelope is checked again after it is verified.
         let remote_owner = self
             .storage
             .get_master_pubkey_for_transport(&remote_str)
@@ -259,27 +196,17 @@ impl DmHandler {
 
         let frame = tokio::time::timeout(ACCEPT_STEP_TIMEOUT, recv.read_to_end(MAX_DM_FRAME_LEN))
             .await
-            .map_err(|_| AppError::Other("frame not received in time".into()))??;
+            .map_err(|_| AppError::Other("envelope not received in time".into()))??;
 
-        let answer = match serde_json::from_slice::<DmMessage>(&frame)? {
-            DmMessage::Handshake(DmHandshake::Init {
-                noise_message,
-                sender,
-            }) => handshake::handle_handshake(self, remote, &sender, &noise_message).await?,
-            DmMessage::Handshake(DmHandshake::Response { .. }) => {
-                return Err(AppError::Other("unexpected handshake response".into()));
-            }
-            DmMessage::Envelope(envelope) => {
-                serde_json::to_vec(&self.handle_encrypted_message(envelope).await?)?
-            }
-        };
+        let envelope: DmEnvelope = serde_json::from_slice(&frame)?;
+        let answer = serde_json::to_vec(&self.handle_envelope(remote, envelope).await?)?;
 
         tokio::time::timeout(ACCEPT_STEP_TIMEOUT, send.write_all(&answer))
             .await
             .map_err(|_| AppError::Other("answer not written in time".into()))??;
         send.finish()?;
 
-        // The initiator closes the connection after it read the answer. Returning before
+        // The sender closes the connection after it read the answer. Returning before
         // that would drop the connection while the answer may still be untransmitted.
         let _ = tokio::time::timeout(ACCEPT_STEP_TIMEOUT, conn.closed()).await;
         Ok(())
@@ -333,7 +260,7 @@ impl ProtocolHandler for DmHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proscenium_types::{DmPayload, EncryptedEnvelope, MediaAttachment, RatchetHeaderWire};
+    use proscenium_types::{DeviceEntry, DmPayload, LinkedDevicesAnnouncement, MediaAttachment};
 
     fn message() -> DirectMessage {
         DirectMessage {
@@ -377,16 +304,30 @@ mod tests {
 
     #[test]
     fn largest_envelope_fits_in_the_frame_limit() {
-        let envelope = EncryptedEnvelope {
-            sender: "f".repeat(64),
-            ratchet_header: RatchetHeaderWire {
-                dh_public: "f".repeat(64),
-                message_number: u32::MAX,
-                previous_chain_length: u32::MAX,
+        let key = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let envelope = DmEnvelope {
+            sender: key(1),
+            sender_device: key(2),
+            recipient: key(3),
+            recipient_device: key(4),
+            sender_devices: LinkedDevicesAnnouncement {
+                master_pubkey: key(1),
+                devices: (0..MAX_LINKED_DEVICES as u8)
+                    .map(|i| DeviceEntry {
+                        node_id: key(i + 10),
+                        device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
+                        is_primary: false,
+                        added_at: u64::MAX,
+                    })
+                    .collect(),
+                version: u64::MAX,
+                timestamp: u64::MAX,
+                signature: "f".repeat(128),
             },
+            encapped_key: vec![0xff; 32],
             ciphertext: vec![0xff; MAX_DM_CIPHERTEXT_LEN],
         };
-        let frame = serde_json::to_vec(&DmMessage::Envelope(envelope)).unwrap();
+        let frame = serde_json::to_vec(&envelope).unwrap();
         assert!(frame.len() <= MAX_DM_FRAME_LEN);
     }
 
@@ -409,34 +350,5 @@ mod tests {
             reply_to: Some("f".repeat(32)),
         });
         assert!(serde_json::to_vec(&payload).unwrap().len() <= MAX_DM_PAYLOAD_LEN);
-    }
-
-    #[tokio::test]
-    async fn session_locks_serialize_one_peer_and_prune_unused_entries() {
-        let locks = Arc::new(SessionLocks::default());
-
-        let guard = locks.lock("peer").await;
-        let waiter = {
-            let locks = locks.clone();
-            tokio::spawn(async move { drop(locks.lock("peer").await) })
-        };
-        // A different peer is not blocked by the held mutex.
-        drop(locks.lock("other").await);
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!waiter.is_finished());
-        drop(guard);
-        waiter.await.unwrap();
-
-        // Unused entries are removed once the map reaches the prune length; the entry of
-        // a held mutex stays.
-        let held = locks.lock("held").await;
-        for i in 0..2 * SESSION_LOCKS_PRUNE_LEN {
-            drop(locks.lock(&format!("peer-{i}")).await);
-        }
-        let map = locks.locks.lock().unwrap();
-        assert!(map.len() <= SESSION_LOCKS_PRUNE_LEN);
-        assert!(map.contains_key("held"));
-        drop(map);
-        drop(held);
     }
 }

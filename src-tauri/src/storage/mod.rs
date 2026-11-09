@@ -10,7 +10,6 @@ mod peer_identities;
 mod posts;
 mod preferences;
 mod profiles;
-mod ratchet;
 mod servers;
 mod social;
 mod sync;

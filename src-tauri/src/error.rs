@@ -17,13 +17,6 @@ pub enum AppError {
     #[error("{0}")]
     Reqwest(#[from] reqwest::Error),
 
-    // -- crypto --
-    #[error("{0}")]
-    Snow(#[from] snow::Error),
-
-    #[error("{0}")]
-    Crypto(#[from] crate::crypto::CryptoError),
-
     // -- encoding --
     #[error("{0}")]
     HexDecode(#[from] hex::FromHexError),

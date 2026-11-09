@@ -315,6 +315,13 @@
           requestAnimationFrame(() => scrollToBottom());
         }
       },
+      // Messages of this conversation that another device of this user received
+      // or sent.
+      "dm-synced": (raw) => {
+        const payload = raw as { peer: string; messages: StoredMessage[] };
+        if (payload.peer !== pubkey) return;
+        messages = mergeMessages(messages, payload.messages);
+      },
       "dm-delivered": (raw) => {
         markDelivered((raw as { message_id: string }).message_id);
       },

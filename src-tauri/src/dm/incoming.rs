@@ -1,16 +1,13 @@
-use crate::crypto::CryptoError;
 use crate::error::AppError;
 use crate::storage::Storage;
+use iroh::EndpointId;
 use proscenium_types::{
-    DmAck, DmNack, DmPayload, EncryptedEnvelope, StoredMessage, is_valid_dm_pubkey, is_valid_id,
-    now_millis, short_id,
+    DmAck, DmEnvelope, DmPayload, StoredMessage, is_valid_id, now_millis, short_id,
+    verify_linked_devices_announcement,
 };
 use tauri::Emitter;
 
-use super::crypto::{dm_pubkey_to_x25519, seal_session, wire_to_ratchet_header};
-use super::{
-    CallSignal, DmHandler, MAX_DM_CIPHERTEXT_LEN, SESSION_LOCK_TIMEOUT, validate_direct_message,
-};
+use super::{CallSignal, DmHandler, MAX_DM_CIPHERTEXT_LEN, envelope, validate_direct_message};
 
 /// Check a decrypted payload: the message limits of `validate_direct_message`, and the
 /// id format of every message id and call id.
@@ -38,117 +35,105 @@ fn validate_payload(payload: &DmPayload) -> Result<(), String> {
     }
 }
 
+/// Reason to refuse `envelope` received from the device `remote` by the device
+/// `my_device` of `me`, or `None` if its fields pass: `remote` is `sender_device`, the
+/// recipient fields name `me` and `my_device`, the sender is another user, the ciphertext
+/// fits, and `sender_devices` verifies, belongs to `sender` and lists `sender_device`.
+fn envelope_refusal(
+    envelope: &DmEnvelope,
+    remote: &str,
+    me: &str,
+    my_device: &str,
+) -> Option<&'static str> {
+    if envelope.sender_device != remote {
+        Some("the envelope was not sent by its sender device")
+    } else if envelope.recipient != me || envelope.recipient_device != my_device {
+        Some("the envelope is for another device")
+    } else if envelope.sender == me {
+        Some("the envelope is from the local identity")
+    } else if envelope.ciphertext.len() > MAX_DM_CIPHERTEXT_LEN {
+        Some("the ciphertext is too long")
+    } else if envelope.sender_devices.master_pubkey != envelope.sender
+        || verify_linked_devices_announcement(&envelope.sender_devices).is_err()
+        || !envelope
+            .sender_devices
+            .devices
+            .iter()
+            .any(|device| device.node_id == envelope.sender_device)
+    {
+        Some("the device list does not list the sender device")
+    } else {
+        None
+    }
+}
+
 impl DmHandler {
-    /// Handle an incoming envelope and return the acknowledgement to send.
+    /// Handle an envelope received from the device `remote` and return the answer.
     ///
-    /// `Ok(DmAck::Failed(_))` means the envelope was refused for a reason the sender can
-    /// act on. `Err` means a local failure (storage, lock timeout); no acknowledgement is
-    /// sent, so the sender keeps the message queued.
-    pub(super) async fn handle_encrypted_message(
+    /// The envelope is applied only if `envelope_refusal` finds nothing, the sender is
+    /// not blocked, the ciphertext decrypts and the payload is valid. The device list is
+    /// cached under the version rule of `Storage::cache_peer_announcement`.
+    ///
+    /// `Ok(DmAck::Rejected)` means the envelope was refused. `Err` means a local failure
+    /// (storage); no answer is sent, so the sender keeps the message queued.
+    pub(super) async fn handle_envelope(
         &self,
-        envelope: EncryptedEnvelope,
+        remote: EndpointId,
+        envelope: DmEnvelope,
     ) -> Result<DmAck, AppError> {
-        let peer_dm_pubkey = envelope.sender.as_str();
-        if !is_valid_dm_pubkey(peer_dm_pubkey) || envelope.ciphertext.len() > MAX_DM_CIPHERTEXT_LEN
-        {
-            return Ok(DmAck::Failed(DmNack::Rejected));
-        }
-        let (Ok(header), Ok(peer_x25519_public)) = (
-            wire_to_ratchet_header(&envelope.ratchet_header),
-            dm_pubkey_to_x25519(peer_dm_pubkey),
-        ) else {
-            return Ok(DmAck::Failed(DmNack::Rejected));
-        };
-        log::debug!(
-            "[dm] received envelope: sender={} msg_n={} prev_chain={} ciphertext_len={}",
-            short_id(peer_dm_pubkey),
-            header.message_number,
-            header.previous_chain_length,
-            envelope.ciphertext.len(),
-        );
-
         let keys = self.dm_keys().await;
-        if peer_dm_pubkey == keys.dm_pubkey {
-            return Ok(DmAck::Failed(DmNack::Rejected));
+        let sender = envelope.sender.clone();
+        let my_device = keys.device_key.public().to_string();
+        if let Some(reason) = envelope_refusal(
+            &envelope,
+            &remote.to_string(),
+            &keys.master_pubkey,
+            &my_device,
+        ) {
+            log::warn!(
+                "[dm] rejecting envelope from node {}: {reason}",
+                short_id(&remote.to_string())
+            );
+            return Ok(DmAck::Rejected);
         }
-
-        // Attribute the DM key to a user before any state is read or written. Without a
-        // cached device list the sender must run a handshake, which verifies its identity.
-        let Some(peer_master_pubkey) = self
-            .storage
-            .get_master_pubkey_for_dm_pubkey(peer_dm_pubkey)
-            .await
-        else {
-            return Ok(DmAck::Failed(DmNack::NoSession));
-        };
-        if self.storage.is_blocked(&peer_master_pubkey).await? {
+        if self.storage.is_blocked(&sender).await? {
             log::debug!(
                 "[dm] rejecting envelope from blocked user {}",
-                short_id(&peer_master_pubkey)
+                short_id(&sender)
             );
-            return Ok(DmAck::Failed(DmNack::Rejected));
+            return Ok(DmAck::Rejected);
+        }
+        if let Err(e) = self
+            .storage
+            .cache_peer_announcement(&envelope.sender_devices)
+            .await
+        {
+            log::warn!(
+                "[dm] failed to store the device list of {}: {e}",
+                short_id(&sender)
+            );
         }
 
-        // Held from loading the session until the advanced session is stored.
-        let session_guard = tokio::time::timeout(
-            SESSION_LOCK_TIMEOUT,
-            self.session_locks.lock(peer_dm_pubkey),
-        )
-        .await
-        .map_err(|_| AppError::Other("session is in use".into()))?;
-
-        let Some(mut ratchet) = self.load_session(&keys, peer_dm_pubkey).await? else {
-            return Ok(DmAck::Failed(DmNack::NoSession));
-        };
-
-        let plaintext = match ratchet.decrypt(
-            &header,
-            &envelope.ciphertext,
-            &peer_x25519_public,
-            &keys.x25519_public,
-        ) {
-            Ok(plaintext) => plaintext,
-            // A local failure says nothing about the peer's session.
-            Err(e @ (CryptoError::Rng | CryptoError::Internal)) => return Err(e.into()),
-            Err(e) => {
-                log::warn!(
-                    "[dm] cannot decrypt envelope from {}: {e}",
-                    short_id(&peer_master_pubkey)
-                );
-                return Ok(DmAck::Failed(DmNack::DecryptFailed));
-            }
-        };
-
-        // The envelope authenticated, so the advanced session is stored in every branch
-        // below, including for a payload that is rejected.
-        let ratchet_sealed = seal_session(&keys.ratchet_storage_key, &ratchet)?;
-        let now = now_millis();
-
-        let payload = match serde_json::from_slice::<DmPayload>(&plaintext)
-            .map_err(|e| e.to_string())
-            .and_then(|payload| validate_payload(&payload).map(|()| payload))
-        {
+        let payload = match envelope::open(&keys.device_key, &envelope).and_then(|plaintext| {
+            let payload = serde_json::from_slice::<DmPayload>(&plaintext)?;
+            validate_payload(&payload).map_err(AppError::Other)?;
+            Ok(payload)
+        }) {
             Ok(payload) => payload,
             Err(e) => {
-                self.storage
-                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, now)
-                    .await?;
-                log::warn!(
-                    "[dm] rejecting payload from {}: {e}",
-                    short_id(&peer_master_pubkey)
-                );
-                return Ok(DmAck::Failed(DmNack::Rejected));
+                log::warn!("[dm] rejecting envelope from {}: {e}", short_id(&sender));
+                return Ok(DmAck::Rejected);
             }
         };
 
-        let conv_id = Storage::conversation_id(&keys.master_pubkey, &peer_master_pubkey);
-
-        let received = match &payload {
+        let conv_id = Storage::conversation_id(&keys.master_pubkey, &sender);
+        match payload {
             DmPayload::Message(msg) => {
+                let now = now_millis();
                 let stored_msg = StoredMessage {
                     id: msg.id.clone(),
                     conversation_id: conv_id.clone(),
-                    from_pubkey: peer_master_pubkey.clone(),
+                    from_pubkey: sender.clone(),
                     to_pubkey: keys.master_pubkey.clone(),
                     content: msg.content.clone(),
                     // A timestamp after the local clock would keep the conversation at
@@ -160,51 +145,27 @@ impl DmHandler {
                     reply_to: msg.reply_to.clone(),
                 };
                 let preview = crate::util::message_preview(&stored_msg.content);
-
-                // Atomically save ratchet state + store message (single SQLite transaction)
-                let inserted = self
+                if self
                     .storage
-                    .receive_dm_message_atomically(
-                        peer_dm_pubkey,
-                        &peer_master_pubkey,
-                        &ratchet_sealed,
-                        now,
-                        &stored_msg,
-                        &preview,
-                    )
-                    .await?;
-                inserted.then_some(stored_msg)
-            }
-            _ => {
-                self.storage
-                    .save_ratchet_session(peer_dm_pubkey, &ratchet_sealed, now)
-                    .await?;
-                None
-            }
-        };
-        drop(session_guard);
-
-        match payload {
-            DmPayload::Message(msg) => match received {
-                Some(stored_msg) => {
-                    log::info!(
-                        "[dm] received message from {}",
-                        short_id(&peer_master_pubkey)
-                    );
+                    .receive_dm_message(&sender, &stored_msg, &preview)
+                    .await?
+                {
+                    log::info!("[dm] received message from {}", short_id(&sender));
                     let _ = self.app_handle.emit(
                         "dm-received",
                         serde_json::json!({
-                            "from": peer_master_pubkey,
+                            "from": sender,
                             "message": stored_msg,
                         }),
                     );
+                } else {
+                    log::debug!(
+                        "[dm] message {} from {} is already stored",
+                        short_id(&msg.id),
+                        short_id(&sender)
+                    );
                 }
-                None => log::debug!(
-                    "[dm] message {} from {} is already stored",
-                    short_id(&msg.id),
-                    short_id(&peer_master_pubkey)
-                ),
-            },
+            }
             DmPayload::Delivered { message_id } => {
                 // Only a message the local user sent in this conversation is updated.
                 if self
@@ -230,17 +191,17 @@ impl DmHandler {
                 }
             }
             DmPayload::Typing => {
-                let _ = self.app_handle.emit(
-                    "typing-indicator",
-                    serde_json::json!({ "peer": peer_master_pubkey }),
-                );
+                let _ = self
+                    .app_handle
+                    .emit("typing-indicator", serde_json::json!({ "peer": sender }));
             }
             payload @ (DmPayload::CallOffer { .. }
             | DmPayload::CallAnswer { .. }
             | DmPayload::CallReject { .. }
             | DmPayload::CallHangup { .. }) => {
                 let _ = self.call_signal_tx.send(CallSignal {
-                    peer_pubkey: peer_master_pubkey.clone(),
+                    peer_pubkey: sender.clone(),
+                    peer_device: remote,
                     payload,
                 });
             }
@@ -248,7 +209,7 @@ impl DmHandler {
 
         // The peer is reachable: attempt its queued messages without waiting for their
         // retry delay.
-        self.retry_peer_outbox_now(&peer_master_pubkey).await;
+        self.retry_peer_outbox_now(&sender).await;
 
         Ok(DmAck::Ok)
     }
@@ -257,7 +218,100 @@ impl DmHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proscenium_types::DirectMessage;
+    use iroh::SecretKey;
+    use proscenium_types::{
+        DeviceEntry, DirectMessage, LinkedDevicesAnnouncement, sign_linked_devices_announcement,
+    };
+
+    struct Party {
+        master: SecretKey,
+        device: SecretKey,
+    }
+
+    impl Party {
+        fn new(seed: u8) -> Self {
+            Self {
+                master: SecretKey::from_bytes(&[seed; 32]),
+                device: SecretKey::from_bytes(&[seed.wrapping_add(100); 32]),
+            }
+        }
+
+        fn pubkey(&self) -> String {
+            self.master.public().to_string()
+        }
+
+        fn node_id(&self) -> String {
+            self.device.public().to_string()
+        }
+
+        fn devices(&self) -> LinkedDevicesAnnouncement {
+            let mut announcement = LinkedDevicesAnnouncement {
+                master_pubkey: self.pubkey(),
+                devices: vec![DeviceEntry {
+                    node_id: self.node_id(),
+                    device_name: "d".to_string(),
+                    is_primary: true,
+                    added_at: 1,
+                }],
+                version: 1,
+                timestamp: 1,
+                signature: String::new(),
+            };
+            sign_linked_devices_announcement(&mut announcement, &self.master);
+            announcement
+        }
+
+        fn seal_to(&self, to: &Party, plaintext: &[u8]) -> DmEnvelope {
+            envelope::seal(
+                &self.device,
+                &self.pubkey(),
+                &self.devices(),
+                &to.pubkey(),
+                &to.device.public(),
+                plaintext,
+            )
+            .unwrap()
+        }
+    }
+
+    #[test]
+    fn envelope_fields_are_checked_before_decryption() {
+        let (alice, bob) = (Party::new(1), Party::new(2));
+        let valid = alice.seal_to(&bob, b"{}");
+        let check = |envelope: &DmEnvelope, remote: &str| {
+            envelope_refusal(envelope, remote, &bob.pubkey(), &bob.node_id())
+        };
+        assert_eq!(check(&valid, &alice.node_id()), None);
+        assert_eq!(
+            envelope::open(&bob.device, &valid).unwrap().as_slice(),
+            b"{}"
+        );
+
+        // Delivered by another node than the sender device.
+        assert!(check(&valid, &bob.node_id()).is_some());
+
+        // Addressed to another device of the recipient.
+        let other_device = Party::new(3).node_id();
+        assert!(envelope_refusal(&valid, &alice.node_id(), &bob.pubkey(), &other_device).is_some());
+
+        // A device list of another identity, or one that does not list the sender device.
+        let carol = Party::new(4);
+        let mut foreign_list = valid.clone();
+        foreign_list.sender_devices = carol.devices();
+        assert!(check(&foreign_list, &alice.node_id()).is_some());
+        let mut tampered_list = valid.clone();
+        tampered_list.sender_devices.devices[0].node_id = carol.node_id();
+        assert!(check(&tampered_list, &alice.node_id()).is_some());
+
+        // From the local identity.
+        let own = bob.seal_to(&bob, b"{}");
+        assert!(envelope_refusal(&own, &bob.node_id(), &bob.pubkey(), &bob.node_id()).is_some());
+
+        // Oversized ciphertext.
+        let mut long = valid;
+        long.ciphertext = vec![0; MAX_DM_CIPHERTEXT_LEN + 1];
+        assert!(check(&long, &alice.node_id()).is_some());
+    }
 
     const ID: &str = "0123456789abcdef0123456789abcdef";
 

@@ -20,15 +20,14 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 
 ### Identity and Key Architecture
 
-Each user has one master key and two kinds of keys derived from it:
+Each user has one master key, and each device a transport key derived from it:
 
 - **Master key** (Ed25519) -- The identity. The master public key is what others follow. The master key signs all of the user's content: posts, interactions, profiles, deletions, device lists, follow requests, server registrations and Stage messages. Stored in `master_key.key` (mode 0600) on every device of the user. A 24-word BIP39 recovery phrase encodes it.
-- **Transport key** (Ed25519) -- Derived from the master key with a per-device index (`device_index` file, 0 on the first device). It is the iroh NodeId of that device. Never signs content.
-- **DM key** (X25519) -- Derived from the master key, the same on all devices of the user. Used for the Noise IK handshake and as the first ratchet key of a DM session.
+- **Transport key** (Ed25519) -- Derived from the master key with a per-device index (`device_index` file, 0 on the first device). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content.
 
 Content is verified against the public key in its `author` field, so it verifies without other cached data. There is no key rotation: a leaked master key can only be replaced by a new identity.
 
-A user's devices and DM public key are listed in a `LinkedDevicesAnnouncement` signed by the master key. An identity response is accepted only if the device list verifies and contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
+A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the master key. An identity response is accepted only if the device list verifies and contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
 
 Every signed byte string is a JSON array that starts with a type tag (`proscenium/<type>/2`), so a signature made for one message type does not verify as another. Post ids are a SHA-256 hash over the post's other fields, including the author. Profiles carry a signed `updated_at`; an older profile does not replace a newer one.
 
@@ -41,7 +40,7 @@ All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
 - **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows.
 - **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is checked before download; blobs over 50 MiB are rejected. Media over 10 MiB is fetched only after a click.
 - **DM** -- End-to-end encrypted direct messages. See "Direct Messaging".
-- **Call** -- 1:1 voice calls. Opus at 48 kHz mono in 20 ms frames over a QUIC bi-stream. Signaling travels through the DM session. The audio connection is accepted only after the local user accepted the call, and both sides prove knowledge of the call id before audio starts.
+- **Call** -- 1:1 voice calls. Opus at 48 kHz mono in 20 ms frames over a QUIC bi-stream. Signaling travels as DMs. The audio connection is accepted only after the local user accepted the call, and both sides prove knowledge of the call id before audio starts.
 - **Stage** -- Live audio rooms. See "Stage (Live Audio Rooms)".
 
 When a user follows a NodeId, the node asks that NodeId for its identity, verifies the response as described above, and caches it. The caller can pass the expected master public key; a mismatch is an error.
@@ -239,49 +238,40 @@ Signed requests are rejected if the timestamp is more than 5 minutes from the se
 
 ## Direct Messaging
 
-End-to-end encrypted direct messages over a QUIC protocol (`proscenium/dm/2`). Only the two participants can read them.
+End-to-end encrypted direct messages over a QUIC protocol (`proscenium/dm/2`). Only the two participants' devices can read them.
 
 ### Encryption Scheme
 
-**Phase 1: Noise IK handshake.** When Alice first messages Bob, a `Noise_IK_25519_ChaChaPoly_BLAKE2s` handshake runs over a QUIC bi-stream:
+Every payload (message, receipt, typing signal, call signal) is encrypted separately to each device it is sent to. There is no session state.
 
-1. Alice takes Bob's X25519 DM public key from his cached, signed device list.
-2. Alice sends the first Noise message and her DM public key.
-3. Bob processes it, checks that the key Noise authenticated equals the claimed sender key, and resolves that key to a master public key. If the key is unknown he asks the connecting NodeId for its identity and verifies it. A blocked user is rejected here.
-4. Both sides derive the ratchet seed: `HKDF-SHA256(ikm = k1 || k2, salt = handshake hash, info = "proscenium-dm-root-v2")`, where `k1` and `k2` are the two Noise transport keys. The handshake hash covers only transmitted bytes and serves as a public salt.
+- **Keys**: the sending and receiving keys are the X25519 forms of the two devices' transport keys: the scalar of the Ed25519 seed, and the Montgomery form of the NodeId.
+- **Encryption**: HPKE (RFC 9180) in Auth mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and ChaCha20-Poly1305. Each envelope has its own ephemeral key. The associated data covers the sender, the sending device, the recipient and the receiving device.
+- **Envelope**: the ciphertext, the encapsulated key, the four sender and recipient fields, and the sender's signed device list.
+- **Checks**: the receiving device accepts an envelope only if the QUIC connection comes from the sending device, the recipient fields name the local user and this device, the device list verifies, belongs to the sender and lists the sending device, the sender is not blocked, and the ciphertext decrypts. The device list is then cached.
 
-**Phase 2: Double Ratchet.**
-
-- **Root key ratchet**: `HKDF-SHA256(root_key, dh_output, info="proscenium-dm-rk")` yields a new root key and chain key.
-- **Chain key ratchet**: `HKDF-SHA256(chain_key, info="proscenium-dm-ck-msg")` yields a message key; `info="proscenium-dm-ck-chain"` yields the next chain key.
-- **Message encryption**: ChaCha20-Poly1305 with a zero nonce (each message key is used once). The associated data covers a domain tag, both parties' DM public keys and the ratchet header.
-- **DH ratchet step**: each direction change uses a new X25519 key pair.
-
-A received message changes the stored session only if its authentication tag verifies. Up to 100 messages per chain may arrive out of order; at most 1,000 skipped message keys are kept per session. One session is advanced by one operation at a time (a per-peer lock covers load, change and save).
-
-Bob's first ratchet key is his long-term DM key. Messages Alice sends before Bob's first reply therefore depend on that key and on the handshake seed; see the doc comment of `RatchetState::init_bob` for the exact consequence.
-
-**At rest.** Ratchet state is stored encrypted with ChaCha20-Poly1305 under a key derived from the DM secret. Message text is stored unencrypted in the local database. Key files are created with mode 0600 in a 0700 directory; there is no passphrase.
+**At rest.** Message text is stored unencrypted in the local database. Key files are created with mode 0600 in a 0700 directory; there is no passphrase.
 
 ### Delivery and Queuing
 
-The receiver answers every envelope with an acknowledgement that carries the outcome. The sender marks a message delivered only on success. If the receiver has no session or cannot decrypt, the sender discards its session, runs a new handshake, encrypts again and sends once more.
+Messages, receipts and typing signals go to every device in the recipient's cached device list at once. Each device answers with an acknowledgement; the sender marks a message delivered when one device acknowledges it. Call signals go to one device: the offer to the first device that answers, every later signal to the device of the call.
 
 Undelivered messages are queued as plaintext payloads and encrypted at send time. Retries back off from 30 seconds to 15 minutes; entries older than 7 days are dropped. The message view can request an immediate retry.
 
+Device sync copies messages between the devices of one user, so a device that was offline when a message arrived, or that did not send it, receives it from a sibling device.
+
 ### Features
 
-- Typing indicators and read receipts over the encrypted session
+- Typing indicators and read receipts
 - Media attachments (images, videos, files)
 - Delivery state from the acknowledgement
 - Conversation list with unread badges and previews
-- Blocked users are rejected by transport NodeId and again by identity after the sender key is resolved
+- Blocked users are rejected by transport NodeId and again by identity after the envelope is checked
 
 ## Voice Calls
 
 1:1 voice calls over a QUIC protocol (`proscenium/call/2`).
 
-- Signaling (offer, answer, reject, hangup) travels through the DM session.
+- Signaling (offer, answer, reject, hangup) travels as DMs. The offer goes to the first device of the callee that answers; the answer, and every later signal, come from and go to the two devices of the call, and the caller opens the audio connection to the device that answered.
 - Call phases: Ringing (caller), Incoming, Connecting, Active. The audio connection is served only for a call the local user accepted. Microphone capture starts in phase Active.
 - Each side sends a proof derived from the call id as the first bytes of the audio stream; audio starts only after the other side's proof verified.
 - Timeouts: 30 seconds ringing, 15 seconds for the audio connection after the answer.
@@ -304,11 +294,11 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 
 Several devices can share one identity.
 
-- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device runs a `Noise_IKpsk2` handshake with that secret, receives the link bundle, and confirms the keys before the existing device registers it.
+- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device dials that NodeId, so QUIC authenticates the existing device, and sends the secret. The existing device compares it in constant time, sends the link bundle, and registers the new device after the new device reported that it stored the bundle.
 - **Bundle**: the master key, the new device's index, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
 - **Keys**: every device holds the master key and derives its own transport key from its device index. A device cannot be removed from the identity.
-- **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins). A device serves device sync only to a NodeId that derives from its own master key.
-- **Not replicated**: DM ratchet sessions and post deletions. A DM is delivered to the first device that acknowledges it; another device establishes its own session when it sends.
+- **Device sync**: devices exchange own posts, interactions, follows, moderation entries and bookmarks (last writer wins), and direct messages (by id, among the newest 50,000). A device serves device sync only to a NodeId that derives from its own master key.
+- **Not replicated**: post deletions, and read state of direct messages.
 
 ## Recommended IDE Setup
 

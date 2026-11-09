@@ -14,9 +14,9 @@
 //! 3. requester: its data frames, a zero-length frame, then finish.
 //!
 //! Data frames: own posts and interactions newer than the newest timestamp in the
-//! receiver's vector, and all follow, moderation and bookmark rows unless both vectors
-//! carry the same `lww_digest`. Double Ratchet sessions are never sent: two devices
-//! advancing copies of one session would reuse message keys.
+//! receiver's vector; all follow, moderation and bookmark rows unless both vectors carry
+//! the same `lww_digest`; and the direct messages among the sender's newest
+//! `MAX_DEVICE_SYNC_DM_IDS` whose ids the receiver's vector does not list.
 
 use crate::constants::BATCH_SIZE;
 use crate::error::AppError;
@@ -30,11 +30,13 @@ use iroh::{
     protocol::AcceptError,
 };
 use proscenium_types::{
-    BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, FollowEntry, Interaction, MAX_LINKED_DEVICES,
-    ModerationEntry, PEER_ALPN, PeerRequest, Post, short_id, validate_interaction, validate_post,
+    BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, DirectMessage, FollowEntry, Interaction,
+    MAX_DEVICE_SYNC_DM_IDS, MAX_LINKED_DEVICES, ModerationEntry, PEER_ALPN, PeerRequest, Post,
+    StoredMessage, is_valid_pubkey, short_id, validate_interaction, validate_post,
     verify_interaction_signature, verify_post_signature,
 };
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
@@ -50,6 +52,8 @@ const MAX_SYNC_FRAMES: usize = 1_000;
 const MAX_SYNC_ITEMS: usize = 200_000;
 /// Follow, moderation or bookmark rows per frame.
 const LWW_BATCH_SIZE: usize = 500;
+/// Direct messages per frame. One message is at most about 64 KiB of JSON.
+const DM_BATCH_SIZE: usize = 100;
 /// QUIC close code for a rejected or failed device sync.
 const CLOSE_FAILED: u32 = 1;
 
@@ -101,6 +105,8 @@ pub struct DeviceSyncStats {
     pub moderation_merged: u32,
     pub bookmarks_merged: u32,
     pub devices_added: u32,
+    /// Direct messages stored for the first time, by the other user of the conversation.
+    pub dms_imported: BTreeMap<String, Vec<StoredMessage>>,
 }
 
 /// True if `post` is authored by `master_pubkey`, passes `validate_post`, and is signed
@@ -119,6 +125,32 @@ fn is_own_valid_interaction(interaction: &Interaction, master_pubkey: &str) -> b
         && verify_interaction_signature(interaction).is_ok()
 }
 
+/// The other user of `message` if it is a valid message between `master_pubkey` and
+/// another user: one of the two parties is `master_pubkey`, the other is a canonical
+/// pubkey, the conversation id matches them, and the message passes
+/// `validate_direct_message`.
+fn own_dm_peer<'a>(message: &'a StoredMessage, master_pubkey: &str) -> Option<&'a str> {
+    let peer = if message.from_pubkey == master_pubkey {
+        message.to_pubkey.as_str()
+    } else if message.to_pubkey == master_pubkey {
+        message.from_pubkey.as_str()
+    } else {
+        return None;
+    };
+    let fields = DirectMessage {
+        id: message.id.clone(),
+        content: message.content.clone(),
+        timestamp: message.timestamp,
+        media: message.media.clone(),
+        reply_to: message.reply_to.clone(),
+    };
+    (peer != master_pubkey
+        && is_valid_pubkey(peer)
+        && message.conversation_id == Storage::conversation_id(master_pubkey, peer)
+        && crate::dm::validate_direct_message(&fields).is_ok())
+    .then_some(peer)
+}
+
 /// Number of posts, interactions or rows in a data frame.
 fn frame_item_count(frame: &DeviceSyncFrame) -> usize {
     match frame {
@@ -128,6 +160,7 @@ fn frame_item_count(frame: &DeviceSyncFrame) -> usize {
         DeviceSyncFrame::Follows(items) => items.len(),
         DeviceSyncFrame::Moderation(items) => items.len(),
         DeviceSyncFrame::Bookmarks(items) => items.len(),
+        DeviceSyncFrame::DirectMessages(items) => items.len(),
     }
 }
 
@@ -269,14 +302,28 @@ impl DeviceSync<'_> {
             }
         }
 
+        let listed: HashSet<&str> = peer.dm_ids.iter().map(String::as_str).collect();
+        let missing: Vec<String> = self
+            .storage
+            .get_newest_dm_ids(MAX_DEVICE_SYNC_DM_IDS)
+            .await?
+            .into_iter()
+            .filter(|id| !listed.contains(id.as_str()))
+            .collect();
+        for chunk in missing.chunks(DM_BATCH_SIZE) {
+            let messages = self.storage.get_dm_messages_by_ids(chunk).await?;
+            write_sync_frame(send, &DeviceSyncFrame::DirectMessages(messages)).await?;
+        }
+
         write_end_frame(send).await
     }
 
     /// Read data frames until the zero-length frame and store their content.
     ///
     /// A post or interaction is stored only if it is authored by the local user, passes
-    /// validation and is signed by the master key. At most `MAX_SYNC_FRAMES` frames and
-    /// `MAX_SYNC_ITEMS` items are accepted.
+    /// validation and is signed by the master key; a direct message only if
+    /// `own_dm_peer` accepts it. At most `MAX_SYNC_FRAMES` frames and `MAX_SYNC_ITEMS`
+    /// items are accepted.
     async fn import_frames(
         &self,
         recv: &mut RecvStream,
@@ -339,6 +386,23 @@ impl DeviceSync<'_> {
                 }
                 DeviceSyncFrame::Bookmarks(entries) => {
                     stats.bookmarks_merged += self.storage.merge_bookmarks_lww(&entries).await?;
+                }
+                DeviceSyncFrame::DirectMessages(messages) => {
+                    for message in messages {
+                        let Some(peer) = own_dm_peer(&message, master_pubkey) else {
+                            stats.rejected += 1;
+                            continue;
+                        };
+                        let incoming = message.from_pubkey == peer;
+                        if self
+                            .storage
+                            .import_synced_dm(peer, &message, incoming)
+                            .await?
+                        {
+                            let peer = peer.to_string();
+                            stats.dms_imported.entry(peer).or_default().push(message);
+                        }
+                    }
                 }
             }
         }
@@ -405,7 +469,8 @@ impl DeviceSync<'_> {
 
 /// Apply the results of a completed exchange that need more than the database.
 ///
-/// Emits `feed-updated` if posts were imported, and broadcasts the device announcement if
+/// Emits `feed-updated` if posts were imported, `dm-synced` (`{ peer, messages }`) for each
+/// conversation with imported direct messages, and broadcasts the device announcement if
 /// the device list changed.
 async fn after_sync(
     storage: &Storage,
@@ -416,6 +481,12 @@ async fn after_sync(
 ) {
     if stats.posts_imported > 0 {
         let _ = app_handle.emit("feed-updated", ());
+    }
+    for (peer, messages) in &stats.dms_imported {
+        let _ = app_handle.emit(
+            "dm-synced",
+            serde_json::json!({ "peer": peer, "messages": messages }),
+        );
     }
     if stats.devices_added == 0 {
         return;
@@ -435,10 +506,11 @@ async fn after_sync(
 
 fn log_stats(role: &str, node_id: &str, stats: &DeviceSyncStats) {
     log::info!(
-        "[device-sync] {role} sync with {}: posts={}, interactions={}, rejected={}, follows={}, moderation={}, bookmarks={}, devices={}",
+        "[device-sync] {role} sync with {}: posts={}, interactions={}, dms={}, rejected={}, follows={}, moderation={}, bookmarks={}, devices={}",
         short_id(node_id),
         stats.posts_imported,
         stats.interactions_imported,
+        stats.dms_imported.values().map(Vec::len).sum::<usize>(),
         stats.rejected,
         stats.follows_merged,
         stats.moderation_merged,
@@ -695,6 +767,13 @@ mod tests {
         a.upsert_linked_device(&node_b, "Device 1", false, false, 2)
             .await
             .unwrap();
+        // A message from `followed` that only device A received.
+        let received = dm(&me, &followed, &followed, &me, "hi from followed");
+        assert!(
+            a.receive_dm_message(&followed, &received, "hi")
+                .await
+                .unwrap()
+        );
 
         // Device B: a like, a mute, the same bookmark in its older active state, and
         // only its own device row.
@@ -716,6 +795,14 @@ mod tests {
         b.upsert_linked_device(&node_b, "Device 1", false, true, 2)
             .await
             .unwrap();
+        // A message to `followed` that device B sent, and the message A received.
+        let sent = dm(&me, &followed, &me, &followed, "reply from device b");
+        assert!(b.import_synced_dm(&followed, &sent, false).await.unwrap());
+        assert!(
+            b.import_synced_dm(&followed, &received, true)
+                .await
+                .unwrap()
+        );
 
         let ep_a = loopback_endpoint(
             SecretKey::from_bytes(&derive_transport_key(&master, 0)),
@@ -761,6 +848,19 @@ mod tests {
         assert_eq!(stats_a.rejected, 0);
         assert_eq!(a.count_interactions_by_author(&me).await.unwrap(), 1);
 
+        // A received B's message; B held both messages, so A sent none.
+        let conversation = Storage::conversation_id(&me, &followed);
+        for storage in [&a, &b] {
+            let messages = storage
+                .get_dm_messages(&conversation, 10, None, None)
+                .await
+                .unwrap();
+            assert_eq!(messages.len(), 2);
+        }
+        assert_eq!(stats_a.dms_imported.len(), 1);
+        assert_eq!(stats_a.dms_imported[&followed][0].id, sent.id);
+        assert!(stats_b.dms_imported.is_empty());
+
         // B learned A's device row; A already held both.
         assert_eq!(stats_b.devices_added, 1);
         assert_eq!(stats_a.devices_added, 0);
@@ -776,6 +876,54 @@ mod tests {
             a.load_lww_state(&me).await.unwrap().digest(),
             b.load_lww_state(&me).await.unwrap().digest()
         );
+    }
+
+    /// A stored message of the conversation of `me` and `peer`, from `from` to `to`.
+    fn dm(me: &str, peer: &str, from: &str, to: &str, content: &str) -> StoredMessage {
+        StoredMessage {
+            id: crate::util::generate_id(),
+            conversation_id: Storage::conversation_id(me, peer),
+            from_pubkey: from.to_string(),
+            to_pubkey: to.to_string(),
+            content: content.to_string(),
+            timestamp: now_millis(),
+            media: vec![],
+            read: false,
+            delivered: true,
+            reply_to: None,
+        }
+    }
+
+    #[test]
+    fn imported_dm_must_be_between_the_local_user_and_another_user() {
+        let me = SecretKey::from_bytes(&[1u8; 32]).public().to_string();
+        let peer = SecretKey::from_bytes(&[2u8; 32]).public().to_string();
+        let third = SecretKey::from_bytes(&[3u8; 32]).public().to_string();
+
+        let incoming = dm(&me, &peer, &peer, &me, "in");
+        assert_eq!(own_dm_peer(&incoming, &me), Some(peer.as_str()));
+        let outgoing = dm(&me, &peer, &me, &peer, "out");
+        assert_eq!(own_dm_peer(&outgoing, &me), Some(peer.as_str()));
+
+        // A message between two other users.
+        assert_eq!(
+            own_dm_peer(&dm(&peer, &third, &peer, &third, "x"), &me),
+            None
+        );
+        // To the local user from the local user.
+        assert_eq!(own_dm_peer(&dm(&me, &me, &me, &me, "x"), &me), None);
+        // A conversation id that does not belong to the two parties.
+        let mut wrong_conversation = incoming.clone();
+        wrong_conversation.conversation_id = Storage::conversation_id(&me, &third);
+        assert_eq!(own_dm_peer(&wrong_conversation, &me), None);
+        // An invalid id, and a peer that is not a canonical pubkey.
+        let mut bad_id = incoming.clone();
+        bad_id.id = "m1".to_string();
+        assert_eq!(own_dm_peer(&bad_id, &me), None);
+        let mut bad_peer = incoming;
+        bad_peer.from_pubkey = "not a key".to_string();
+        bad_peer.conversation_id = Storage::conversation_id(&me, "not a key");
+        assert_eq!(own_dm_peer(&bad_peer, &me), None);
     }
 
     #[test]

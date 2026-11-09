@@ -165,7 +165,6 @@ impl TestUser {
     pub fn announcement(&self, version: u64, node_ids: &[String]) -> LinkedDevicesAnnouncement {
         let mut announcement = LinkedDevicesAnnouncement {
             master_pubkey: self.master_pubkey.clone(),
-            dm_pubkey: "ab".repeat(32),
             devices: node_ids
                 .iter()
                 .map(|node_id| DeviceEntry {

@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use iroh::EndpointId;
 use proscenium_types::{CallState, DmPayload, is_valid_id, short_id};
 
 use super::state::{ActiveCall, CONNECT_TIMEOUT, CallPhase, PeerNotice, RING_TIMEOUT};
@@ -14,8 +15,9 @@ enum OfferDecision {
 }
 
 impl super::CallHandler {
-    /// Called when we receive a CallOffer from a peer (via DM handler).
-    pub async fn on_call_offer(&self, call_id: &str, peer_pubkey: &str) {
+    /// Called when the device `peer_device` of a peer sends a CallOffer. The call's
+    /// signals go to that device, and only that device may open its audio connection.
+    pub async fn on_call_offer(&self, call_id: &str, peer_pubkey: &str, peer_device: EndpointId) {
         if !is_valid_id(call_id) {
             log::warn!(
                 "[call] ignoring offer with an invalid call id from {}",
@@ -31,7 +33,7 @@ impl super::CallHandler {
                 Some(call) if call.call_id == call_id => OfferDecision::Duplicate,
                 Some(_) => OfferDecision::Busy,
                 None => {
-                    let call = ActiveCall::new(call_id, peer_pubkey, false);
+                    let call = ActiveCall::new(call_id, peer_pubkey, Some(peer_device), false);
                     let ring_timeout = call.phase_timeout.clone();
                     *lock = Some(call);
                     OfferDecision::Ring(ring_timeout)
@@ -58,7 +60,9 @@ impl super::CallHandler {
                 };
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handler.send_signal(&peer_pubkey, reject).await;
+                    let _ = handler
+                        .send_signal(&peer_pubkey, Some(peer_device), reject)
+                        .await;
                 });
             }
             OfferDecision::Ring(ring_timeout) => {
@@ -83,7 +87,7 @@ impl super::CallHandler {
     /// delivered the call returns to phase `Incoming` with its ring timeout still
     /// running, and the error is returned.
     pub async fn accept_call(&self, call_id: &str) -> Result<(), AppError> {
-        let peer_pubkey = {
+        let (peer_pubkey, peer_device) = {
             let mut lock = self.active_call.lock().await;
             match lock.as_mut() {
                 Some(call) if call.call_id == call_id && !call.outgoing => {
@@ -91,7 +95,7 @@ impl super::CallHandler {
                         return Err(AppError::Other("call already accepted".into()));
                     }
                     call.phase = CallPhase::Connecting;
-                    call.peer_pubkey.clone()
+                    (call.peer_pubkey.clone(), call.peer_device)
                 }
                 _ => return Err(AppError::Other("no incoming call with that ID".into())),
             }
@@ -106,7 +110,7 @@ impl super::CallHandler {
         let answer = DmPayload::CallAnswer {
             call_id: call_id.to_string(),
         };
-        let sent = self.send_signal(&peer_pubkey, answer).await;
+        let sent = self.send_signal(&peer_pubkey, peer_device, answer).await;
 
         let mut lock = self.active_call.lock().await;
         let Some(call) = lock.as_mut().filter(|c| c.call_id == call_id) else {

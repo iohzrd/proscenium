@@ -135,11 +135,8 @@ impl std::fmt::Debug for LinkQrPayload {
     }
 }
 
-/// Data sent from the existing device to the new device during linking,
-/// encrypted with the Noise transport state.
-///
-/// The new device derives its transport key from the master key and `device_index`, and
-/// the DM key from the master key. Double Ratchet sessions are not transferred.
+/// Data sent from the existing device to the new device during linking. The new device
+/// derives its transport key from the master key and `device_index`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LinkBundleData {
     /// The master secret key (32 bytes, standard base64).
@@ -158,7 +155,7 @@ pub struct LinkBundleData {
     /// Bookmark rows, including removed ones.
     pub bookmarks: Vec<BookmarkEntry>,
     /// Signed device announcements of followed users. Each carries the user's transport
-    /// NodeIds and DM pubkey, which sync, gossip subscription and DMs require.
+    /// NodeIds, which sync, gossip subscription and DMs require.
     pub peer_announcements: Vec<crate::protocol::LinkedDevicesAnnouncement>,
 }
 
@@ -385,4 +382,9 @@ pub struct DeviceSyncVector {
     pub lww_digest: String,
     /// The sender's device list.
     pub devices: Vec<DeviceEntry>,
+    /// Ids of the sender's newest direct messages, at most `MAX_DEVICE_SYNC_DM_IDS`.
+    pub dm_ids: Vec<String>,
 }
+
+/// Number of direct message ids a `DeviceSyncVector` lists.
+pub const MAX_DEVICE_SYNC_DM_IDS: usize = 50_000;

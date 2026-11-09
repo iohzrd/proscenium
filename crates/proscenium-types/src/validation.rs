@@ -59,11 +59,6 @@ pub fn parse_pubkey(s: &str) -> Result<PublicKey, String> {
     Ok(key)
 }
 
-/// True if `s` is 64 lowercase hex digits (an X25519 public key).
-pub fn is_valid_dm_pubkey(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// True if `timestamp` is at most `MAX_TIMESTAMP_DRIFT_MS` away from the local clock.
 pub fn is_recent_timestamp(timestamp: u64) -> bool {
     timestamp.abs_diff(now_millis()) <= MAX_TIMESTAMP_DRIFT_MS

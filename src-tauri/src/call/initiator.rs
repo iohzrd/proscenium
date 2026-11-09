@@ -9,8 +9,9 @@ use super::state::{
 };
 
 impl super::CallHandler {
-    /// Initiate an outgoing call to a peer: register the call, then send a CallOffer
-    /// via the DM ratchet. The audio connection is opened when the answer arrives.
+    /// Initiate an outgoing call to a peer: register the call, then send a CallOffer to
+    /// the first device of the peer that answers. The audio connection is opened to the
+    /// device that sends the answer.
     pub async fn start_call(&self, peer_pubkey: &str) -> Result<String, AppError> {
         if !is_valid_pubkey(peer_pubkey) {
             return Err(AppError::Other("invalid peer pubkey".into()));
@@ -24,7 +25,7 @@ impl super::CallHandler {
             if lock.is_some() {
                 return Err(AppError::Other("already in a call".into()));
             }
-            let call = ActiveCall::new(&call_id, peer_pubkey, true);
+            let call = ActiveCall::new(&call_id, peer_pubkey, None, true);
             let ring_timeout = call.phase_timeout.clone();
             *lock = Some(call);
             ring_timeout
@@ -36,12 +37,11 @@ impl super::CallHandler {
             short_id(peer_pubkey)
         );
 
-        // Send call offer via E2E encrypted DM channel
         let offer = DmPayload::CallOffer {
             call_id: call_id.clone(),
             video: false,
         };
-        if let Err(e) = self.send_signal(peer_pubkey, offer).await {
+        if let Err(e) = self.send_signal(peer_pubkey, None, offer).await {
             // The peer never saw the offer: remove the call without an event.
             let mut lock = self.active_call.lock().await;
             if lock.as_ref().is_some_and(|c| c.call_id == call_id)
@@ -68,10 +68,16 @@ impl super::CallHandler {
         Ok(call_id)
     }
 
-    /// Called when we receive a CallAnswer from the peer (via DM handler).
+    /// Called when the device `peer_device` of the peer sends a CallAnswer.
     /// Accepted only from the peer of the active outgoing call while it rings.
-    /// Starts a task that opens the audio connection.
-    pub async fn on_call_answered(&self, call_id: &str, peer_pubkey: &str) {
+    /// Records `peer_device` as the call's device and starts a task that opens the audio
+    /// connection to it.
+    pub async fn on_call_answered(
+        &self,
+        call_id: &str,
+        peer_pubkey: &str,
+        peer_device: EndpointId,
+    ) {
         let tokens = {
             let mut lock = self.active_call.lock().await;
             match lock.as_mut() {
@@ -81,6 +87,7 @@ impl super::CallHandler {
                         && call.outgoing
                         && call.phase == CallPhase::Ringing =>
                 {
+                    call.peer_device = Some(peer_device);
                     Some((call.enter_phase(CallPhase::Connecting), call.cancel.clone()))
                 }
                 _ => None,
@@ -107,11 +114,10 @@ impl super::CallHandler {
         // signals and must not wait for the connection.
         let handler = self.clone();
         let call_id = call_id.to_string();
-        let peer_pubkey = peer_pubkey.to_string();
         tokio::spawn(async move {
             let opened = tokio::select! {
                 _ = call_cancel.cancelled() => return,
-                opened = handler.open_audio(&call_id, &peer_pubkey) => opened,
+                opened = handler.open_audio(&call_id, peer_device) => opened,
             };
             match opened {
                 Ok((conn, send, recv)) => {
@@ -127,23 +133,13 @@ impl super::CallHandler {
         });
     }
 
-    /// Caller side: dial the peer on CALL_ALPN, exchange the call proofs and move the
-    /// call to phase `Active`. Every step has a timeout.
+    /// Caller side: dial the peer's device `target` on CALL_ALPN, exchange the call
+    /// proofs and move the call to phase `Active`. Every step has a timeout.
     async fn open_audio(
         &self,
         call_id: &str,
-        peer_pubkey: &str,
+        target: EndpointId,
     ) -> Result<(Connection, SendStream, RecvStream), String> {
-        let node_ids = self
-            .storage
-            .get_peer_transport_node_ids(peer_pubkey)
-            .await
-            .unwrap_or_default();
-        let target: EndpointId = node_ids
-            .iter()
-            .find_map(|id| id.parse().ok())
-            .ok_or_else(|| format!("no transport NodeId for {}", short_id(peer_pubkey)))?;
-
         let conn = tokio::time::timeout(
             CONNECT_TIMEOUT,
             self.endpoint.connect(EndpointAddr::from(target), CALL_ALPN),

@@ -6,12 +6,11 @@ use crate::stage::StageHandler;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
-use proscenium_types::{DeviceEntry, MAX_LINKED_DEVICES, derive_dm_key, derive_transport_key};
+use proscenium_types::{DeviceEntry, MAX_LINKED_DEVICES, derive_transport_key};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroize;
 
 /// Commands sent to the peer sync task to trigger on-demand syncs.
 pub enum SyncCommand {
@@ -31,14 +30,6 @@ pub struct Identity {
     pub master_key: SecretKey,
     /// Master public key string (the user ID).
     pub master_pubkey: String,
-    /// DM public key string (hex-encoded X25519).
-    pub dm_pubkey: String,
-    /// X25519 private key bytes (the clamped DM key).
-    pub dm_x25519_private: [u8; 32],
-    /// X25519 public key bytes.
-    pub dm_x25519_public: [u8; 32],
-    /// Key for encrypting ratchet state at rest (derived from the DM key).
-    pub ratchet_storage_key: [u8; 32],
     /// Transport key derivation index of this device (0 for the primary device).
     pub device_index: u32,
     /// Transport NodeId string (iroh's own key, for QUIC networking).
@@ -46,29 +37,21 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// Derive the DM key and the transport key of `device_index` from the master key.
+    /// Derive the identity of the device with transport key derivation index
+    /// `device_index` from the master key.
     pub fn derive(master_secret_key_bytes: [u8; 32], device_index: u32) -> Self {
         let master_key = SecretKey::from_bytes(&master_secret_key_bytes);
-        let mut dm_secret_key_bytes = derive_dm_key(&master_secret_key_bytes);
-        let (dm_x25519_private, dm_x25519_public) =
-            crate::crypto::x25519_keypair_from_raw(&dm_secret_key_bytes);
-        let ratchet_storage_key = crate::crypto::derive_ratchet_storage_key(&dm_secret_key_bytes);
-        dm_secret_key_bytes.zeroize();
-
         Self {
             master_secret_key_bytes,
             master_pubkey: master_key.public().to_string(),
             master_key,
-            dm_pubkey: hex::encode(dm_x25519_public),
-            dm_x25519_private,
-            dm_x25519_public,
-            ratchet_storage_key,
             device_index,
             transport_node_id: device_node_id(&master_secret_key_bytes, device_index),
         }
     }
 
-    /// Secret key of this device's iroh endpoint.
+    /// Secret key of this device's iroh endpoint. Its X25519 form decrypts the DMs sent
+    /// to this device.
     pub fn transport_secret_key(&self) -> SecretKey {
         SecretKey::from_bytes(&derive_transport_key(
             &self.master_secret_key_bytes,
@@ -94,7 +77,6 @@ impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
             .field("master_pubkey", &self.master_pubkey)
-            .field("dm_pubkey", &self.dm_pubkey)
             .field("device_index", &self.device_index)
             .field("transport_node_id", &self.transport_node_id)
             .finish_non_exhaustive()

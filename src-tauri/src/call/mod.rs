@@ -75,7 +75,7 @@ impl ProtocolHandler for CallHandler {
     /// Accept the caller's audio connection for a call the local user answered.
     ///
     /// The connection is served only if all of these hold:
-    /// - the remote NodeId belongs to the peer of the active call,
+    /// - the remote NodeId is the device that sent the offer of the active call,
     /// - the call is incoming and in phase `Connecting` (`accept_call` was invoked),
     /// - the first bytes of the stream are the caller's proof of the call id.
     ///
@@ -102,6 +102,7 @@ impl ProtocolHandler for CallHandler {
             match lock.as_ref() {
                 Some(call)
                     if call.peer_pubkey == peer_pubkey
+                        && call.peer_device == Some(conn.remote_id())
                         && !call.outgoing
                         && call.phase == CallPhase::Connecting =>
                 {

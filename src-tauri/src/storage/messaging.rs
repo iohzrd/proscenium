@@ -356,39 +356,53 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
-    /// Store the ratchet session of `peer_dm_pubkey` and a message received through it,
-    /// in one transaction. Returns true if the message was inserted.
-    ///
-    /// If a message with the same id is already stored, only the ratchet session is
-    /// written: the conversation preview, `last_message_at` and `unread_count` keep their
-    /// values, and false is returned.
-    pub async fn receive_dm_message_atomically(
+    /// Store a message received from `peer_master_pubkey` and update its conversation:
+    /// the preview and `last_message_at` follow the newest message, and `unread_count`
+    /// grows by one. Returns false, and writes nothing, if a message with the same id is
+    /// stored.
+    pub async fn receive_dm_message(
         &self,
-        peer_dm_pubkey: &str,
         peer_master_pubkey: &str,
-        ratchet_state: &str,
-        ratchet_updated_at: u64,
         message: &StoredMessage,
         preview: &str,
+    ) -> Result<bool, AppError> {
+        self.insert_dm_message(peer_master_pubkey, message, preview, 1)
+            .await
+    }
+
+    /// Store a message of the conversation with `peer_pubkey` that another device of the
+    /// local user sent during device sync. `incoming` is true if `peer_pubkey` wrote it;
+    /// `unread_count` grows by one only for an incoming message that is not read.
+    /// Returns false, and writes nothing, if a message with the same id is stored.
+    pub async fn import_synced_dm(
+        &self,
+        peer_pubkey: &str,
+        message: &StoredMessage,
+        incoming: bool,
+    ) -> Result<bool, AppError> {
+        let preview = crate::util::message_preview(&message.content);
+        let unread = i64::from(incoming && !message.read);
+        self.insert_dm_message(peer_pubkey, message, &preview, unread)
+            .await
+    }
+
+    /// Insert `message` and create or update its conversation with `peer_pubkey`, in one
+    /// transaction, adding `unread_increment` to `unread_count`. Returns false, and
+    /// writes nothing, if a message with the same id is stored.
+    async fn insert_dm_message(
+        &self,
+        peer_pubkey: &str,
+        message: &StoredMessage,
+        preview: &str,
+        unread_increment: i64,
     ) -> Result<bool, AppError> {
         let conv_id = &message.conversation_id;
         let media_json = serde_json::to_string(&message.media)?;
         let timestamp = to_db_millis(message.timestamp);
 
-        let mut tx = self.pool.begin().await?;
-
-        // The first statement is a write, so no other writer can insert the same message
-        // id between the existence check and the insert below.
-        sqlx::query(
-            "INSERT INTO dm_ratchet_sessions (peer_pubkey, state_json, updated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(peer_pubkey) DO UPDATE SET state_json=?2, updated_at=?3",
-        )
-        .bind(peer_dm_pubkey)
-        .bind(ratchet_state)
-        .bind(to_db_millis(ratchet_updated_at))
-        .execute(&mut *tx)
-        .await?;
+        // BEGIN IMMEDIATE takes the write lock, so no other writer can insert the same
+        // message id between the existence check and the insert below.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let exists: bool = sqlx::query_scalar("SELECT COUNT(*) > 0 FROM dm_messages WHERE id=?1")
             .bind(&message.id)
@@ -403,17 +417,18 @@ impl Storage {
             "INSERT INTO dm_conversations
                  (conversation_id, peer_pubkey, last_message_at, last_message_preview,
                   unread_count, created_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, ?3)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?3)
                  ON CONFLICT(conversation_id) DO UPDATE SET
-                    unread_count = unread_count + 1,
+                    unread_count = unread_count + ?5,
                     last_message_preview = CASE WHEN ?3 >= last_message_at
                         THEN ?4 ELSE last_message_preview END,
                     last_message_at = MAX(last_message_at, ?3)",
         )
         .bind(conv_id)
-        .bind(peer_master_pubkey)
+        .bind(peer_pubkey)
         .bind(timestamp)
         .bind(preview)
+        .bind(unread_increment)
         .execute(&mut *tx)
         .await?;
 
@@ -438,5 +453,31 @@ impl Storage {
 
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Ids of the newest `limit` messages by `(timestamp, id)`, newest first.
+    pub async fn get_newest_dm_ids(&self, limit: usize) -> Result<Vec<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT id FROM dm_messages ORDER BY timestamp DESC, id DESC LIMIT ?1",
+        )
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// The stored messages whose id is in `ids`, oldest first. Unknown ids are skipped.
+    pub async fn get_dm_messages_by_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<StoredMessage>, AppError> {
+        let rows = sqlx::query(
+            "SELECT id, conversation_id, from_pubkey, to_pubkey, content, timestamp, media_json, read, delivered, reply_to
+             FROM dm_messages WHERE id IN (SELECT value FROM json_each(?1))
+             ORDER BY timestamp, id",
+        )
+        .bind(serde_json::to_string(ids)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(Self::row_to_stored_message).collect()
     }
 }

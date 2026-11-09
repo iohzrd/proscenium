@@ -2,9 +2,7 @@ use crate::protocol::{
     IdentityResponse, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
 };
 use crate::types::{Interaction, Post, Profile};
-use crate::validation::{
-    ID_HEX_LEN, is_valid_dm_pubkey, is_valid_pubkey, parse_pubkey, validate_profile,
-};
+use crate::validation::{ID_HEX_LEN, is_valid_pubkey, parse_pubkey, validate_profile};
 use iroh::{SecretKey, Signature};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -227,7 +225,6 @@ fn linked_devices_signing_bytes(announcement: &LinkedDevicesAnnouncement) -> Vec
     canonical_bytes(&(
         LINKED_DEVICES_TAG,
         &announcement.master_pubkey,
-        &announcement.dm_pubkey,
         &announcement.devices,
         announcement.version,
         announcement.timestamp,
@@ -245,19 +242,15 @@ pub fn sign_linked_devices_announcement(
     announcement.signature = signature_to_hex(&sig);
 }
 
-/// Verify a LinkedDevicesAnnouncement: `dm_pubkey` is 64 lowercase hex digits, the list
-/// holds 1 to `MAX_LINKED_DEVICES` devices, every NodeId is a canonical public key, every
-/// device name is at most `MAX_DEVICE_NAME_LEN` bytes, and the signature was made by
-/// `master_pubkey`.
+/// Verify a LinkedDevicesAnnouncement: the list holds 1 to `MAX_LINKED_DEVICES` devices,
+/// every NodeId is a canonical public key, every device name is at most
+/// `MAX_DEVICE_NAME_LEN` bytes, and the signature was made by `master_pubkey`.
 ///
 /// Does not compare the version with previously stored values; the caller does that when
 /// it stores the announcement.
 pub fn verify_linked_devices_announcement(
     announcement: &LinkedDevicesAnnouncement,
 ) -> Result<(), String> {
-    if !is_valid_dm_pubkey(&announcement.dm_pubkey) {
-        return Err("announcement holds an invalid DM pubkey".to_string());
-    }
     if announcement.devices.is_empty() || announcement.devices.len() > MAX_LINKED_DEVICES {
         return Err(format!(
             "announcement lists {} devices (allowed 1..={MAX_LINKED_DEVICES})",
@@ -290,11 +283,6 @@ pub struct VerifiedIdentity {
 }
 
 impl VerifiedIdentity {
-    /// The DM pubkey from the signed device list.
-    pub fn dm_pubkey(&self) -> &str {
-        &self.announcement.dm_pubkey
-    }
-
     pub fn transport_node_ids(&self) -> Vec<String> {
         self.announcement
             .devices
@@ -364,7 +352,6 @@ mod tests {
     fn announcement(id: &TestIdentity, nodes: &[String]) -> LinkedDevicesAnnouncement {
         let mut a = LinkedDevicesAnnouncement {
             master_pubkey: id.master_pubkey.clone(),
-            dm_pubkey: "ab".repeat(32),
             devices: nodes
                 .iter()
                 .map(|n| DeviceEntry {
@@ -480,9 +467,9 @@ mod tests {
         assert!(verify_identity_response(response.clone(), &listed).is_ok());
         assert!(verify_identity_response(response.clone(), &other).is_err());
 
-        // The DM pubkey is covered by the signature.
+        // The device list is covered by the signature.
         let mut tampered = response;
-        tampered.announcement.dm_pubkey = "cd".repeat(32);
+        tampered.announcement.devices[0].device_name = "other".to_string();
         assert!(verify_identity_response(tampered, &listed).is_err());
 
         // A device list for a's identity signed by b's key is rejected.
