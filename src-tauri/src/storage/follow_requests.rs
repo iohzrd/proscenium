@@ -20,6 +20,18 @@ pub enum FollowRequestOutcome {
     Full,
 }
 
+/// Result of `approve_follower_directly`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectApproval {
+    /// The requester became an approved follower with this call.
+    New,
+    /// The requester was an approved follower already.
+    Repeated,
+    /// The local user denied this requester and the denial has not expired. Nothing was
+    /// written.
+    Denied,
+}
+
 impl Storage {
     /// Record a verified follow request from `pubkey` and return the resulting row state.
     ///
@@ -105,7 +117,7 @@ impl Storage {
     /// Store `pubkey` as an approved follower of `me` without a pending step, in one
     /// transaction. Used when a Private user receives a request from a user they follow.
     ///
-    /// Returns `false` and writes nothing if an unexpired denied row exists for `pubkey`.
+    /// Writes nothing and returns `Denied` if an unexpired denied row exists for `pubkey`.
     pub async fn approve_follower_directly(
         &self,
         me: &str,
@@ -113,13 +125,25 @@ impl Storage {
         timestamp: u64,
         now: u64,
         expires_at: u64,
-    ) -> Result<bool, AppError> {
+    ) -> Result<DirectApproval, AppError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let result = sqlx::query(
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT status, expires_at FROM follow_requests WHERE pubkey=?1")
+                .bind(pubkey)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let approval = match &row {
+            Some((status, expires)) if status == "denied" && *expires > now as i64 => {
+                tx.commit().await?;
+                return Ok(DirectApproval::Denied);
+            }
+            Some((status, _)) if status == "approved" => DirectApproval::Repeated,
+            _ => DirectApproval::New,
+        };
+        sqlx::query(
             "INSERT INTO follow_requests (pubkey, timestamp, status, created_at, expires_at)
              VALUES (?1, ?2, 'approved', ?3, ?4)
-             ON CONFLICT(pubkey) DO UPDATE SET status='approved', timestamp=?2
-             WHERE follow_requests.status != 'denied' OR follow_requests.expires_at <= ?3",
+             ON CONFLICT(pubkey) DO UPDATE SET status='approved', timestamp=?2",
         )
         .bind(pubkey)
         .bind(timestamp as i64)
@@ -127,12 +151,9 @@ impl Storage {
         .bind(expires_at as i64)
         .execute(&mut *tx)
         .await?;
-        let approved = result.rows_affected() > 0;
-        if approved {
-            Self::upsert_follower_tx(&mut tx, me, pubkey, now).await?;
-        }
+        Self::upsert_follower_tx(&mut tx, me, pubkey, now).await?;
         tx.commit().await?;
-        Ok(approved)
+        Ok(approval)
     }
 
     /// Deny the pending, unexpired request of `pubkey`.

@@ -52,7 +52,7 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Create and delete posts (text + media attachments)
 - Likes, reposts, and replies with real-time interaction counts
 - Follow/unfollow users by Node ID, with the expected identity checked
-- Follow requests for Listed and Private profiles
+- Follow requests for Listed and Private profiles. A Private user approves requests from users they follow, then sends a follow request back, so two Private users who follow each other become mutuals in either order.
 - View user profiles with their post history and media filters
 - Profile page with your own post history
 - Thread view with inline reply composer

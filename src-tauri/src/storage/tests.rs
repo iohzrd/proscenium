@@ -2252,10 +2252,11 @@ async fn follow_request_denied_stays_denied_until_expiry() {
     assert_eq!(outcome, FollowRequestOutcome::Denied);
     assert_eq!(s.get_pending_follow_request_count(2001).await.unwrap(), 0);
     assert!(!s.approve_follow_request("me", "r1", 2002).await.unwrap());
-    assert!(
-        !s.approve_follower_directly("me", "r1", 2000, 2003, 19999)
+    assert_eq!(
+        s.approve_follower_directly("me", "r1", 2000, 2003, 19999)
             .await
-            .unwrap()
+            .unwrap(),
+        DirectApproval::Denied
     );
     assert!(!s.is_approved_follower("r1").await.unwrap());
 
@@ -2341,22 +2342,31 @@ async fn follow_request_pending_rows_are_capped() {
 #[tokio::test]
 async fn follow_request_direct_approval_writes_request_and_follower() {
     let s = test_storage().await;
-    assert!(
+    assert_eq!(
         s.approve_follower_directly("me", "r1", 1000, 1001, 9999)
             .await
-            .unwrap()
+            .unwrap(),
+        DirectApproval::New
     );
     assert!(s.is_approved_follower("r1").await.unwrap());
     assert!(s.is_follower("me", "r1").await.unwrap());
+    // A second request of the same follower.
+    assert_eq!(
+        s.approve_follower_directly("me", "r1", 2000, 2001, 9999)
+            .await
+            .unwrap(),
+        DirectApproval::Repeated
+    );
 
     // A pending row is approved by the same call.
     s.record_follow_request("r2", 1000, 1001, 9999)
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         s.approve_follower_directly("me", "r2", 1000, 1002, 9999)
             .await
-            .unwrap()
+            .unwrap(),
+        DirectApproval::New
     );
     assert!(s.is_approved_follower("r2").await.unwrap());
 }

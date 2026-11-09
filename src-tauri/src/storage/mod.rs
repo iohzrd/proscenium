@@ -16,7 +16,7 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
-pub use follow_requests::FollowRequestOutcome;
+pub use follow_requests::{DirectApproval, FollowRequestOutcome};
 pub use peer_identities::AnnouncementOutcome;
 pub use social::RemoteListKind;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};

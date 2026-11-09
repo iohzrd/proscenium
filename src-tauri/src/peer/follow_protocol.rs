@@ -1,5 +1,5 @@
 use crate::constants::FOLLOW_REQUEST_TTL_MS;
-use crate::storage::FollowRequestOutcome;
+use crate::storage::{DirectApproval, FollowRequestOutcome};
 use iroh::{
     endpoint::{Connection, SendStream},
     protocol::AcceptError,
@@ -18,6 +18,8 @@ impl PeerHandler {
     /// Public: approved without a stored row. Listed: a pending row is stored for the
     /// local user to approve or deny; an approved requester is answered `Approved`, a denied one
     /// `Denied`. Private: approved if the local user follows the requester, else denied.
+    /// After the first approval of a requester a Private user sends a follow request back,
+    /// so two Private users who follow each other become mutuals in either order.
     pub(super) async fn handle_follow_request(
         &self,
         remote_str: &str,
@@ -66,6 +68,7 @@ impl PeerHandler {
 
         let now = now_millis();
         let expires_at = now.saturating_add(FOLLOW_REQUEST_TTL_MS);
+        let mut reciprocate = false;
         let approved = match visibility {
             Visibility::Public => true,
             Visibility::Listed => {
@@ -104,12 +107,13 @@ impl PeerHandler {
                 }
             }
             Visibility::Private => {
-                self.storage
+                let follows_requester = self
+                    .storage
                     .is_following(&my_pubkey, requester)
                     .await
-                    .map_err(AcceptError::from_err)?
-                    && self
-                        .storage
+                    .map_err(AcceptError::from_err)?;
+                let approval = if follows_requester {
+                    self.storage
                         .approve_follower_directly(
                             &my_pubkey,
                             requester,
@@ -119,6 +123,11 @@ impl PeerHandler {
                         )
                         .await
                         .map_err(AcceptError::from_err)?
+                } else {
+                    DirectApproval::Denied
+                };
+                reciprocate = approval == DirectApproval::New;
+                approval != DirectApproval::Denied
             }
         };
 
@@ -146,7 +155,32 @@ impl PeerHandler {
             conn,
             &FollowResponse::Approved(Box::new(own_identity)),
         )
-        .await
+        .await?;
+        if reciprocate {
+            self.request_follow_back(conn.remote_id(), requester);
+        }
+        Ok(())
+    }
+
+    /// Send a follow request to `pubkey` at the NodeId `node` in a background task.
+    /// Called by a Private user after approving `pubkey`, whom the local user follows.
+    fn request_follow_back(&self, node: iroh::EndpointId, pubkey: &str) {
+        let endpoint = self.gossip.endpoint.clone();
+        let storage = self.storage.clone();
+        let identity = self.identity.clone();
+        let pubkey = pubkey.to_string();
+        tokio::spawn(async move {
+            match super::send_follow_request(&endpoint, &storage, &identity, node, &pubkey).await {
+                Ok(response) => log::info!(
+                    "[follow-req] follow request back to {}: {response:?}",
+                    short_id(&pubkey)
+                ),
+                Err(e) => log::warn!(
+                    "[follow-req] follow request back to {} failed: {e}",
+                    short_id(&pubkey)
+                ),
+            }
+        });
     }
 
     /// Store the verified identity of a follow requester.
