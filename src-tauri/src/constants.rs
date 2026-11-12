@@ -65,6 +65,8 @@ pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Number of cached NodeIds of one user that a sync, push, list fetch or follow request
 /// connects to.
 pub const MAX_NODE_IDS_TRIED: usize = 4;
+/// Upper bound of the mirrors `sync_one_peer` connects to after the author's devices.
+pub const MAX_MIRRORS_TRIED: usize = 3;
 /// Entries stored per fetched follow or follower list.
 pub const MAX_REMOTE_LIST_ENTRIES: usize = 5_000;
 /// Largest list response a requester accepts.

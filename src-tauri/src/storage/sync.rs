@@ -214,6 +214,20 @@ impl Storage {
         Ok(())
     }
 
+    /// Apply a verified deletion of the interaction `(author, id)`: store its tombstone,
+    /// then delete the interaction and its "like" notification. The tombstone is stored
+    /// first, so an interaction that arrives during the call is not stored again.
+    /// Returns `true` if an interaction row was deleted.
+    pub async fn apply_interaction_deletion(
+        &self,
+        author: &str,
+        id: &str,
+        now: u64,
+    ) -> Result<bool, AppError> {
+        self.record_interaction_tombstone(author, id, now).await?;
+        self.delete_interaction(id, author).await
+    }
+
     pub async fn is_interaction_tombstoned(
         &self,
         author: &str,

@@ -137,7 +137,8 @@ pub struct ChangeOutcome {
     /// `Public` or `Listed`. Posts are stored only for `Public`.
     pub visibility: Visibility,
     pub registered_at: i64,
-    /// False if the change carried a profile older than the stored one.
+    /// False if the change carried a profile that `apply_profile` did not store: its
+    /// `(updated_at, signature)` is not greater than the stored pair.
     pub profile_stored: bool,
 }
 
@@ -241,7 +242,9 @@ struct RegistrationRow {
     visibility: String,
     last_request_timestamp: i64,
     profile_updated_at: i64,
+    profile_signature: Option<String>,
     announcement_version: i64,
+    announcement_signature: Option<String>,
 }
 
 /// Join that restricts `posts p` to authors with an active public registration.
@@ -314,6 +317,10 @@ impl Storage {
         (
             "003_interaction_tombstones",
             include_str!("../migrations/003_interaction_tombstones.sql"),
+        ),
+        (
+            "004_signature_tiebreak",
+            include_str!("../migrations/004_signature_tiebreak.sql"),
         ),
     ];
 
@@ -397,7 +404,8 @@ impl Storage {
     ) -> Result<Option<RegistrationRow>, sqlx::Error> {
         sqlx::query_as::<_, RegistrationRow>(
             "SELECT registered_at, is_active, requested_visibility, profile_visibility, visibility,
-                    last_request_timestamp, profile_updated_at, announcement_version
+                    last_request_timestamp, profile_updated_at, profile_signature,
+                    announcement_version, announcement_signature
              FROM registrations WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -440,8 +448,9 @@ impl Storage {
         sqlx::query(
             "UPDATE registrations
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
-                 bio = NULL, avatar_hash = NULL, transport_node_id = NULL,
-                 device_node_ids_json = NULL, announcement_version = 0
+                 bio = NULL, avatar_hash = NULL, profile_signature = NULL,
+                 transport_node_id = NULL, device_node_ids_json = NULL,
+                 announcement_version = 0, announcement_signature = NULL
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -466,8 +475,8 @@ impl Storage {
     /// Apply one registration, unregistration or profile change in one transaction.
     ///
     /// For a signed HTTP request the transaction first rejects a `timestamp` that is not
-    /// greater than the last accepted one. A profile is stored only if its `updated_at`
-    /// is not lower than the stored value; a profile with private visibility deactivates
+    /// greater than the last accepted one. A profile is stored only under the rule of
+    /// `apply_profile`; a profile with private visibility deactivates
     /// the registration. Posts, interactions and tombstones of the user are deleted when
     /// the registration stops being active with public visibility.
     pub async fn apply_registration_change(
@@ -593,8 +602,9 @@ impl Storage {
         Ok(outcome)
     }
 
-    /// Store `profile` for the active registration `row` unless it is older than the
-    /// stored profile. A private profile deactivates the registration.
+    /// Store `profile` for the active registration `row` if `(updated_at, signature)` is
+    /// greater than the stored pair; a registration without a stored profile has signature
+    /// "". A private profile deactivates the registration.
     async fn apply_profile(
         conn: &mut SqliteConnection,
         pubkey: &str,
@@ -618,7 +628,11 @@ impl Storage {
             profile_stored: false,
         };
         let updated_at = to_i64(profile.updated_at);
-        if updated_at < row.profile_updated_at {
+        let stored = (
+            row.profile_updated_at,
+            row.profile_signature.as_deref().unwrap_or(""),
+        );
+        if (updated_at, profile.signature.as_str()) <= stored {
             return Ok(outcome);
         }
         outcome.profile_stored = true;
@@ -639,7 +653,8 @@ impl Storage {
         sqlx::query(
             "UPDATE registrations
              SET display_name = ?2, bio = ?3, avatar_hash = ?4, profile_visibility = ?5,
-                 visibility = ?6, profile_updated_at = ?7, last_seen = ?8
+                 visibility = ?6, profile_updated_at = ?7, profile_signature = ?8,
+                 last_seen = ?9
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -649,6 +664,7 @@ impl Storage {
         .bind(profile.visibility.to_string())
         .bind(outcome.visibility.to_string())
         .bind(updated_at)
+        .bind(&profile.signature)
         .bind(now)
         .execute(conn)
         .await?;
@@ -671,8 +687,11 @@ impl Storage {
         // `announcement_version` is 0 while no list is stored.
         if row.announcement_version > 0
             && !announcement_replaces(
-                announcement.version,
-                row.announcement_version as u64,
+                (announcement.version, &announcement.signature),
+                (
+                    row.announcement_version as u64,
+                    row.announcement_signature.as_deref().unwrap_or(""),
+                ),
                 now_millis(),
             )
         {
@@ -684,12 +703,14 @@ impl Storage {
             .map(|d| d.node_id.as_str())
             .collect();
         sqlx::query(
-            "UPDATE registrations SET device_node_ids_json = ?2, announcement_version = ?3
+            "UPDATE registrations SET device_node_ids_json = ?2, announcement_version = ?3,
+                 announcement_signature = ?4
              WHERE pubkey = ?1",
         )
         .bind(&announcement.master_pubkey)
         .bind(serde_json::to_string(&node_ids)?)
         .bind(version)
+        .bind(&announcement.signature)
         .execute(&mut *tx)
         .await?;
         if !announcement.removed.is_empty() {

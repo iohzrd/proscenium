@@ -66,3 +66,7 @@ webpki-root-certs = "1.0.12"
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
 tauri-plugin-haptics = "2"
+
+[dev-dependencies]
+# Mock runtime (`tauri::test::mock_app`) for tests of functions that take an `AppHandle`.
+tauri = { version = "2.11", features = ["test"] }

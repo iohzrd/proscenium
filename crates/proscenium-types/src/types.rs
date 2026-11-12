@@ -246,7 +246,8 @@ pub struct ServerEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendSyncResult {
     pub posts: Vec<Post>,
-    pub remote_total: u64,
+    /// Post count the author's device reported; `None` if a mirror answered.
+    pub remote_total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

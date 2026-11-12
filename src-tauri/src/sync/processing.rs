@@ -8,18 +8,18 @@ use crate::ingest::{
 };
 use crate::storage::Storage;
 use proscenium_types::{MAX_SYNC_TOMBSTONES, Post, SyncFrame};
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 
 /// Verifies and stores the frames of one sync stream as they arrive.
 ///
 /// Every item must be authored and signed by `pubkey`. Items that fail a check are
 /// skipped; exceeding an item cap is an error.
-pub(super) struct FrameIngest<'a> {
+pub(super) struct FrameIngest<'a, R: Runtime> {
     storage: &'a Storage,
     pubkey: &'a str,
     label: &'a str,
     my_id: &'a str,
-    app_handle: &'a AppHandle,
+    app_handle: &'a AppHandle<R>,
     posts_received: usize,
     interactions_received: usize,
     tombstones_received: usize,
@@ -36,13 +36,13 @@ pub(super) struct FrameIngest<'a> {
     interaction_ids: Option<Vec<String>>,
 }
 
-impl<'a> FrameIngest<'a> {
+impl<'a, R: Runtime> FrameIngest<'a, R> {
     pub fn new(
         storage: &'a Storage,
         pubkey: &'a str,
         label: &'a str,
         my_id: &'a str,
-        app_handle: &'a AppHandle,
+        app_handle: &'a AppHandle<R>,
         collect_interaction_ids: bool,
     ) -> Self {
         Self {

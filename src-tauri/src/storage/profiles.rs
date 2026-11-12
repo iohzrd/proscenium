@@ -6,14 +6,17 @@ use super::Storage;
 
 impl Storage {
     /// Insert or replace the profile stored under `pubkey`.
-    /// An existing row is replaced only if `profile.updated_at` is greater than or equal to
-    /// the stored value. Returns `true` if a row was written.
+    /// An existing row is replaced only if `(updated_at, signature)` of `profile` is greater
+    /// than the stored pair, so two profiles with the same `updated_at` leave the same row
+    /// whatever their arrival order. Returns `true` if a row was written.
     pub async fn save_profile(&self, pubkey: &str, profile: &Profile) -> Result<bool, AppError> {
         let result = sqlx::query(
             "INSERT INTO profiles (pubkey, display_name, bio, avatar_hash, avatar_ticket, visibility, signature, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(pubkey) DO UPDATE SET display_name=?2, bio=?3, avatar_hash=?4, avatar_ticket=?5, visibility=?6, signature=?7, updated_at=?8
-             WHERE excluded.updated_at >= profiles.updated_at",
+             WHERE excluded.updated_at > profiles.updated_at
+                OR (excluded.updated_at = profiles.updated_at
+                    AND excluded.signature > profiles.signature)",
         )
         .bind(pubkey)
         .bind(&profile.display_name)

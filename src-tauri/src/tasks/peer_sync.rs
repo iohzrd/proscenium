@@ -175,6 +175,7 @@ async fn wait_for_relay(state: &AppState) {
 }
 
 async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
+    let mirrors = state.gossip().feed_neighbors(pubkey);
     match crate::sync::sync_one_peer(
         &state.endpoint(),
         &state.storage,
@@ -182,12 +183,13 @@ async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
         pubkey,
         &state.app_handle,
         label,
+        &mirrors,
     )
     .await
     {
         Ok(result) => {
             log::info!(
-                "[peer-sync] {label} {}: stored={} remote={}",
+                "[peer-sync] {label} {}: stored={} remote={:?}",
                 short_id(pubkey),
                 result.stored,
                 result.remote_post_count,

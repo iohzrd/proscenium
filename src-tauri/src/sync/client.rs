@@ -14,8 +14,20 @@ use proscenium_types::{
     SyncSummary, post_ids_digest, short_id, verify_linked_devices_announcement,
     verify_stage_announcement,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::time::Instant;
+
+/// The node that answers a sync request for an author.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SyncSource {
+    /// A device of the author.
+    Author,
+    /// Another device of the local user; the author is the local user.
+    OwnDevice,
+    /// A node of another user that stores the author's posts (see
+    /// `sync::server::authorize_mirror_requester`).
+    Mirror,
+}
 
 /// Requester side of the sync protocol: fetch the content of `author` from the NodeId
 /// `target`, verifying and storing each frame when it arrives. The request carries the
@@ -25,23 +37,26 @@ use tokio::time::Instant;
 /// continues from there. An error is returned only if no summary was received or the
 /// summary could not be used.
 ///
-/// If `author` is the local user, `target` is another device of the local user: the device list
-/// and stage announcement of the summary are ignored (device sync exchanges device
-/// lists), and local interactions that `target` lacks are kept, because neither device
-/// holds the complete set.
+/// The device list and stage announcement of the summary are used only from
+/// `SyncSource::Author`: device sync exchanges device lists, and a mirror is not a device
+/// of the author. Local interactions of the author that the responder lacks are deleted
+/// only after a sync from `SyncSource::Author`: neither of two own devices holds the
+/// complete set, and a mirror sends no interactions. Posts are deleted only by signed
+/// tombstones, from any source.
 ///
 /// Emits `feed-updated` once at the end if a post row was inserted or deleted or a new
 /// tombstone was stored. Rows that already existed produce no event.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn sync_from_peer(
+pub(super) async fn sync_from_peer<R: Runtime>(
     endpoint: &Endpoint,
     storage: &Storage,
     identity: &SharedIdentity,
     target: EndpointId,
     author: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     label: &str,
     deadline: Instant,
+    source: SyncSource,
 ) -> Result<SyncOneResult, AppError> {
     let start = Instant::now();
     let my_id = identity.read().await.master_pubkey.clone();
@@ -89,10 +104,12 @@ pub(super) async fn sync_from_peer(
     let summary_bytes =
         read_to_end_timeout(&mut recv, SYNC_MAX_SUMMARY_BYTES, SYNC_STEP_TIMEOUT).await?;
     let summary: SyncSummary = serde_json::from_slice(&summary_bytes)?;
-    let own_device = author == my_id;
+    let from_author = source == SyncSource::Author;
+    // A mirror's post count is not the author's.
+    let remote_post_count = from_author.then_some(summary.server_post_count);
 
     // The responder's signed device list: the current NodeIds of the author.
-    if !own_device && let Some(announcement) = &summary.announcement {
+    if from_author && let Some(announcement) = &summary.announcement {
         if announcement.master_pubkey != author {
             log::warn!("[{label}] sync summary carries a device list of another user");
         } else if let Err(reason) = verify_linked_devices_announcement(announcement) {
@@ -115,12 +132,12 @@ pub(super) async fn sync_from_peer(
         }
     }
 
-    if !own_device && let Some(stage) = &summary.active_stage {
+    if from_author && let Some(stage) = &summary.active_stage {
         emit_verified_stage(stage, author, app_handle, label);
     }
 
     log::info!(
-        "[{label}] {} mode={:?}, remote=({}/{}/{}), local=({post_count}/{interaction_count}/{tombstone_count})",
+        "[{label}] {} from {source:?} mode={:?}, remote=({}/{}/{}), local=({post_count}/{interaction_count}/{tombstone_count})",
         short_id(author),
         summary.mode,
         summary.server_post_count,
@@ -133,7 +150,7 @@ pub(super) async fn sync_from_peer(
         return Ok(SyncOneResult {
             stored: 0,
             posts: Vec::new(),
-            remote_post_count: summary.server_post_count,
+            remote_post_count,
         });
     }
 
@@ -169,7 +186,7 @@ pub(super) async fn sync_from_peer(
     // interaction set: local interactions of the author that the responder no longer
     // has were deleted by the author and are removed.
     if complete
-        && !own_device
+        && from_author
         && let Some(received_ids) = ingest.take_interaction_ids()
         && received_ids.len() as u64 == summary.server_interaction_count
     {
@@ -193,7 +210,7 @@ pub(super) async fn sync_from_peer(
     }
 
     log::info!(
-        "[{label}] stored {} posts, removed {} from {} via {} in {:.1}s (mode={:?}, complete={complete})",
+        "[{label}] stored {} posts, removed {} from {} via {} ({source:?}) in {:.1}s (mode={:?}, complete={complete})",
         ingest.posts_stored,
         ingest.posts_removed,
         short_id(author),
@@ -205,15 +222,15 @@ pub(super) async fn sync_from_peer(
     Ok(SyncOneResult {
         stored: ingest.posts_stored,
         posts: ingest.take_new_posts(),
-        remote_post_count: summary.server_post_count,
+        remote_post_count,
     })
 }
 
 /// Open the data stream, send the id list if the mode requires it, and pass every frame
 /// to `ingest`. Returns `true` if the stream ended with the zero-length end marker.
-async fn receive_frames(
+async fn receive_frames<R: Runtime>(
     conn: &iroh::endpoint::Connection,
-    ingest: &mut FrameIngest<'_>,
+    ingest: &mut FrameIngest<'_, R>,
     mode: SyncMode,
     ids_for_diff: &[String],
     deadline: Instant,
@@ -278,10 +295,10 @@ async fn receive_frames(
 
 /// Emit `stage-announced` for a stage announcement from a sync summary, only if
 /// `author` is its host and signed it.
-fn emit_verified_stage(
+fn emit_verified_stage<R: Runtime>(
     stage: &StageAnnouncement,
     author: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     label: &str,
 ) {
     if stage.host_pubkey != author {

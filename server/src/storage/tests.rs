@@ -342,7 +342,7 @@ async fn unregister_requires_active_registration_and_clears_identifying_columns(
 // --- Profiles and visibility ---
 
 #[tokio::test]
-async fn profile_is_replaced_only_if_not_older() {
+async fn profile_is_replaced_only_by_a_newer_or_greater_signature() {
     let storage = storage().await;
     let user = TestUser::new(1);
     let pk = &user.master_pubkey;
@@ -384,13 +384,15 @@ async fn profile_is_replaced_only_if_not_older() {
     assert!(!outcome.profile_stored);
     assert_eq!(outcome.visibility, Visibility::Public);
 
-    // Equal and newer: stored.
+    // Equal `updated_at`: stored only with a greater signature. Newer: stored.
+    let stored_signature = user.profile("v10", Visibility::Public, 10).signature;
     let same = user.profile("v10b", Visibility::Public, 10);
-    assert!(
+    assert_eq!(
         peer_profile(&storage, &user, &same)
             .await
             .unwrap()
-            .profile_stored
+            .profile_stored,
+        same.signature > stored_signature
     );
     let newer = user.profile("v11", Visibility::Public, 11);
     assert!(
@@ -421,6 +423,64 @@ async fn profile_is_replaced_only_if_not_older() {
             .unwrap()
             .profile_stored
     );
+}
+
+/// Every ordering of `items`.
+fn orderings<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut result = Vec::new();
+    for i in 0..items.len() {
+        let mut rest = items.to_vec();
+        let first = rest.remove(i);
+        for mut tail in orderings(&rest) {
+            tail.insert(0, first.clone());
+            result.push(tail);
+        }
+    }
+    result
+}
+
+#[tokio::test]
+async fn stored_profile_and_device_list_do_not_depend_on_arrival_order() {
+    let user = TestUser::new(1);
+    let pk = &user.master_pubkey;
+    // Two profiles and two device lists with equal `updated_at` and version, an older one
+    // of each, and a duplicate.
+    let profiles = [
+        user.profile("a", Visibility::Public, 10),
+        user.profile("b", Visibility::Public, 10),
+        user.profile("old", Visibility::Public, 9),
+        user.profile("a", Visibility::Public, 10),
+    ];
+    let lists = [
+        user.announcement(5, &[node_id(50)]),
+        user.announcement(5, &[node_id(60)]),
+        user.announcement(4, &[node_id(70)]),
+        user.announcement(5, &[node_id(60)]),
+    ];
+    let mut results = std::collections::HashSet::new();
+    for (profile_order, list_order) in orderings(&profiles).iter().zip(orderings(&lists)) {
+        let storage = storage().await;
+        register(&storage, &user, 1_000, Visibility::Public)
+            .await
+            .unwrap();
+        for profile in profile_order {
+            peer_profile(&storage, &user, profile).await.unwrap();
+        }
+        for list in &list_order {
+            storage.cache_announcement(list).await.unwrap();
+        }
+        let name = storage
+            .get_user_info(pk)
+            .await
+            .unwrap()
+            .and_then(|u| u.display_name);
+        let devices = storage.get_device_node_ids(pk).await.unwrap();
+        results.insert((name, devices));
+    }
+    assert_eq!(results.len(), 1, "{results:?}");
 }
 
 #[tokio::test]
@@ -537,7 +597,7 @@ async fn private_profile_deactivates_registration() {
 // --- Device announcements ---
 
 #[tokio::test]
-async fn announcement_device_list_is_replaced_only_by_higher_version() {
+async fn announcement_device_list_is_replaced_by_higher_version_or_greater_signature() {
     let storage = storage().await;
     let user = TestUser::new(1);
     let pk = &user.master_pubkey;
@@ -566,14 +626,22 @@ async fn announcement_device_list_is_replaced_only_by_higher_version() {
         Some(vec![transport.clone(), node_id(50)])
     );
 
-    // Equal and lower versions keep the list.
-    for version in [5, 4] {
-        let other = user.announcement(version, &[node_id(60)]);
-        assert_eq!(
-            storage.cache_announcement(&other).await.unwrap(),
+    // A lower version keeps the list. An equal version replaces it only with a greater
+    // signature.
+    let lower = user.announcement(4, &[node_id(60)]);
+    assert_eq!(
+        storage.cache_announcement(&lower).await.unwrap(),
+        AnnouncementOutcome::NotNewer
+    );
+    let same_version = user.announcement(5, &[node_id(60)]);
+    assert_eq!(
+        storage.cache_announcement(&same_version).await.unwrap(),
+        if same_version.signature > v5.signature {
+            AnnouncementOutcome::Stored
+        } else {
             AnnouncementOutcome::NotNewer
-        );
-    }
+        }
+    );
     // The registering device is listed once even if the announcement names it.
     let v6 = user.announcement(6, &[transport.clone(), node_id(51)]);
     assert_eq!(

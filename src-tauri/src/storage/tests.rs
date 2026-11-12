@@ -126,10 +126,16 @@ async fn profile_save_and_get() {
 }
 
 #[tokio::test]
-async fn profile_upsert_updates() {
+async fn profile_upsert_replaces_a_newer_profile() {
     let s = test_storage().await;
     s.save_profile("pk_a", &make_profile("V1")).await.unwrap();
-    s.save_profile("pk_a", &make_profile("V2")).await.unwrap();
+    let newer = Profile {
+        updated_at: 1,
+        ..make_profile("V2")
+    };
+    assert!(s.save_profile("pk_a", &newer).await.unwrap());
+    // The same `(updated_at, signature)` again writes nothing.
+    assert!(!s.save_profile("pk_a", &newer).await.unwrap());
 
     let loaded = s.get_profile("pk_a").await.unwrap().unwrap();
     assert_eq!(loaded.display_name, "V2");

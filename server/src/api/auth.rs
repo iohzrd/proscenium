@@ -195,7 +195,7 @@ async fn update_profile(
     let message = if outcome.profile_stored {
         "profile updated"
     } else {
-        "stored profile is newer; not replaced"
+        "stored profile is the same or newer; not replaced"
     };
     Ok(Json(MessageResponse {
         message: message.to_string(),

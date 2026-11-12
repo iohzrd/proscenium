@@ -481,7 +481,7 @@ impl IngestionManager {
                 };
                 match self.apply_registration_change(change).await {
                     Ok(outcome) if !outcome.profile_stored => {
-                        return Err("profile is older than the stored one".to_string());
+                        return Err("profile is not newer than the stored one".to_string());
                     }
                     Ok(outcome) => tracing::info!(
                         "[ingestion] stored profile of {} (active={}, visibility={})",

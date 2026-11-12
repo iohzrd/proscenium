@@ -36,8 +36,8 @@ pub async fn save_my_profile(
         (id.master_pubkey.clone(), id.master_key.clone())
     };
     let new_visibility: Visibility = visibility.parse()?;
-    // `save_profile` only replaces a row with an equal or greater `updated_at`, so the new
-    // value must exceed the stored one even if the system clock moved backwards.
+    // `save_profile` replaces a row only if `(updated_at, signature)` is greater, so the new
+    // `updated_at` must exceed the stored one even if the system clock moved backwards.
     let stored_updated_at = state
         .storage
         .get_profile(&node_id)

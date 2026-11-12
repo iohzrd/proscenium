@@ -1,10 +1,10 @@
-use super::client::sync_from_peer;
-use crate::constants::{MAX_NODE_IDS_TRIED, SYNC_PEER_TIMEOUT};
+use super::client::{SyncSource, sync_from_peer};
+use crate::constants::{MAX_MIRRORS_TRIED, MAX_NODE_IDS_TRIED, SYNC_PEER_TIMEOUT};
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointId};
-use proscenium_types::{Post, is_valid_pubkey, short_id};
+use proscenium_types::{Post, Visibility, is_valid_pubkey, short_id};
 use tauri::AppHandle;
 use tokio::time::Instant;
 
@@ -14,16 +14,20 @@ pub struct SyncOneResult {
     pub stored: usize,
     /// The newest newly stored posts (at most `SYNC_RETURNED_POSTS_MAX`, newest first).
     pub posts: Vec<Post>,
-    /// Number of posts the responder reported for the author.
-    pub remote_post_count: u64,
+    /// Number of posts the author's device reported; `None` after a sync from a mirror.
+    pub remote_post_count: Option<u64>,
 }
 
-/// Sync the content of the user `pubkey` from one of its cached transport NodeIds.
+/// Sync the content of the user `pubkey` from one of its cached transport NodeIds, or
+/// else from one of `mirrors`.
 ///
-/// Connects to at most `MAX_NODE_IDS_TRIED` NodeIds in order and runs for at most
-/// `SYNC_PEER_TIMEOUT` in total (plus one frame timeout). Returns the result of the
-/// first NodeId that answered with a usable summary. Nothing is requested for a muted
-/// or blocked user.
+/// Connects to at most `MAX_NODE_IDS_TRIED` NodeIds of the user in order. If none
+/// answers and the stored profile of `pubkey` is Public, connects to at most
+/// `MAX_MIRRORS_TRIED` of `mirrors` that are not in the user's device list: nodes of
+/// other users that follow `pubkey` and serve its posts and post deletions. Runs for at
+/// most `SYNC_PEER_TIMEOUT` in total (plus one frame timeout). Returns the result of the
+/// first node that answered with a usable summary. Nothing is requested for a muted or
+/// blocked user.
 pub async fn sync_one_peer(
     endpoint: &Endpoint,
     storage: &Storage,
@@ -31,6 +35,7 @@ pub async fn sync_one_peer(
     pubkey: &str,
     app_handle: &AppHandle,
     label: &str,
+    mirrors: &[EndpointId],
 ) -> Result<SyncOneResult, AppError> {
     if !is_valid_pubkey(pubkey) {
         return Err(AppError::Other("invalid pubkey".into()));
@@ -42,7 +47,7 @@ pub async fn sync_one_peer(
         return Ok(SyncOneResult {
             stored: 0,
             posts: Vec::new(),
-            remote_post_count: 0,
+            remote_post_count: None,
         });
     }
 
@@ -71,7 +76,15 @@ pub async fn sync_one_peer(
         };
         tried += 1;
         match sync_from_peer(
-            endpoint, storage, identity, target, pubkey, app_handle, label, deadline,
+            endpoint,
+            storage,
+            identity,
+            target,
+            pubkey,
+            app_handle,
+            label,
+            deadline,
+            SyncSource::Author,
         )
         .await
         {
@@ -79,6 +92,46 @@ pub async fn sync_one_peer(
             Err(e) => {
                 log::debug!("[{label}] sync via {} failed: {e}", short_id(node_id));
                 last_err = e.to_string();
+            }
+        }
+    }
+
+    let public = storage
+        .get_profile(pubkey)
+        .await?
+        .is_some_and(|p| p.visibility == Visibility::Public);
+    if public {
+        let candidates = mirrors
+            .iter()
+            .filter(|m| !node_ids.contains(&m.to_string()))
+            .take(MAX_MIRRORS_TRIED);
+        for &mirror in candidates {
+            if Instant::now() >= deadline {
+                last_err = "time limit reached".to_string();
+                break;
+            }
+            tried += 1;
+            match sync_from_peer(
+                endpoint,
+                storage,
+                identity,
+                mirror,
+                pubkey,
+                app_handle,
+                label,
+                deadline,
+                SyncSource::Mirror,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    log::debug!(
+                        "[{label}] sync via mirror {} failed: {e}",
+                        mirror.fmt_short()
+                    );
+                    last_err = e.to_string();
+                }
             }
         }
     }
@@ -110,6 +163,7 @@ pub async fn sync_from_own_device(
         app_handle,
         "device-sync",
         deadline,
+        SyncSource::OwnDevice,
     )
     .await
 }

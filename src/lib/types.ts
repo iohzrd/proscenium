@@ -111,7 +111,8 @@ export type FollowOutcome = "followed" | "pending" | "denied";
 
 export interface SyncResult {
   posts: Post[];
-  remote_total: number;
+  /** Post count the author's device reported; null if a mirror answered. */
+  remote_total: number | null;
 }
 
 export interface SyncStatus {

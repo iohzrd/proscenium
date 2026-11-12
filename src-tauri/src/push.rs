@@ -163,6 +163,19 @@ pub async fn handle_push(
         .await
         .map_err(AcceptError::from_err)?;
     if !hidden {
+        // The profile is stored first: posts of a non-Public author are then never stored
+        // while the stored profile still reads Public, which would let this node serve
+        // them as a mirror (`sync::server::authorize_mirror_requester`).
+        if let Some(profile) = &msg.profile {
+            match verify_and_store_profile(storage, author, profile).await {
+                Ok(true) => {
+                    let _ = app_handle.emit("profile-updated", author);
+                }
+                Ok(false) => {}
+                Err(e) => log::warn!("[push-rx] rejected profile from {}: {e}", short_id(author)),
+            }
+        }
+
         let removed = verify_and_apply_post_tombstones(storage, author, &msg.tombstones, "push-rx")
             .await
             .posts_removed;
@@ -187,16 +200,6 @@ pub async fn handle_push(
             .await;
             if outcome == InteractionOutcome::Stored {
                 ack.received_interaction_ids.push(interaction.id.clone());
-            }
-        }
-
-        if let Some(profile) = &msg.profile {
-            match verify_and_store_profile(storage, author, profile).await {
-                Ok(true) => {
-                    let _ = app_handle.emit("profile-updated", author);
-                }
-                Ok(false) => {}
-                Err(e) => log::warn!("[push-rx] rejected profile from {}: {e}", short_id(author)),
             }
         }
 

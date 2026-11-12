@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tauri::State;
 
 /// Sync the content of `pubkey` now. Returns the newest newly stored posts (at most
-/// `SYNC_RETURNED_POSTS_MAX`, newest first) and the post count the remote reported.
+/// `SYNC_RETURNED_POSTS_MAX`, newest first) and the post count the author's device
+/// reported (`None` if a mirror answered).
 ///
 /// For a user the local user does not follow, only the newest `MAX_VIEWED_AUTHOR_ITEMS`
 /// posts and interactions are kept, and the content of at most `MAX_VIEWED_AUTHORS` such
@@ -37,6 +38,7 @@ pub async fn sync_posts(
     }
 
     let ep = state.endpoint();
+    let mirrors = state.gossip().feed_neighbors(&pubkey);
     let result = crate::sync::sync_one_peer(
         &ep,
         &state.storage,
@@ -44,6 +46,7 @@ pub async fn sync_posts(
         &pubkey,
         &state.app_handle,
         "sync",
+        &mirrors,
     )
     .await;
     // A failed sync can have stored content before it failed.

@@ -255,15 +255,10 @@ impl super::GossipService {
             );
             return;
         }
-        // The tombstone is stored first: from then on the interaction is not stored again.
-        if let Err(e) = storage
-            .record_interaction_tombstone(author, id, now_millis())
+        match storage
+            .apply_interaction_deletion(author, id, now_millis())
             .await
         {
-            log::error!("[gossip-rx] failed to store interaction deletion: {e}");
-            return;
-        }
-        match storage.delete_interaction(id, author).await {
             Ok(true) => {
                 log::info!(
                     "[gossip-rx] deleted interaction {} of {}",
@@ -276,7 +271,7 @@ impl super::GossipService {
                 );
             }
             Ok(false) => {}
-            Err(e) => log::error!("[gossip-rx] failed to delete interaction: {e}"),
+            Err(e) => log::error!("[gossip-rx] failed to apply interaction deletion: {e}"),
         }
     }
 

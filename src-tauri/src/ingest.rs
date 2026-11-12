@@ -5,7 +5,7 @@ use proscenium_types::{
     validate_interaction, validate_post, validate_profile, verify_delete_post_signature,
     verify_interaction_signature, verify_post_signature, verify_profile_signature,
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// Result of offering one interaction to `verify_and_store_interaction`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,12 +23,12 @@ pub enum InteractionOutcome {
 ///
 /// Returns `true` only if a new row was inserted. Mention, reply and quote notifications
 /// and their events are produced only in that case.
-pub async fn verify_and_store_post(
+pub async fn verify_and_store_post<R: Runtime>(
     storage: &Storage,
     post: &Post,
     label: &str,
     my_id: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
 ) -> bool {
     if let Err(reason) = validate_post(post) {
         log::error!("[{label}] rejected post {}: {reason}", short_id(&post.id));
@@ -122,13 +122,13 @@ pub async fn verify_and_store_post(
 ///
 /// A "like" notification is produced only for `InteractionOutcome::Stored` and only if
 /// the liked post is stored locally and authored by `my_id`.
-pub async fn verify_and_store_interaction(
+pub async fn verify_and_store_interaction<R: Runtime>(
     storage: &Storage,
     interaction: &Interaction,
     expected_author: &str,
     label: &str,
     my_id: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
 ) -> InteractionOutcome {
     if interaction.author != expected_author {
         return InteractionOutcome::Rejected;
@@ -195,8 +195,8 @@ pub async fn verify_and_store_interaction(
     InteractionOutcome::Stored
 }
 
-/// Validate a profile of `author`, verify that `author` signed it, and store it if it
-/// differs from the stored profile and is not older.
+/// Validate a profile of `author`, verify that `author` signed it, and store it under the
+/// rule of `Storage::save_profile`.
 ///
 /// Returns `Ok(true)` if the profile row changed.
 pub async fn verify_and_store_profile(
@@ -206,12 +206,6 @@ pub async fn verify_and_store_profile(
 ) -> Result<bool, AppError> {
     validate_profile(profile)?;
     verify_profile_signature(profile, author)?;
-    if let Some(stored) = storage.get_profile(author).await?
-        && stored.updated_at == profile.updated_at
-        && stored.signature == profile.signature
-    {
-        return Ok(false);
-    }
     storage.save_profile(author, profile).await
 }
 
@@ -258,5 +252,267 @@ pub async fn verify_and_apply_post_tombstones(
             log::error!("[{label}] failed to apply post deletions: {e}");
             TombstoneOutcome::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The stored state after a set of signed records must not depend on the order in
+    //! which the records arrive or on how often each arrives.
+
+    use super::*;
+    use iroh::SecretKey;
+    use proscenium_types::{
+        InteractionKind, LinkedDevicesAnnouncement, sign_delete_post, sign_interaction,
+        sign_linked_devices_announcement, sign_post, sign_profile,
+    };
+    use std::collections::HashSet;
+    use std::fmt::Debug;
+    use std::hash::Hash;
+
+    const LABEL: &str = "test";
+
+    /// Every ordering of `items`.
+    fn orderings<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut result = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let first = rest.remove(i);
+            for mut tail in orderings(&rest) {
+                tail.insert(0, first.clone());
+                result.push(tail);
+            }
+        }
+        result
+    }
+
+    /// Apply every ordering of `items` to a new storage with `apply`, read the result
+    /// with `read`, and require one result for all orderings.
+    async fn assert_order_independent<T, S, A, F>(items: &[T], apply: A, read: F)
+    where
+        T: Clone,
+        S: Eq + Hash + Debug,
+        A: AsyncFn(&Storage, &T),
+        F: AsyncFn(&Storage) -> S,
+    {
+        let mut results = HashSet::new();
+        for order in orderings(items) {
+            let storage = Storage::open_in_memory().await.unwrap();
+            for item in &order {
+                apply(&storage, item).await;
+            }
+            results.insert(read(&storage).await);
+        }
+        assert_eq!(results.len(), 1, "{results:?}");
+    }
+
+    fn identity(seed: u8) -> (SecretKey, String) {
+        let key = SecretKey::from_bytes(&[seed; 32]);
+        let pubkey = key.public().to_string();
+        (key, pubkey)
+    }
+
+    fn post(key: &SecretKey, content: &str, timestamp: u64) -> Post {
+        let mut post = Post {
+            id: String::new(),
+            author: key.public().to_string(),
+            content: content.to_string(),
+            timestamp,
+            media: vec![],
+            reply_to: None,
+            reply_to_author: None,
+            quote_of: None,
+            quote_of_author: None,
+            signature: String::new(),
+        };
+        sign_post(&mut post, key);
+        post
+    }
+
+    #[derive(Clone)]
+    enum Item {
+        Post(Post),
+        PostDeletion(PostTombstone),
+        Like(Interaction),
+        LikeDeletion(String),
+    }
+
+    #[tokio::test]
+    async fn posts_and_post_deletions_do_not_depend_on_arrival_order() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+        let (key, author) = identity(1);
+        let kept = post(&key, "kept", 1_000);
+        let deleted = post(&key, "deleted", 2_000);
+        let deletion = PostTombstone {
+            id: deleted.id.clone(),
+            author: author.clone(),
+            signature: sign_delete_post(&deleted.id, &author, &key),
+        };
+        let items = [
+            Item::Post(kept),
+            Item::Post(deleted.clone()),
+            Item::PostDeletion(deletion),
+            Item::Post(deleted),
+        ];
+        assert_order_independent(
+            &items,
+            async |storage: &Storage, item: &Item| match item {
+                Item::Post(post) => {
+                    verify_and_store_post(storage, post, LABEL, "me", handle).await;
+                }
+                Item::PostDeletion(tombstone) => {
+                    verify_and_apply_post_tombstones(
+                        storage,
+                        &author,
+                        std::slice::from_ref(tombstone),
+                        LABEL,
+                    )
+                    .await;
+                }
+                _ => unreachable!(),
+            },
+            async |storage: &Storage| {
+                let mut posts = storage.get_post_ids_by_author(&author).await.unwrap();
+                posts.sort();
+                let tombstones: Vec<String> = storage
+                    .get_post_tombstones(&author, usize::MAX)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|t| t.id)
+                    .collect();
+                (posts, tombstones)
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn likes_and_like_deletions_do_not_depend_on_arrival_order() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+        let (key, author) = identity(1);
+        let (other_key, _) = identity(2);
+        let like = |target: &Post, n: u32| {
+            let mut like = Interaction {
+                id: format!("{n:032x}"),
+                author: author.clone(),
+                kind: InteractionKind::Like,
+                target_post_id: target.id.clone(),
+                target_author: target.author.clone(),
+                timestamp: 1_000 + u64::from(n),
+                signature: String::new(),
+            };
+            sign_interaction(&mut like, &key);
+            like
+        };
+        let kept = like(&post(&other_key, "a", 1), 1);
+        let deleted = like(&post(&other_key, "b", 2), 2);
+        let items = [
+            Item::Like(kept),
+            Item::Like(deleted.clone()),
+            Item::LikeDeletion(deleted.id.clone()),
+            Item::Like(deleted),
+        ];
+        assert_order_independent(
+            &items,
+            async |storage: &Storage, item: &Item| match item {
+                Item::Like(like) => {
+                    verify_and_store_interaction(storage, like, &author, LABEL, "me", handle).await;
+                }
+                Item::LikeDeletion(id) => {
+                    storage
+                        .apply_interaction_deletion(&author, id, 1)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            },
+            async |storage: &Storage| {
+                let mut likes: Vec<String> = storage
+                    .get_interactions_paged(&author, 100, 0)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.id)
+                    .collect();
+                likes.sort();
+                likes
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stored_profile_does_not_depend_on_arrival_order() {
+        let (key, author) = identity(1);
+        let profile = |name: &str, updated_at: u64| {
+            let mut profile = Profile {
+                display_name: name.to_string(),
+                bio: String::new(),
+                avatar_hash: None,
+                avatar_ticket: None,
+                visibility: proscenium_types::Visibility::Public,
+                updated_at,
+                signature: String::new(),
+            };
+            sign_profile(&mut profile, &author, &key);
+            profile
+        };
+        // Two profiles with the same `updated_at`, an older one and a duplicate.
+        let items = [
+            profile("a", 10),
+            profile("b", 10),
+            profile("old", 9),
+            profile("a", 10),
+        ];
+        assert_order_independent(
+            &items,
+            async |storage: &Storage, profile: &Profile| {
+                verify_and_store_profile(storage, &author, profile)
+                    .await
+                    .unwrap();
+            },
+            async |storage: &Storage| {
+                let stored = storage.get_profile(&author).await.unwrap().unwrap();
+                (stored.display_name, stored.updated_at, stored.signature)
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stored_device_list_does_not_depend_on_arrival_order() {
+        let (key, master) = identity(1);
+        let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let list = |version: u64, device: u8| {
+            let mut list = LinkedDevicesAnnouncement {
+                master_pubkey: master.clone(),
+                devices: vec![proscenium_types::DeviceEntry {
+                    node_id: node_id(device),
+                    device_name: "device".to_string(),
+                    added_at: 1,
+                }],
+                removed: vec![],
+                version,
+                signature: String::new(),
+            };
+            sign_linked_devices_announcement(&mut list, &key);
+            list
+        };
+        // Two lists with the same version, an older one and a duplicate.
+        let items = [list(5, 50), list(5, 60), list(4, 70), list(5, 60)];
+        assert_order_independent(
+            &items,
+            async |storage: &Storage, list: &LinkedDevicesAnnouncement| {
+                storage.cache_peer_announcement(list, None).await.unwrap();
+            },
+            async |storage: &Storage| storage.get_peer_transport_node_ids(&master).await.unwrap(),
+        )
+        .await;
     }
 }

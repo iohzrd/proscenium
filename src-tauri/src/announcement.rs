@@ -115,9 +115,12 @@ pub async fn build_own_identity_response(
     };
 
     let mut profile = storage.get_profile(&master_pubkey).await?;
+    // A new signature with the same `updated_at` can compare lower than the stored one
+    // and not replace it, so the re-signed profile is one millisecond newer.
     if let Some(p) = profile.as_mut()
         && verify_profile_signature(p, &master_pubkey).is_err()
     {
+        p.updated_at = p.updated_at.saturating_add(1);
         sign_profile(p, &master_pubkey, &master_key);
         storage.save_profile(&master_pubkey, p).await?;
     }

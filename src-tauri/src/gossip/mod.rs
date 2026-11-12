@@ -10,7 +10,7 @@ use crate::constants::{MAX_NODE_IDS_TRIED, PUSH_CONCURRENCY};
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
-use iroh::Endpoint;
+use iroh::{Endpoint, EndpointId};
 use iroh_gossip::{Gossip, api::GossipSender};
 use proscenium_types::{Profile, PushMessage, Visibility, short_id};
 use std::collections::HashMap;
@@ -41,6 +41,10 @@ pub struct GossipService {
     pub(crate) inner: Arc<tokio::sync::Mutex<GossipInner>>,
     /// Sender for reconnect requests; cloned into each subscription task.
     pub(crate) reconnect_tx: mpsc::UnboundedSender<String>,
+    /// Current neighbors on the feed topic of each followed user, by master pubkey. Each
+    /// subscription task writes its entry on every neighbor change and removes it when
+    /// it ends; `unfollow_user` removes the entry of the task it aborts.
+    pub(crate) feed_neighbors: FeedNeighbors,
     /// Limits the push connections open at the same time, over all pending pushes.
     push_limit: Arc<Semaphore>,
 }
@@ -61,6 +65,7 @@ impl GossipService {
             storage,
             app_handle,
             reconnect_tx,
+            feed_neighbors: FeedNeighbors::default(),
             inner: Arc::new(tokio::sync::Mutex::new(GossipInner {
                 my_sender: None,
                 own_feed_handle: None,
@@ -69,6 +74,13 @@ impl GossipService {
             })),
             push_limit: Arc::new(Semaphore::new(PUSH_CONCURRENCY)),
         }
+    }
+
+    /// NodeIds that are currently neighbors on the feed topic of `pubkey`: devices
+    /// subscribed to that topic, which are devices of `pubkey`, of its followers, or of a
+    /// discovery server. Empty if the local user does not follow `pubkey`.
+    pub fn feed_neighbors(&self, pubkey: &str) -> Vec<EndpointId> {
+        self.feed_neighbors.get(pubkey)
     }
 
     /// Return a clone of the underlying iroh-gossip handle for direct topic subscriptions
@@ -164,9 +176,11 @@ impl GossipService {
 
     /// Send `msg` directly to every push recipient (see `Storage::get_push_recipients`).
     ///
-    /// Returns after spawning the delivery task. If `msg.announcement` is empty it is set
-    /// to the local user's signed device list, so recipients hold the current NodeIds and
-    /// DM pubkey. At most `PUSH_CONCURRENCY` connections are open at
+    /// Returns after spawning the delivery task. An empty `msg.announcement` or
+    /// `msg.profile` is set to the local user's signed device list or profile, so
+    /// recipients hold the current NodeIds and visibility: a follower that stores non-Public
+    /// posts then also stores the non-Public profile, and does not serve the posts as a
+    /// mirror. At most `PUSH_CONCURRENCY` connections are open at
     /// once over all pending pushes, and at most `MAX_NODE_IDS_TRIED` NodeIds are tried
     /// per recipient. A recipient that does not acknowledge receives the content at its next sync.
     pub(crate) async fn attempt_push(&self, mut msg: PushMessage) {
@@ -185,10 +199,17 @@ impl GossipService {
         if recipients.is_empty() {
             return;
         }
-        if msg.announcement.is_none() {
-            match crate::announcement::build_own_announcement(&self.storage, &self.identity).await {
-                Ok(announcement) => msg.announcement = Some(announcement),
-                Err(e) => log::error!("[push] failed to build device announcement: {e}"),
+        if msg.announcement.is_none() || msg.profile.is_none() {
+            match crate::announcement::build_own_identity_response(&self.storage, &self.identity)
+                .await
+            {
+                Ok(own) => {
+                    msg.announcement.get_or_insert(own.announcement);
+                    if msg.profile.is_none() {
+                        msg.profile = own.profile;
+                    }
+                }
+                Err(e) => log::error!("[push] failed to build device list and profile: {e}"),
             }
         }
 
@@ -224,6 +245,39 @@ impl GossipService {
         self.broadcast_profile(profile).await?;
         self.stop_own_feed().await;
         Ok(())
+    }
+}
+
+/// Neighbor NodeIds per feed topic, keyed by the master pubkey of the topic's owner.
+///
+/// A `std::sync::Mutex`: every access is one map operation without an await point.
+#[derive(Clone, Default)]
+pub(crate) struct FeedNeighbors(Arc<std::sync::Mutex<HashMap<String, Vec<EndpointId>>>>);
+
+impl FeedNeighbors {
+    /// A poisoned lock is used anyway: every writer replaces or removes a whole entry.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<EndpointId>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, pubkey: &str) -> Vec<EndpointId> {
+        self.lock().get(pubkey).cloned().unwrap_or_default()
+    }
+
+    /// Store `neighbors` for `pubkey`; an empty list removes the entry.
+    pub(crate) fn set(&self, pubkey: &str, neighbors: Vec<EndpointId>) {
+        let mut map = self.lock();
+        if neighbors.is_empty() {
+            map.remove(pubkey);
+        } else {
+            map.insert(pubkey.to_string(), neighbors);
+        }
+    }
+
+    pub(crate) fn remove(&self, pubkey: &str) {
+        self.lock().remove(pubkey);
     }
 }
 

@@ -100,6 +100,7 @@ impl super::GossipService {
         let my_id = self.identity.read().await.master_pubkey.clone();
         let app_handle = self.app_handle.clone();
         let reconnect_tx = self.reconnect_tx.clone();
+        let feed_neighbors = self.feed_neighbors.clone();
 
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
@@ -122,6 +123,7 @@ impl super::GossipService {
                             .await;
                         }
                         Ok(Some(Event::NeighborUp(_))) => {
+                            feed_neighbors.set(&pk, receiver.neighbors().collect());
                             log::info!(
                                 "[gossip-rx] neighbor up for {} ({} neighbors)",
                                 short_id(&pk),
@@ -129,6 +131,7 @@ impl super::GossipService {
                             );
                         }
                         Ok(Some(Event::NeighborDown(_))) => {
+                            feed_neighbors.set(&pk, receiver.neighbors().collect());
                             log::info!(
                                 "[gossip-rx] neighbor down for {} ({} neighbors)",
                                 short_id(&pk),
@@ -143,6 +146,7 @@ impl super::GossipService {
                                 "[gossip-rx] receiver for {} lagged, queueing a sync",
                                 short_id(&pk)
                             );
+                            feed_neighbors.set(&pk, receiver.neighbors().collect());
                             queue_sync(&app_handle, &pk);
                             rejoin(&storage, &sender, &pk).await;
                         }
@@ -164,6 +168,7 @@ impl super::GossipService {
                     }
                 }
             }
+            feed_neighbors.remove(&pk);
             log::warn!(
                 "[gossip-rx] stream for {} ended, requesting reconnect",
                 short_id(&pk)
@@ -181,6 +186,7 @@ impl super::GossipService {
             log::info!("[gossip] unsubscribed from {}", short_id(pubkey));
             handle.abort();
         }
+        self.feed_neighbors.remove(pubkey);
     }
 
     pub async fn get_subscription_count(&self) -> usize {

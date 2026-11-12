@@ -73,7 +73,8 @@ impl Storage {
         // The version comparison is part of the first statement, a write, so no other
         // writer can store an announcement between the comparison and the update. The
         // WHERE clause is `announcement_replaces` with ?5 = now + MAX_TIMESTAMP_DRIFT_MS:
-        // a version above ?5 is ahead of the clock.
+        // a version above ?5 is ahead of the clock. Signatures are hex strings, compared
+        // bytewise as in Rust.
         let now = now_millis();
         let stored = sqlx::query(
             "INSERT INTO peer_device_announcements
@@ -85,7 +86,11 @@ impl Storage {
                 cached_at = excluded.cached_at
              WHERE (excluded.version <= ?5 AND peer_device_announcements.version > ?5)
                 OR ((excluded.version <= ?5) = (peer_device_announcements.version <= ?5)
-                    AND excluded.version > peer_device_announcements.version)",
+                    AND (excluded.version > peer_device_announcements.version
+                         OR (excluded.version = peer_device_announcements.version
+                             AND json_extract(excluded.announcement_json, '$.signature')
+                                 > json_extract(peer_device_announcements.announcement_json,
+                                                '$.signature'))))",
         )
         .bind(master)
         .bind(&json)

@@ -28,8 +28,11 @@ fn reject(reason: &'static str) -> AcceptError {
 /// Responder side of the sync protocol, dispatched from `PeerHandler::accept`.
 ///
 /// The `PeerRequest::Sync` request has been read; `send` is the response side of the
-/// first bi-stream. Serves only the local user's own content, and only to a requester
-/// that the local visibility allows.
+/// first bi-stream. Serves the local user's own content to a requester that the local
+/// visibility allows. As a mirror, serves the stored posts, post deletions and profile of
+/// another author under the conditions of `authorize_mirror_requester`; a mirror sends
+/// no interactions (its summary repeats the requester's interaction count), no device
+/// list and no stage announcement.
 pub async fn handle_sync(
     storage: &Storage,
     identity: &SharedIdentity,
@@ -44,16 +47,20 @@ pub async fn handle_sync(
         (id.master_pubkey.clone(), id.master_key.clone())
     };
 
-    // Posts of other authors stored on this node are never served.
-    if req.author != my_pubkey {
-        log::warn!(
-            "[sync-server] rejecting request for another author from {}",
-            short_id(remote_str)
-        );
-        return Err(reject("author is not served by this node"));
+    let author = req.author.as_str();
+    let mirror = author != my_pubkey;
+    if mirror {
+        authorize_mirror_requester(
+            storage,
+            &my_pubkey,
+            author,
+            remote_str,
+            req.announcement.as_ref(),
+        )
+        .await?;
+    } else {
+        authorize_requester(storage, &my_pubkey, remote_str, req.announcement.as_ref()).await?;
     }
-
-    authorize_requester(storage, &my_pubkey, remote_str, req.announcement.as_ref()).await?;
 
     let map_err = |e: AppError| AcceptError::from_err(e);
 
@@ -62,26 +69,31 @@ pub async fn handle_sync(
     let lower = req.since.checked_sub(1);
     let after = |newest: u64| lower.map_or(newest, |lower| newest.max(lower));
     let mut id_timestamps = storage
-        .get_post_ids_with_timestamps(&my_pubkey)
+        .get_post_ids_with_timestamps(author)
         .await
         .map_err(map_err)?;
     id_timestamps.retain(|(_, timestamp)| *timestamp >= req.since);
     let server_post_count = id_timestamps.len() as u64;
-    let server_interaction_count = match lower {
-        None => storage.count_interactions_by_author(&my_pubkey).await,
-        Some(lower) => storage.count_interactions_after(&my_pubkey, lower).await,
-    }
-    .map_err(map_err)?;
+    let (server_interaction_count, interactions_after_count) = if mirror {
+        (req.interaction_count, 0)
+    } else {
+        let count = match lower {
+            None => storage.count_interactions_by_author(author).await,
+            Some(lower) => storage.count_interactions_after(author, lower).await,
+        }
+        .map_err(map_err)?;
+        let after_count = storage
+            .count_interactions_after(author, after(req.newest_interaction_timestamp))
+            .await
+            .map_err(map_err)?;
+        (count, after_count)
+    };
     let server_tombstone_count = storage
-        .count_post_tombstones(&my_pubkey)
+        .count_post_tombstones(author)
         .await
         .map_err(map_err)?;
     let posts_after_count = storage
-        .count_posts_after(&my_pubkey, after(req.newest_timestamp))
-        .await
-        .map_err(map_err)?;
-    let interactions_after_count = storage
-        .count_interactions_after(&my_pubkey, after(req.newest_interaction_timestamp))
+        .count_posts_after(author, after(req.newest_timestamp))
         .await
         .map_err(map_err)?;
 
@@ -92,17 +104,29 @@ pub async fn handle_sync(
         server_tombstone_count,
     );
 
-    let own_identity = crate::announcement::build_own_identity_response(storage, identity)
-        .await
-        .map_err(map_err)?;
-    let active_stage = stage_handle
-        .get_active_announcement()
-        .await
-        .and_then(|stage| sign_own_stage(stage, &my_pubkey, &master_key));
+    let (profile, announcement, active_stage) = if mirror {
+        let profile = storage.get_profile(author).await.map_err(map_err)?;
+        (profile, None, None)
+    } else {
+        let own_identity = crate::announcement::build_own_identity_response(storage, identity)
+            .await
+            .map_err(map_err)?;
+        let active_stage = stage_handle
+            .get_active_announcement()
+            .await
+            .and_then(|stage| sign_own_stage(stage, &my_pubkey, &master_key));
+        (
+            own_identity.profile,
+            Some(own_identity.announcement),
+            active_stage,
+        )
+    };
 
     log::info!(
-        "[sync-server] requester={}, client=({}/{}/{}), server=({server_post_count}/{server_interaction_count}/{server_tombstone_count}), mode={mode:?}",
+        "[sync-server] requester={}, author={}{}, client=({}/{}/{}), server=({server_post_count}/{server_interaction_count}/{server_tombstone_count}), mode={mode:?}",
         short_id(remote_str),
+        short_id(author),
+        if mirror { " (mirror)" } else { "" },
         req.post_count,
         req.interaction_count,
         req.tombstone_count,
@@ -114,9 +138,9 @@ pub async fn handle_sync(
         posts_after_count,
         interactions_after_count,
         mode,
-        profile: own_identity.profile,
+        profile,
         active_stage,
-        announcement: Some(own_identity.announcement),
+        announcement,
         server_tombstone_count,
     };
     let mut summary_bytes = serde_json::to_vec(&summary).map_err(AcceptError::from_err)?;
@@ -154,7 +178,7 @@ pub async fn handle_sync(
             let wanted: std::collections::HashSet<&str> =
                 id_timestamps.iter().map(|(id, _)| id.as_str()).collect();
             let mut missing = storage
-                .get_missing_post_ids(&my_pubkey, &known_ids)
+                .get_missing_post_ids(author, &known_ids)
                 .await
                 .map_err(map_err)?;
             missing.retain(|id| wanted.contains(id.as_str()));
@@ -171,7 +195,7 @@ pub async fn handle_sync(
     // 1. Tombstones, only if the counts differ.
     if req.tombstone_count != server_tombstone_count {
         let tombstones = storage
-            .get_post_tombstones(&my_pubkey, MAX_SYNC_TOMBSTONES)
+            .get_post_tombstones(author, MAX_SYNC_TOMBSTONES)
             .await
             .map_err(map_err)?;
         for batch in tombstones.chunks(SYNC_TOMBSTONE_BATCH) {
@@ -185,7 +209,7 @@ pub async fn handle_sync(
     let mut posts_sent = 0usize;
     for id_batch in post_ids_to_send.chunks(BATCH_SIZE) {
         let posts = storage
-            .get_posts_by_ids(&my_pubkey, id_batch)
+            .get_posts_by_ids(author, id_batch)
             .await
             .map_err(map_err)?;
         posts_sent += posts.len();
@@ -195,7 +219,8 @@ pub async fn handle_sync(
     }
 
     // 3. Interactions, only if the counts differ: those after the requester's newest
-    // timestamp if that accounts for the whole difference, otherwise all.
+    // timestamp if that accounts for the whole difference, otherwise all. A mirror
+    // reports the requester's count, so it sends none.
     if req.interaction_count != server_interaction_count {
         let only_newer = proscenium_types::sends_only_newer_interactions(
             server_interaction_count,
@@ -207,18 +232,18 @@ pub async fn handle_sync(
             let batch = match (only_newer, lower) {
                 (false, None) => {
                     storage
-                        .get_interactions_paged(&my_pubkey, BATCH_SIZE, offset)
+                        .get_interactions_paged(author, BATCH_SIZE, offset)
                         .await
                 }
                 (false, Some(lower)) => {
                     storage
-                        .get_interactions_after(&my_pubkey, lower, BATCH_SIZE, offset)
+                        .get_interactions_after(author, lower, BATCH_SIZE, offset)
                         .await
                 }
                 (true, _) => {
                     storage
                         .get_interactions_after(
-                            &my_pubkey,
+                            author,
                             after(req.newest_interaction_timestamp),
                             BATCH_SIZE,
                             offset,
@@ -242,7 +267,8 @@ pub async fn handle_sync(
     data_send.finish().map_err(AcceptError::from_err)?;
 
     log::info!(
-        "[sync-server] sent {posts_sent} posts to {} (mode={mode:?})",
+        "[sync-server] sent {posts_sent} posts of {} to {} (mode={mode:?})",
+        short_id(author),
         short_id(remote_str),
     );
 
@@ -287,10 +313,9 @@ fn select_mode(
 /// Return an error unless the NodeId `remote_str` is another device of the local user or
 /// the local visibility allows it to sync.
 ///
-/// The requester is the master of `announcement` if that list verifies and lists
-/// `remote_str`, which QUIC authenticates; otherwise the master that `remote_str` is mapped
-/// to, if any. A blocked requester is rejected at any visibility. Then Public: anyone.
-/// Listed: approved followers. Private: approved followers that the local user follows.
+/// The requester is identified by `identify_unblocked_requester`, which rejects a blocked
+/// requester at any visibility. Then Public: anyone. Listed: approved followers.
+/// Private: approved followers that the local user follows.
 /// The list is cached only for an allowed requester, so unknown requesters do not add
 /// rows. A failed device, block, visibility or follower lookup rejects the request.
 async fn authorize_requester(
@@ -306,27 +331,8 @@ async fn authorize_requester(
     {
         return Ok(());
     }
-    let presented = announcement.filter(|a| {
-        a.master_pubkey != my_pubkey
-            && a.devices.iter().any(|d| d.node_id == remote_str)
-            && verify_linked_devices_announcement(a).is_ok()
-    });
-    let remote_pubkey = match presented {
-        Some(a) => Some(a.master_pubkey.clone()),
-        None => storage
-            .try_get_master_pubkey_for_transport(remote_str)
-            .await
-            .map_err(AcceptError::from_err)?,
-    };
-    if let Some(pubkey) = &remote_pubkey
-        && storage
-            .is_blocked(pubkey)
-            .await
-            .map_err(AcceptError::from_err)?
-    {
-        log::warn!("[sync-server] rejecting blocked user {}", short_id(pubkey));
-        return Err(reject("not authorized"));
-    }
+    let (remote_pubkey, presented) =
+        identify_unblocked_requester(storage, my_pubkey, remote_str, announcement).await?;
     let visibility = storage
         .get_visibility(my_pubkey)
         .await
@@ -361,6 +367,83 @@ async fn authorize_requester(
             short_id(&remote_pubkey)
         );
     }
+    Ok(())
+}
+
+/// The master pubkey of the requesting NodeId `remote_str`, if known, and the device
+/// list that identified it, if any. Returns an error if that master is blocked.
+///
+/// The requester is the master of `announcement` if that list verifies, is not the local
+/// user's and lists `remote_str`, which QUIC authenticates; otherwise the master that
+/// `remote_str` is mapped to, if any.
+async fn identify_unblocked_requester<'a>(
+    storage: &Storage,
+    my_pubkey: &str,
+    remote_str: &str,
+    announcement: Option<&'a LinkedDevicesAnnouncement>,
+) -> Result<(Option<String>, Option<&'a LinkedDevicesAnnouncement>), AcceptError> {
+    let presented = announcement.filter(|a| {
+        a.master_pubkey != my_pubkey
+            && a.devices.iter().any(|d| d.node_id == remote_str)
+            && verify_linked_devices_announcement(a).is_ok()
+    });
+    let remote_pubkey = match presented {
+        Some(a) => Some(a.master_pubkey.clone()),
+        None => storage
+            .try_get_master_pubkey_for_transport(remote_str)
+            .await
+            .map_err(AcceptError::from_err)?,
+    };
+    if let Some(pubkey) = &remote_pubkey
+        && storage
+            .is_blocked(pubkey)
+            .await
+            .map_err(AcceptError::from_err)?
+    {
+        log::warn!("[sync-server] rejecting blocked user {}", short_id(pubkey));
+        return Err(reject("not authorized"));
+    }
+    Ok((remote_pubkey, presented))
+}
+
+/// Return an error unless the local node serves, as a mirror, the content of `author`,
+/// another user, to the NodeId `remote_str`: the local user follows `author`, has not
+/// muted or blocked `author`, the stored profile of `author` is Public, and the requester
+/// is not blocked (see `identify_unblocked_requester`).
+///
+/// The author signs its posts, deletions and profile, so a requester verifies a mirror's
+/// response as it verifies the author's. Only followed authors are served: a request for
+/// another stored author would reveal which profiles the local user viewed. Every push of
+/// a non-Public author carries its profile (`GossipService::attempt_push`), so a mirror
+/// that holds non-Public posts also holds the non-Public profile and refuses.
+async fn authorize_mirror_requester(
+    storage: &Storage,
+    my_pubkey: &str,
+    author: &str,
+    remote_str: &str,
+    announcement: Option<&LinkedDevicesAnnouncement>,
+) -> Result<(), AcceptError> {
+    let map_err = AcceptError::from_err;
+    let public = storage
+        .get_profile(author)
+        .await
+        .map_err(map_err)?
+        .is_some_and(|p| p.visibility == Visibility::Public);
+    if !public
+        || !storage
+            .is_following(my_pubkey, author)
+            .await
+            .map_err(map_err)?
+        || storage.is_hidden(author).await.map_err(map_err)?
+    {
+        log::debug!(
+            "[sync-server] not a mirror of {} for {}",
+            short_id(author),
+            short_id(remote_str)
+        );
+        return Err(reject("author is not served by this node"));
+    }
+    identify_unblocked_requester(storage, my_pubkey, remote_str, announcement).await?;
     Ok(())
 }
 
@@ -607,6 +690,75 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn mirror_serves_only_a_followed_unhidden_public_author_to_unblocked_requesters() {
+        let storage = Storage::open_in_memory().await.unwrap();
+        let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let me = SecretKey::from_bytes(&[1u8; 32]).public().to_string();
+        let author_key = SecretKey::from_bytes(&[10u8; 32]);
+        let author = author_key.public().to_string();
+        let requester = device_list(20, &[node_id(21)]);
+        let allowed = async |storage: &Storage| {
+            authorize_mirror_requester(storage, &me, &author, &node_id(21), Some(&requester))
+                .await
+                .is_ok()
+        };
+        let profile = |visibility: Visibility, updated_at: u64| {
+            let mut profile = Profile {
+                display_name: "author".to_string(),
+                bio: String::new(),
+                avatar_hash: None,
+                avatar_ticket: None,
+                visibility,
+                updated_at,
+                signature: String::new(),
+            };
+            proscenium_types::sign_profile(&mut profile, &author, &author_key);
+            profile
+        };
+        let follow = |state: &str, at: u64| proscenium_types::FollowEntry {
+            pubkey: author.clone(),
+            followed_at: 1,
+            state: state.to_string(),
+            last_changed_at: at,
+        };
+
+        // No stored profile, then Public but not followed.
+        assert!(!allowed(&storage).await);
+        storage
+            .save_profile(&author, &profile(Visibility::Public, 1))
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+
+        // Followed and Public: served.
+        storage
+            .merge_follows_lww(&me, &[follow("active", 1)])
+            .await
+            .unwrap();
+        assert!(allowed(&storage).await);
+
+        // Muted author, then blocked requester.
+        storage.mute_user(&author).await.unwrap();
+        assert!(!allowed(&storage).await);
+        storage.unmute_user(&author).await.unwrap();
+        assert!(allowed(&storage).await);
+        storage.block_user(&requester.master_pubkey).await.unwrap();
+        assert!(!allowed(&storage).await);
+        storage
+            .unblock_user(&requester.master_pubkey)
+            .await
+            .unwrap();
+        assert!(allowed(&storage).await);
+
+        // Listed author.
+        storage
+            .save_profile(&author, &profile(Visibility::Listed, 2))
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
     }
 
     fn rows(posts: &[(&str, u64)]) -> Vec<(String, u64)> {

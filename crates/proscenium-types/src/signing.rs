@@ -289,17 +289,20 @@ pub fn verify_linked_devices_announcement(
     )
 }
 
-/// True if a cache that holds a device list with version `stored` replaces it with a list
-/// of the same identity with version `new`, at local time `now`.
+/// True if a cache that holds a device list with `(version, signature)` `stored` replaces
+/// it with a list of the same identity with `(version, signature)` `new`, at local time
+/// `now`.
 ///
 /// A version more than `MAX_TIMESTAMP_DRIFT_MS` after `now` is ahead of the clock. A list
 /// that is not ahead replaces one that is; a list that is ahead never replaces one that is
-/// not; otherwise the higher version wins. A list signed far in the future therefore never
-/// displaces a current list, however often it is delivered, and a list from a device with
-/// a fast clock is stored when no current list is.
-pub fn announcement_replaces(new: u64, stored: u64, now: u64) -> bool {
+/// not; otherwise the higher version wins, and between equal versions the greater
+/// signature string. A list signed far in the future therefore never displaces a current
+/// list, however often it is delivered, and a list from a device with a fast clock is
+/// stored when no current list is. Two devices of an identity that sign different lists
+/// with the same version leave every cache with the same list, whatever the arrival order.
+pub fn announcement_replaces(new: (u64, &str), stored: (u64, &str), now: u64) -> bool {
     let limit = now.saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS);
-    match (new > limit, stored > limit) {
+    match (new.0 > limit, stored.0 > limit) {
         (false, true) => true,
         (true, false) => false,
         _ => new > stored,
@@ -504,20 +507,35 @@ mod tests {
         let now = 1_000_000_000;
         let drift = crate::validation::MAX_TIMESTAMP_DRIFT_MS;
         let ahead = now + drift + 1;
+        let r = |new: u64, stored: u64| announcement_replaces((new, "s"), (stored, "s"), now);
         // Current lists: the higher version wins.
-        assert!(announcement_replaces(now, now - 1, now));
-        assert!(!announcement_replaces(now - 1, now, now));
-        assert!(!announcement_replaces(now, now, now));
+        assert!(r(now, now - 1));
+        assert!(!r(now - 1, now));
+        assert!(!r(now, now));
         // A list ahead of the clock does not replace a current one, at any version.
-        assert!(!announcement_replaces(ahead, now, now));
-        assert!(!announcement_replaces(u64::MAX, now - 1, now));
+        assert!(!r(ahead, now));
+        assert!(!r(u64::MAX, now - 1));
         // A current list replaces one ahead of the clock, even with a lower version.
-        assert!(announcement_replaces(now - 1, ahead, now));
+        assert!(r(now - 1, ahead));
         // Among lists ahead of the clock the higher version wins.
-        assert!(announcement_replaces(ahead + 1, ahead, now));
-        assert!(!announcement_replaces(ahead, ahead + 1, now));
+        assert!(r(ahead + 1, ahead));
+        assert!(!r(ahead, ahead + 1));
         // A version within the drift limit counts as current.
-        assert!(announcement_replaces(now + drift, now, now));
+        assert!(r(now + drift, now));
+    }
+
+    #[test]
+    fn equal_versions_are_ordered_by_signature() {
+        let now = 1_000_000_000;
+        let ahead = now + crate::validation::MAX_TIMESTAMP_DRIFT_MS + 1;
+        for version in [now, ahead] {
+            assert!(announcement_replaces((version, "b"), (version, "a"), now));
+            assert!(!announcement_replaces((version, "a"), (version, "b"), now));
+            assert!(!announcement_replaces((version, "a"), (version, "a"), now));
+        }
+        // The signature does not override the version or the clock tier.
+        assert!(!announcement_replaces((now - 1, "z"), (now, "a"), now));
+        assert!(!announcement_replaces((ahead, "z"), (now, "a"), now));
     }
 
     #[test]

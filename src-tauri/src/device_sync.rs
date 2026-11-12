@@ -483,10 +483,11 @@ impl DeviceSync<'_> {
                             stats.rejected += 1;
                             continue;
                         }
-                        self.storage
-                            .record_interaction_tombstone(master_pubkey, &id, now_millis())
-                            .await?;
-                        if self.storage.delete_interaction(&id, master_pubkey).await? {
+                        if self
+                            .storage
+                            .apply_interaction_deletion(master_pubkey, &id, now_millis())
+                            .await?
+                        {
                             stats.interactions_removed += 1;
                         }
                     }
