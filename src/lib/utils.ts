@@ -8,6 +8,12 @@ export const MAX_BLOB_SIZE = 50 * 1024 * 1024;
 /** Attachment limit per post or message; equals `MAX_MEDIA_COUNT` in the types crate. */
 export const MAX_ATTACHMENTS = 10;
 
+/**
+ * Discovery server offered on the profile setup screen. The server's configured
+ * `public_url` must equal this URL: registration requests name it and are signed.
+ */
+export const DEFAULT_DISCOVERY_SERVER = "https://discovery.identia.app";
+
 const AVATAR_COLORS = [
   "#c24b3f",
   "#4f7fc0",

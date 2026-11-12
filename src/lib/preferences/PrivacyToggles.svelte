@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { onMount } from "svelte";
+  import ToggleSwitch from "#lib/ToggleSwitch.svelte";
 
   interface Toggle {
     label: string;
@@ -94,17 +95,12 @@
       <span class="toggle-label">{toggle.label}</span>
       <p class="toggle-desc">{toggle.description}</p>
     </div>
-    <button
-      class="toggle-switch"
-      class:active={enabled[toggle.setCommand]}
-      role="switch"
-      aria-checked={enabled[toggle.setCommand]}
-      aria-label={toggle.label}
-      onclick={() => flip(toggle)}
+    <ToggleSwitch
+      checked={enabled[toggle.setCommand]}
+      label={toggle.label}
       disabled={!loaded || saving[toggle.setCommand]}
-    >
-      <span class="toggle-knob"></span>
-    </button>
+      onchange={() => flip(toggle)}
+    />
   </div>
 {/snippet}
 
@@ -164,44 +160,6 @@
     font-size: var(--text-xs);
     margin: 0.25rem 0 0;
     line-height: 1.4;
-  }
-
-  .toggle-switch {
-    position: relative;
-    width: 44px;
-    height: 24px;
-    border-radius: 12px;
-    border: none;
-    background: var(--bg-elevated);
-    cursor: pointer;
-    flex-shrink: 0;
-    padding: 0;
-    transition: background 0.2s;
-    margin-top: 0.1rem;
-  }
-
-  .toggle-switch.active {
-    background: var(--accent);
-  }
-
-  .toggle-switch:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  .toggle-knob {
-    position: absolute;
-    top: 3px;
-    left: 3px;
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    background: var(--text-primary);
-    transition: transform 0.2s;
-  }
-
-  .toggle-switch.active .toggle-knob {
-    transform: translateX(20px);
   }
 
   .toggle-error {

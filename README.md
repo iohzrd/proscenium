@@ -182,7 +182,7 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 
 ## Discovery Server
 
-A self-hosted server binary (`server/`) that adds opt-in search, trending and a user directory. A user registers with a request signed by the master key; the server verifies the signature, the timestamp, and that the request names this server. The server then subscribes to the user's gossip topic, syncs the user's posts, and indexes them in SQLite with FTS5. It stores and serves content only for users whose registration and profile are both Public.
+A self-hosted server binary (`server/`) that adds opt-in search, trending and a user directory. A user registers with a request signed by the master key; the server verifies the signature, the timestamp, and that the request names this server. The server then subscribes to the user's gossip topic, syncs the user's posts, and indexes them in SQLite with FTS5. It stores and serves content only for users whose registration and profile are both Public. The profile setup screen offers to add and register with `https://discovery.identia.app`; the option starts switched on for Public and Listed profiles and is unavailable for Private ones, which servers refuse.
 
 The server is an overlay. Users who never connect to a server lose nothing. Clients verify the signatures of posts a server returns and discard posts that do not verify.
 
@@ -203,6 +203,14 @@ A `config.toml` is required; unknown keys are errors. `[server] public_url` is m
 | `[trending]` | `recompute_interval_minutes`, `window_hours` |
 
 The server speaks plain HTTP/1. Terminate TLS in a reverse proxy and set `trust_forwarded_for = true` so the per-address rate limit sees client addresses.
+
+### Provisioning
+
+```bash
+PROVISION_HOST=root@host PUBLIC_HOSTNAME=discovery.example.org scripts/provision-server.sh
+```
+
+Prepares a fresh Debian or Ubuntu host once: installs Caddy from its package repository as the TLS reverse proxy (it obtains the certificate when the name resolves to the host), opens 80, 443 and UDP in ufw if ufw is active, creates the `proscenium` user, `/opt/proscenium` with a config whose `public_url` is `https://$PUBLIC_HOSTNAME` and whose server listens on `127.0.0.1:3000`, and the systemd unit, then installs and starts the server and checks that it answers. An existing config, binary or database is kept. Optional: `PROVISION_SSH_KEY`, `SERVER_NAME`, `SERVER_DESCRIPTION`, `DEPLOY_DIR`, `DEPLOY_SERVICE`, `SERVER_PORT`.
 
 ### Deploying
 

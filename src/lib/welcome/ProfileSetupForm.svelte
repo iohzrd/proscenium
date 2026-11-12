@@ -2,9 +2,10 @@
   import { goto } from "$app/navigation";
   import { invoke } from "@tauri-apps/api/core";
   import Avatar from "#lib/Avatar.svelte";
+  import ToggleSwitch from "#lib/ToggleSwitch.svelte";
   import VisibilityPicker from "#lib/profile/VisibilityPicker.svelte";
   import type { Visibility } from "#lib/types.ts";
-  import { uploadFiles } from "#lib/utils.ts";
+  import { DEFAULT_DISCOVERY_SERVER, uploadFiles } from "#lib/utils.ts";
 
   let {
     onback,
@@ -18,7 +19,23 @@
   let avatarHash = $state<string | null>(null);
   let avatarTicket = $state<string | null>(null);
   let saving = $state(false);
+  // True while the registration with the discovery server runs.
+  let registering = $state(false);
   let uploading = $state(false);
+
+  const serverHost = new URL(DEFAULT_DISCOVERY_SERVER).host;
+  // The user's switch position; null until the user changes it, so the option
+  // follows the chosen visibility.
+  let serverChoice = $state<boolean | null>(null);
+  // Servers refuse Private registrations: the option is off and disabled then.
+  let registerOnServer = $derived(
+    visibility !== "private" && (serverChoice ?? true),
+  );
+  const SERVER_HINTS: Record<Visibility, string> = {
+    public: `${serverHost} indexes your profile and posts for search, trending and its user directory.`,
+    listed: `${serverHost} lists your profile in its user directory. Your posts stay with approved followers.`,
+    private: "Servers do not list Private profiles.",
+  };
   let errorMessage = $state("");
   let fileInput = $state<HTMLInputElement>(null!);
 
@@ -43,6 +60,12 @@
     uploading = false;
   }
 
+  /**
+   * Save the profile, then add and register with the discovery server if the
+   * option is on. If the registration fails, the form stays open with the
+   * error: the profile is saved, and the user can try again or switch the
+   * option off.
+   */
   async function saveProfile() {
     if (!displayName.trim()) return;
     saving = true;
@@ -55,10 +78,28 @@
         avatarTicket,
         visibility,
       });
-      await goto("/");
     } catch (err) {
       errorMessage = `Failed to save profile: ${err}`;
+      saving = false;
+      return;
     }
+    if (registerOnServer) {
+      registering = true;
+      try {
+        await invoke("add_server", { url: DEFAULT_DISCOVERY_SERVER });
+        await invoke("register_with_server", {
+          url: DEFAULT_DISCOVERY_SERVER,
+          visibility,
+        });
+      } catch (err) {
+        errorMessage = `Your profile was saved, but registering with ${serverHost} failed: ${err}. Try again, or switch the option off to continue.`;
+        registering = false;
+        saving = false;
+        return;
+      }
+      registering = false;
+    }
+    await goto("/");
     saving = false;
   }
 </script>
@@ -118,6 +159,21 @@
     <VisibilityPicker bind:value={visibility} />
   </div>
 
+  <div class="server-option">
+    <div class="server-info">
+      <span class="server-label">List me on {serverHost}</span>
+      <p class="server-hint">
+        {SERVER_HINTS[visibility]} You can change this later on the Servers page.
+      </p>
+    </div>
+    <ToggleSwitch
+      checked={registerOnServer}
+      label="List me on {serverHost}"
+      disabled={visibility === "private" || saving}
+      onchange={(checked) => (serverChoice = checked)}
+    />
+  </div>
+
   {#if errorMessage}
     <p class="error" role="alert">{errorMessage}</p>
   {/if}
@@ -129,7 +185,11 @@
       onclick={saveProfile}
       disabled={!displayName.trim() || saving || uploading}
     >
-      {saving ? "Saving..." : "Get Started"}
+      {registering
+        ? `Registering with ${serverHost}...`
+        : saving
+          ? "Saving..."
+          : "Get Started"}
     </button>
   </div>
 </div>
@@ -190,6 +250,31 @@
   .field textarea {
     resize: vertical;
     min-height: 60px;
+  }
+
+  .server-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    margin: 0.75rem 0 1rem;
+    text-align: left;
+  }
+
+  .server-info {
+    flex: 1;
+  }
+
+  .server-label {
+    font-weight: 600;
+    font-size: var(--text-sm);
+    color: var(--text-primary);
+  }
+
+  .server-hint {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    margin: 0.25rem 0 0;
+    line-height: 1.4;
   }
 
   .error {

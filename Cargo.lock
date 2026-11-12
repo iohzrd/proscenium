@@ -5280,7 +5280,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium"
-version = "0.2.44"
+version = "0.2.45"
 dependencies = [
  "aec3",
  "base64 0.23.1",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.44"
+version = "0.2.45"
 dependencies = [
  "hex",
  "iroh",
