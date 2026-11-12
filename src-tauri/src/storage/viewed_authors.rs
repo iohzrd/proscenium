@@ -38,6 +38,14 @@ impl Storage {
         Ok(dropped)
     }
 
+    /// The recorded authors.
+    pub async fn get_viewed_authors(&self) -> Result<Vec<String>, AppError> {
+        let authors = sqlx::query_scalar("SELECT pubkey FROM viewed_authors")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(authors)
+    }
+
     /// Delete the records of the authors synced before `cutoff` and return them; the
     /// caller deletes their content.
     pub async fn take_viewed_authors_before(&self, cutoff: u64) -> Result<Vec<String>, AppError> {

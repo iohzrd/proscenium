@@ -32,8 +32,9 @@ pub struct RemoteFollowersResult {
 pub enum FollowOutcome {
     /// The follow is stored.
     Followed,
-    /// The user's profile is not Public and the follow request awaits approval. Nothing
-    /// is stored; following again after approval stores the follow.
+    /// The user's profile is not Public and the follow request awaits approval. The
+    /// follow is stored: content arrives once the request is approved, and a Private
+    /// user approves the request once they follow the local user.
     Pending,
     /// The user denied the follow request.
     Denied,
@@ -44,8 +45,10 @@ pub enum FollowOutcome {
 /// The node's identity is verified before anything is stored. If `expected_pubkey` is
 /// given, the command fails unless the node's master pubkey equals it. Unless the node
 /// returned a Public profile (a node returns a Listed or Private profile only to approved
-/// followers), a follow request is sent to the node first and the follow is stored only
-/// if the request is approved; a Public node approves at once.
+/// followers), the follow is stored and then a follow request is sent; a denial or a
+/// failed request removes the follow again. The follow is stored before the request
+/// because a Private user that approves it sends a follow request back at once, which
+/// the local node approves only if it already follows that user.
 #[tauri::command]
 pub async fn follow_user(
     state: State<'_, Arc<AppState>>,
@@ -93,6 +96,17 @@ pub async fn follow_user(
     );
     let node_ids = identity.transport_node_ids();
 
+    log::info!("[follow] following {}...", short_id(&pubkey));
+    let entry = SocialGraphEntry {
+        pubkey: pubkey.clone(),
+        followed_at: now_millis(),
+        first_seen: 0,
+        last_seen: 0,
+        is_online: false,
+    };
+    state.storage.follow(&my_id, &entry).await?;
+
+    let mut outcome = FollowOutcome::Followed;
     if identity
         .profile
         .as_ref()
@@ -106,24 +120,21 @@ pub async fn follow_user(
             target,
             &pubkey,
         )
-        .await?;
+        .await;
         match response {
-            FollowResponse::Approved(_) => {}
-            FollowResponse::Pending => return Ok(FollowOutcome::Pending),
-            FollowResponse::Denied => return Ok(FollowOutcome::Denied),
+            Ok(FollowResponse::Approved(_)) => {}
+            Ok(FollowResponse::Pending) => outcome = FollowOutcome::Pending,
+            Ok(FollowResponse::Denied) => {
+                state.storage.unfollow(&my_id, &pubkey).await?;
+                return Ok(FollowOutcome::Denied);
+            }
+            Err(e) => {
+                state.storage.unfollow(&my_id, &pubkey).await?;
+                return Err(e);
+            }
         }
     }
 
-    log::info!("[follow] following {}...", short_id(&pubkey));
-
-    let entry = SocialGraphEntry {
-        pubkey: pubkey.clone(),
-        followed_at: now_millis(),
-        first_seen: 0,
-        last_seen: 0,
-        is_online: false,
-    };
-    state.storage.follow(&my_id, &entry).await?;
     state.gossip().follow_user(pubkey.clone(), node_ids).await?;
     log::info!("[follow] subscribed to gossip for {}", short_id(&pubkey));
 
@@ -137,7 +148,7 @@ pub async fn follow_user(
         log::debug!("[follow] sync queue full, {} not queued", short_id(&pubkey));
     }
 
-    Ok(FollowOutcome::Followed)
+    Ok(outcome)
 }
 
 /// Unfollow `pubkey`: mark the follow as removed, close the gossip subscription, and

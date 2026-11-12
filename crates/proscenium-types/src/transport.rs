@@ -11,8 +11,12 @@ pub const STREAM_RECEIVE_WINDOW: u32 = 1024 * 1024;
 /// application open at most two per connection; iroh-blobs opens one per request.
 pub const MAX_BIDI_STREAMS: u32 = 32;
 /// Unidirectional streams a peer may have open on one connection. iroh-gossip opens one
-/// per topic that the two endpoints share; Stage forwards one per speaker.
-pub const MAX_UNI_STREAMS: u32 = 128;
+/// per topic that the two endpoints share and closes the connection when an open waits
+/// 15 s at this limit, so two nodes that share more topics than this, such as a client
+/// following many registered users and the discovery server, would reconnect
+/// repeatedly. Stage forwards one per speaker. Memory stays bounded by
+/// `CONNECTION_RECEIVE_WINDOW`.
+pub const MAX_UNI_STREAMS: u32 = 1024;
 
 /// iroh's default transport configuration with the limits above.
 pub fn quic_transport_config() -> QuicTransportConfig {

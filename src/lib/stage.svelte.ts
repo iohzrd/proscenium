@@ -1,3 +1,4 @@
+import { ensureMicrophonePermission } from "#lib/microphone.ts";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { SvelteMap } from "svelte/reactivity";
@@ -34,11 +35,14 @@ export const stageStore = $state<{
   reactions: StageReaction[];
   /** Reason the last stage was left without a local request; empty otherwise. */
   notice: string;
+  /** Problem of the current stage session shown in the room; cleared on leave. */
+  warning: string;
 }>({
   stage: null,
   chat: [],
   reactions: [],
   notice: "",
+  warning: "",
 });
 
 let nextItemId = 0;
@@ -69,6 +73,7 @@ function clearStage() {
   stageStore.stage = null;
   stageStore.chat = [];
   stageStore.reactions = [];
+  stageStore.warning = "";
 }
 
 function addReaction(emoji: string) {
@@ -170,6 +175,9 @@ export function applyStageEvent(ev: StageEvent) {
     case "auth_failed":
       console.warn("Stage auth failed:", ev.reason, "from", ev.source);
       break;
+    case "microphone_unavailable":
+      stageStore.warning = `Your microphone could not be opened, so the stage does not hear you: ${ev.reason}`;
+      break;
   }
 }
 
@@ -185,6 +193,8 @@ export async function refreshStage(): Promise<void> {
 
 /** Create a stage and load its state. Returns the invite ticket. */
 export async function createStage(title: string): Promise<string> {
+  // The host speaks from the start.
+  await ensureMicrophonePermission();
   const ticket = await invoke<string>("create_stage", { title });
   stageStore.notice = "";
   await refreshStage();
@@ -237,6 +247,8 @@ export async function toggleStageHand(): Promise<void> {
   const stage = stageStore.stage;
   if (!stage) return;
   const raise = !stage.hand_raised;
+  // A raised hand asks to speak: capture starts on promotion.
+  if (raise) await ensureMicrophonePermission();
   await invoke(raise ? "stage_raise_hand" : "stage_lower_hand");
   if (stageStore.stage) stageStore.stage.hand_raised = raise;
 }

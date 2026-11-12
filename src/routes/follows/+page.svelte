@@ -180,6 +180,8 @@
       });
       if (outcome !== "followed") {
         toast.show(...followRequestNotice(outcome));
+        // A pending request stores the follow too.
+        if (outcome === "pending") await loadFollows();
         return outcome === "pending";
       }
       await loadFollows();

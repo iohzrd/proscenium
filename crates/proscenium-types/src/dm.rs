@@ -38,6 +38,9 @@ pub enum DmAck {
 pub enum DmPayload {
     Message(DirectMessage),
     Typing,
+    /// The reader read every message the recipient of this receipt sent in their
+    /// conversation up to and including `message_id`, in the recipient's
+    /// `(timestamp, id)` order. One receipt covers all messages read at once.
     Read {
         message_id: String,
     },

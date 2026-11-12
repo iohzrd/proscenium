@@ -265,7 +265,8 @@ export type StageEvent =
   | { type: "chat"; pubkey: string; text: string }
   | { type: "ended"; stage_id: string }
   | { type: "kicked" }
-  | { type: "auth_failed"; source: string; reason: string };
+  | { type: "auth_failed"; source: string; reason: string }
+  | { type: "microphone_unavailable"; reason: string };
 
 export interface StageAnnouncement {
   stage_id: string;

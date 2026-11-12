@@ -108,20 +108,27 @@ impl PeerHandler {
                     .is_following(&my_pubkey, requester)
                     .await
                     .map_err(AcceptError::from_err)?;
-                let approval = if follows_requester {
-                    self.storage
-                        .approve_follower_directly(
-                            &my_pubkey,
-                            requester,
-                            req.timestamp,
-                            now,
-                            expires_at,
-                        )
-                        .await
-                        .map_err(AcceptError::from_err)?
-                } else {
-                    DirectApproval::Denied
-                };
+                if !follows_requester {
+                    // Not a decision of the user: the request is approved once the local
+                    // user follows the requester, whose follow is already stored. Nothing
+                    // is recorded, so that later request is not refused.
+                    log::info!(
+                        "[follow-req] {} is not followed; the request is approved when the local user follows it",
+                        short_id(requester)
+                    );
+                    return Self::respond(send, conn, &FollowResponse::Pending).await;
+                }
+                let approval = self
+                    .storage
+                    .approve_follower_directly(
+                        &my_pubkey,
+                        requester,
+                        req.timestamp,
+                        now,
+                        expires_at,
+                    )
+                    .await
+                    .map_err(AcceptError::from_err)?;
                 reciprocate = approval == DirectApproval::New;
                 approval != DirectApproval::Denied
             }

@@ -9,6 +9,10 @@ use std::collections::HashSet;
 
 use super::Storage;
 
+/// Time within which a device that received a link bundle from this device is stored at
+/// its first device sync.
+const PENDING_LINK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// `preferences` key of the highest version of a device list of the local identity.
 const OWN_ANNOUNCEMENT_VERSION_KEY: &str = "own_announcement_version";
 
@@ -248,6 +252,39 @@ impl Storage {
             .await?
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0))
+    }
+
+    /// Record that this device sent a link bundle to the new device `node_id` at `now`.
+    pub async fn record_pending_link(&self, node_id: &str, now: u64) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT INTO pending_link_devices (node_id, linked_at) VALUES (?1, ?2)
+             ON CONFLICT(node_id) DO UPDATE SET linked_at = excluded.linked_at",
+        )
+        .bind(node_id)
+        .bind(i64::try_from(now).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete the record of `record_pending_link` for `node_id` and return true if it
+    /// existed and is at most `PENDING_LINK_TTL_MS` old at `now`. Older records are
+    /// deleted too.
+    pub async fn take_pending_link(&self, node_id: &str, now: u64) -> Result<bool, AppError> {
+        let cutoff = i64::try_from(now.saturating_sub(PENDING_LINK_TTL_MS)).unwrap_or(0);
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query("DELETE FROM pending_link_devices WHERE linked_at < ?1")
+            .bind(cutoff)
+            .execute(&mut *tx)
+            .await?;
+        let taken = sqlx::query("DELETE FROM pending_link_devices WHERE node_id = ?1")
+            .bind(node_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(taken)
     }
 
     /// The row of `node_id` if it is stored as another device of the local user.

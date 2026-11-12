@@ -1563,9 +1563,29 @@ async fn messaging_mark_delivered_and_read() {
     assert!(messages[0].delivered);
     assert!(!messages[0].read);
 
-    assert!(s.mark_dm_read_by_id(&conv_id, "me", "m1").await.unwrap());
+    assert!(s.mark_dm_read_up_to(&conv_id, "me", "m1").await.unwrap());
     let messages = s.get_dm_messages(&conv_id, 50, None, None).await.unwrap();
     assert!(messages[0].read);
+}
+
+#[tokio::test]
+async fn read_receipt_covers_every_earlier_own_message() {
+    let s = test_storage().await;
+    let conv_id = Storage::conversation_id("me", "bob");
+    send_message(&s, "m1", "bob", "one", 1000, 0).await;
+    send_message(&s, "m2", "bob", "two", 2000, 0).await;
+    send_message(&s, "m3", "bob", "three", 3000, 0).await;
+    assert!(receive_message(&s, "b1", "bob", "from bob", 1500).await);
+
+    assert!(s.mark_dm_read_up_to(&conv_id, "me", "m2").await.unwrap());
+    let messages = s.get_dm_messages(&conv_id, 50, None, None).await.unwrap();
+    let read = |id: &str| messages.iter().find(|m| m.id == id).unwrap().read;
+    assert!(read("m1") && read("m2"));
+    assert!(!read("m3"));
+    // A message of the peer is not changed by a receipt for the local user's messages.
+    assert!(!read("b1"));
+    // A receipt naming a message of another sender changes nothing.
+    assert!(!s.mark_dm_read_up_to(&conv_id, "me", "b1").await.unwrap());
 }
 
 #[tokio::test]
@@ -1817,7 +1837,7 @@ async fn messaging_receipts_are_scoped_to_conversation_and_sender() {
             .unwrap()
     );
     assert!(
-        !s.mark_dm_read_by_id(&bob_conv, "me", "to_carol")
+        !s.mark_dm_read_up_to(&bob_conv, "me", "to_carol")
             .await
             .unwrap()
     );
@@ -1828,7 +1848,7 @@ async fn messaging_receipts_are_scoped_to_conversation_and_sender() {
             .unwrap()
     );
     assert!(
-        !s.mark_dm_read_by_id(&bob_conv, "me", "from_bob")
+        !s.mark_dm_read_up_to(&bob_conv, "me", "from_bob")
             .await
             .unwrap()
     );
@@ -1856,7 +1876,7 @@ async fn messaging_receipts_are_scoped_to_conversation_and_sender() {
             .unwrap()
     );
     assert!(
-        s.mark_dm_read_by_id(&bob_conv, "me", "to_bob")
+        s.mark_dm_read_up_to(&bob_conv, "me", "to_bob")
             .await
             .unwrap()
     );
@@ -3627,8 +3647,10 @@ async fn messages_from_strangers_are_bounded() {
         s.receive_dm_message("bob", &extra, "hi").await.unwrap(),
         ReceivedDm::Refused
     );
+    assert!(s.is_stranger("me", "bob").await.unwrap());
     // After a reply of the local user, the peer is no stranger.
     send_message(&s, &id(1_000), "bob", "hello", 3_000, 0).await;
+    assert!(!s.is_stranger("me", "bob").await.unwrap());
     assert!(receive_message(&s, &id(1_001), "bob", "hi", 4_000).await);
 
     // A followed peer is no stranger either.
@@ -3644,6 +3666,7 @@ async fn messages_from_strangers_are_bounded() {
     )
     .await
     .unwrap();
+    assert!(!s.is_stranger("me", "dave").await.unwrap());
     assert!(receive_message(&s, &id(2_000), "dave", "hi", 1).await);
 
     // Stranger conversations beyond the limit evict the one with the oldest message.

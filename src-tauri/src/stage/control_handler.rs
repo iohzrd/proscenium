@@ -18,6 +18,14 @@ impl ActiveStage {
         if signed.stage_id != self.stage_id {
             return Outcome::Continue;
         }
+        // Gossip does not deliver this node's own broadcasts back to it, and every
+        // action of the local user is applied when it is sent. A message signed by the
+        // local identity is a replay by another node, for example of an earlier Promote
+        // or SelfMuteToggle, and is discarded.
+        if signed.sender_pubkey == self.my_pubkey {
+            log::debug!("[stage-ctrl] discarding a message signed by the local identity");
+            return Outcome::Continue;
+        }
 
         let actor = match (&signed.control, presence) {
             (StageControl::Presence { .. }, Some(presence)) => {
@@ -26,6 +34,7 @@ impl ActiveStage {
                 let protected =
                     |pubkey: &str| is_protected(pubkey, my_pubkey, roles, serving, host);
                 if roles.is_banned(&presence.master_pubkey)
+                    || self.kicked.is_kicked(&presence.master_pubkey, now_millis())
                     || !self.senders.admit(&presence.master_pubkey, protected)
                 {
                     return Outcome::Continue;

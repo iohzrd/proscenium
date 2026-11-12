@@ -328,6 +328,8 @@ impl IngestionManager {
                         );
                         self.request_event_sync(pubkey, &mut last_sync_request);
                     }
+                    // Events a later iroh-gossip release adds.
+                    Ok(Some(_)) => {}
                     Ok(None) => return,
                     Err(e) => {
                         tracing::error!("[ingestion] gossip error for {}: {e}", short_id(pubkey));

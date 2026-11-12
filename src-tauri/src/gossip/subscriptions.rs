@@ -146,6 +146,8 @@ impl super::GossipService {
                             queue_sync(&app_handle, &pk);
                             rejoin(&storage, &sender, &pk).await;
                         }
+                        // Events a later iroh-gossip release adds.
+                        Ok(Some(_)) => {}
                         Ok(None) => {
                             log::warn!("[gossip-rx] stream ended for {}", short_id(&pk));
                             break;

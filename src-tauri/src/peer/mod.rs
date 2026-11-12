@@ -272,12 +272,23 @@ impl ProtocolHandler for PeerHandler {
             .try_get_master_pubkey_for_transport(&remote_str)
             .await
             .map_err(AcceptError::from_err)?;
-        let known = mapped.is_some()
-            || self
+        // Known: another device of the local user, or the device of a user the local user
+        // follows or approved as follower, both decisions of the local user. A mapping
+        // alone is not enough: one stored message or follow request of a generated
+        // identity creates one.
+        let my_pubkey = self.identity.read().await.master_pubkey.clone();
+        let known = match &mapped {
+            Some(master) => self
                 .storage
-                .is_other_device(&remote_str)
+                .is_trusted_peer(&my_pubkey, master)
                 .await
-                .map_err(AcceptError::from_err)?;
+                .map_err(AcceptError::from_err)?,
+            None => false,
+        } || self
+            .storage
+            .is_other_device(&remote_str)
+            .await
+            .map_err(AcceptError::from_err)?;
 
         // Bound the handlers that run at the same time, from known and from unknown
         // NodeIds, and per remote NodeId. Both are released when this function returns.
@@ -336,8 +347,6 @@ impl ProtocolHandler for PeerHandler {
             },
             short_id(&remote_str)
         );
-
-        let my_pubkey = self.identity.read().await.master_pubkey.clone();
 
         match req {
             PeerRequest::Sync(sync_req) => {

@@ -403,6 +403,9 @@ pub enum StageEvent {
     /// Stream authentication failed (relay may be tampering with audio).
     /// `source` is the transport NodeId of the node we were receiving from.
     AuthFailed { source: String, reason: String },
+    /// The local user is a speaker but the microphone could not be opened. The speaker
+    /// connection stays open and plays the other speakers; nothing is sent.
+    MicrophoneUnavailable { reason: String },
 }
 
 #[cfg(test)]

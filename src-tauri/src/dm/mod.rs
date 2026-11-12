@@ -21,10 +21,10 @@ use proscenium_types::{
     DM_ALPN, DirectMessage, DmEnvelope, MAX_ANNOUNCEMENT_JSON_LEN, is_valid_id, short_id,
     validate_media_list,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tokio::sync::{Notify, Semaphore, mpsc};
 
@@ -40,6 +40,13 @@ pub(crate) const MAX_DM_PAYLOAD_LEN: usize = 64 * 1024;
 /// `MAX_DM_PAYLOAD_LEN` bytes and a device list of at most `MAX_ANNOUNCEMENT_JSON_LEN`
 /// bytes. The other fields take under 1 KiB.
 const MAX_DM_FRAME_LEN: usize = MAX_DM_PAYLOAD_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
+
+/// New conversations with strangers (see `Storage::receive_dm_message`) accepted per
+/// `STRANGER_WINDOW`, over all senders. NodeIds and identities cost nothing to generate,
+/// so a per-sender limit does not stop one sender with many keys from replacing every
+/// stranger conversation; this limit makes that take hours.
+const MAX_NEW_STRANGER_CONVERSATIONS: usize = 20;
+const STRANGER_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// Incoming DM connections handled at the same time, in total and per remote NodeId.
 const DM_MAX_CONNECTIONS: usize = 64;
@@ -81,6 +88,8 @@ pub struct DmHandler {
     connection_limit: Arc<Semaphore>,
     /// Incoming connections currently handled per remote NodeId.
     connections_per_node: Arc<StdMutex<HashMap<EndpointId, usize>>>,
+    /// Times at which new stranger conversations were accepted within `STRANGER_WINDOW`.
+    stranger_admissions: Arc<StdMutex<VecDeque<Instant>>>,
 }
 
 impl std::fmt::Debug for DmHandler {
@@ -107,7 +116,17 @@ impl DmHandler {
             call_signal_tx,
             connection_limit: Arc::new(Semaphore::new(DM_MAX_CONNECTIONS)),
             connections_per_node: Arc::new(StdMutex::new(HashMap::new())),
+            stranger_admissions: Arc::new(StdMutex::new(VecDeque::new())),
         }
+    }
+
+    /// Count one new stranger conversation against `MAX_NEW_STRANGER_CONVERSATIONS`.
+    /// Returns false, and counts nothing, if the limit is reached.
+    pub(super) fn admit_new_stranger(&self) -> bool {
+        let Ok(mut admitted) = self.stranger_admissions.lock() else {
+            return false;
+        };
+        admit_in_window(&mut admitted, Instant::now())
     }
 
     /// Take the call signal receiver. Must be called once during setup
@@ -202,6 +221,17 @@ impl DmHandler {
     }
 }
 
+/// Drop the entries of `admitted` older than `STRANGER_WINDOW` at `now`, then record `now`
+/// and return true unless `MAX_NEW_STRANGER_CONVERSATIONS` entries remain.
+fn admit_in_window(admitted: &mut VecDeque<Instant>, now: Instant) -> bool {
+    admitted.retain(|at| now.saturating_duration_since(*at) < STRANGER_WINDOW);
+    if admitted.len() >= MAX_NEW_STRANGER_CONVERSATIONS {
+        return false;
+    }
+    admitted.push_back(now);
+    true
+}
+
 /// Check a `DirectMessage` against the limits both the sender and the receiver apply:
 /// id format, content length, attachment list, `reply_to` format.
 pub(crate) fn validate_direct_message(message: &DirectMessage) -> Result<(), String> {
@@ -281,6 +311,18 @@ mod tests {
             media: vec![],
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn new_stranger_conversations_are_limited_per_window() {
+        let mut admitted = VecDeque::new();
+        let start = Instant::now();
+        for _ in 0..MAX_NEW_STRANGER_CONVERSATIONS {
+            assert!(admit_in_window(&mut admitted, start));
+        }
+        assert!(!admit_in_window(&mut admitted, start));
+        // After the window the earlier admissions no longer count.
+        assert!(admit_in_window(&mut admitted, start + STRANGER_WINDOW));
     }
 
     #[test]

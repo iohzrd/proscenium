@@ -20,10 +20,10 @@
 //!   connection with `LINK_CLOSE_DECLINED`.
 //!
 //! The new device validates the bundle and closes the connection with `LINK_CLOSE_DONE`.
-//! The existing device does not store the new NodeId: the new device installs the
-//! identity after the connection closed and can still fail, so the existing device stores
-//! it when the new device first device-syncs with it, presenting a list signed by the
-//! master key that names it.
+//! The existing device does not store the new NodeId as a device: the new device installs
+//! the identity after the connection closed and can still fail. It records the NodeId as
+//! pending, and stores it when the new device first device-syncs with it, presenting a
+//! list signed by the master key that names it.
 
 use crate::announcement::{build_own_announcement, local_device_name, verify_lists_device};
 use crate::error::AppError;
@@ -422,7 +422,13 @@ impl PeerHandler {
         // The QR code is no longer accepted; the devices page closes it on this event.
         let _ = self.app_handle.emit("device-link-progress", "confirming");
         let served = self
-            .confirm_and_send(send, conn, &link_code(&local_node, &new_node), device_name)
+            .confirm_and_send(
+                send,
+                conn,
+                &link_code(&local_node, &new_node),
+                &new_node_id,
+                device_name,
+            )
             .await;
         match &served {
             Ok(LinkServed::Linked) => {}
@@ -436,13 +442,15 @@ impl PeerHandler {
         served
     }
 
-    /// Ask the user to compare `code` (`confirm_link`), send the bundle, and wait until
-    /// the new device closed the connection with `LINK_CLOSE_DONE`.
+    /// Ask the user to compare `code` (`confirm_link`), send the bundle, wait until the
+    /// new device closed the connection with `LINK_CLOSE_DONE`, and record `new_node_id`
+    /// for its first device sync (`Storage::record_pending_link`).
     async fn confirm_and_send(
         &self,
         mut send: SendStream,
         conn: &Connection,
         code: &str,
+        new_node_id: &str,
         device_name: &str,
     ) -> Result<LinkServed, AppError> {
         if !self.confirm_link(conn, code, device_name).await? {
@@ -483,6 +491,10 @@ impl PeerHandler {
 
         wait_for_completion(conn).await?;
         log::info!("[link] the new device stored the link bundle");
+        // Device sync stores the new NodeId at its first sync with this device.
+        self.storage
+            .record_pending_link(new_node_id, now_millis())
+            .await?;
         let _ = self.app_handle.emit("device-link-progress", "bundle_sent");
         Ok(LinkServed::Linked)
     }

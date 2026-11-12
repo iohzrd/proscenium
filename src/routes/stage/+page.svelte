@@ -240,6 +240,10 @@
         </div>
       </div>
 
+      {#if stageStore.warning}
+        <p class="room-warning" role="alert">{stageStore.warning}</p>
+      {/if}
+
       <div class="room-body">
         <!-- Main: speakers + listeners -->
         <div class="room-main">
@@ -705,5 +709,14 @@
     .speaker-card {
       width: 100px;
     }
+  }
+
+  .room-warning {
+    margin: 0 0 0.75rem;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--color-warning);
+    border-radius: var(--radius-md);
+    color: var(--color-warning);
+    font-size: var(--text-sm);
   }
 </style>

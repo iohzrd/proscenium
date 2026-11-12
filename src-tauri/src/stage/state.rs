@@ -455,6 +455,40 @@ pub(super) struct StageRuntime {
     pub(super) cmd_tx: ActorSender,
 }
 
+/// Time a kicked identity is refused by this node.
+pub(super) const KICK_DURATION_MS: u64 = 10 * 60 * 1000;
+/// Kicked identities remembered; a new kick replaces the one that expires first.
+const MAX_KICKED: usize = 256;
+
+/// Identities kicked from the stage, with the time until which they are refused. Kick
+/// removes an identity for `KICK_DURATION_MS`; Ban removes it for the session.
+#[derive(Debug, Default)]
+pub(super) struct KickList(HashMap<String, u64>);
+
+impl KickList {
+    /// Refuse `pubkey` until `now + KICK_DURATION_MS`.
+    pub(super) fn kick(&mut self, pubkey: &str, now: u64) {
+        self.0.retain(|_, until| *until > now);
+        if self.0.len() >= MAX_KICKED
+            && !self.0.contains_key(pubkey)
+            && let Some(first) = self
+                .0
+                .iter()
+                .min_by_key(|(_, until)| **until)
+                .map(|(key, _)| key.clone())
+        {
+            self.0.remove(&first);
+        }
+        self.0
+            .insert(pubkey.to_string(), now.saturating_add(KICK_DURATION_MS));
+    }
+
+    /// True if `pubkey` was kicked and the kick has not expired at `now`.
+    pub(super) fn is_kicked(&self, pubkey: &str, now: u64) -> bool {
+        self.0.get(pubkey).is_some_and(|until| *until > now)
+    }
+}
+
 /// All live state for an active Stage session.
 pub(crate) struct ActiveStage {
     pub(super) rt: StageRuntime,
@@ -483,6 +517,8 @@ pub(crate) struct ActiveStage {
     /// Live participant list, keyed by master pubkey.
     pub(super) participants: HashMap<String, Participant>,
     pub(super) senders: SenderTable,
+    /// Identities kicked in this session; refused until their kick expires.
+    pub(super) kicked: KickList,
     /// Signs this node's control messages.
     pub(super) signer: Arc<ControlSigner>,
     /// Gossip control plane for this room.
@@ -514,6 +550,24 @@ mod tests {
         roles.co_hosts.insert("cohost2".to_string());
         roles.speakers.insert("speaker".to_string());
         roles
+    }
+
+    #[test]
+    fn kick_refuses_an_identity_until_it_expires() {
+        let mut kicked = KickList::default();
+        kicked.kick("a", 1_000);
+        assert!(kicked.is_kicked("a", 1_000));
+        assert!(kicked.is_kicked("a", 1_000 + KICK_DURATION_MS - 1));
+        assert!(!kicked.is_kicked("a", 1_000 + KICK_DURATION_MS));
+        assert!(!kicked.is_kicked("b", 1_000));
+        // The list is bounded: the kick that expires first is replaced.
+        for i in 0..MAX_KICKED {
+            kicked.kick(&format!("k{i}"), 2_000 + i as u64);
+        }
+        kicked.kick("late", 5_000);
+        assert!(kicked.is_kicked("late", 5_000));
+        assert!(!kicked.is_kicked("k0", 5_000));
+        assert!(kicked.is_kicked("k1", 5_000));
     }
 
     #[test]

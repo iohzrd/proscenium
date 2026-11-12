@@ -38,19 +38,34 @@ impl super::CallHandler {
             call_id: call_id.clone(),
             video: false,
         };
-        if let Err(e) = self.send_signal(peer_pubkey, None, offer).await {
-            // The peer never saw the offer: remove the call without an event.
+        let sent = self.send_signal(peer_pubkey, None, offer).await;
+        // The answer can arrive before the acknowledgement of the offer, or instead of it.
+        let phase = {
             let mut lock = self.active_call.lock().await;
-            if lock.as_ref().is_some_and(|c| c.call_id == call_id)
-                && let Some(call) = lock.take()
-            {
-                call.cancel.cancel();
+            match lock.as_ref() {
+                Some(call) if call.call_id == call_id => {
+                    if sent.is_err() && call.phase == CallPhase::Ringing {
+                        // The peer did not acknowledge the offer and did not answer:
+                        // remove the call without an event.
+                        if let Some(call) = lock.take() {
+                            call.cancel.cancel();
+                        }
+                        None
+                    } else {
+                        Some(call.phase)
+                    }
+                }
+                _ => None,
             }
-            return Err(e);
-        }
-        if ring_timeout.is_cancelled() {
+        };
+        match (phase, sent) {
+            (None, Err(e)) => return Err(e),
             // The local user hung up while the offer was in transit.
-            return Err(AppError::Other("call cancelled".into()));
+            (None, Ok(())) => return Err(AppError::Other("call cancelled".into())),
+            // The answer arrived: it proves the offer was delivered, and
+            // `on_call_answered` reported the call as active.
+            (Some(phase), _) if phase != CallPhase::Ringing => return Ok(call_id),
+            (Some(_), _) => {}
         }
 
         self.emit_call_event(&call_id, peer_pubkey, CallState::Ringing);

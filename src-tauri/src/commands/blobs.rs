@@ -2,7 +2,7 @@ use crate::error::{AppError, CmdResult};
 use crate::state::AppState;
 use futures_lite::StreamExt;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::get::request::{get_blob, get_verified_size};
@@ -11,10 +11,11 @@ use proscenium_types::{MAX_BLOB_SIZE, MAX_BLOB_TICKET_LEN};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::ipc::Response;
 use tauri::{Manager, State};
 use tokio::io::AsyncReadExt;
+use tokio::sync::Semaphore;
 
 /// Time limit for connecting to the node named in a ticket.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -99,13 +100,49 @@ fn parse_ticket(s: &str) -> Result<BlobTicket, AppError> {
     Ok(ticket)
 }
 
-/// Remote blob downloads running at the same time, over `fetch_blob_bytes` and
-/// `refetch_blob_bytes`. The webview requests the media of every visible post and message,
-/// so without a limit a stranger's messages with many attachments start that many
-/// concurrent 10 MiB downloads.
-const MAX_CONCURRENT_DOWNLOADS: usize = 4;
-static DOWNLOAD_SLOTS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DOWNLOADS);
+/// Blob transfers running at the same time, per class: automatic loads (a size limit
+/// is given) and loads the user requested (Load, Save As, Refetch). The webview requests
+/// the media of every visible post and message, so without a limit a stranger's messages
+/// with many attachments start that many concurrent 10 MiB downloads; the separate class
+/// keeps a requested load from waiting behind automatic ones. A transfer takes its slot
+/// only after the provider connected and proved the blob size.
+const MAX_CONCURRENT_TRANSFERS: usize = 4;
+static AUTOMATIC_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
+static REQUESTED_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
+/// Connections to blob providers being opened at the same time, with their size request.
+const MAX_CONCURRENT_CONNECTS: usize = 16;
+static CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CONNECTS);
+/// Time a provider whose connection failed is not dialed again.
+const UNREACHABLE_RETRY_AFTER: Duration = Duration::from_secs(60);
+/// Providers remembered as unreachable; the oldest entry is removed when full.
+const MAX_UNREACHABLE_PROVIDERS: usize = 256;
+
+/// Providers whose connection failed, and when.
+static UNREACHABLE_PROVIDERS: Mutex<VecDeque<(EndpointId, Instant)>> = Mutex::new(VecDeque::new());
+
+/// Error if a connection to `provider` failed less than `UNREACHABLE_RETRY_AFTER` ago.
+fn check_reachable(provider: EndpointId) -> CmdResult<()> {
+    let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() else {
+        return Ok(());
+    };
+    list.retain(|(_, failed_at)| failed_at.elapsed() < UNREACHABLE_RETRY_AFTER);
+    if list.iter().any(|(id, _)| *id == provider) {
+        return Err("the blob provider was unreachable less than a minute ago".into());
+    }
+    Ok(())
+}
+
+/// Remember that a connection to `provider` failed.
+fn record_unreachable(provider: EndpointId) {
+    let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() else {
+        return;
+    };
+    list.retain(|(id, _)| *id != provider);
+    if list.len() >= MAX_UNREACHABLE_PROVIDERS {
+        list.pop_front();
+    }
+    list.push_back((provider, Instant::now()));
+}
 
 /// Address of `endpoint` for a blob ticket: its NodeId and home relay URL, without direct
 /// addresses. Tickets end up in signed posts and avatars that followers and discovery
@@ -179,12 +216,28 @@ async fn connect_and_check_size(
     max_size: u64,
 ) -> CmdResult<(Connection, u64)> {
     let hash = ticket.hash();
-    let conn = tokio::time::timeout(
+    let provider = ticket.addr().id;
+    check_reachable(provider)?;
+    let _connect_slot = CONNECT_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| "blob connection limit closed")?;
+    let connected = tokio::time::timeout(
         CONNECT_TIMEOUT,
         endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
     )
-    .await
-    .map_err(|_| "timed out connecting to the blob provider")??;
+    .await;
+    let conn = match connected {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => {
+            record_unreachable(provider);
+            return Err(e.into());
+        }
+        Err(_) => {
+            record_unreachable(provider);
+            return Err("timed out connecting to the blob provider".into());
+        }
+    };
     let (size, _stats) =
         tokio::time::timeout(SIZE_REQUEST_TIMEOUT, get_verified_size(&conn, &hash))
             .await
@@ -351,17 +404,23 @@ pub async fn fetch_blob_bytes(
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
         return Ok(Response::new(bytes));
     }
-    let _slot = DOWNLOAD_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| "blob download limit closed")?;
-    // Another request may have downloaded the blob while this one waited.
-    if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
-        return Ok(Response::new(bytes));
-    }
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
     let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit).await?;
+    let slots = if max_size.is_some() {
+        &AUTOMATIC_TRANSFER_SLOTS
+    } else {
+        &REQUESTED_TRANSFER_SLOTS
+    };
+    let _slot = slots
+        .acquire()
+        .await
+        .map_err(|_| "blob transfer limit closed")?;
+    // Another request may have downloaded the blob while this one waited.
+    if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
+        conn.close(0u32.into(), b"done");
+        return Ok(Response::new(bytes));
+    }
     download_to_store(state.blobs().remote(), conn, hash, size).await?;
     let bytes = read_local_blob(&state.blob_store(), hash)
         .await?
@@ -382,13 +441,13 @@ pub async fn refetch_blob_bytes(
 ) -> CmdResult<Response> {
     let ticket = parse_ticket(&ticket)?;
     let hash = ticket.hash();
-    let _slot = DOWNLOAD_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| "blob download limit closed")?;
     log::info!("[blob] downloading {hash} from remote without using the local store...");
     let (conn, size) =
         connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
+    let _slot = REQUESTED_TRANSFER_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| "blob transfer limit closed")?;
     let bytes = download_to_memory(conn, hash, size).await?;
     log::info!("[blob] downloaded {hash} from remote ({size} bytes)");
     Ok(Response::new(bytes))
@@ -416,6 +475,25 @@ mod tests {
         // The oldest entry was removed to stay within the cap.
         assert!(!dropped.contains(Path::new("/tmp/a")));
         assert!(dropped.contains(Path::new("/tmp/file0")));
+    }
+
+    #[test]
+    fn unreachable_provider_is_not_dialed_again_for_a_minute() {
+        let provider = iroh::SecretKey::from_bytes(&[201u8; 32]).public();
+        let other = iroh::SecretKey::from_bytes(&[202u8; 32]).public();
+        assert!(check_reachable(provider).is_ok());
+        record_unreachable(provider);
+        assert!(check_reachable(provider).is_err());
+        assert!(check_reachable(other).is_ok());
+        // An entry older than the retry time is dropped.
+        if let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() {
+            for (_, failed_at) in list.iter_mut() {
+                if let Some(earlier) = failed_at.checked_sub(UNREACHABLE_RETRY_AFTER) {
+                    *failed_at = earlier;
+                }
+            }
+        }
+        assert!(check_reachable(provider).is_ok());
     }
 
     #[test]

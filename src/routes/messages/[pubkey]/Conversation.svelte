@@ -120,10 +120,10 @@
   }
 
   /**
-   * Mark the conversation read and send one read receipt per unread incoming
-   * message in the list. Returns early unless the window is active. After the
-   * first successful call, also returns early if the list has no unread
-   * incoming message.
+   * Mark the conversation read and send one read receipt for the newest unread
+   * incoming message, which covers every earlier one. Returns early unless the
+   * window is active. After the first successful call, also returns early if the
+   * list has no unread incoming message.
    */
   async function markRead() {
     if (!isWindowActive()) return;
@@ -143,11 +143,12 @@
     messages = messages.map((m) =>
       unreadIds.has(m.id) ? { ...m, read: true } : m,
     );
-    for (const id of unreadIds) {
+    const newest = [...unread].sort(comparePosition).at(-1);
+    if (newest) {
       invoke("send_dm_signal", {
         to: pubkey,
         signalType: "read",
-        messageId: id,
+        messageId: newest.id,
       }).catch(() => {});
     }
   }
@@ -365,10 +366,17 @@
           }, TYPING_DISPLAY_MS);
         }
       },
+      // The receipt covers the named own message and every earlier own one.
       "dm-read": (raw) => {
         const payload = raw as { message_id: string };
+        const reference = messages.find((m) => m.id === payload.message_id);
+        if (!reference) return;
         messages = messages.map((m) =>
-          m.id === payload.message_id ? { ...m, read: true } : m,
+          m.from_pubkey === node.pubkey &&
+          !m.read &&
+          comparePosition(m, reference) <= 0
+            ? { ...m, read: true }
+            : m,
         );
       },
     });

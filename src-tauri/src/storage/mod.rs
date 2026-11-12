@@ -152,6 +152,10 @@ impl Storage {
             "023_viewed_authors",
             include_str!("../../migrations/023_viewed_authors.sql"),
         ),
+        (
+            "024_pending_link_devices",
+            include_str!("../../migrations/024_pending_link_devices.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {

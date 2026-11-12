@@ -5,6 +5,7 @@
   import QrModal from "#lib/QrModal.svelte";
   import PostFeed from "#lib/PostFeed.svelte";
   import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import { ensureMicrophonePermission } from "#lib/microphone.ts";
   import ConfirmDialog from "../../ConfirmDialog.svelte";
   import ProfileEditor from "#lib/ProfileEditor.svelte";
   import ProfileHeaderCard from "#lib/profile/ProfileHeaderCard.svelte";
@@ -299,6 +300,8 @@
       });
       if (outcome !== "followed") {
         toast.show(...followRequestNotice(outcome));
+        // A pending request stores the follow; posts arrive once it is approved.
+        isFollowing = outcome === "pending";
         return;
       }
       isFollowing = true;
@@ -362,9 +365,10 @@
 
   async function startCall() {
     try {
+      await ensureMicrophonePermission();
       await invoke("start_call", { peerPubkey: pubkey });
     } catch (e) {
-      toast.show("Failed to start call");
+      toast.show(`Failed to start call: ${e}`);
       console.error("Failed to start call:", e);
     }
   }

@@ -25,6 +25,16 @@ use commands::*;
 #[cfg(not(mobile))]
 use tauri::Manager;
 
+/// Show, unminimize and focus the main window. Closing the window only hides it.
+#[cfg(not(mobile))]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
 #[cfg(not(mobile))]
 fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::{
@@ -56,13 +66,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .tooltip("Proscenium")
         .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.unminimize();
-                    let _ = w.set_focus();
-                }
-            }
+            "show" => show_main_window(app),
             "quit" => {
                 // `exit` triggers `RunEvent::ExitRequested`, whose handler stops the
                 // network. The call here covers the case where `exit` cannot reach
@@ -87,7 +91,10 @@ pub fn run() {
     #[cfg(not(mobile))]
     {
         use tauri::Emitter;
+        // A second launch shows the running instance's window, which closing only hid:
+        // without a tray icon (GNOME by default) this is the way to reopen it.
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            show_main_window(app);
             for arg in &argv {
                 if arg.starts_with("proscenium://") {
                     let _ = app.emit("deep-link-received", vec![arg.clone()]);
@@ -259,6 +266,7 @@ pub fn run() {
             get_accent_color,
             set_accent_color,
             wipe_all_data,
+            quit_app,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -266,6 +274,12 @@ pub fn run() {
             // Stop the network stack (at most 3 s) before the process exits or restarts.
             if let tauri::RunEvent::ExitRequested { .. } = &event {
                 setup::shutdown_for_exit(app);
+            }
+
+            // macOS: a click on the Dock icon shows the hidden window.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = &event {
+                show_main_window(app);
             }
 
             #[cfg(not(mobile))]

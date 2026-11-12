@@ -788,6 +788,12 @@ async fn interactions_missing_from_the_complete_set_are_deleted() {
     );
     assert!(!storage.delete_interaction(&likes[1].id, pk).await.unwrap());
     assert!(storage.delete_interaction(&likes[0].id, pk).await.unwrap());
+    // The deleted like is not stored again when its signed original is sent again.
+    let stored = storage
+        .insert_interactions(pk, std::slice::from_ref(&likes[1]), 100)
+        .await
+        .unwrap();
+    assert_eq!(stored.stored, 0);
     // Interactions of other authors are kept.
     assert!(
         storage

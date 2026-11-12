@@ -51,9 +51,11 @@ impl ActiveStage {
 
     /// Serve an incoming audio connection whose hello was verified, or close it.
     pub(super) async fn admit(&mut self, incoming: IncomingAudio, conn_id: u64) {
-        if self.roles.is_banned(&incoming.master_pubkey) {
+        if self.roles.is_banned(&incoming.master_pubkey)
+            || self.kicked.is_kicked(&incoming.master_pubkey, now_millis())
+        {
             log::info!(
-                "[stage] rejected connection of banned identity {}",
+                "[stage] rejected connection of banned or kicked identity {}",
                 short_id(&incoming.master_pubkey)
             );
             incoming.conn.close(CLOSE_BANNED.into(), b"banned");

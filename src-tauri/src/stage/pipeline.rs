@@ -702,6 +702,8 @@ async fn speaker_mic_send(
 /// Parameters of the speaker audio pipeline.
 pub(super) struct SpeakerConfig {
     pub(super) endpoint: Endpoint,
+    /// Receives `StageEvent::MicrophoneUnavailable`.
+    pub(super) app_handle: tauri::AppHandle,
     pub(super) host_node_id: String,
     pub(super) signer: Arc<ControlSigner>,
     pub(super) speaker_mixer: SpeakerMixerHandle,
@@ -814,13 +816,24 @@ async fn run_speaker_once(config: &SpeakerConfig, host_id: EndpointId) -> Sessio
         Ok(Err(e)) => Some(e),
         Err(_) => Some("microphone thread did not start".to_string()),
     };
-    if let Some(e) = mic_error {
-        log::error!("[stage-speaker] mic capture failed: {e}");
-        conn.close(CLOSE_NORMAL.into(), b"no microphone");
-        return SessionEnd::Failed;
-    }
-
-    tokio::spawn(speaker_mic_send(send, mic_rx, session_cancel.clone()));
+    // Without a microphone the session receives the other speakers and sends nothing:
+    // closing it would also stop the audio the user hears, as the listener pipeline of
+    // a speaker is stopped.
+    let mic_opened = match mic_error {
+        Some(e) => {
+            log::error!("[stage-speaker] mic capture failed, receiving only: {e}");
+            let _ = config.app_handle.emit(
+                "stage-event",
+                StageEvent::MicrophoneUnavailable { reason: e },
+            );
+            drop(send);
+            false
+        }
+        None => {
+            tokio::spawn(speaker_mic_send(send, mic_rx, session_cancel.clone()));
+            true
+        }
+    };
 
     let mut next_stream_id: u32 = 0;
     loop {
@@ -854,7 +867,9 @@ async fn run_speaker_once(config: &SpeakerConfig, host_id: EndpointId) -> Sessio
     conn.close(CLOSE_NORMAL.into(), b"speaker left");
     if banned {
         SessionEnd::Banned
-    } else {
+    } else if mic_opened {
         SessionEnd::EndedAfterAudio
+    } else {
+        SessionEnd::Failed
     }
 }

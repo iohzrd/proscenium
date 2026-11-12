@@ -227,6 +227,22 @@ impl Storage {
 
     /// True if the local user `me` follows `pubkey` and `pubkey` holds an approved
     /// follow request.
+    /// True if `me` follows `pubkey` or approved it as follower.
+    pub async fn is_trusted_peer(&self, me: &str, pubkey: &str) -> Result<bool, AppError> {
+        let trusted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM social_graph
+                     WHERE follower = ?1 AND followee = ?2
+                       AND state = 'active' AND followed_at IS NOT NULL)
+                 OR EXISTS (SELECT 1 FROM follow_requests
+                     WHERE pubkey = ?2 AND status = 'approved')",
+        )
+        .bind(me)
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(trusted)
+    }
+
     pub async fn is_mutual(&self, me: &str, pubkey: &str) -> Result<bool, AppError> {
         Ok(self.is_following(me, pubkey).await? && self.is_approved_follower(pubkey).await?)
     }

@@ -244,6 +244,9 @@ impl ActiveStage {
                     }
                 } else {
                     self.roles.remove(target);
+                    // Refused at admission until the kick expires, so the kicked
+                    // identity does not reconnect at once.
+                    self.kicked.kick(target, now_millis());
                 }
                 if target == self.my_pubkey {
                     return Ok(Outcome::Kicked);

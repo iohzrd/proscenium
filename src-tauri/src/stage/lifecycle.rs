@@ -8,8 +8,8 @@ use crate::stage::mixer::spawn_mixer;
 use crate::stage::pipeline::{self, ListenerConfig, SpeakerConfig};
 use crate::stage::speaker_mixer::spawn_speaker_mixer;
 use crate::stage::state::{
-    ActiveStage, HostState, LISTENER_CAPACITY, LISTENER_CAPACITY_RESERVE, MixedStreamServer,
-    Participant, RoomRoles, SenderTable, SpeakerSession, StageRuntime,
+    ActiveStage, HostState, KickList, LISTENER_CAPACITY, LISTENER_CAPACITY_RESERVE,
+    MixedStreamServer, Participant, RoomRoles, SenderTable, SpeakerSession, StageRuntime,
 };
 use crate::stage::topology::TopologyManager;
 use iroh::EndpointId;
@@ -194,6 +194,7 @@ impl StageActor {
             started_at: now,
             participants,
             senders,
+            kicked: KickList::default(),
             signer,
             control_plane,
             cancel: cancel.clone(),
@@ -338,6 +339,7 @@ impl StageActor {
             started_at: now,
             participants,
             senders,
+            kicked: KickList::default(),
             signer,
             control_plane,
             cancel: cancel.clone(),
@@ -451,6 +453,7 @@ impl ActiveStage {
         let mixer = spawn_speaker_mixer(cancel.clone());
         tokio::spawn(pipeline::start_speaker_pipeline(SpeakerConfig {
             endpoint: self.rt.endpoint.clone(),
+            app_handle: self.rt.app_handle.clone(),
             host_node_id: self.host_node_id.clone(),
             signer: self.signer.clone(),
             speaker_mixer: mixer,

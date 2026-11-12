@@ -243,24 +243,43 @@ impl Storage {
         Ok(updated)
     }
 
-    /// Set `read` on message `message_id`, only if the message is in `conversation_id`
-    /// and was sent by `from_pubkey`. Returns true if such a message exists.
-    pub async fn mark_dm_read_by_id(
+    /// Set `read` on message `message_id` and on every earlier message, by
+    /// `(timestamp, id)`, that `from_pubkey` sent in `conversation_id`: the meaning of a
+    /// `DmPayload::Read` receipt. Nothing changes unless `message_id` is a message of
+    /// `from_pubkey` in `conversation_id`. Returns true if `message_id` exists there.
+    pub async fn mark_dm_read_up_to(
         &self,
         conversation_id: &str,
         from_pubkey: &str,
         message_id: &str,
     ) -> Result<bool, AppError> {
-        let result = sqlx::query(
-            "UPDATE dm_messages SET read = 1
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reference: Option<i64> = sqlx::query_scalar(
+            "SELECT timestamp FROM dm_messages
              WHERE id=?1 AND conversation_id=?2 AND from_pubkey=?3",
         )
         .bind(message_id)
         .bind(conversation_id)
         .bind(from_pubkey)
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let Some(timestamp) = reference else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        sqlx::query(
+            "UPDATE dm_messages SET read = 1
+             WHERE conversation_id=?1 AND from_pubkey=?2 AND read = 0
+               AND (timestamp < ?3 OR (timestamp = ?3 AND id <= ?4))",
+        )
+        .bind(conversation_id)
+        .bind(from_pubkey)
+        .bind(timestamp)
+        .bind(message_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Delete a message and its outbox entry in one transaction.
@@ -390,6 +409,25 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
+    /// True if `peer_pubkey` is a stranger to `me`: `me` does not follow it and wrote no
+    /// message in their conversation.
+    pub async fn is_stranger(&self, me: &str, peer_pubkey: &str) -> Result<bool, AppError> {
+        let conv_id = Self::conversation_id(me, peer_pubkey);
+        let stranger: bool = sqlx::query_scalar(
+            "SELECT NOT EXISTS (SELECT 1 FROM social_graph s
+                     WHERE s.follower = ?1 AND s.followee = ?2
+                       AND s.state = 'active' AND s.followed_at IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM dm_messages m
+                     WHERE m.conversation_id = ?3 AND m.from_pubkey = ?1)",
+        )
+        .bind(me)
+        .bind(peer_pubkey)
+        .bind(&conv_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(stranger)
+    }
+
     /// True if a conversation with `peer_pubkey` is stored.
     pub async fn has_conversation(&self, peer_pubkey: &str) -> Result<bool, AppError> {
         let exists: bool = sqlx::query_scalar(
@@ -423,8 +461,10 @@ impl Storage {
 
     /// Store a message of the conversation with `peer_pubkey` that another device of the
     /// local user sent during device sync. `incoming` is true if `peer_pubkey` wrote it;
-    /// `unread_count` grows by one only for an incoming message that is not read.
-    /// Returns false, and writes nothing, if a message with the same id is stored.
+    /// `unread_count` grows by one only for an incoming message that is not read. An
+    /// incoming message is subject to the stranger limits of `receive_dm_message`.
+    /// Returns false, and writes nothing, if a message with the same id is stored or the
+    /// limits refuse it.
     pub async fn import_synced_dm(
         &self,
         peer_pubkey: &str,
@@ -434,7 +474,7 @@ impl Storage {
         let preview = crate::util::message_preview(&message.content);
         let unread = i64::from(incoming && !message.read);
         Ok(self
-            .insert_dm_message(peer_pubkey, message, &preview, unread, false)
+            .insert_dm_message(peer_pubkey, message, &preview, unread, incoming)
             .await?
             == ReceivedDm::Stored)
     }

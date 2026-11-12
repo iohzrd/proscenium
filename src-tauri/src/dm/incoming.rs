@@ -103,6 +103,16 @@ impl DmHandler {
         let mut cache_list = known_sender;
         match envelope.payload {
             DmPayload::Message(msg) => {
+                if !known_sender
+                    && self.storage.is_stranger(&me, &sender).await?
+                    && !self.admit_new_stranger()
+                {
+                    log::warn!(
+                        "[dm] refusing a new conversation from {}: limit of new conversations with unknown senders reached",
+                        short_id(&sender)
+                    );
+                    return Ok(DmAck::Rejected);
+                }
                 let now = now_millis();
                 let stored_msg = StoredMessage {
                     id: msg.id.clone(),
@@ -165,7 +175,7 @@ impl DmHandler {
             DmPayload::Read { message_id } => {
                 if self
                     .storage
-                    .mark_dm_read_by_id(&conv_id, &me, &message_id)
+                    .mark_dm_read_up_to(&conv_id, &me, &message_id)
                     .await?
                 {
                     let _ = self

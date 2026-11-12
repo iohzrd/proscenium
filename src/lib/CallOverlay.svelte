@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { ensureMicrophonePermission } from "#lib/microphone.ts";
   import { invoke } from "@tauri-apps/api/core";
   import type { CallState } from "#lib/types.ts";
   import Avatar from "#lib/Avatar.svelte";
@@ -65,6 +66,7 @@
     accepting = true;
     errorMessage = "";
     try {
+      await ensureMicrophonePermission();
       await invoke("accept_call", { callId });
     } catch (e) {
       errorMessage = `Failed to answer: ${e}`;

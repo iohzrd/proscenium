@@ -257,11 +257,13 @@ impl DeviceSync<'_> {
 
     /// Store `announcement`, a list that passed `verify_device_list` for `remote`.
     ///
-    /// Returns an error, and stores nothing, if `remote` was removed. Its removed NodeIds
-    /// are stored only if `remote` is a stored device of the local user; a list from an
-    /// unknown NodeId adds devices only. If such a list removes the local device, sets
-    /// `stats.local_removed_by` and stores nothing. Then its devices that are not stored
-    /// yet are stored.
+    /// Returns an error, and stores nothing, if `remote` was removed, or if `remote` is
+    /// neither a stored device nor a device this device linked (`take_pending_link`).
+    /// Every device holds the master key, so a removed device that generates a new NodeId
+    /// signs valid lists; it is not accepted unless a stored device's list names it.
+    /// Removed NodeIds are stored only from a stored device; a newly linked device adds
+    /// devices only. If a list removes the local device, sets `stats.local_removed_by`
+    /// and stores nothing. Then its devices that are not stored yet are stored.
     async fn merge_device_list(
         &self,
         announcement: &LinkedDevicesAnnouncement,
@@ -271,21 +273,32 @@ impl DeviceSync<'_> {
         if self.storage.is_removed_device(remote).await? {
             return Err("device sync: the other device was removed from this identity".into());
         }
+        let own_node_id = self.identity.read().await.transport_node_id.clone();
+        match self.storage.get_other_device(remote).await? {
+            Some(remover) => {
+                let merged = self
+                    .storage
+                    .merge_removed_devices(&announcement.removed, &own_node_id)
+                    .await?;
+                if merged.local_removed {
+                    stats.local_removed_by = Some(remover.device_name);
+                    return Ok(());
+                }
+                stats.devices_removed = merged.devices_removed;
+            }
+            None => {
+                if !self.storage.take_pending_link(remote, now_millis()).await? {
+                    return Err(
+                        "device sync: unknown device; no stored device lists it and this \
+                         device did not link it"
+                            .into(),
+                    );
+                }
+            }
+        }
         self.storage
             .record_own_announcement_version(announcement.version)
             .await?;
-        let own_node_id = self.identity.read().await.transport_node_id.clone();
-        if let Some(remover) = self.storage.get_other_device(remote).await? {
-            let merged = self
-                .storage
-                .merge_removed_devices(&announcement.removed, &own_node_id)
-                .await?;
-            if merged.local_removed {
-                stats.local_removed_by = Some(remover.device_name);
-                return Ok(());
-            }
-            stats.devices_removed = merged.devices_removed;
-        }
         let other_devices: Vec<_> = announcement
             .devices
             .iter()
@@ -1030,6 +1043,9 @@ mod tests {
         b.upsert_linked_device(&node_id(seed_b), "Android", true, 2)
             .await
             .unwrap();
+        b.upsert_linked_device(&node_id(seed_a), "Linux", false, 1)
+            .await
+            .unwrap();
         b.upsert_linked_device(&node_id(seed_c), "Windows", false, 3)
             .await
             .unwrap();
@@ -1081,8 +1097,8 @@ mod tests {
         assert_eq!(stats_a.dms_imported[&followed][0].id, sent.id);
         assert!(stats_b.dms_imported.is_empty());
 
-        // Each device stored the devices of the other device's list.
-        assert_eq!(stats_b.devices_added, 1);
+        // A stored device C from B's list; B already knew every device of A's list.
+        assert_eq!(stats_b.devices_added, 0);
         assert_eq!(stats_a.devices_added, 1);
         let mut on_a = a.get_other_device_node_ids().await.unwrap();
         on_a.sort();
@@ -1229,16 +1245,40 @@ mod tests {
             identity: &identity,
         };
 
-        // A list of the unknown NodeId E that removes A and C adds E and nothing else.
+        // The unknown NodeId E, for example a removed device with a new transport key, is
+        // refused although it holds the master key, and stores nothing.
         let from_e = crafted_list(master, &[seed_e], &[seed_a, seed_c]);
+        let mut stats = DeviceSyncStats::default();
+        assert!(
+            sync.merge_device_list(&from_e, &node_id(seed_e), &mut stats)
+                .await
+                .is_err()
+        );
+        assert!(!a.is_other_device(&node_id(seed_e)).await.unwrap());
+        assert!(a.is_other_device(&node_id(seed_c)).await.unwrap());
+        assert!(a.get_removed_device_ids().await.unwrap().is_empty());
+
+        // A device that this device linked is stored at its first sync, without its
+        // removals; at its second sync it is a stored device.
+        a.record_pending_link(&node_id(seed_e), now_millis())
+            .await
+            .unwrap();
         let mut stats = DeviceSyncStats::default();
         sync.merge_device_list(&from_e, &node_id(seed_e), &mut stats)
             .await
             .unwrap();
-        assert!(stats.local_removed_by.is_none());
         assert_eq!(stats.devices_added, 1);
+        assert!(stats.local_removed_by.is_none());
         assert!(a.is_other_device(&node_id(seed_c)).await.unwrap());
-        assert!(a.get_removed_device_ids().await.unwrap().is_empty());
+        assert!(a.is_other_device(&node_id(seed_e)).await.unwrap());
+        // The pending record is used once.
+        assert!(
+            !a.take_pending_link(&node_id(seed_e), now_millis())
+                .await
+                .unwrap()
+        );
+        // From here on E is a stored device; restore the state of the rest of the test.
+        a.remove_linked_device(&node_id(seed_e), 1).await.unwrap();
 
         // The same removal from the stored device B is reported and stores nothing.
         let from_b = crafted_list(master, &[seed_b], &[seed_a, seed_c]);

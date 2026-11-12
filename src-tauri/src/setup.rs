@@ -511,6 +511,19 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         }
         Err(e) => log::error!("[setup] failed to read viewed authors: {e}"),
     }
+    // A sync that the process did not finish leaves its author untrimmed.
+    match state.storage.get_viewed_authors().await {
+        Ok(authors) => {
+            for author in authors {
+                if let Ok(false) = state.storage.is_following(&master_pubkey, &author).await
+                    && let Err(e) = state.storage.trim_author_content(&author).await
+                {
+                    log::error!("[setup] failed to trim content of a viewed author: {e}");
+                }
+            }
+        }
+        Err(e) => log::error!("[setup] failed to read viewed authors: {e}"),
+    }
 
     // Signs the stored profile again if its signature does not verify under the master
     // key, then broadcasts the profile and the device list.

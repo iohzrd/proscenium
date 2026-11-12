@@ -84,22 +84,14 @@ impl ProtocolHandler for CallHandler {
             short_id(&remote_str)
         );
 
-        // Resolve transport NodeId to master pubkey
-        let Some(peer_pubkey) = self
-            .storage
-            .get_master_pubkey_for_transport(&remote_str)
-            .await
-        else {
-            conn.close(1u32.into(), b"unknown peer");
-            return Err(reject("audio connection from an unknown node"));
-        };
-
+        // The call's device is the NodeId that delivered the offer, authenticated by QUIC
+        // and listed in the caller's signed device list; no stored NodeId mapping is
+        // needed, so a caller without a conversation is served too.
         let call_id = {
             let lock = self.active_call.lock().await;
             match lock.as_ref() {
                 Some(call)
-                    if call.peer_pubkey == peer_pubkey
-                        && call.peer_device == Some(conn.remote_id())
+                    if call.peer_device == Some(conn.remote_id())
                         && !call.outgoing
                         && call.phase == CallPhase::Connecting =>
                 {
@@ -108,7 +100,7 @@ impl ProtocolHandler for CallHandler {
                 _ => {
                     log::warn!(
                         "[call] rejecting unexpected audio connection from {}",
-                        short_id(&peer_pubkey)
+                        short_id(&remote_str)
                     );
                     conn.close(1u32.into(), b"no accepted call");
                     return Err(reject("no accepted call with this peer"));

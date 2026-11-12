@@ -236,11 +236,11 @@
       nodeId,
       expectedPubkey: pubkey,
     });
-    if (outcome !== "followed") {
-      toast.show(...followRequestNotice(outcome));
-      return;
+    if (outcome !== "followed") toast.show(...followRequestNotice(outcome));
+    // A pending request stores the follow too.
+    if (outcome !== "denied") {
+      followedPubkeys = new Set([...followedPubkeys, pubkey]);
     }
-    followedPubkeys = new Set([...followedPubkeys, pubkey]);
   }
 
   /** Follow `pubkey`, or show the unfollow confirmation. */

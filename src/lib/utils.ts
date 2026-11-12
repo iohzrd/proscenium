@@ -462,6 +462,9 @@ export function followRequestNotice(
   outcome: "pending" | "denied",
 ): [string, "success" | "error"] {
   return outcome === "pending"
-    ? ["Follow request sent. Waiting for approval.", "success"]
+    ? [
+        "Follow request sent. Their posts appear once they approve it.",
+        "success",
+      ]
     : ["Follow request denied", "error"];
 }

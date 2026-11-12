@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { invoke } from "@tauri-apps/api/core";
+  import { platform } from "@tauri-apps/plugin-os";
   import { onMount } from "svelte";
   import AudioDeviceSelect from "#lib/AudioDeviceSelect.svelte";
   import { useNodeInit } from "#lib/composables/index.ts";
@@ -9,6 +11,9 @@
   import AccentPicker from "#lib/preferences/AccentPicker.svelte";
 
   const node = useNodeInit(async () => {});
+  // Closing the window keeps the app running; on desktop it is quit here or from
+  // the tray.
+  const isDesktop = platform() !== "android" && platform() !== "ios";
 
   onMount(() => {
     node.init();
@@ -61,6 +66,19 @@
   <PrivacyToggles />
 
   <SecuritySection />
+
+  {#if isDesktop}
+    <section class="settings-section">
+      <h3>Application</h3>
+      <p class="setting-hint">
+        Closing the window keeps Proscenium running in the background, so
+        messages and calls still arrive. Starting it again shows the window.
+      </p>
+      <button class="btn-elevated quit-btn" onclick={() => invoke("quit_app")}>
+        Quit Proscenium
+      </button>
+    </section>
+  {/if}
 
   <DangerZoneSection />
 </div>
@@ -135,5 +153,9 @@
 
   .server-manage-link:hover {
     text-decoration: underline;
+  }
+
+  .quit-btn {
+    margin-top: 0.75rem;
   }
 </style>

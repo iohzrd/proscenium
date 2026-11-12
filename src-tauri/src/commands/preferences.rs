@@ -76,6 +76,13 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     Ok(())
 }
 
+/// End the application. `RunEvent::ExitRequested` stops the network first. Closing the
+/// window only hides it, so this is the way to quit without a tray icon.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[tauri::command]
 pub async fn get_mdns_discovery(state: State<'_, Arc<AppState>>) -> CmdResult<bool> {
     state
