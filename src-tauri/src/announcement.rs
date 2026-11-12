@@ -158,18 +158,21 @@ mod tests {
 
         // Rows as a link bundle import leaves them: the other devices, then the local one.
         storage
-            .insert_missing_linked_devices(&[
-                DeviceEntry {
-                    node_id: node_id(10),
-                    device_name: "Linux".to_string(),
-                    added_at: 10,
-                },
-                DeviceEntry {
-                    node_id: node_id(11),
-                    device_name: "Android".to_string(),
-                    added_at: 20,
-                },
-            ])
+            .insert_missing_linked_devices(
+                &[
+                    DeviceEntry {
+                        node_id: node_id(10),
+                        device_name: "Linux".to_string(),
+                        added_at: 10,
+                    },
+                    DeviceEntry {
+                        node_id: node_id(11),
+                        device_name: "Android".to_string(),
+                        added_at: 20,
+                    },
+                ],
+                0,
+            )
             .await
             .unwrap();
         storage

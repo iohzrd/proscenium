@@ -2938,19 +2938,25 @@ async fn linked_devices_insert_missing_keeps_existing_rows() {
         .unwrap();
 
     let inserted = s
-        .insert_missing_linked_devices(&[
-            device_entry(&own, "renamed"),
-            device_entry(&other, "Android"),
-        ])
+        .insert_missing_linked_devices(
+            &[
+                device_entry(&own, "renamed"),
+                device_entry(&other, "Android"),
+            ],
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(inserted, 1);
     // A second call with one known and one new NodeId inserts only the new one.
     let inserted = s
-        .insert_missing_linked_devices(&[
-            device_entry(&other, "Android"),
-            device_entry(&third, &"n".repeat(200)),
-        ])
+        .insert_missing_linked_devices(
+            &[
+                device_entry(&other, "Android"),
+                device_entry(&third, &"n".repeat(200)),
+            ],
+            0,
+        )
         .await
         .unwrap();
     assert_eq!(inserted, 1);
@@ -2981,7 +2987,7 @@ async fn removed_device_is_not_stored_again() {
     s.upsert_linked_device(&own, "Linux", true, 1)
         .await
         .unwrap();
-    s.insert_missing_linked_devices(&[device_entry(&other, "Android")])
+    s.insert_missing_linked_devices(&[device_entry(&other, "Android")], 0)
         .await
         .unwrap();
 
@@ -3000,7 +3006,7 @@ async fn removed_device_is_not_stored_again() {
 
     // A device list that still lists the removed device does not store it again.
     let inserted = s
-        .insert_missing_linked_devices(&[device_entry(&other, "Android")])
+        .insert_missing_linked_devices(&[device_entry(&other, "Android")], 0)
         .await
         .unwrap();
     assert_eq!(inserted, 0);
@@ -3014,7 +3020,7 @@ async fn merged_removals_delete_rows_and_detect_the_local_device() {
     s.upsert_linked_device(&own, "Linux", true, 1)
         .await
         .unwrap();
-    s.insert_missing_linked_devices(&[device_entry(&other, "Android")])
+    s.insert_missing_linked_devices(&[device_entry(&other, "Android")], 0)
         .await
         .unwrap();
 
@@ -3049,7 +3055,7 @@ async fn removed_devices_keep_the_newest_records() {
     let count = MAX_REMOVED_DEVICES as u8 + 3;
     for i in 0..count {
         let node_id = pubkey(10 + i);
-        s.insert_missing_linked_devices(&[device_entry(&node_id, "d")])
+        s.insert_missing_linked_devices(&[device_entry(&node_id, "d")], 0)
             .await
             .unwrap();
         assert!(
@@ -3067,7 +3073,7 @@ async fn removed_devices_keep_the_newest_records() {
     assert_eq!(ids, expected);
     assert!(s.is_removed_device(&pubkey(10)).await.unwrap());
     let inserted = s
-        .insert_missing_linked_devices(&[device_entry(&pubkey(10), "d")])
+        .insert_missing_linked_devices(&[device_entry(&pubkey(10), "d")], 0)
         .await
         .unwrap();
     assert_eq!(inserted, 0);
@@ -3730,4 +3736,44 @@ async fn messages_from_strangers_are_bounded() {
     assert!(peers.contains(&"bob".to_string()));
     assert!(peers.contains(&"dave".to_string()));
     assert_eq!(peers.len(), MAX_STRANGER_CONVERSATIONS as usize + 2);
+}
+
+#[tokio::test]
+async fn devices_learned_by_device_sync_sort_after_stored_devices() {
+    let s = test_storage().await;
+    s.upsert_linked_device("self", "Linux", true, 100)
+        .await
+        .unwrap();
+    s.upsert_linked_device("phone", "Android", false, 200)
+        .await
+        .unwrap();
+    // Another own device names a device with an early `added_at`.
+    let early = proscenium_types::DeviceEntry {
+        node_id: "late".to_string(),
+        device_name: "x".to_string(),
+        added_at: 0,
+    };
+    s.insert_missing_linked_devices(&[early], 1_000)
+        .await
+        .unwrap();
+    let order: Vec<String> = s
+        .get_linked_devices()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.node_id)
+        .collect();
+    assert_eq!(order, ["self", "phone", "late"]);
+}
+
+#[tokio::test]
+async fn pending_link_is_known_until_taken_or_expired() {
+    let s = test_storage().await;
+    s.record_pending_link("new", 1_000).await.unwrap();
+    assert!(s.has_pending_link("new", 2_000).await.unwrap());
+    assert!(!s.has_pending_link("other", 2_000).await.unwrap());
+    let eight_days = 8 * 24 * 60 * 60 * 1000;
+    assert!(!s.has_pending_link("new", 1_000 + eight_days).await.unwrap());
+    assert!(s.take_pending_link("new", 2_000).await.unwrap());
+    assert!(!s.has_pending_link("new", 2_000).await.unwrap());
 }

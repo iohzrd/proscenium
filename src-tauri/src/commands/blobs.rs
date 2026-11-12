@@ -21,10 +21,18 @@ use tokio::sync::Semaphore;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time limit for the size request that precedes a download.
 const SIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// A download into the store is aborted if no progress report arrives for this long.
+/// A download into the store is aborted if it does not receive `MIN_PROGRESS_BYTES` more
+/// within this time.
 const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Time limit for one download.
+/// Bytes a download must add within `TRANSFER_IDLE_TIMEOUT`. A progress report with fewer
+/// new bytes does not extend the idle time, so a provider that sends a few bytes per
+/// report cannot hold a transfer slot until the time limit.
+const MIN_PROGRESS_BYTES: u64 = 64 * 1024;
+/// Time limit for one download the user requested.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Time limit for one automatic download (a size limit is given), which a stranger's
+/// post or message starts without a click.
+const AUTOMATIC_TRANSFER_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Number of dropped paths remembered. The oldest entry is removed when the list is full.
 const MAX_DROPPED_PATHS: usize = 256;
 /// Largest RGBA pixel buffer `add_blob_from_rgba` encodes. PNG encoding shrinks typical
@@ -109,9 +117,11 @@ fn parse_ticket(s: &str) -> Result<BlobTicket, AppError> {
 const MAX_CONCURRENT_TRANSFERS: usize = 4;
 static AUTOMATIC_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
 static REQUESTED_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
-/// Connections to blob providers being opened at the same time, with their size request.
+/// Connections to blob providers being opened at the same time, with their size request,
+/// per class as for transfers, so automatic loads do not delay a requested one.
 const MAX_CONCURRENT_CONNECTS: usize = 16;
-static CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CONNECTS);
+static AUTOMATIC_CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CONNECTS);
+static REQUESTED_CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
 /// Time a provider whose connection failed is not dialed again.
 const UNREACHABLE_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Providers remembered as unreachable; the oldest entry is removed when full.
@@ -206,22 +216,32 @@ async fn read_local_blob(blob_store: &FsStore, hash: Hash) -> CmdResult<Option<V
     }
 }
 
-/// Connect to the node named in `ticket` and request the size of the blob.
+/// Connect to the node named in `ticket` and request the size of the blob, holding a
+/// connect slot of the automatic or the requested class.
 ///
 /// The provider answers with the last chunk and its hash path, which proves the size for
-/// this hash, so a blob above `max_size` is rejected before its content is requested.
+/// this hash, so a blob above `max_size` is rejected before its content is requested. A
+/// provider that cannot be connected or does not answer the size request in time is
+/// recorded as unreachable; the check is repeated after the wait for a slot.
 async fn connect_and_check_size(
     endpoint: &Endpoint,
     ticket: &BlobTicket,
     max_size: u64,
+    requested: bool,
 ) -> CmdResult<(Connection, u64)> {
     let hash = ticket.hash();
     let provider = ticket.addr().id;
     check_reachable(provider)?;
-    let _connect_slot = CONNECT_SLOTS
+    let slots = if requested {
+        &REQUESTED_CONNECT_SLOTS
+    } else {
+        &AUTOMATIC_CONNECT_SLOTS
+    };
+    let _connect_slot = slots
         .acquire()
         .await
         .map_err(|_| "blob connection limit closed")?;
+    check_reachable(provider)?;
     let connected = tokio::time::timeout(
         CONNECT_TIMEOUT,
         endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
@@ -239,39 +259,50 @@ async fn connect_and_check_size(
         }
     };
     let (size, _stats) =
-        tokio::time::timeout(SIZE_REQUEST_TIMEOUT, get_verified_size(&conn, &hash))
-            .await
-            .map_err(|_| "timed out requesting the blob size")??;
+        match tokio::time::timeout(SIZE_REQUEST_TIMEOUT, get_verified_size(&conn, &hash)).await {
+            Ok(result) => result?,
+            Err(_) => {
+                record_unreachable(provider);
+                return Err("timed out requesting the blob size".into());
+            }
+        };
     check_size_limit(size, max_size)?;
     Ok((conn, size))
 }
 
 /// Download the parts of the blob that the local store lacks, from `conn` into the store.
 ///
-/// Returns an error, which stops the transfer, if no progress is reported for
-/// `TRANSFER_IDLE_TIMEOUT`, if the whole transfer exceeds `TRANSFER_TIMEOUT`, or if the
-/// provider sends more payload than `size`.
+/// Returns an error, which stops the transfer, if fewer than `MIN_PROGRESS_BYTES` new
+/// bytes arrive within `TRANSFER_IDLE_TIMEOUT`, if the whole transfer exceeds `limit`, or
+/// if the provider sends more payload than `size`.
 async fn download_to_store(
     remote: &Remote,
     conn: Connection,
     hash: Hash,
     size: u64,
+    limit: Duration,
 ) -> CmdResult<()> {
     let progress = remote.fetch(conn, HashAndFormat::raw(hash));
     let mut stream = std::pin::pin!(progress.stream());
-    let deadline = tokio::time::Instant::now() + TRANSFER_TIMEOUT;
+    let now = tokio::time::Instant::now();
+    let deadline = now + limit;
+    let mut idle_deadline = now + TRANSFER_IDLE_TIMEOUT;
+    // Received byte count when the idle deadline was last set.
+    let mut mark: u64 = 0;
     loop {
-        let item = tokio::time::timeout_at(
-            deadline.min(tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT),
-            stream.next(),
-        )
-        .await
-        .map_err(|_| "blob download timed out")?;
+        let item = tokio::time::timeout_at(deadline.min(idle_deadline), stream.next())
+            .await
+            .map_err(|_| "blob download timed out")?;
         match item {
             Some(GetProgressItem::Progress(received)) if received > size => {
                 return Err("blob provider sent more data than the blob size".into());
             }
-            Some(GetProgressItem::Progress(_)) => {}
+            Some(GetProgressItem::Progress(received)) => {
+                if received >= mark.saturating_add(MIN_PROGRESS_BYTES) {
+                    mark = received;
+                    idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
+                }
+            }
             Some(GetProgressItem::Done(_)) => return Ok(()),
             Some(GetProgressItem::Error(e)) => return Err(e.into()),
             None => return Err("blob download ended without a result".into()),
@@ -406,11 +437,12 @@ pub async fn fetch_blob_bytes(
     }
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
-    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit).await?;
-    let slots = if max_size.is_some() {
-        &AUTOMATIC_TRANSFER_SLOTS
+    let requested = max_size.is_none();
+    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit, requested).await?;
+    let (slots, time_limit) = if requested {
+        (&REQUESTED_TRANSFER_SLOTS, TRANSFER_TIMEOUT)
     } else {
-        &REQUESTED_TRANSFER_SLOTS
+        (&AUTOMATIC_TRANSFER_SLOTS, AUTOMATIC_TRANSFER_TIMEOUT)
     };
     let _slot = slots
         .acquire()
@@ -421,7 +453,14 @@ pub async fn fetch_blob_bytes(
         conn.close(0u32.into(), b"done");
         return Ok(Response::new(bytes));
     }
-    download_to_store(state.blobs().remote(), conn, hash, size).await?;
+    let provider = ticket.addr().id;
+    let downloaded = download_to_store(state.blobs().remote(), conn, hash, size, time_limit).await;
+    if downloaded.is_err() {
+        // Not dialed again for `UNREACHABLE_RETRY_AFTER`: a provider that stalls a
+        // transfer would otherwise take the next slot at once.
+        record_unreachable(provider);
+    }
+    downloaded?;
     let bytes = read_local_blob(&state.blob_store(), hash)
         .await?
         .ok_or("blob is incomplete after download")?;
@@ -443,7 +482,7 @@ pub async fn refetch_blob_bytes(
     let hash = ticket.hash();
     log::info!("[blob] downloading {hash} from remote without using the local store...");
     let (conn, size) =
-        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
+        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64, true).await?;
     let _slot = REQUESTED_TRANSFER_SLOTS
         .acquire()
         .await
@@ -562,23 +601,29 @@ mod tests {
 
         // A limit one byte below the blob size: rejected, and nothing is stored.
         assert!(
-            connect_and_check_size(&fetcher, &ticket, size - 1)
+            connect_and_check_size(&fetcher, &ticket, size - 1, false)
                 .await
                 .is_err()
         );
         assert!(read_local_blob(&store, hash).await.unwrap().is_none());
 
-        let (conn, proven_size) = connect_and_check_size(&fetcher, &ticket, size)
+        let (conn, proven_size) = connect_and_check_size(&fetcher, &ticket, size, false)
             .await
             .unwrap();
         assert_eq!(proven_size, size);
         // A transfer that reports more payload than the given size is stopped.
         assert!(
-            download_to_store(store.remote(), conn.clone(), hash, size - 1)
-                .await
-                .is_err()
+            download_to_store(
+                store.remote(),
+                conn.clone(),
+                hash,
+                size - 1,
+                TRANSFER_TIMEOUT
+            )
+            .await
+            .is_err()
         );
-        download_to_store(store.remote(), conn.clone(), hash, size)
+        download_to_store(store.remote(), conn.clone(), hash, size, TRANSFER_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(read_local_blob(&store, hash).await.unwrap().unwrap(), data);

@@ -307,7 +307,7 @@ impl DeviceSync<'_> {
             .collect();
         stats.devices_added = self
             .storage
-            .insert_missing_linked_devices(&other_devices)
+            .insert_missing_linked_devices(&other_devices, now_millis())
             .await?;
         Ok(())
     }

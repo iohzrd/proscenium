@@ -11,7 +11,7 @@ use crate::constants::{
     PEER_MAX_FOLLOW_REQUEST_BYTES, PEER_MAX_LINK_REQUEST_BYTES, PEER_MAX_PUSH_BYTES,
     PEER_MAX_SMALL_REQUEST_BYTES, PEER_MAX_SYNC_REQUEST_BYTES, PEER_MAX_UNKNOWN_CONNECTIONS,
     PEER_REQUEST_READ_TIMEOUT, PEER_RESPONSE_WRITE_TIMEOUT, SYNC_SERVE_TIMEOUT,
-    SYNC_SERVER_CONCURRENCY, SYNC_SERVER_UNKNOWN_CONCURRENCY,
+    SYNC_SERVE_UNKNOWN_TIMEOUT, SYNC_SERVER_CONCURRENCY, SYNC_SERVER_UNKNOWN_CONCURRENCY,
 };
 use crate::error::AppError;
 use crate::framing::{wait_closed, write_all_timeout};
@@ -272,10 +272,10 @@ impl ProtocolHandler for PeerHandler {
             .try_get_master_pubkey_for_transport(&remote_str)
             .await
             .map_err(AcceptError::from_err)?;
-        // Known: another device of the local user, or the device of a user the local user
-        // follows or approved as follower, both decisions of the local user. A mapping
-        // alone is not enough: one stored message or follow request of a generated
-        // identity creates one.
+        // Known: another device of the local user, a device this device linked that has
+        // not synced yet, or the device of a user the local user follows or approved as
+        // follower, all decisions of the local user. A mapping alone is not enough: one
+        // stored message or follow request of a generated identity creates one.
         let my_pubkey = self.identity.read().await.master_pubkey.clone();
         let known = match &mapped {
             Some(master) => self
@@ -288,7 +288,12 @@ impl ProtocolHandler for PeerHandler {
             .storage
             .is_other_device(&remote_str)
             .await
-            .map_err(AcceptError::from_err)?;
+            .map_err(AcceptError::from_err)?
+            || self
+                .storage
+                .has_pending_link(&remote_str, proscenium_types::now_millis())
+                .await
+                .map_err(AcceptError::from_err)?;
 
         // Bound the handlers that run at the same time, from known and from unknown
         // NodeIds, and per remote NodeId. Both are released when this function returns.
@@ -363,8 +368,13 @@ impl ProtocolHandler for PeerHandler {
                     conn.close(1u32.into(), b"busy");
                     return Err(reject("sync limit reached"));
                 };
+                let serve_timeout = if known {
+                    SYNC_SERVE_TIMEOUT
+                } else {
+                    SYNC_SERVE_UNKNOWN_TIMEOUT
+                };
                 let served = tokio::time::timeout(
-                    SYNC_SERVE_TIMEOUT,
+                    serve_timeout,
                     crate::sync::handle_sync(
                         &self.storage,
                         &self.identity,

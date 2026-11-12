@@ -76,6 +76,45 @@ pub struct IngestionManager {
 
 /// Writes at most `REJECT_LOGS_PER_WINDOW` warn records per window for one topic and
 /// reports the number of unlogged rejections when the next window starts.
+/// Messages a topic may deliver at once, and on average per second, before further
+/// messages are discarded unread. Each message costs a signature check and a write
+/// transaction, and a re-encoded copy of a signed message passes the deduplication of
+/// iroh-gossip. Content of a discarded message reaches the server at its next sync of
+/// the author.
+const TOPIC_MESSAGE_BURST: f64 = 60.0;
+const TOPIC_MESSAGES_PER_SECOND: f64 = 1.0;
+
+/// Token bucket of one topic subscription: `TOPIC_MESSAGE_BURST` tokens, refilled at
+/// `TOPIC_MESSAGES_PER_SECOND`.
+struct MessageBudget {
+    tokens: f64,
+    refilled_at: Instant,
+}
+
+impl MessageBudget {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: TOPIC_MESSAGE_BURST,
+            refilled_at: now,
+        }
+    }
+
+    /// Take one token at `now`; false if none is left.
+    fn take(&mut self, now: Instant) -> bool {
+        let elapsed = now
+            .saturating_duration_since(self.refilled_at)
+            .as_secs_f64();
+        self.refilled_at = now;
+        self.tokens = (self.tokens + elapsed * TOPIC_MESSAGES_PER_SECOND).min(TOPIC_MESSAGE_BURST);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct RejectLog {
     window_start: Instant,
     logged: u32,
@@ -288,6 +327,7 @@ impl IngestionManager {
         receiver: &mut GossipReceiver,
     ) {
         let mut reject_log = RejectLog::new();
+        let mut budget = MessageBudget::new(Instant::now());
         let mut rejoin_delay = REJOIN_MIN_DELAY;
         let mut rejoin_at = Instant::now() + rejoin_delay;
         let mut last_sync_request: Option<Instant> = None;
@@ -297,7 +337,9 @@ impl IngestionManager {
             tokio::select! {
                 event = receiver.try_next() => match event {
                     Ok(Some(Event::Received(message))) => {
-                        if let Err(reason) =
+                        if !budget.take(Instant::now()) {
+                            reject_log.record(pubkey, "message rate limit of the topic reached");
+                        } else if let Err(reason) =
                             self.handle_gossip_message(pubkey, &message.content).await
                         {
                             reject_log.record(pubkey, &reason);
@@ -637,4 +679,29 @@ impl IngestionManager {
 /// True if `outcome` describes an active registration with public visibility.
 pub(crate) fn is_public(outcome: &ChangeOutcome) -> bool {
     outcome.is_active && outcome.visibility == Visibility::Public
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_budget_allows_a_burst_then_the_refill_rate() {
+        let start = Instant::now();
+        let mut budget = MessageBudget::new(start);
+        for _ in 0..TOPIC_MESSAGE_BURST as usize {
+            assert!(budget.take(start));
+        }
+        assert!(!budget.take(start));
+        // One second later one token was added, not more.
+        let later = start + Duration::from_secs(1);
+        assert!(budget.take(later));
+        assert!(!budget.take(later));
+        // The bucket does not grow above the burst size.
+        let much_later = start + Duration::from_secs(3_600);
+        for _ in 0..TOPIC_MESSAGE_BURST as usize {
+            assert!(budget.take(much_later));
+        }
+        assert!(!budget.take(much_later));
+    }
 }

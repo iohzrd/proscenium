@@ -31,6 +31,10 @@ pub const SYNC_SERVER_UNKNOWN_CONCURRENCY: usize = 4;
 /// Time limit for serving one sync request. A requester stops after `SYNC_PEER_TIMEOUT`
 /// too.
 pub const SYNC_SERVE_TIMEOUT: Duration = SYNC_PEER_TIMEOUT;
+/// Time limit for serving one sync request to a NodeId that is not known (see
+/// `PeerHandler::accept`), so that generated NodeIds hold the permits of that class only
+/// briefly. A requester that did not finish continues at its next sync.
+pub const SYNC_SERVE_UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Peer protocol (accept side)
 /// Connections on the peer ALPN handled at the same time from known NodeIds (other devices

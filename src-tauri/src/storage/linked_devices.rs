@@ -82,10 +82,17 @@ impl Storage {
     /// its row; a NodeId in `removed_devices` is not inserted. Returns the number of rows
     /// inserted.
     ///
+    /// The `added_at` of an inserted row is at least `added_at_floor`. The own device list
+    /// holds the `MAX_LINKED_DEVICES` rows with the lowest `added_at`, so device sync passes
+    /// the current time: a removed device that still holds the master key and syncs with
+    /// a device that has not merged its removal then cannot push stored devices out of
+    /// that list by naming devices with an early `added_at`.
+    ///
     /// The caller passes only entries of a device list signed by the local master key.
     pub async fn insert_missing_linked_devices(
         &self,
         devices: &[DeviceEntry],
+        added_at_floor: u64,
     ) -> Result<u32, AppError> {
         let mut inserted = 0u32;
         for device in devices {
@@ -97,7 +104,7 @@ impl Storage {
             )
             .bind(&device.node_id)
             .bind(bounded_device_name(&device.device_name))
-            .bind(i64::try_from(device.added_at).unwrap_or(i64::MAX))
+            .bind(i64::try_from(device.added_at.max(added_at_floor)).unwrap_or(i64::MAX))
             .execute(&self.pool)
             .await?;
             if result.rows_affected() > 0 {
@@ -287,6 +294,20 @@ impl Storage {
         Ok(taken)
     }
 
+    /// True if `record_pending_link` recorded `node_id` at most `PENDING_LINK_TTL_MS`
+    /// before `now`. Does not delete the record.
+    pub async fn has_pending_link(&self, node_id: &str, now: u64) -> Result<bool, AppError> {
+        let cutoff = i64::try_from(now.saturating_sub(PENDING_LINK_TTL_MS)).unwrap_or(0);
+        let exists: bool = sqlx::query_scalar(
+            "SELECT COUNT(*) > 0 FROM pending_link_devices WHERE node_id = ?1 AND linked_at >= ?2",
+        )
+        .bind(node_id)
+        .bind(cutoff)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// The row of `node_id` if it is stored as another device of the local user.
     pub async fn get_other_device(&self, node_id: &str) -> Result<Option<DeviceEntry>, AppError> {
         let row = sqlx::query(
@@ -383,7 +404,8 @@ impl Storage {
             .await?;
         self.merge_removed_devices(&bundle.announcement.removed, &own_device.node_id)
             .await?;
-        self.insert_missing_linked_devices(&bundle.announcement.devices)
+        // The bundle comes from the device the user links with: its order is kept.
+        self.insert_missing_linked_devices(&bundle.announcement.devices, 0)
             .await?;
         self.upsert_linked_device(
             &own_device.node_id,
