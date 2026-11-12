@@ -102,6 +102,7 @@ impl Node {
 
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
+            .transport_config(proscenium_types::quic_transport_config())
             .bind()
             .await?;
 

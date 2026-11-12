@@ -3,9 +3,11 @@
 //! Every device holds the master key. Each side sends its device list signed by the
 //! master key and accepts the other side only if that list is signed by the local master
 //! key and lists the NodeId of the connection, which QUIC authenticates, and the NodeId
-//! was not removed. Both sides store the removed NodeIds and the devices of the other
-//! side's list. A device whose NodeId the other side's list removes stops the exchange and
-//! deletes its data (`crate::setup::reset_removed_device`).
+//! was not removed. Both sides store the devices of the other side's list, and its
+//! removed NodeIds if the other side is a stored device of the local user. A device whose
+//! NodeId such a list removes stops the exchange and asks the user whether to delete its
+//! data (`crate::setup::confirm_removed_device_reset`). A removed device holds the master
+//! key, so a removal never deletes data without that confirmation.
 //!
 //! Stream 1 (opened by the requester): JSON `PeerRequest::DeviceSyncRequest` with the
 //! requester's device list, then finish. The responder answers with the JSON of its own
@@ -131,8 +133,9 @@ pub struct DeviceSyncStats {
     pub devices_added: u32,
     /// Rows of other devices deleted because the other side's list removed them.
     pub devices_removed: u32,
-    /// The other side's list removed the local device; the exchange stopped there.
-    pub local_removed: bool,
+    /// Name of the stored device whose list removed the local device; the exchange
+    /// stopped there.
+    pub local_removed_by: Option<String>,
     /// Direct messages stored for the first time, by the other user of the conversation.
     pub dms_imported: BTreeMap<String, Vec<StoredMessage>>,
     /// Own interactions deleted by tombstones from the other device.
@@ -252,29 +255,36 @@ impl DeviceSync<'_> {
         verify_lists_device(announcement, &master_pubkey, remote)
     }
 
-    /// Store the removed NodeIds of `announcement`, a list that passed
-    /// `verify_device_list` for `remote`, then its devices that are not stored yet.
+    /// Store `announcement`, a list that passed `verify_device_list` for `remote`.
     ///
-    /// If the list removes the local device, sets `stats.local_removed` and stores
-    /// nothing. Returns an error if `remote` was removed.
+    /// Returns an error, and stores nothing, if `remote` was removed. Its removed NodeIds
+    /// are stored only if `remote` is a stored device of the local user; a list from an
+    /// unknown NodeId adds devices only. If such a list removes the local device, sets
+    /// `stats.local_removed_by` and stores nothing. Then its devices that are not stored
+    /// yet are stored.
     async fn merge_device_list(
         &self,
         announcement: &LinkedDevicesAnnouncement,
         remote: &str,
         stats: &mut DeviceSyncStats,
     ) -> Result<(), AppError> {
-        let own_node_id = self.identity.read().await.transport_node_id.clone();
-        let merged = self
-            .storage
-            .merge_removed_devices(&announcement.removed, &own_node_id)
-            .await?;
-        if merged.local_removed {
-            stats.local_removed = true;
-            return Ok(());
-        }
-        stats.devices_removed = merged.devices_removed;
         if self.storage.is_removed_device(remote).await? {
             return Err("device sync: the other device was removed from this identity".into());
+        }
+        self.storage
+            .record_own_announcement_version(announcement.version)
+            .await?;
+        let own_node_id = self.identity.read().await.transport_node_id.clone();
+        if let Some(remover) = self.storage.get_other_device(remote).await? {
+            let merged = self
+                .storage
+                .merge_removed_devices(&announcement.removed, &own_node_id)
+                .await?;
+            if merged.local_removed {
+                stats.local_removed_by = Some(remover.device_name);
+                return Ok(());
+            }
+            stats.devices_removed = merged.devices_removed;
         }
         let other_devices: Vec<_> = announcement
             .devices
@@ -501,7 +511,7 @@ impl DeviceSync<'_> {
             let _ = timed("flush device list", STEP_TIMEOUT, request_send.stopped()).await;
             return Err(e);
         }
-        if stats.local_removed {
+        if stats.local_removed_by.is_some() {
             return Ok(stats);
         }
 
@@ -546,7 +556,7 @@ impl DeviceSync<'_> {
         self.verify_device_list(&announcement, &remote).await?;
         self.merge_device_list(&announcement, &remote, &mut stats)
             .await?;
-        if stats.local_removed {
+        if stats.local_removed_by.is_some() {
             return Ok(stats);
         }
 
@@ -579,7 +589,8 @@ impl DeviceSync<'_> {
 /// the user's posts are deleted, as `commands::social::unfollow_user` does. Emits
 /// `feed-updated` if interactions or posts were removed, `dm-synced`
 /// (`{ peer, messages }`) for each conversation with imported direct messages, and
-/// broadcasts the device announcement if devices were added or removed.
+/// `linked-devices-changed` and broadcasts the device announcement if devices were added
+/// or removed.
 async fn after_sync(
     storage: &Storage,
     identity: &SharedIdentity,
@@ -615,6 +626,7 @@ async fn after_sync(
     if stats.devices_added == 0 && stats.devices_removed == 0 {
         return;
     }
+    let _ = app_handle.emit("linked-devices-changed", ());
     match build_own_announcement(storage, identity).await {
         Ok(announcement) => {
             if let Err(e) = gossip.broadcast_linked_devices(&announcement).await {
@@ -642,15 +654,17 @@ fn log_stats(role: &str, node_id: &str, stats: &DeviceSyncStats) {
     );
 }
 
-/// Start `crate::setup::reset_removed_device` on its own task: it stops the network
-/// stack, which aborts the device sync tasks.
-fn start_removed_device_reset(app_handle: &AppHandle) {
-    log::warn!("[device-sync] another device removed this device from the identity");
+/// Start `crate::setup::confirm_removed_device_reset` on its own task: the reset stops
+/// the network stack, which aborts the device sync tasks. `remover` names the device
+/// whose list removed this device.
+fn start_removed_device_reset(app_handle: &AppHandle, remover: &str) {
+    log::warn!("[device-sync] device {remover} removed this device from the identity");
     match app_handle.try_state::<Arc<AppState>>() {
         Some(state) => {
-            tokio::spawn(crate::setup::reset_removed_device(Arc::clone(
-                state.inner(),
-            )));
+            tokio::spawn(crate::setup::confirm_removed_device_reset(
+                Arc::clone(state.inner()),
+                remover.to_string(),
+            ));
         }
         None => log::error!("[device-sync] no app state; the data of this device is kept"),
     }
@@ -707,8 +721,11 @@ pub async fn handle_device_sync(
         Err(_) => Err("device sync: exchange timed out".into()),
     };
     match result {
-        Ok(stats) if stats.local_removed => {
-            start_removed_device_reset(app_handle);
+        Ok(DeviceSyncStats {
+            local_removed_by: Some(remover),
+            ..
+        }) => {
+            start_removed_device_reset(app_handle, &remover);
             Ok(())
         }
         Ok(stats) => {
@@ -787,8 +804,11 @@ pub async fn sync_all_devices(state: &AppState) {
         )
         .await
         {
-            Ok(Ok(stats)) if stats.local_removed => {
-                start_removed_device_reset(&state.app_handle);
+            Ok(Ok(DeviceSyncStats {
+                local_removed_by: Some(remover),
+                ..
+            })) => {
+                start_removed_device_reset(&state.app_handle, &remover);
                 return;
             }
             Ok(Ok(stats)) => {
@@ -982,10 +1002,11 @@ mod tests {
         .unwrap();
         // A message from `followed` that only device A received.
         let received = dm(&me, &followed, &followed, &me, "hi from followed");
-        assert!(
+        assert_eq!(
             a.receive_dm_message(&followed, &received, "hi")
                 .await
-                .unwrap()
+                .unwrap(),
+            crate::storage::ReceivedDm::Stored
         );
 
         // Device B: the follow that A removed, in its older active state, a mute, the same bookmark in its older active state, its own row and the
@@ -1139,7 +1160,7 @@ mod tests {
         let (stats_b, stats_a) = (stats_b.expect("requester"), stats_a.expect("responder"));
         assert_eq!(stats_b.devices_removed, 1);
         assert_eq!(stats_a.devices_added, 0);
-        assert!(!stats_a.local_removed && !stats_b.local_removed);
+        assert!(stats_a.local_removed_by.is_none() && stats_b.local_removed_by.is_none());
         assert!(b.is_removed_device(&node_id(seed_c)).await.unwrap());
         assert_eq!(
             b.get_other_device_node_ids().await.unwrap(),
@@ -1157,15 +1178,92 @@ mod tests {
         )
         .await;
         assert!(stats_a.is_err());
-        assert!(stats_c.expect("requester").local_removed);
+        assert_eq!(
+            stats_c.expect("requester").local_removed_by.as_deref(),
+            Some("Android")
+        );
 
         // B requests a sync from C: C finds its removal in B's list.
         let (stats_b, stats_c) =
             run_sync((seed_c, c.clone(), id_c), (seed_b, b.clone(), id_b)).await;
         assert!(stats_b.is_err());
-        assert!(stats_c.expect("responder").local_removed);
+        assert!(stats_c.expect("responder").local_removed_by.is_some());
         // C stored nothing of the lists that removed it.
         assert!(c.get_removed_device_ids().await.unwrap().is_empty());
+    }
+
+    /// A list of the identity `master` with the devices `devices` and the removed NodeIds
+    /// `removed`, signed by `master`, as a modified client can send it.
+    fn crafted_list(
+        master: [u8; 32],
+        devices: &[u8],
+        removed: &[u8],
+    ) -> proscenium_types::LinkedDevicesAnnouncement {
+        let key = SecretKey::from_bytes(&master);
+        let mut list = proscenium_types::LinkedDevicesAnnouncement {
+            master_pubkey: key.public().to_string(),
+            devices: devices
+                .iter()
+                .map(|&seed| proscenium_types::DeviceEntry {
+                    node_id: node_id(seed),
+                    device_name: "Android".to_string(),
+                    added_at: 1,
+                })
+                .collect(),
+            removed: removed.iter().map(|&seed| node_id(seed)).collect(),
+            version: now_millis(),
+            signature: String::new(),
+        };
+        proscenium_types::sign_linked_devices_announcement(&mut list, &key);
+        list
+    }
+
+    #[tokio::test]
+    async fn removals_apply_only_from_a_stored_device() {
+        let master = [1u8; 32];
+        let (seed_a, seed_b, seed_c, seed_e) = (41u8, 42u8, 43u8, 44u8);
+        let identity = shared_identity(master, seed_a);
+        let a = device_storage(seed_a, &[seed_b, seed_c]).await;
+        let sync = DeviceSync {
+            storage: &a,
+            identity: &identity,
+        };
+
+        // A list of the unknown NodeId E that removes A and C adds E and nothing else.
+        let from_e = crafted_list(master, &[seed_e], &[seed_a, seed_c]);
+        let mut stats = DeviceSyncStats::default();
+        sync.merge_device_list(&from_e, &node_id(seed_e), &mut stats)
+            .await
+            .unwrap();
+        assert!(stats.local_removed_by.is_none());
+        assert_eq!(stats.devices_added, 1);
+        assert!(a.is_other_device(&node_id(seed_c)).await.unwrap());
+        assert!(a.get_removed_device_ids().await.unwrap().is_empty());
+
+        // The same removal from the stored device B is reported and stores nothing.
+        let from_b = crafted_list(master, &[seed_b], &[seed_a, seed_c]);
+        let mut stats = DeviceSyncStats::default();
+        sync.merge_device_list(&from_b, &node_id(seed_b), &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(stats.local_removed_by.as_deref(), Some("Android"));
+        assert!(a.is_other_device(&node_id(seed_c)).await.unwrap());
+
+        // B removes C: A applies it, then refuses C before reading anything of its list.
+        let from_b = crafted_list(master, &[seed_b], &[seed_c]);
+        let mut stats = DeviceSyncStats::default();
+        sync.merge_device_list(&from_b, &node_id(seed_b), &mut stats)
+            .await
+            .unwrap();
+        assert_eq!(stats.devices_removed, 1);
+        let from_c = crafted_list(master, &[seed_c], &[seed_b]);
+        let mut stats = DeviceSyncStats::default();
+        assert!(
+            sync.merge_device_list(&from_c, &node_id(seed_c), &mut stats)
+                .await
+                .is_err()
+        );
+        assert!(a.is_other_device(&node_id(seed_b)).await.unwrap());
     }
 
     /// A stored message of the conversation of `me` and `peer`, from `from` to `to`.

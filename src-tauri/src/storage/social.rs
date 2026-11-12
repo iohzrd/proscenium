@@ -147,6 +147,20 @@ impl Storage {
         Ok(is_new)
     }
 
+    /// Delete the row that records `pubkey` as a follower of `me`.
+    pub(super) async fn delete_follower_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        me: &str,
+        pubkey: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query("DELETE FROM social_graph WHERE follower=?1 AND followee=?2")
+            .bind(pubkey)
+            .bind(me)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
     /// `upsert_follower` inside an open write transaction.
     pub(super) async fn upsert_follower_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,

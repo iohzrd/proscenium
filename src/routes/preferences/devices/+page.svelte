@@ -59,7 +59,7 @@
     error = null;
     try {
       await invoke("remove_linked_device", { nodeId: device.node_id });
-      linkStatus = `${device.device_name} was removed. It deletes its data the next time it connects to one of your devices.`;
+      linkStatus = `${device.device_name} was removed. The next time it connects to one of your devices, it asks whether to delete its data.`;
       await loadDevices();
     } catch (e) {
       // "cancelled": the native confirmation was declined.
@@ -142,9 +142,13 @@
           linkStatus = null;
           error = "The link failed. Generate a new code to try again.";
         } else if (payload === "bundle_sent") {
-          linkStatus = "Link bundle sent to new device.";
-          loadDevices();
+          linkStatus =
+            "Link bundle sent. The new device appears in this list after its first device sync.";
         }
+      },
+      // Device sync added or removed a device.
+      "linked-devices-changed": () => {
+        loadDevices();
       },
       // New device: the code to compare with the existing device.
       "device-link-code": (payload) => {

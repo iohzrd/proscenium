@@ -68,6 +68,14 @@ pub async fn save_my_profile(
     state.gossip().apply_stored_visibility().await?;
     state.gossip().broadcast_profile(&profile).await?;
 
+    // The other devices of the user read the new visibility when they fetch this
+    // profile in a device sync. Until then a device that was Public keeps broadcasting
+    // and serving as Public, so the sync starts now instead of at the next interval.
+    if old_visibility != new_visibility {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move { crate::device_sync::sync_all_devices(&state).await });
+    }
+
     if let Ok(servers) = state.storage.get_servers().await {
         for server in servers {
             if server.registered_at.is_some()

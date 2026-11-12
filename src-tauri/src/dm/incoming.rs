@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::storage::Storage;
+use crate::storage::{ReceivedDm, Storage};
 use iroh::EndpointId;
 use proscenium_types::{
     DmAck, DmEnvelope, DmPayload, StoredMessage, is_valid_id, now_millis, short_id,
@@ -60,8 +60,11 @@ impl DmHandler {
     /// Handle an envelope received from the device `remote` and return the answer.
     ///
     /// The envelope is applied only if `envelope_refusal` finds nothing, the sender is
-    /// not blocked and the payload is valid. Then the device list is cached, delivered by
-    /// `remote`, under the rule of `Storage::cache_peer_announcement`.
+    /// not blocked and the payload is valid. A message from a stranger beyond the limits
+    /// of `Storage::receive_dm_message` is refused. The device list, delivered by `remote`,
+    /// is cached under the rule of `Storage::cache_peer_announcement` after a message was
+    /// stored, or for another payload if a conversation with the sender exists or the
+    /// sender is followed, so signals from unknown identities add no rows.
     ///
     /// `Ok(DmAck::Rejected)` means the envelope was refused. `Err` means a local failure
     /// (storage); no answer is sent, so the sender keeps the message queued.
@@ -94,18 +97,10 @@ impl DmHandler {
             return Ok(DmAck::Rejected);
         }
 
-        if let Err(e) = self
-            .storage
-            .cache_peer_announcement(&envelope.sender_devices, Some(&remote.to_string()))
-            .await
-        {
-            log::warn!(
-                "[dm] failed to store the device list of {}: {e}",
-                short_id(&sender)
-            );
-        }
-
+        let known_sender = self.storage.has_conversation(&sender).await?
+            || self.storage.is_following(&me, &sender).await?;
         let conv_id = Storage::conversation_id(&me, &sender);
+        let mut cache_list = known_sender;
         match envelope.payload {
             DmPayload::Message(msg) => {
                 let now = now_millis();
@@ -124,25 +119,34 @@ impl DmHandler {
                     reply_to: msg.reply_to.clone(),
                 };
                 let preview = crate::util::message_preview(&stored_msg.content);
-                if self
+                match self
                     .storage
                     .receive_dm_message(&sender, &stored_msg, &preview)
                     .await?
                 {
-                    log::info!("[dm] received message from {}", short_id(&sender));
-                    let _ = self.app_handle.emit(
-                        "dm-received",
-                        serde_json::json!({
-                            "from": sender,
-                            "message": stored_msg,
-                        }),
-                    );
-                } else {
-                    log::debug!(
+                    ReceivedDm::Stored => {
+                        cache_list = true;
+                        log::info!("[dm] received message from {}", short_id(&sender));
+                        let _ = self.app_handle.emit(
+                            "dm-received",
+                            serde_json::json!({
+                                "from": sender,
+                                "message": stored_msg,
+                            }),
+                        );
+                    }
+                    ReceivedDm::Duplicate => log::debug!(
                         "[dm] message {} from {} is already stored",
                         short_id(&msg.id),
                         short_id(&sender)
-                    );
+                    ),
+                    ReceivedDm::Refused => {
+                        log::warn!(
+                            "[dm] refusing message from {}: message limit of an unanswered sender",
+                            short_id(&sender)
+                        );
+                        return Ok(DmAck::Rejected);
+                    }
                 }
             }
             DmPayload::Delivered { message_id } => {
@@ -184,6 +188,18 @@ impl DmHandler {
                     payload,
                 });
             }
+        }
+
+        if cache_list
+            && let Err(e) = self
+                .storage
+                .cache_peer_announcement(&envelope.sender_devices, Some(&remote.to_string()))
+                .await
+        {
+            log::warn!(
+                "[dm] failed to store the device list of {}: {e}",
+                short_id(&sender)
+            );
         }
 
         // The peer is reachable: attempt its queued messages without waiting for their

@@ -311,6 +311,7 @@ async fn build_network_stack(
     log::info!("[setup] binding iroh endpoint...");
     let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(transport_secret_key)
+        .transport_config(proscenium_types::quic_transport_config())
         .alpns(vec![
             iroh_blobs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
@@ -494,6 +495,22 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         Ok(n) => log::info!("[setup] deleted {n} stale device lists of unrelated users"),
         Err(e) => log::error!("[setup] failed to delete stale device lists: {e}"),
     }
+    // Content that profile views synced of users the local user does not follow.
+    let cutoff = now_millis().saturating_sub(crate::constants::VIEWED_AUTHOR_RETENTION_MS);
+    match state.storage.take_viewed_authors_before(cutoff).await {
+        Ok(authors) => {
+            for author in authors {
+                if let Err(e) = state
+                    .storage
+                    .delete_content_unless_followed(&master_pubkey, &author)
+                    .await
+                {
+                    log::error!("[setup] failed to delete content of a viewed author: {e}");
+                }
+            }
+        }
+        Err(e) => log::error!("[setup] failed to read viewed authors: {e}"),
+    }
 
     // Signs the stored profile again if its signature does not verify under the master
     // key, then broadcasts the profile and the device list.
@@ -611,11 +628,13 @@ async fn install_identity(
 
     let dir = data_dir.clone();
     run_blocking_io(move || {
-        write_identity_files(&dir, &keys)?;
         // The identity exists outside this device (on the linking device, or as the
         // recovery phrase the user entered). With the marker present, `get_seed_phrase`
-        // returns the phrase only after native confirmation.
-        write_secret_file(&dir.join(SEED_BACKED_UP_FILE), b"1")
+        // returns the phrase only after native confirmation. It is written before the
+        // keys, so a failure between them leaves the marker next to the previous keys,
+        // not the new keys without it.
+        write_secret_file(&dir.join(SEED_BACKED_UP_FILE), b"1")?;
+        write_identity_files(&dir, &keys)
     })
     .await?;
 
@@ -653,9 +672,9 @@ impl Drop for ReplacementInProgress<'_> {
 /// stack in place. Used by seed phrase recovery (`bundle` is `None`) and device linking.
 ///
 /// Order: stop the network stack (which closes the blob store), delete all rows and the
-/// blob store, write the transport key file and then the master key file, import
-/// `bundle`, load the identity from disk, build and start a new network stack. Returns an
-/// error, and changes nothing, if the network stack does not stop within
+/// blob store, write the seed phrase marker, the transport key file and then the master
+/// key file, import `bundle`, load the identity from disk, build and start a new network
+/// stack. Returns an error, and changes nothing, if the network stack does not stop within
 /// `REPLACE_SHUTDOWN_LIMIT`. The returned error of any later step states that a restart
 /// is required. Returns an error at once if another call is in progress.
 pub async fn replace_identity(
@@ -693,15 +712,43 @@ pub async fn replace_identity(
     Ok(())
 }
 
+/// Ask in a native dialog whether to delete the data of this device, which the stored
+/// device `remover` removed from the identity, and run `reset_removed_device` if the user
+/// confirms. Any holder of the master key can sign such a removal, so the data is deleted
+/// only on confirmation. The question is asked once per process (`removal_prompted`).
+pub(crate) async fn confirm_removed_device_reset(state: Arc<AppState>, remover: String) {
+    if state.removal_prompted.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let confirmed = crate::confirm::confirm_native(
+        &state.app_handle,
+        "Device removed",
+        &format!(
+            "Your device {} removed this device from your identity.\n\n\
+             Delete the data on this device, including its copy of the identity? The app \
+             then restarts with a new identity. Choose Cancel if you did not remove this \
+             device: any device that holds your identity can send this removal.",
+            crate::confirm::dialog_device_name(&remover)
+        ),
+        "Delete data",
+    )
+    .await;
+    if confirmed {
+        reset_removed_device(state).await;
+    } else {
+        log::warn!("[identity] the removal of this device was declined; its data is kept");
+    }
+}
+
 /// Delete the data of this device after another device of the identity removed it, then
 /// restart the app. At startup `ensure_key_files` generates a new identity.
 ///
-/// Stops the network stack, deletes all rows, then the blob store, the master key file,
-/// the transport key file and the seed phrase markers, and writes `DEVICE_REMOVED_FILE`.
+/// Stops the network stack, deletes all rows, then the master key file, the transport key
+/// file, the seed phrase markers and the blob store, and writes `DEVICE_REMOVED_FILE`.
 /// If the rows were not deleted, the files are kept, so the next start loads the same
-/// identity and the next device sync starts this again. Returns without changes while an
+/// identity and the next device sync asks again. Returns without changes while an
 /// identity replacement is in progress.
-pub(crate) async fn reset_removed_device(state: Arc<AppState>) {
+async fn reset_removed_device(state: Arc<AppState>) {
     let Some(_replacement) = ReplacementInProgress::begin(&state) else {
         log::warn!("[identity] an identity replacement is in progress; the removal is not applied");
         return;
@@ -730,11 +777,8 @@ pub(crate) async fn reset_removed_device(state: Arc<AppState>) {
         app.request_restart();
         return;
     }
-    match tokio::fs::remove_dir_all(data_dir.join(BLOBS_DIR)).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log::error!("[identity] failed to remove the blob store: {e}"),
-    }
+    // The key files go first after the rows: an exit before they are deleted would leave
+    // the identity next to an empty database, which no device sync asks about again.
     for name in [
         MASTER_KEY_FILE,
         TRANSPORT_KEY_FILE,
@@ -746,6 +790,11 @@ pub(crate) async fn reset_removed_device(state: Arc<AppState>) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => log::error!("[identity] failed to delete {name}: {e}"),
         }
+    }
+    match tokio::fs::remove_dir_all(data_dir.join(BLOBS_DIR)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::error!("[identity] failed to remove the blob store: {e}"),
     }
     let marker = data_dir.join(DEVICE_REMOVED_FILE);
     if let Err(e) = run_blocking_io(move || write_secret_file(&marker, b"1")).await {
@@ -795,6 +844,27 @@ pub fn initialize(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
     tauri::async_runtime::block_on(setup(handle))
 }
 
+/// A `reqwest` client builder whose TLS verification works on this platform.
+///
+/// On Android, `rustls-platform-verifier` needs JNI initialization and a Kotlin component
+/// in the APK, neither of which this app has; without them certificate verification
+/// panics. The Android client therefore trusts only the Mozilla root certificates of
+/// `webpki-root-certs`. Other platforms use the operating system's verifier.
+fn http_client_builder() -> Result<reqwest::ClientBuilder, AppError> {
+    #[cfg(target_os = "android")]
+    {
+        let roots = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(reqwest::Client::builder().tls_certs_only(roots))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(reqwest::Client::builder())
+    }
+}
+
 async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = handle.path().app_data_dir()?;
     create_data_dir(&data_dir).map_err(|e| {
@@ -840,7 +910,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
 
     // Redirects are not followed: a discovery server must not be able to forward a
     // signed request to another host.
-    let http_client = reqwest::Client::builder()
+    let http_client = http_client_builder()?
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("proscenium/1.0")

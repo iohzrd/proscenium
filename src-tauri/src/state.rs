@@ -85,6 +85,9 @@ pub struct AppState {
     pub(crate) exit_started: AtomicBool,
     /// Set while `setup::replace_identity` runs.
     pub(crate) replacing_identity: AtomicBool,
+    /// Set when the user was asked whether to delete the data of this device after
+    /// another device removed it. The question is asked once per process.
+    pub(crate) removal_prompted: AtomicBool,
 }
 
 impl AppState {
@@ -171,6 +174,7 @@ impl AppState {
             net: std::sync::RwLock::new(net),
             exit_started: AtomicBool::new(false),
             replacing_identity: AtomicBool::new(false),
+            removal_prompted: AtomicBool::new(false),
         }
     }
 }

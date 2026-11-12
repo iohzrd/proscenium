@@ -15,8 +15,10 @@ mod social;
 mod sync;
 #[cfg(test)]
 mod tests;
+mod viewed_authors;
 
 pub use follow_requests::{DirectApproval, FollowRequestOutcome};
+pub use messaging::ReceivedDm;
 pub use peer_identities::AnnouncementOutcome;
 pub use social::RemoteListKind;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -145,6 +147,10 @@ impl Storage {
         (
             "022_removed_devices",
             include_str!("../../migrations/022_removed_devices.sql"),
+        ),
+        (
+            "023_viewed_authors",
+            include_str!("../../migrations/023_viewed_authors.sql"),
         ),
     ];
 

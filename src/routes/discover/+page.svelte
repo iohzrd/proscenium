@@ -8,6 +8,7 @@
   import UserResultsList from "#lib/discover/UserResultsList.svelte";
   import PostResultsList from "#lib/discover/PostResultsList.svelte";
   import TrendingList from "#lib/discover/TrendingList.svelte";
+  import ConfirmDialog from "../ConfirmDialog.svelte";
   import type {
     ServerEntry,
     ServerUser,
@@ -202,16 +203,26 @@
     }
   }
 
-  async function unfollow(pubkey: string) {
-    if (
-      !confirm(
-        "Unfollow this user? Their posts will be deleted from your device.",
-      )
-    ) {
-      return;
+  // User whose unfollow confirmation is shown.
+  let pendingUnfollow = $state<string | null>(null);
+
+  /** Run the unfollow confirmed in the dialog. */
+  async function unfollow() {
+    const pubkey = pendingUnfollow;
+    pendingUnfollow = null;
+    if (!pubkey || togglingFollow) return;
+    togglingFollow = pubkey;
+    try {
+      await invoke("unfollow_user", { pubkey });
+      followedPubkeys = new Set(
+        [...followedPubkeys].filter((p) => p !== pubkey),
+      );
+    } catch (e) {
+      toast.show(`Failed to unfollow: ${e}`);
+      console.error("Unfollow failed:", e);
+    } finally {
+      togglingFollow = null;
     }
-    await invoke("unfollow_user", { pubkey });
-    followedPubkeys = new Set([...followedPubkeys].filter((p) => p !== pubkey));
   }
 
   async function follow(pubkey: string) {
@@ -232,11 +243,16 @@
     followedPubkeys = new Set([...followedPubkeys, pubkey]);
   }
 
+  /** Follow `pubkey`, or show the unfollow confirmation. */
   async function toggleFollow(pubkey: string) {
     if (togglingFollow) return;
+    if (followedPubkeys.has(pubkey)) {
+      pendingUnfollow = pubkey;
+      return;
+    }
     togglingFollow = pubkey;
     try {
-      await (followedPubkeys.has(pubkey) ? unfollow(pubkey) : follow(pubkey));
+      await follow(pubkey);
     } catch (e) {
       toast.show(`Failed to update follow: ${e}`);
       console.error("Follow toggle failed:", e);
@@ -337,6 +353,17 @@
       />
     {/if}
   </div>
+{/if}
+
+{#if pendingUnfollow}
+  <ConfirmDialog
+    label="Unfollow"
+    confirmLabel="Unfollow"
+    onconfirm={unfollow}
+    oncancel={() => (pendingUnfollow = null)}
+  >
+    <p>Unfollow this user? Their posts will be deleted from your device.</p>
+  </ConfirmDialog>
 {/if}
 
 {#if toast.message}

@@ -116,7 +116,18 @@ pub fn validate_media_list(media: &[MediaAttachment]) -> Result<(), String> {
     Ok(())
 }
 
+/// Check `profile` with `validate_profile_fields`, and that `updated_at` is at most
+/// `MAX_TIMESTAMP_DRIFT_MS` after the local clock.
 pub fn validate_profile(profile: &Profile) -> Result<(), String> {
+    validate_profile_fields(profile)?;
+    if profile.updated_at > now_millis() + MAX_TIMESTAMP_DRIFT_MS {
+        return Err("profile updated_at is too far in the future".to_string());
+    }
+    Ok(())
+}
+
+/// Check the length limits of the fields of `profile`. Does not check `updated_at`.
+pub fn validate_profile_fields(profile: &Profile) -> Result<(), String> {
     if profile.display_name.len() > MAX_DISPLAY_NAME_LEN {
         return Err(format!(
             "display name too long: {} bytes (max {})",
@@ -148,9 +159,6 @@ pub fn validate_profile(profile: &Profile) -> Result<(), String> {
         return Err(format!(
             "avatar ticket too long (max {MAX_BLOB_TICKET_LEN} bytes)"
         ));
-    }
-    if profile.updated_at > now_millis() + MAX_TIMESTAMP_DRIFT_MS {
-        return Err("profile updated_at is too far in the future".to_string());
     }
     Ok(())
 }

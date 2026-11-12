@@ -23,15 +23,22 @@ pub const SYNC_MAX_INTERACTIONS_PER_RUN: usize = 100_000;
 pub const SYNC_RETURNED_POSTS_MAX: usize = 200;
 /// Tombstones per `Tombstones` frame sent by a responder.
 pub const SYNC_TOMBSTONE_BATCH: usize = 1_000;
-/// Sync requests served at the same time, in total. One NodeId is served one at a time.
+/// Sync requests served at the same time to known NodeIds (other devices of the local
+/// user, and NodeIds mapped to an identity), and separately to other NodeIds. One NodeId
+/// is served one at a time.
 pub const SYNC_SERVER_CONCURRENCY: usize = 4;
+pub const SYNC_SERVER_UNKNOWN_CONCURRENCY: usize = 4;
 /// Time limit for serving one sync request. A requester stops after `SYNC_PEER_TIMEOUT`
 /// too.
 pub const SYNC_SERVE_TIMEOUT: Duration = SYNC_PEER_TIMEOUT;
 
 // Peer protocol (accept side)
-/// Connections on the peer ALPN handled at the same time, in total and per remote NodeId.
+/// Connections on the peer ALPN handled at the same time from known NodeIds (other devices
+/// of the local user, and NodeIds mapped to an identity), from other NodeIds, and per
+/// remote NodeId. NodeIds cost nothing to generate, so unknown NodeIds have their own
+/// limit and cannot take the connections of known ones.
 pub const PEER_MAX_CONNECTIONS: usize = 64;
+pub const PEER_MAX_UNKNOWN_CONNECTIONS: usize = 32;
 pub const PEER_MAX_CONNECTIONS_PER_NODE: usize = 4;
 /// Time allowed for the remote to open the request stream.
 pub const PEER_ACCEPT_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,6 +98,9 @@ pub const SERVER_PROFILE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(60);
 pub const SERVER_PROFILE_SYNC_INTERVAL: Duration = Duration::from_secs(600);
 /// Cached device lists of unrelated users older than this are deleted at startup.
 pub const PEER_ANNOUNCEMENT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+/// Time the content of a user the local user does not follow, synced by a profile view,
+/// is kept. Deleted at startup.
+pub const VIEWED_AUTHOR_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 // DM outbox
 pub const OUTBOX_FLUSH_INTERVAL: Duration = Duration::from_secs(60);

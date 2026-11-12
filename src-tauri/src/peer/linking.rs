@@ -20,7 +20,10 @@
 //!   connection with `LINK_CLOSE_DECLINED`.
 //!
 //! The new device validates the bundle and closes the connection with `LINK_CLOSE_DONE`.
-//! The existing device stores the new device only after it received that close code.
+//! The existing device does not store the new NodeId: the new device installs the
+//! identity after the connection closed and can still fail, so the existing device stores
+//! it when the new device first device-syncs with it, presenting a list signed by the
+//! master key that names it.
 
 use crate::announcement::{build_own_announcement, local_device_name, verify_lists_device};
 use crate::error::AppError;
@@ -419,13 +422,7 @@ impl PeerHandler {
         // The QR code is no longer accepted; the devices page closes it on this event.
         let _ = self.app_handle.emit("device-link-progress", "confirming");
         let served = self
-            .confirm_and_send(
-                send,
-                conn,
-                &link_code(&local_node, &new_node),
-                &new_node_id,
-                device_name,
-            )
+            .confirm_and_send(send, conn, &link_code(&local_node, &new_node), device_name)
             .await;
         match &served {
             Ok(LinkServed::Linked) => {}
@@ -439,15 +436,13 @@ impl PeerHandler {
         served
     }
 
-    /// Ask the user to compare `code` (`confirm_link`), send the bundle, and store
-    /// `new_node_id` as the device `device_name` and announce it after the new device
-    /// closed the connection with `LINK_CLOSE_DONE`.
+    /// Ask the user to compare `code` (`confirm_link`), send the bundle, and wait until
+    /// the new device closed the connection with `LINK_CLOSE_DONE`.
     async fn confirm_and_send(
         &self,
         mut send: SendStream,
         conn: &Connection,
         code: &str,
-        new_node_id: &str,
         device_name: &str,
     ) -> Result<LinkServed, AppError> {
         if !self.confirm_link(conn, code, device_name).await? {
@@ -487,25 +482,8 @@ impl PeerHandler {
         log::info!("[link] sent link bundle ({bundle_len} bytes)");
 
         wait_for_completion(conn).await?;
-
-        self.storage
-            .upsert_linked_device(new_node_id, device_name, false, now_millis())
-            .await?;
-        log::info!("[link] registered new device {}", short_id(new_node_id));
-        // The devices page closes the QR code and reloads the device list on this event.
+        log::info!("[link] the new device stored the link bundle");
         let _ = self.app_handle.emit("device-link-progress", "bundle_sent");
-
-        match build_own_announcement(&self.storage, &self.identity).await {
-            Ok(announcement) => {
-                if let Err(e) = self.gossip.broadcast_linked_devices(&announcement).await {
-                    log::error!("[link] failed to broadcast device announcement: {e}");
-                } else {
-                    log::info!("[link] broadcast updated device announcement");
-                }
-            }
-            Err(e) => log::error!("[link] failed to build device announcement: {e}"),
-        }
-
         Ok(LinkServed::Linked)
     }
 

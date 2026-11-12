@@ -140,7 +140,7 @@ pub(super) async fn sync_from_peer(
     // The responder sends every interaction of the author, not only newer ones, when the
     // count difference is not explained by interactions after the newest local timestamp.
     let full_interaction_set = summary.server_interaction_count != interaction_count
-        && !super::sends_only_newer_interactions(
+        && !proscenium_types::sends_only_newer_interactions(
             summary.server_interaction_count,
             interaction_count,
             summary.interactions_after_count,

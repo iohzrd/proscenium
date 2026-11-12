@@ -9,8 +9,9 @@ use crate::constants::{
     PEER_ACCEPT_STREAM_TIMEOUT, PEER_CLOSE_WAIT, PEER_MAX_CONNECTIONS,
     PEER_MAX_CONNECTIONS_PER_NODE, PEER_MAX_DEVICE_SYNC_REQUEST_BYTES,
     PEER_MAX_FOLLOW_REQUEST_BYTES, PEER_MAX_LINK_REQUEST_BYTES, PEER_MAX_PUSH_BYTES,
-    PEER_MAX_SMALL_REQUEST_BYTES, PEER_MAX_SYNC_REQUEST_BYTES, PEER_REQUEST_READ_TIMEOUT,
-    PEER_RESPONSE_WRITE_TIMEOUT, SYNC_SERVE_TIMEOUT, SYNC_SERVER_CONCURRENCY,
+    PEER_MAX_SMALL_REQUEST_BYTES, PEER_MAX_SYNC_REQUEST_BYTES, PEER_MAX_UNKNOWN_CONNECTIONS,
+    PEER_REQUEST_READ_TIMEOUT, PEER_RESPONSE_WRITE_TIMEOUT, SYNC_SERVE_TIMEOUT,
+    SYNC_SERVER_CONCURRENCY, SYNC_SERVER_UNKNOWN_CONCURRENCY,
 };
 use crate::error::AppError;
 use crate::framing::{wait_closed, write_all_timeout};
@@ -127,12 +128,15 @@ pub struct PeerHandler {
     pending_link: PendingLinkState,
     app_handle: tauri::AppHandle,
     stage_handle: StageActorHandle,
-    /// Limits the connections handled at the same time.
+    /// Limits the connections handled at the same time, from known and from unknown
+    /// NodeIds (see `PEER_MAX_CONNECTIONS`).
     connection_limit: Arc<Semaphore>,
+    unknown_connection_limit: Arc<Semaphore>,
     /// Connections currently handled per remote NodeId.
     connections_per_node: Arc<Mutex<HashMap<EndpointId, usize>>>,
-    /// Limits the sync requests served at the same time.
+    /// Limits the sync requests served at the same time, to known and to unknown NodeIds.
     sync_limit: Arc<Semaphore>,
+    unknown_sync_limit: Arc<Semaphore>,
     /// Sync requests currently served per remote NodeId (at most one).
     syncs_per_node: Arc<Mutex<HashMap<EndpointId, usize>>>,
 }
@@ -153,8 +157,10 @@ impl PeerHandler {
             app_handle,
             stage_handle,
             connection_limit: Arc::new(Semaphore::new(PEER_MAX_CONNECTIONS)),
+            unknown_connection_limit: Arc::new(Semaphore::new(PEER_MAX_UNKNOWN_CONNECTIONS)),
             connections_per_node: Arc::new(Mutex::new(HashMap::new())),
             sync_limit: Arc::new(Semaphore::new(SYNC_SERVER_CONCURRENCY)),
+            unknown_sync_limit: Arc::new(Semaphore::new(SYNC_SERVER_UNKNOWN_CONCURRENCY)),
             syncs_per_node: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -202,7 +208,7 @@ impl PeerHandler {
 
     /// True if the NodeId `remote_str` may read a profile with `visibility`: another
     /// device of the local user, or the device of an approved follower (Listed) or of a
-    /// mutual (Private).
+    /// mutual (Private) that is not blocked.
     async fn may_see_profile(
         &self,
         remote_str: &str,
@@ -224,6 +230,14 @@ impl PeerHandler {
         else {
             return Ok(false);
         };
+        if self
+            .storage
+            .is_blocked(&remote_pubkey)
+            .await
+            .map_err(AcceptError::from_err)?
+        {
+            return Ok(false);
+        }
         let my_pubkey = self.identity.read().await.master_pubkey.clone();
         match visibility {
             Visibility::Private => self.storage.is_mutual(&my_pubkey, &remote_pubkey).await,
@@ -251,9 +265,28 @@ impl ProtocolHandler for PeerHandler {
         let remote = conn.remote_id();
         let remote_str = remote.to_string();
 
-        // Bound the handlers that run at the same time, in total and per remote NodeId.
-        // Both are released when this function returns.
-        let Ok(_connection_permit) = self.connection_limit.clone().try_acquire_owned() else {
+        // The NodeId is mapped to a master pubkey if it delivered a stored device list; a
+        // failed lookup rejects the connection.
+        let mapped = self
+            .storage
+            .try_get_master_pubkey_for_transport(&remote_str)
+            .await
+            .map_err(AcceptError::from_err)?;
+        let known = mapped.is_some()
+            || self
+                .storage
+                .is_other_device(&remote_str)
+                .await
+                .map_err(AcceptError::from_err)?;
+
+        // Bound the handlers that run at the same time, from known and from unknown
+        // NodeIds, and per remote NodeId. Both are released when this function returns.
+        let limit = if known {
+            &self.connection_limit
+        } else {
+            &self.unknown_connection_limit
+        };
+        let Ok(_connection_permit) = limit.clone().try_acquire_owned() else {
             conn.close(1u32.into(), b"busy");
             return Err(reject("connection limit reached"));
         };
@@ -266,14 +299,8 @@ impl ProtocolHandler for PeerHandler {
             return Err(reject("per-node connection limit reached"));
         };
 
-        // Reject a blocked user. The NodeId is mapped to a master pubkey if a stored
-        // device list names it; a failed lookup rejects the connection.
-        let remote_pubkey = self
-            .storage
-            .try_get_master_pubkey_for_transport(&remote_str)
-            .await
-            .map_err(AcceptError::from_err)?
-            .unwrap_or_else(|| remote_str.clone());
+        // Reject a blocked user.
+        let remote_pubkey = mapped.unwrap_or_else(|| remote_str.clone());
         if self
             .storage
             .is_blocked(&remote_pubkey)
@@ -318,7 +345,12 @@ impl ProtocolHandler for PeerHandler {
                     conn.close(1u32.into(), b"busy");
                     return Err(reject("a sync of this node is already served"));
                 };
-                let Ok(_sync_permit) = self.sync_limit.clone().try_acquire_owned() else {
+                let sync_limit = if known {
+                    &self.sync_limit
+                } else {
+                    &self.unknown_sync_limit
+                };
+                let Ok(_sync_permit) = sync_limit.clone().try_acquire_owned() else {
                     conn.close(1u32.into(), b"busy");
                     return Err(reject("sync limit reached"));
                 };

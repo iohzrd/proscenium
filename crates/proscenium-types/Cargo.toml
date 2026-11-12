@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 hex = "0.4"
-iroh = "1.0.3"
+iroh = "1.4.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

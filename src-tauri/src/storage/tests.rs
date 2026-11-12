@@ -1511,7 +1511,7 @@ async fn send_message(
 async fn receive_message(s: &Storage, id: &str, from: &str, content: &str, ts: u64) -> bool {
     let conv_id = Storage::conversation_id("me", from);
     let msg = make_stored_message(id, &conv_id, from, "me", content, ts);
-    s.receive_dm_message(from, &msg, content).await.unwrap()
+    s.receive_dm_message(from, &msg, content).await.unwrap() == ReceivedDm::Stored
 }
 
 #[tokio::test]
@@ -1593,6 +1593,13 @@ async fn messaging_unread_count() {
 
     s.mark_conversation_read("bob", "me").await.unwrap();
     assert_eq!(s.get_total_unread_count().await.unwrap(), 0);
+
+    // The received message is read; the own message keeps its flag until a receipt.
+    let conv_id = Storage::conversation_id("me", "bob");
+    let messages = s.get_dm_messages(&conv_id, 50, None, None).await.unwrap();
+    let read = |id: &str| messages.iter().find(|m| m.id == id).unwrap().read;
+    assert!(read("m1"));
+    assert!(!read("m0"));
 }
 
 #[tokio::test]
@@ -1707,7 +1714,7 @@ async fn messaging_duplicate_message_id_changes_nothing() {
         .receive_dm_message("bob", &duplicate, "replaced")
         .await
         .unwrap();
-    assert!(!inserted);
+    assert_eq!(inserted, ReceivedDm::Duplicate);
 
     let convos = s.get_conversations().await.unwrap();
     assert_eq!(convos.len(), 1);
@@ -1721,10 +1728,11 @@ async fn messaging_duplicate_message_id_changes_nothing() {
     // An id that exists in another conversation creates no conversation row.
     let carol_conv = Storage::conversation_id("me", "carol");
     let other = make_stored_message("m1", &carol_conv, "carol", "me", "mine now", 9500);
-    assert!(
-        !s.receive_dm_message("carol", &other, "mine now")
+    assert_eq!(
+        s.receive_dm_message("carol", &other, "mine now")
             .await
-            .unwrap()
+            .unwrap(),
+        ReceivedDm::Duplicate
     );
     assert_eq!(s.get_conversations().await.unwrap().len(), 1);
 }
@@ -2022,38 +2030,42 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
 }
 
 #[tokio::test]
-async fn peer_announcement_ahead_of_the_clock_is_stored_at_the_drift_limit() {
+async fn peer_announcement_ahead_of_the_clock_never_displaces_a_current_list() {
     let s = test_storage().await;
-    // A list from a device whose clock is far ahead is stored, so its devices can be
-    // dialed, and ranked at most MAX_TIMESTAMP_DRIFT_MS after the local clock.
-    let future = make_identity("master_pk", &["fast_device"], u64::MAX / 2);
+    let cache = |version: u64, node: &'static str| {
+        let s = &s;
+        async move {
+            let identity = make_identity("master_pk", &[node], version);
+            s.cache_peer_announcement(&identity.announcement, None)
+                .await
+                .unwrap()
+        }
+    };
+    let now = now_millis();
+    // With nothing cached, a list from a device whose clock is far ahead is stored, so
+    // its devices can be dialed.
     assert_eq!(
-        s.cache_peer_announcement(&future.announcement, None)
-            .await
-            .unwrap(),
+        cache(u64::MAX / 2, "fast").await,
         AnnouncementOutcome::Stored
     );
     assert_eq!(
         s.get_peer_transport_node_ids("master_pk").await.unwrap(),
-        vec!["fast_device"]
+        vec!["fast"]
     );
-    let stored: i64 = sqlx::query_scalar(
-        "SELECT version FROM peer_device_announcements WHERE master_pubkey = 'master_pk'",
-    )
-    .fetch_one(&s.pool)
-    .await
-    .unwrap();
-    assert!(stored as u64 <= now_millis() + MAX_TIMESTAMP_DRIFT_MS);
-
-    // A list with a later version than the stored rank replaces it. Its rank is capped
-    // at the clock of its store, which must be later.
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let later = make_identity("master_pk", &["other_device"], stored as u64 + 1);
+    // A current list replaces it although its version is lower.
+    assert_eq!(cache(now, "current").await, AnnouncementOutcome::Stored);
+    // Delivering a list ahead of the clock again, or a higher one, changes nothing.
     assert_eq!(
-        s.cache_peer_announcement(&later.announcement, None)
-            .await
-            .unwrap(),
-        AnnouncementOutcome::Stored
+        cache(u64::MAX / 2, "fast").await,
+        AnnouncementOutcome::NotNewer
+    );
+    assert_eq!(
+        cache(u64::MAX / 2 + 1, "faster").await,
+        AnnouncementOutcome::NotNewer
+    );
+    assert_eq!(
+        s.get_peer_transport_node_ids("master_pk").await.unwrap(),
+        vec!["current"]
     );
 }
 
@@ -2969,6 +2981,7 @@ async fn removed_devices_keep_the_newest_records() {
     s.upsert_linked_device(&own, "Linux", true, 1)
         .await
         .unwrap();
+    // More removals than the device list carries: all stay recorded.
     let count = MAX_REMOVED_DEVICES as u8 + 3;
     for i in 0..count {
         let node_id = pubkey(10 + i);
@@ -2988,7 +3001,12 @@ async fn removed_devices_keep_the_newest_records() {
         .map(|i| pubkey(10 + i))
         .collect();
     assert_eq!(ids, expected);
-    assert!(!s.is_removed_device(&pubkey(10)).await.unwrap());
+    assert!(s.is_removed_device(&pubkey(10)).await.unwrap());
+    let inserted = s
+        .insert_missing_linked_devices(&[device_entry(&pubkey(10), "d")])
+        .await
+        .unwrap();
+    assert_eq!(inserted, 0);
 }
 
 #[tokio::test]
@@ -3091,6 +3109,32 @@ async fn request_status(s: &Storage, requester: &str) -> Option<String> {
 }
 
 #[tokio::test]
+async fn merged_pending_requests_keep_the_pending_limit() {
+    let s = test_storage().await;
+    let me = pubkey(1);
+    let limit = crate::constants::MAX_PENDING_FOLLOW_REQUESTS as usize;
+    // More pending rows than the limit, as a sibling device holding evicted rows sends.
+    let entries: Vec<FollowRequestEntry> = (0..limit + 20)
+        .map(|i| {
+            let key = iroh::SecretKey::from_bytes(&{
+                let mut seed = [7u8; 32];
+                seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                seed
+            });
+            let mut entry = request_entry(&key.public().to_string(), "pending", 0);
+            entry.created_at = 1_000 + i as u64;
+            entry
+        })
+        .collect();
+    s.merge_follow_requests(&me, &entries).await.unwrap();
+    s.merge_follow_requests(&me, &entries).await.unwrap();
+    let pending = s.get_follow_requests(now_millis()).await.unwrap();
+    assert_eq!(pending.len(), limit);
+    // The oldest rows were evicted.
+    assert!(pending.iter().all(|r| r.created_at >= 1_020));
+}
+
+#[tokio::test]
 async fn merged_follow_request_keeps_the_later_decision() {
     let s = test_storage().await;
     let (me, requester) = (pubkey(1), pubkey(2));
@@ -3129,6 +3173,8 @@ async fn merged_follow_request_keeps_the_later_decision() {
         request_status(&s, &requester).await.as_deref(),
         Some("denied")
     );
+    // The merged denial removed the follower record.
+    assert!(!s.is_follower(&me, &requester).await.unwrap());
 
     // Invalid, own and expired entries are skipped.
     let mut expired = request_entry(&pubkey(3), "pending", 0);
@@ -3355,10 +3401,14 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
     let bookmarked = "ab".repeat(16);
     let unbookmarked = "cd".repeat(16);
 
+    // A Private profile last changed on a device whose clock is far ahead.
+    let mut profile = make_profile("me");
+    profile.visibility = Visibility::Private;
+    profile.updated_at = now_millis() + 24 * 60 * 60 * 1000;
     let bundle = LinkBundleData {
         master_secret_key: String::new(),
         announcement: signed_announcement(1, 10, 5),
-        profile: Some(make_profile("me")),
+        profile: Some(profile),
         follows: vec![
             follow_entry(&followed.master_pubkey, "active", 100),
             follow_entry(&forged.master_pubkey, "active", 100),
@@ -3385,10 +3435,13 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
             .unwrap();
     }
 
+    // The profile is stored although its time is ahead of the clock, so the new
+    // device does not read the user as Public.
     assert_eq!(
         s.get_profile(&me).await.unwrap().unwrap().display_name,
         "me"
     );
+    assert_eq!(s.get_visibility(&me).await.unwrap(), Visibility::Private);
 
     let devices = s.get_linked_devices().await.unwrap();
     assert_eq!(devices.len(), 2);
@@ -3437,4 +3490,177 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
     let lww = s.load_lww_state(&me).await.unwrap();
     assert!(lww.follows.iter().all(|f| f.last_changed_at == 100));
     assert!(lww.bookmarks.iter().all(|b| b.last_changed_at == 100));
+}
+
+#[tokio::test]
+async fn viewed_author_content_is_bounded() {
+    use super::viewed_authors::{MAX_VIEWED_AUTHOR_ITEMS, MAX_VIEWED_AUTHORS};
+    let s = test_storage().await;
+    let me = pubkey(1);
+
+    // Posts of one viewed author beyond the per-author limit: the oldest are deleted.
+    let author = pubkey(2);
+    let total = MAX_VIEWED_AUTHOR_ITEMS as u64 + 5;
+    for i in 0..total {
+        s.insert_post(&make_post(&format!("{i:032x}"), &author, 1_000 + i))
+            .await
+            .unwrap();
+    }
+    assert_eq!(s.trim_author_content(&author).await.unwrap(), 5);
+    assert_eq!(
+        s.count_posts_by_author(&author).await.unwrap(),
+        MAX_VIEWED_AUTHOR_ITEMS as u64
+    );
+
+    // Recording more viewed authors than the limit drops the one synced longest ago.
+    let mut dropped = Vec::new();
+    for i in 0..=MAX_VIEWED_AUTHORS as u64 {
+        dropped.extend(
+            s.record_viewed_author(&format!("author{i:03}"), 100 + i)
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(dropped, vec!["author000".to_string()]);
+    let old = s.take_viewed_authors_before(102).await.unwrap();
+    assert_eq!(old, vec!["author001".to_string()]);
+
+    // Content of a followed author is kept.
+    s.follow(
+        &me,
+        &SocialGraphEntry {
+            pubkey: author.clone(),
+            followed_at: 1,
+            is_online: false,
+            last_seen: 0,
+            first_seen: 0,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.delete_content_unless_followed(&me, &author)
+            .await
+            .unwrap(),
+        0
+    );
+    s.unfollow(&me, &author).await.unwrap();
+    assert_eq!(
+        s.delete_content_unless_followed(&me, &author)
+            .await
+            .unwrap(),
+        MAX_VIEWED_AUTHOR_ITEMS as u64
+    );
+}
+
+#[tokio::test]
+async fn evicted_requester_leaves_no_cached_identity() {
+    let s = test_storage().await;
+    let limit = crate::constants::MAX_PENDING_FOLLOW_REQUESTS;
+    let first = signed_announcement(200, 201, 5);
+    let requester = first.master_pubkey.clone();
+    s.cache_peer_announcement(&first, Some(&first.devices[0].node_id))
+        .await
+        .unwrap();
+    s.save_profile(&requester, &make_profile("first"))
+        .await
+        .unwrap();
+    s.record_follow_request(&requester, 1, 1, u64::MAX)
+        .await
+        .unwrap();
+    // A followed requester keeps its cached rows when its request is evicted.
+    let followed = signed_announcement(210, 211, 5);
+    s.cache_peer_announcement(&followed, None).await.unwrap();
+    s.merge_follows_lww(
+        &pubkey(1),
+        &[follow_entry(&followed.master_pubkey, "active", 100)],
+    )
+    .await
+    .unwrap();
+    s.record_follow_request(&followed.master_pubkey, 1, 2, u64::MAX)
+        .await
+        .unwrap();
+
+    for i in 0..limit {
+        let key = iroh::SecretKey::from_bytes(&{
+            let mut seed = [9u8; 32];
+            seed[..8].copy_from_slice(&i.to_le_bytes());
+            seed
+        });
+        s.record_follow_request(&key.public().to_string(), 1, 10 + i, u64::MAX)
+            .await
+            .unwrap();
+    }
+    assert!(s.get_profile(&requester).await.unwrap().is_none());
+    assert!(
+        s.get_peer_transport_node_ids(&requester)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.get_master_pubkey_for_transport(&first.devices[0].node_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        !s.get_peer_transport_node_ids(&followed.master_pubkey)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn messages_from_strangers_are_bounded() {
+    use super::messaging::{MAX_STRANGER_CONVERSATIONS, MAX_STRANGER_MESSAGES};
+    let s = test_storage().await;
+    let id = |n: u64| format!("{n:032x}");
+
+    // A stranger's messages beyond the limit are refused.
+    for n in 0..MAX_STRANGER_MESSAGES as u64 {
+        assert!(receive_message(&s, &id(n), "bob", "hi", 1_000 + n).await);
+    }
+    let conv_id = Storage::conversation_id("me", "bob");
+    let extra = make_stored_message(&id(999), &conv_id, "bob", "me", "hi", 2_000);
+    assert_eq!(
+        s.receive_dm_message("bob", &extra, "hi").await.unwrap(),
+        ReceivedDm::Refused
+    );
+    // After a reply of the local user, the peer is no stranger.
+    send_message(&s, &id(1_000), "bob", "hello", 3_000, 0).await;
+    assert!(receive_message(&s, &id(1_001), "bob", "hi", 4_000).await);
+
+    // A followed peer is no stranger either.
+    s.follow(
+        "me",
+        &SocialGraphEntry {
+            pubkey: "dave".to_string(),
+            followed_at: 1,
+            first_seen: 0,
+            last_seen: 0,
+            is_online: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(receive_message(&s, &id(2_000), "dave", "hi", 1).await);
+
+    // Stranger conversations beyond the limit evict the one with the oldest message.
+    for n in 0..=MAX_STRANGER_CONVERSATIONS as u64 {
+        let peer = format!("stranger{n:03}");
+        assert!(receive_message(&s, &id(10_000 + n), &peer, "hi", 10_000 + n).await);
+    }
+    let peers: Vec<String> = s
+        .get_conversations()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.peer_pubkey)
+        .collect();
+    assert!(!peers.contains(&"stranger000".to_string()));
+    assert!(peers.contains(&"stranger001".to_string()));
+    assert!(peers.contains(&"bob".to_string()));
+    assert!(peers.contains(&"dave".to_string()));
+    assert_eq!(peers.len(), MAX_STRANGER_CONVERSATIONS as usize + 2);
 }

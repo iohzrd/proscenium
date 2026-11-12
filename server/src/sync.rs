@@ -5,9 +5,10 @@ use crate::storage::{ChangeError, RegistrationChange};
 use iroh::endpoint::{Connection, RecvStream};
 use proscenium_types::{
     Interaction, MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, PEER_ALPN, PeerRequest, Post, PostTombstone,
-    SyncFrame, SyncMode, SyncRequest, SyncSummary, is_valid_id, post_ids_digest, short_id,
-    validate_profile, verify_delete_post_signature, verify_interaction_signature,
-    verify_linked_devices_announcement, verify_post_signature, verify_profile_signature,
+    SyncFrame, SyncMode, SyncRequest, SyncSummary, is_valid_id, post_ids_digest,
+    sends_only_newer_interactions, short_id, validate_profile, verify_delete_post_signature,
+    verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
+    verify_profile_signature,
 };
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,11 @@ const MAX_SUMMARY_BYTES: usize = 64 * 1024;
 /// Largest accepted frame. Equal to the limit of the client's frame reader; a frame of
 /// 200 posts of maximum size is about 8 MB.
 const MAX_FRAME_BYTES: usize = 10_000_000;
+/// Data frames accepted in one sync. A responder sends at most 200 posts per frame.
+const MAX_SYNC_FRAMES: usize = 2_000;
+/// Frames without an item accepted in one sync. Without this limit a responder holds the
+/// sync permit for `SYNC_TOTAL_TIMEOUT` by sending one empty frame per `FRAME_TIMEOUT`.
+const MAX_EMPTY_FRAMES: usize = 16;
 
 /// Items checked between two yields to the scheduler. One signature verification takes
 /// tens of microseconds and one frame can hold tens of thousands of items.
@@ -60,6 +66,9 @@ pub struct SyncStats {
     pub interactions: usize,
     /// Stored posts deleted because of a received tombstone.
     pub deleted_posts: u64,
+    /// Stored interactions deleted because the author's complete interaction set lacks
+    /// them.
+    pub deleted_interactions: u64,
     /// Items not stored: wrong author, failed validation or signature, or over a limit.
     pub rejected: usize,
     received_posts: usize,
@@ -124,13 +133,18 @@ impl IngestionManager {
 
         let mut stats = SyncStats::default();
         let result = timeout(SYNC_TOTAL_TIMEOUT, self.sync_from_peer(pubkey, &mut stats)).await;
-        if stats.posts > 0 || stats.interactions > 0 || stats.deleted_posts > 0 {
+        if stats.posts > 0
+            || stats.interactions > 0
+            || stats.deleted_posts > 0
+            || stats.deleted_interactions > 0
+        {
             tracing::info!(
-                "[sync] {}: stored {} posts and {} interactions, deleted {} posts",
+                "[sync] {}: stored {} posts and {} interactions, deleted {} posts and {} interactions",
                 short_id(pubkey),
                 stats.posts,
                 stats.interactions,
-                stats.deleted_posts
+                stats.deleted_posts,
+                stats.deleted_interactions
             );
         }
         if stats.rejected > 0 {
@@ -298,14 +312,41 @@ impl IngestionManager {
         .await
         .map_err(|_| anyhow::anyhow!("id list not sent within {}s", ID_LIST_TIMEOUT.as_secs()))??;
 
+        // The responder sends every interaction of the author, not only newer ones, when
+        // the count difference is not explained by interactions after the newest stored
+        // timestamp. The ids of that set identify the interactions the author deleted.
+        let full_interaction_set = summary.server_interaction_count != cursor.interaction_count
+            && !sends_only_newer_interactions(
+                summary.server_interaction_count,
+                cursor.interaction_count,
+                summary.interactions_after_count,
+            );
+        let mut received_interaction_ids: Vec<String> = Vec::new();
+
+        let (mut frames, mut empty_frames) = (0usize, 0usize);
         loop {
             let frame = timeout(FRAME_TIMEOUT, read_frame(&mut recv))
                 .await
                 .map_err(|_| anyhow::anyhow!("no frame within {}s", FRAME_TIMEOUT.as_secs()))??;
             let Some(frame) = frame else {
-                return Ok(());
+                break;
             };
-            match serde_json::from_slice::<SyncFrame>(&frame)? {
+            let frame = serde_json::from_slice::<SyncFrame>(&frame)?;
+            frames += 1;
+            let items = match &frame {
+                SyncFrame::Tombstones(items) => items.len(),
+                SyncFrame::Posts(items) => items.len(),
+                SyncFrame::Interactions(items) => items.len(),
+            };
+            if items == 0 {
+                empty_frames += 1;
+            }
+            if frames > MAX_SYNC_FRAMES || empty_frames > MAX_EMPTY_FRAMES {
+                anyhow::bail!(
+                    "peer sent more than {MAX_SYNC_FRAMES} frames or {MAX_EMPTY_FRAMES} empty frames"
+                );
+            }
+            match frame {
                 SyncFrame::Tombstones(tombstones) => {
                     self.store_synced_tombstones(pubkey, tombstones, stats)
                         .await?;
@@ -314,11 +355,25 @@ impl IngestionManager {
                     self.store_synced_posts(pubkey, posts, stats).await?;
                 }
                 SyncFrame::Interactions(interactions) => {
+                    if full_interaction_set {
+                        received_interaction_ids.extend(interactions.iter().map(|i| i.id.clone()));
+                    }
                     self.store_synced_interactions(pubkey, interactions, stats)
                         .await?;
                 }
             }
         }
+
+        // The stream ended with its end marker and carried the author's complete set.
+        if full_interaction_set
+            && received_interaction_ids.len() as u64 == summary.server_interaction_count
+        {
+            stats.deleted_interactions = self
+                .storage
+                .delete_interactions_not_in(pubkey, &received_interaction_ids)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Verify the tombstones of one frame; delete the named posts and store the

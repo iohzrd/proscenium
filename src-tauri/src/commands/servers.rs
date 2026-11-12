@@ -316,6 +316,16 @@ pub async fn register_with_server(
         sync_profile_to_server_inner(&state.http_client, &state.storage, &state.identity, &url)
             .await
     {
+        // A profile the server refuses ends the registration; any other failure is retried
+        // by the server profile task.
+        if state
+            .storage
+            .get_server(&url)
+            .await?
+            .is_some_and(|server| server.registered_at.is_none())
+        {
+            return Err(e);
+        }
         log::warn!("[server] profile sync to {url} after registration failed: {e}");
     }
     Ok(())
@@ -480,6 +490,10 @@ pub async fn sync_profile_to_server(state: State<'_, Arc<AppState>>, url: String
 /// `ProfileUpdateRequest`, and record its `updated_at` as accepted by that server. Called
 /// from `save_my_profile`, `register_with_server`, the `sync_profile_to_server` command and
 /// the task that retries servers without the current profile.
+///
+/// The server answers 404 if it holds no registration and 403 if the profile ended the
+/// registration (a Private profile). Then the server is recorded as not registered, so the
+/// profile is not sent to it again, and an error is returned.
 pub(crate) async fn sync_profile_to_server_inner(
     http_client: &reqwest::Client,
     storage: &Storage,
@@ -513,7 +527,13 @@ pub(crate) async fn sync_profile_to_server_inner(
         .json(&request)
         .send()
         .await?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
+        let failure = describe_failure(resp).await;
+        storage.mark_server_unregistered(&url).await?;
+        return Err(format!("the server removed the registration: {failure}").into());
+    }
+    if !status.is_success() {
         return Err(format!("profile sync failed: {}", describe_failure(resp).await).into());
     }
     storage.mark_server_profile_synced(&url, updated_at).await

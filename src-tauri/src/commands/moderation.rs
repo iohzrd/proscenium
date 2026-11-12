@@ -63,6 +63,18 @@ pub async fn block_user(state: State<'_, Arc<AppState>>, pubkey: String) -> CmdR
         state.gossip().unfollow_user(&pubkey).await;
     }
     state.storage.block_user(&pubkey).await?;
+    // A blocked user loses an approval as follower, so it no longer receives Listed or
+    // Private content after an unblock either, until it is approved again.
+    let now = proscenium_types::now_millis();
+    state
+        .storage
+        .revoke_follower(
+            &my_id,
+            &pubkey,
+            now,
+            now.saturating_add(crate::constants::FOLLOW_REQUEST_TTL_MS),
+        )
+        .await?;
     Ok(())
 }
 

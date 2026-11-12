@@ -369,7 +369,9 @@ impl ActiveStage {
     /// Host only: register the relay offered by `actor` and assign it the listeners
     /// that have no source. The relay's NodeId is the one of `actor`'s speaker
     /// connection, which QUIC authenticated; an offer from an identity without a
-    /// speaking role or without a speaker connection is ignored.
+    /// speaking role or without a speaker connection is ignored. An identity has at most
+    /// one relay: a relay it registered under another NodeId is removed first, so
+    /// `remove_relay_of` removes every relay of a banned or demoted identity.
     pub(super) async fn handle_relay_volunteer(&mut self, actor: &str, capacity: u32) {
         if !matches!(
             self.roles.role_of(actor),
@@ -381,7 +383,7 @@ impl ActiveStage {
             );
             return;
         }
-        let Some(host) = self.host.as_mut() else {
+        let Some(host) = self.host.as_ref() else {
             return;
         };
         let Some(relay_node_id) = host
@@ -394,6 +396,16 @@ impl ActiveStage {
                 "[stage-host] ignoring relay offer of {}: no speaker connection",
                 short_id(actor)
             );
+            return;
+        };
+        if host
+            .relay_owners
+            .get(actor)
+            .is_some_and(|registered| *registered != relay_node_id)
+        {
+            self.remove_relay_of(actor).await;
+        }
+        let Some(host) = self.host.as_mut() else {
             return;
         };
         let capacity = usize::try_from(capacity)

@@ -2,7 +2,7 @@ use super::*;
 use crate::content::fts_query;
 use crate::test_util::{TestUser, node_id};
 use futures_lite::StreamExt;
-use proscenium_types::{MAX_TIMESTAMP_DRIFT_MS, REGISTRATION_ACTION_UNREGISTER};
+use proscenium_types::REGISTRATION_ACTION_UNREGISTER;
 
 const URL: &str = "https://server.test";
 const OPEN: RegistrationPolicy = RegistrationPolicy {
@@ -585,30 +585,22 @@ async fn announcement_device_list_is_replaced_only_by_higher_version() {
         Some(vec![transport.clone(), node_id(51)])
     );
 
-    // A list ahead of the clock is stored, ranked at most MAX_TIMESTAMP_DRIFT_MS after
-    // the local clock, so a later list replaces it.
+    // A list ahead of the clock does not replace a current one, however often it is
+    // delivered.
     let future = user.announcement(u64::MAX / 2, &[transport.clone(), node_id(52)]);
+    for _ in 0..2 {
+        assert_eq!(
+            storage.cache_announcement(&future).await.unwrap(),
+            AnnouncementOutcome::NotNewer
+        );
+    }
     assert_eq!(
-        storage.cache_announcement(&future).await.unwrap(),
-        AnnouncementOutcome::Stored
-    );
-    let ranked: i64 =
-        sqlx::query_scalar("SELECT announcement_version FROM registrations WHERE pubkey = ?1")
-            .bind(pk)
-            .fetch_one(&storage.pool)
-            .await
-            .unwrap();
-    assert!(ranked as u64 <= now_millis() + MAX_TIMESTAMP_DRIFT_MS);
-    // The rank of `later` is capped at the clock of its store, which must be later.
-    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    let later = user.announcement(ranked as u64 + 1, &[transport.clone(), node_id(51)]);
-    assert_eq!(
-        storage.cache_announcement(&later).await.unwrap(),
-        AnnouncementOutcome::Stored
+        storage.get_device_node_ids(pk).await.unwrap(),
+        Some(vec![transport.clone(), node_id(51)])
     );
 
     // A list that removes the registering device clears it.
-    let mut v7 = user.announcement(ranked as u64 + 2, &[node_id(51)]);
+    let mut v7 = user.announcement(7, &[node_id(51)]);
     v7.removed = vec![transport];
     assert_eq!(
         storage.cache_announcement(&v7).await.unwrap(),
@@ -758,6 +750,51 @@ async fn deleted_interaction_is_not_stored_again() {
         .unwrap();
     assert_eq!(stored.stored, 1);
     assert!(!storage.delete_interaction(&like.id, pk).await.unwrap());
+}
+
+#[tokio::test]
+async fn interactions_missing_from_the_complete_set_are_deleted() {
+    let storage = storage().await;
+    let user = TestUser::new(1);
+    let other_user = TestUser::new(2);
+    let pk = &user.master_pubkey;
+    for u in [&user, &other_user] {
+        register(&storage, u, 1_000, Visibility::Public)
+            .await
+            .unwrap();
+    }
+    let target = user.post("target", 100);
+    storage
+        .insert_posts(pk, std::slice::from_ref(&target), 100)
+        .await
+        .unwrap();
+    let likes: Vec<Interaction> = (0..3).map(|n| user.like(&target, n, 100)).collect();
+    storage.insert_interactions(pk, &likes, 100).await.unwrap();
+    let foreign = other_user.like(&target, 0, 100);
+    storage
+        .insert_interactions(
+            &other_user.master_pubkey,
+            std::slice::from_ref(&foreign),
+            100,
+        )
+        .await
+        .unwrap();
+
+    // The author's set no longer holds the second like.
+    let kept = vec![likes[0].id.clone(), likes[2].id.clone()];
+    assert_eq!(
+        storage.delete_interactions_not_in(pk, &kept).await.unwrap(),
+        1
+    );
+    assert!(!storage.delete_interaction(&likes[1].id, pk).await.unwrap());
+    assert!(storage.delete_interaction(&likes[0].id, pk).await.unwrap());
+    // Interactions of other authors are kept.
+    assert!(
+        storage
+            .delete_interaction(&foreign.id, &other_user.master_pubkey)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

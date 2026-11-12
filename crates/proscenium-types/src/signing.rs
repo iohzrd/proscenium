@@ -249,7 +249,7 @@ pub fn sign_linked_devices_announcement(
 /// `MAX_DEVICE_NAME_LEN` bytes, and the signature was made by `master_pubkey`.
 ///
 /// Does not check the version: a list signed by a device with a fast clock still
-/// authenticates its devices. A cache ranks a list by `announcement_cache_version`.
+/// authenticates its devices. A cache decides with `announcement_replaces`.
 pub fn verify_linked_devices_announcement(
     announcement: &LinkedDevicesAnnouncement,
 ) -> Result<(), String> {
@@ -289,14 +289,21 @@ pub fn verify_linked_devices_announcement(
     )
 }
 
-/// The version under which a cache ranks `announcement`: its version (a creation time),
-/// at most `MAX_TIMESTAMP_DRIFT_MS` after the local clock. A list with a later version,
-/// from a device with a fast clock or signed with a version far in the future, then
-/// outranks later lists for at most `MAX_TIMESTAMP_DRIFT_MS`.
-pub fn announcement_cache_version(announcement: &LinkedDevicesAnnouncement) -> u64 {
-    announcement.version.min(
-        crate::validation::now_millis().saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS),
-    )
+/// True if a cache that holds a device list with version `stored` replaces it with a list
+/// of the same identity with version `new`, at local time `now`.
+///
+/// A version more than `MAX_TIMESTAMP_DRIFT_MS` after `now` is ahead of the clock. A list
+/// that is not ahead replaces one that is; a list that is ahead never replaces one that is
+/// not; otherwise the higher version wins. A list signed far in the future therefore never
+/// displaces a current list, however often it is delivered, and a list from a device with
+/// a fast clock is stored when no current list is.
+pub fn announcement_replaces(new: u64, stored: u64, now: u64) -> bool {
+    let limit = now.saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS);
+    match (new > limit, stored > limit) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => new > stored,
+    }
 }
 
 /// An `IdentityResponse` whose device list and profile signatures were verified, and
@@ -484,21 +491,33 @@ mod tests {
     }
 
     #[test]
-    fn announcement_ahead_of_the_clock_verifies_and_ranks_at_the_drift_limit() {
+    fn announcement_ahead_of_the_clock_verifies() {
         let a = identity(1);
         let mut list = announcement(&a, &[node_id(50)]);
-        let now = crate::validation::now_millis();
-        list.version = now;
-        sign_linked_devices_announcement(&mut list, &a.key);
-        assert!(verify_linked_devices_announcement(&list).is_ok());
-        assert_eq!(announcement_cache_version(&list), now);
-
         list.version = u64::MAX;
         sign_linked_devices_announcement(&mut list, &a.key);
         assert!(verify_linked_devices_announcement(&list).is_ok());
-        let ranked = announcement_cache_version(&list);
-        let limit = crate::validation::now_millis() + crate::validation::MAX_TIMESTAMP_DRIFT_MS;
-        assert!(ranked <= limit && ranked >= now + crate::validation::MAX_TIMESTAMP_DRIFT_MS);
+    }
+
+    #[test]
+    fn a_list_ahead_of_the_clock_never_displaces_a_current_list() {
+        let now = 1_000_000_000;
+        let drift = crate::validation::MAX_TIMESTAMP_DRIFT_MS;
+        let ahead = now + drift + 1;
+        // Current lists: the higher version wins.
+        assert!(announcement_replaces(now, now - 1, now));
+        assert!(!announcement_replaces(now - 1, now, now));
+        assert!(!announcement_replaces(now, now, now));
+        // A list ahead of the clock does not replace a current one, at any version.
+        assert!(!announcement_replaces(ahead, now, now));
+        assert!(!announcement_replaces(u64::MAX, now - 1, now));
+        // A current list replaces one ahead of the clock, even with a lower version.
+        assert!(announcement_replaces(now - 1, ahead, now));
+        // Among lists ahead of the clock the higher version wins.
+        assert!(announcement_replaces(ahead + 1, ahead, now));
+        assert!(!announcement_replaces(ahead, ahead + 1, now));
+        // A version within the drift limit counts as current.
+        assert!(announcement_replaces(now + drift, now, now));
     }
 
     #[test]

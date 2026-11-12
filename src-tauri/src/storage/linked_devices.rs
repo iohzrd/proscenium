@@ -1,13 +1,16 @@
 use crate::error::AppError;
 use proscenium_types::{
     DeviceEntry, LinkBundleData, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN,
-    MAX_REMOVED_DEVICES, now_millis, short_id, truncate_chars, validate_profile,
-    verify_linked_devices_announcement,
+    MAX_REMOVED_DEVICES, MAX_TIMESTAMP_DRIFT_MS, now_millis, short_id, truncate_chars,
+    validate_profile_fields, verify_linked_devices_announcement,
 };
 use sqlx::{Row, Sqlite, Transaction};
 use std::collections::HashSet;
 
 use super::Storage;
+
+/// `preferences` key of the highest version of a device list of the local identity.
+const OWN_ANNOUNCEMENT_VERSION_KEY: &str = "own_announcement_version";
 
 /// Result of `Storage::merge_removed_devices`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -18,14 +21,18 @@ pub struct RemovedMerge {
     pub local_removed: bool,
 }
 
-/// Delete the records of `removed_devices` except the newest `MAX_REMOVED_DEVICES`.
+/// Removed NodeIds each device keeps. The device list carries the newest
+/// `MAX_REMOVED_DEVICES` of them.
+const MAX_STORED_REMOVED_DEVICES: i64 = 256;
+
+/// Delete the records of `removed_devices` except the newest `MAX_STORED_REMOVED_DEVICES`.
 async fn trim_removed_devices(tx: &mut Transaction<'_, Sqlite>) -> Result<(), AppError> {
     sqlx::query(
         "DELETE FROM removed_devices WHERE node_id NOT IN (
              SELECT node_id FROM removed_devices ORDER BY removed_at DESC, node_id LIMIT ?1
          )",
     )
-    .bind(MAX_REMOVED_DEVICES as i64)
+    .bind(MAX_STORED_REMOVED_DEVICES)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -114,7 +121,7 @@ impl Storage {
     }
 
     /// Remove the other device `node_id`: delete its row and record its NodeId in
-    /// `removed_devices`, which keeps the newest `MAX_REMOVED_DEVICES` records. Returns
+    /// `removed_devices`, which keeps the newest `MAX_STORED_REMOVED_DEVICES` records. Returns
     /// false, and changes nothing, unless `node_id` is stored as another device.
     pub async fn remove_linked_device(
         &self,
@@ -146,7 +153,7 @@ impl Storage {
 
     /// Store the removed NodeIds of a device list signed by the local master key: record
     /// each in `removed_devices` (a recorded NodeId keeps its time) and delete its row.
-    /// Keeps the newest `MAX_REMOVED_DEVICES` records.
+    /// Keeps the newest `MAX_STORED_REMOVED_DEVICES` records.
     ///
     /// If `removed` contains `own_node_id`, the NodeId of the local device, nothing is
     /// stored and `local_removed` is set.
@@ -192,7 +199,8 @@ impl Storage {
         })
     }
 
-    /// The recorded removed NodeIds, newest first.
+    /// The newest `MAX_REMOVED_DEVICES` recorded removed NodeIds, newest first: the
+    /// removed NodeIds of the local device list.
     pub async fn get_removed_device_ids(&self) -> Result<Vec<String>, AppError> {
         let ids = sqlx::query_scalar(
             "SELECT node_id FROM removed_devices ORDER BY removed_at DESC, node_id LIMIT ?1",
@@ -211,6 +219,51 @@ impl Storage {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(exists)
+    }
+
+    /// Record `version` of a device list of the local identity, built here or received
+    /// from another own device. The stored value only increases, and a version more than
+    /// `MAX_TIMESTAMP_DRIFT_MS` after the local clock is not recorded.
+    pub async fn record_own_announcement_version(&self, version: u64) -> Result<(), AppError> {
+        if version > now_millis().saturating_add(MAX_TIMESTAMP_DRIFT_MS) {
+            return Ok(());
+        }
+        let version = i64::try_from(version).unwrap_or(i64::MAX);
+        sqlx::query(
+            "INSERT INTO preferences (key, value) VALUES (?1, CAST(?2 AS TEXT))
+             ON CONFLICT(key) DO UPDATE SET
+                value = CAST(MAX(CAST(value AS INTEGER), ?2) AS TEXT)",
+        )
+        .bind(OWN_ANNOUNCEMENT_VERSION_KEY)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The highest version recorded by `record_own_announcement_version`, or 0.
+    pub async fn get_own_announcement_version(&self) -> Result<u64, AppError> {
+        Ok(self
+            .get_preference(OWN_ANNOUNCEMENT_VERSION_KEY)
+            .await?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0))
+    }
+
+    /// The row of `node_id` if it is stored as another device of the local user.
+    pub async fn get_other_device(&self, node_id: &str) -> Result<Option<DeviceEntry>, AppError> {
+        let row = sqlx::query(
+            "SELECT node_id, device_name, added_at FROM linked_devices
+             WHERE node_id = ?1 AND is_self = 0",
+        )
+        .bind(node_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| DeviceEntry {
+            node_id: row.get(0),
+            device_name: row.get(1),
+            added_at: row.get::<i64, _>(2) as u64,
+        }))
     }
 
     /// True if `node_id` is stored as another device of the local user.
@@ -269,9 +322,11 @@ impl Storage {
     ///
     /// `own_device` is the row of the local device. The caller has checked that
     /// `bundle.announcement` is signed by the bundle's master key. Its removed NodeIds
-    /// are recorded first. The profile is stored only if it passes `validate_profile`; a
-    /// peer announcement is stored only if it verifies and belongs to an actively followed
-    /// user.
+    /// are recorded first. The profile is stored if its fields pass
+    /// `validate_profile_fields`, also with an `updated_at` after the local clock: a
+    /// missing own profile reads as Public, so the new device of a Private user would
+    /// serve its posts to anyone. A peer announcement is stored only if it verifies and
+    /// belongs to an actively followed user.
     pub async fn import_link_bundle(
         &self,
         master_pubkey: &str,
@@ -279,7 +334,7 @@ impl Storage {
         bundle: &LinkBundleData,
     ) -> Result<(), AppError> {
         if let Some(profile) = &bundle.profile {
-            match validate_profile(profile) {
+            match validate_profile_fields(profile) {
                 Ok(()) => {
                     self.save_profile(master_pubkey, profile).await?;
                 }
@@ -287,6 +342,8 @@ impl Storage {
             }
         }
 
+        self.record_own_announcement_version(bundle.announcement.version)
+            .await?;
         self.merge_removed_devices(&bundle.announcement.removed, &own_device.node_id)
             .await?;
         self.insert_missing_linked_devices(&bundle.announcement.devices)

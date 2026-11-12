@@ -37,6 +37,10 @@
   let peerName = $state("");
   let peerProfile = $state<Profile | null>(null);
   let messages = $state<StoredMessage[]>([]);
+  // Oldest message of the pages loaded from storage: the cursor of the next older
+  // page. Messages merged from events do not move it, so a merged message with an
+  // old timestamp does not skip the stored messages after it.
+  let pageCursor: StoredMessage | null = null;
   let hasMore = $state(true);
   let loadingMore = $state(false);
   let messagesContainer = $state<HTMLDivElement>(null!);
@@ -72,6 +76,7 @@
       beforeId: null,
     });
     messages = mergeMessages(page, messages);
+    pageCursor = oldestOf(page);
     hasMore = page.length >= PAGE_SIZE;
 
     // Own messages still waiting for an acknowledgement, such as queued ones
@@ -102,6 +107,11 @@
   }
 
   /** Union of both lists by id (entries of `preferred` win), ascending by `(timestamp, id)`. */
+  /** The first message of `page` in list order, or null for an empty page. */
+  function oldestOf(page: StoredMessage[]): StoredMessage | null {
+    return [...page].sort(comparePosition)[0] ?? null;
+  }
+
   function mergeMessages(
     preferred: StoredMessage[],
     others: StoredMessage[],
@@ -163,20 +173,25 @@
   }
 
   async function loadOlder() {
-    if (loadingMore || !hasMore || messages.length === 0) return;
+    const cursor = pageCursor;
+    if (loadingMore || !hasMore || !cursor) return;
     loadingMore = true;
     try {
-      const oldest = messages[0];
       const olderMsgs: StoredMessage[] = await invoke("get_dm_messages", {
         peerPubkey: pubkey,
         limit: PAGE_SIZE,
-        before: oldest.timestamp,
-        beforeId: oldest.id,
+        before: cursor.timestamp,
+        beforeId: cursor.id,
       });
+      pageCursor = oldestOf(olderMsgs) ?? cursor;
       const known = new Set(messages.map((m) => m.id));
       const added = olderMsgs.filter((m) => !known.has(m.id));
-      if (added.length === 0) {
+      if (olderMsgs.length === 0) {
         hasMore = false;
+      } else if (added.length === 0) {
+        // Every message of this page was merged from an event already.
+        hasMore = olderMsgs.length >= PAGE_SIZE;
+        requestAnimationFrame(loadOlderUntilScrollable);
       } else {
         const prevHeight = messagesContainer?.scrollHeight ?? 0;
         messages = mergeMessages(messages, added);

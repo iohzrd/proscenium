@@ -5,6 +5,7 @@
   import QrModal from "#lib/QrModal.svelte";
   import PostFeed from "#lib/PostFeed.svelte";
   import DeleteConfirmModal from "#lib/DeleteConfirmModal.svelte";
+  import ConfirmDialog from "../../ConfirmDialog.svelte";
   import ProfileEditor from "#lib/ProfileEditor.svelte";
   import ProfileHeaderCard from "#lib/profile/ProfileHeaderCard.svelte";
   import ProfileIdSection from "#lib/profile/ProfileIdSection.svelte";
@@ -264,14 +265,14 @@
     fetchingRemote = false;
   }
 
+  // Set while the unfollow confirmation is shown.
+  let confirmingUnfollow = $state(false);
+
+  /** Run the unfollow confirmed in the dialog. */
   async function unfollow() {
-    if (
-      !confirm(
-        "Unfollow this user? Their posts will be deleted from your device.",
-      )
-    ) {
-      return;
-    }
+    confirmingUnfollow = false;
+    if (toggling) return;
+    toggling = true;
     try {
       await invoke("unfollow_user", { pubkey });
       isFollowing = false;
@@ -279,6 +280,8 @@
     } catch (e) {
       toast.show(`Failed to unfollow: ${e}`);
       console.error("Unfollow failed:", e);
+    } finally {
+      toggling = false;
     }
   }
 
@@ -307,11 +310,16 @@
     }
   }
 
+  /** Follow, or show the unfollow confirmation. */
   async function toggleFollow() {
     if (toggling) return;
+    if (isFollowing) {
+      confirmingUnfollow = true;
+      return;
+    }
     toggling = true;
     try {
-      await (isFollowing ? unfollow() : follow());
+      await follow();
     } finally {
       toggling = false;
     }
@@ -520,6 +528,17 @@
   {#if peerOffline && !scroll.hasMore && posts.length > 0}
     <p class="offline-notice">End of cached posts -- peer is offline</p>
   {/if}
+{/if}
+
+{#if confirmingUnfollow}
+  <ConfirmDialog
+    label="Unfollow"
+    confirmLabel="Unfollow"
+    onconfirm={unfollow}
+    oncancel={() => (confirmingUnfollow = false)}
+  >
+    <p>Unfollow this user? Their posts will be deleted from your device.</p>
+  </ConfirmDialog>
 {/if}
 
 {#if toast.message}

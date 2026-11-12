@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::storage::Storage;
 use proscenium_types::{
-    LinkedDevicesAnnouncement, VerifiedIdentity, announcement_cache_version, now_millis,
+    LinkedDevicesAnnouncement, MAX_TIMESTAMP_DRIFT_MS, VerifiedIdentity, now_millis,
 };
 
 /// Result of offering a peer's device announcement to the cache.
@@ -13,13 +13,47 @@ pub enum AnnouncementOutcome {
     NotNewer,
 }
 
+/// Delete the cached device list, NodeId mappings and profile of each identity in
+/// `pubkeys` that nothing else refers to: no row of `social_graph`, `dm_conversations` or
+/// `follow_requests`, and no stored post or interaction of it. Used when the pending
+/// follow request of an identity is evicted or expires, so requests from generated
+/// identities leave no rows behind.
+pub(super) async fn delete_unreferenced_identities_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pubkeys: &[String],
+) -> Result<(), AppError> {
+    if pubkeys.is_empty() {
+        return Ok(());
+    }
+    let json = serde_json::to_string(pubkeys)?;
+    let unreferenced = "SELECT j.value FROM json_each(?1) j
+         WHERE NOT EXISTS (SELECT 1 FROM social_graph s
+                 WHERE s.follower = j.value OR s.followee = j.value)
+           AND NOT EXISTS (SELECT 1 FROM dm_conversations c WHERE c.peer_pubkey = j.value)
+           AND NOT EXISTS (SELECT 1 FROM follow_requests r WHERE r.pubkey = j.value)
+           AND NOT EXISTS (SELECT 1 FROM posts p WHERE p.author = j.value)
+           AND NOT EXISTS (SELECT 1 FROM interactions i WHERE i.author = j.value)";
+    for table in [
+        "peer_transports WHERE master_pubkey",
+        "peer_device_announcements WHERE master_pubkey",
+        "profiles WHERE pubkey",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} IN ({unreferenced})"
+        )))
+        .bind(&json)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
 impl Storage {
     /// Store a device announcement that passed `verify_linked_devices_announcement`.
     ///
-    /// The announcement replaces the cached one of its master pubkey only if its
-    /// `announcement_cache_version` (the version, at most `MAX_TIMESTAMP_DRIFT_MS` after
-    /// the local clock) is greater than the stored one; otherwise
-    /// `AnnouncementOutcome::NotNewer` is returned.
+    /// The announcement replaces the cached one of its master pubkey only under the rule of
+    /// `proscenium_types::announcement_replaces`; otherwise `AnnouncementOutcome::NotNewer`
+    /// is returned.
     ///
     /// `peer_transports` maps a NodeId to a master pubkey only if the NodeId delivered,
     /// over a connection that QUIC authenticates, a device list of that master that the
@@ -37,7 +71,10 @@ impl Storage {
         let master = &announcement.master_pubkey;
         let mut tx = self.pool.begin().await?;
         // The version comparison is part of the first statement, a write, so no other
-        // writer can store an announcement between the comparison and the update.
+        // writer can store an announcement between the comparison and the update. The
+        // WHERE clause is `announcement_replaces` with ?5 = now + MAX_TIMESTAMP_DRIFT_MS:
+        // a version above ?5 is ahead of the clock.
+        let now = now_millis();
         let stored = sqlx::query(
             "INSERT INTO peer_device_announcements
                 (master_pubkey, announcement_json, version, cached_at)
@@ -46,12 +83,15 @@ impl Storage {
                 announcement_json = excluded.announcement_json,
                 version = excluded.version,
                 cached_at = excluded.cached_at
-             WHERE excluded.version > peer_device_announcements.version",
+             WHERE (excluded.version <= ?5 AND peer_device_announcements.version > ?5)
+                OR ((excluded.version <= ?5) = (peer_device_announcements.version <= ?5)
+                    AND excluded.version > peer_device_announcements.version)",
         )
         .bind(master)
         .bind(&json)
-        .bind(i64::try_from(announcement_cache_version(announcement)).unwrap_or(i64::MAX))
-        .bind(now_millis() as i64)
+        .bind(i64::try_from(announcement.version).unwrap_or(i64::MAX))
+        .bind(now as i64)
+        .bind(i64::try_from(now.saturating_add(MAX_TIMESTAMP_DRIFT_MS)).unwrap_or(i64::MAX))
         .execute(&mut *tx)
         .await?
         .rows_affected()

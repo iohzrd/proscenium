@@ -90,6 +90,10 @@ else
     sudo rm -f -- "$dir/proscenium-server.previous"
 fi
 sudo systemctl stop "$service"
+# Until the start below, a failed step exits this script: start the unit again. The steps
+# only copy the database files, and the binary is replaced last with one rename, so the
+# unit starts with the binary installed at that moment and the unchanged database.
+trap 'echo "a deploy step failed; starting $service again" >&2; sudo systemctl start "$service" || true' ERR
 for file in server.db server.db-wal server.db-shm; do
     sudo rm -f -- "$data/$file.previous"
     if sudo test -f "$data/$file"; then
@@ -99,6 +103,7 @@ done
 # Write next to the target, then rename: the target path never holds a partial file.
 sudo install -o root -g root -m 0755 -- "$tmp/proscenium-server" "$dir/proscenium-server.new"
 sudo mv -f -- "$dir/proscenium-server.new" "$dir/proscenium-server"
+trap - ERR
 # A failed start is detected by the health check, which then restores the copies.
 sudo systemctl start "$service" || echo "systemctl start $service failed" >&2
 REMOTE

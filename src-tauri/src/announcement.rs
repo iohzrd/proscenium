@@ -3,8 +3,8 @@ use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use proscenium_types::{
     DeviceEntry, IdentityResponse, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN,
-    MAX_LINKED_DEVICES, now_millis, sign_linked_devices_announcement, sign_profile, truncate_chars,
-    verify_linked_devices_announcement, verify_profile_signature,
+    MAX_LINKED_DEVICES, MAX_TIMESTAMP_DRIFT_MS, now_millis, sign_linked_devices_announcement,
+    sign_profile, truncate_chars, verify_linked_devices_announcement, verify_profile_signature,
 };
 
 /// Name of the local device: the name of the operating system it runs on.
@@ -43,15 +43,23 @@ pub fn verify_lists_device(
 /// The local device is listed first, whether or not the table holds a row for it, then
 /// the other rows, at most `MAX_LINKED_DEVICES` in total. `removed` holds the recorded
 /// removed NodeIds that are not listed as devices, newest first. `version` is the creation
-/// time in milliseconds, so receivers replace an earlier announcement with a later one.
+/// time in milliseconds, raised to one more than the highest recorded own version (at most
+/// `MAX_TIMESTAMP_DRIFT_MS` after the clock), so a list built on a device whose clock is
+/// behind another own device still replaces that device's lists at receivers.
 pub async fn build_own_announcement(
     storage: &Storage,
     identity: &SharedIdentity,
 ) -> Result<LinkedDevicesAnnouncement, AppError> {
     let stored = storage.get_linked_devices().await?;
     let mut removed = storage.get_removed_device_ids().await?;
+    let last_version = storage.get_own_announcement_version().await?;
     let id = identity.read().await;
     let now = now_millis();
+    let version = now.max(
+        last_version
+            .saturating_add(1)
+            .min(now.saturating_add(MAX_TIMESTAMP_DRIFT_MS)),
+    );
 
     let mut devices: Vec<DeviceEntry> = Vec::with_capacity(stored.len() + 1);
     let own_added_at = stored
@@ -83,10 +91,12 @@ pub async fn build_own_announcement(
         master_pubkey: id.master_pubkey.clone(),
         devices,
         removed,
-        version: now,
+        version,
         signature: String::new(),
     };
     sign_linked_devices_announcement(&mut announcement, &id.master_key);
+    drop(id);
+    storage.record_own_announcement_version(version).await?;
     Ok(announcement)
 }
 
@@ -182,6 +192,28 @@ mod tests {
         let announcement = build_own_announcement(&empty, &identity).await.unwrap();
         assert_eq!(announcement.devices.len(), 1);
         assert_eq!(announcement.devices[0].node_id, node_id(2));
+    }
+
+    #[tokio::test]
+    async fn own_list_version_exceeds_the_highest_recorded_version() {
+        let storage = Storage::open_in_memory().await.unwrap();
+        let identity = shared_identity([5u8; 32], 2);
+        let first = build_own_announcement(&storage, &identity).await.unwrap();
+        // Another own device, with a clock 2 minutes ahead, published a list.
+        let sibling = now_millis() + 120_000;
+        storage
+            .record_own_announcement_version(sibling)
+            .await
+            .unwrap();
+        let second = build_own_announcement(&storage, &identity).await.unwrap();
+        assert!(second.version > sibling && second.version > first.version);
+        // A version ahead of the clock is not recorded, so it does not raise the next one.
+        storage
+            .record_own_announcement_version(u64::MAX / 2)
+            .await
+            .unwrap();
+        let third = build_own_announcement(&storage, &identity).await.unwrap();
+        assert_eq!(third.version, second.version + 1);
     }
 
     #[tokio::test]

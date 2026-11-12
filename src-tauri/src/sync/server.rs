@@ -197,7 +197,7 @@ pub async fn handle_sync(
     // 3. Interactions, only if the counts differ: those after the requester's newest
     // timestamp if that accounts for the whole difference, otherwise all.
     if req.interaction_count != server_interaction_count {
-        let only_newer = super::sends_only_newer_interactions(
+        let only_newer = proscenium_types::sends_only_newer_interactions(
             server_interaction_count,
             req.interaction_count,
             interactions_after_count,
@@ -287,11 +287,12 @@ fn select_mode(
 /// Return an error unless the NodeId `remote_str` is another device of the local user or
 /// the local visibility allows it to sync.
 ///
-/// Public: anyone. Listed: approved followers. Private: approved followers that the local
-/// user follows. The requester is the master of `announcement` if that list verifies and
-/// lists `remote_str`, which QUIC authenticates; otherwise the master that `remote_str` is
-/// mapped to. The list is cached only for an allowed requester, so unknown requesters do
-/// not add rows. A failed device, visibility or follower lookup rejects the request.
+/// The requester is the master of `announcement` if that list verifies and lists
+/// `remote_str`, which QUIC authenticates; otherwise the master that `remote_str` is mapped
+/// to, if any. A blocked requester is rejected at any visibility. Then Public: anyone.
+/// Listed: approved followers. Private: approved followers that the local user follows.
+/// The list is cached only for an allowed requester, so unknown requesters do not add
+/// rows. A failed device, block, visibility or follower lookup rejects the request.
 async fn authorize_requester(
     storage: &Storage,
     my_pubkey: &str,
@@ -305,6 +306,27 @@ async fn authorize_requester(
     {
         return Ok(());
     }
+    let presented = announcement.filter(|a| {
+        a.master_pubkey != my_pubkey
+            && a.devices.iter().any(|d| d.node_id == remote_str)
+            && verify_linked_devices_announcement(a).is_ok()
+    });
+    let remote_pubkey = match presented {
+        Some(a) => Some(a.master_pubkey.clone()),
+        None => storage
+            .try_get_master_pubkey_for_transport(remote_str)
+            .await
+            .map_err(AcceptError::from_err)?,
+    };
+    if let Some(pubkey) = &remote_pubkey
+        && storage
+            .is_blocked(pubkey)
+            .await
+            .map_err(AcceptError::from_err)?
+    {
+        log::warn!("[sync-server] rejecting blocked user {}", short_id(pubkey));
+        return Err(reject("not authorized"));
+    }
     let visibility = storage
         .get_visibility(my_pubkey)
         .await
@@ -312,27 +334,12 @@ async fn authorize_requester(
     if visibility == Visibility::Public {
         return Ok(());
     }
-    let presented = announcement.filter(|a| {
-        a.master_pubkey != my_pubkey
-            && a.devices.iter().any(|d| d.node_id == remote_str)
-            && verify_linked_devices_announcement(a).is_ok()
-    });
-    let remote_pubkey = match presented {
-        Some(a) => a.master_pubkey.clone(),
-        None => match storage
-            .try_get_master_pubkey_for_transport(remote_str)
-            .await
-            .map_err(AcceptError::from_err)?
-        {
-            Some(pubkey) => pubkey,
-            None => {
-                log::warn!(
-                    "[sync-server] rejecting unknown NodeId {} ({visibility} profile)",
-                    short_id(remote_str)
-                );
-                return Err(reject("not authorized"));
-            }
-        },
+    let Some(remote_pubkey) = remote_pubkey else {
+        log::warn!(
+            "[sync-server] rejecting unknown NodeId {} ({visibility} profile)",
+            short_id(remote_str)
+        );
+        return Err(reject("not authorized"));
     };
     let allowed = match visibility {
         Visibility::Private => storage.is_mutual(my_pubkey, &remote_pubkey).await,
@@ -540,6 +547,65 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_follower_is_refused_from_any_node_id() {
+        let storage = Storage::open_in_memory().await.unwrap();
+        let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let me = SecretKey::from_bytes(&[1u8; 32]).public().to_string();
+        let follower = SecretKey::from_bytes(&[20u8; 32]).public().to_string();
+        let profile = Profile {
+            display_name: "me".to_string(),
+            bio: String::new(),
+            avatar_hash: None,
+            avatar_ticket: None,
+            visibility: Visibility::Listed,
+            updated_at: 1,
+            signature: String::new(),
+        };
+        storage.save_profile(&me, &profile).await.unwrap();
+        storage
+            .approve_follower_directly(&me, &follower, 1, 1, u64::MAX)
+            .await
+            .unwrap();
+        let list = device_list(20, &[node_id(21)]);
+        assert!(
+            authorize_requester(&storage, &me, &node_id(21), Some(&list))
+                .await
+                .is_ok()
+        );
+
+        // Blocked: refused from the mapped NodeId and from a new NodeId with a fresh list,
+        // also while the approval is still stored.
+        storage.block_user(&follower).await.unwrap();
+        assert!(storage.is_approved_follower(&follower).await.unwrap());
+        let fresh = device_list(20, &[node_id(22)]);
+        assert!(
+            authorize_requester(&storage, &me, &node_id(21), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            authorize_requester(&storage, &me, &node_id(22), Some(&fresh))
+                .await
+                .is_err()
+        );
+
+        // Revoking the approval keeps the follower refused after an unblock.
+        assert!(
+            storage
+                .revoke_follower(&me, &follower, 2, u64::MAX)
+                .await
+                .unwrap()
+        );
+        storage.unblock_user(&follower).await.unwrap();
+        assert!(!storage.is_approved_follower(&follower).await.unwrap());
+        assert!(
+            authorize_requester(&storage, &me, &node_id(22), Some(&fresh))
+                .await
+                .is_err()
         );
     }
 

@@ -1,8 +1,8 @@
 use crate::error::{AppError, CmdResult};
 use crate::state::AppState;
 use futures_lite::StreamExt;
-use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::get::request::{get_blob, get_verified_size};
@@ -99,6 +99,26 @@ fn parse_ticket(s: &str) -> Result<BlobTicket, AppError> {
     Ok(ticket)
 }
 
+/// Remote blob downloads running at the same time, over `fetch_blob_bytes` and
+/// `refetch_blob_bytes`. The webview requests the media of every visible post and message,
+/// so without a limit a stranger's messages with many attachments start that many
+/// concurrent 10 MiB downloads.
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+static DOWNLOAD_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_DOWNLOADS);
+
+/// Address of `endpoint` for a blob ticket: its NodeId and home relay URL, without direct
+/// addresses. Tickets end up in signed posts and avatars that followers and discovery
+/// servers store and serve, and direct addresses would publish the device's LAN and public
+/// IP addresses. A fetcher reaches the device through the relay or iroh address lookup.
+fn ticket_addr(endpoint: &Endpoint) -> EndpointAddr {
+    let addr = EndpointAddr::new(endpoint.id());
+    match endpoint.addr().relay_urls().next() {
+        Some(relay_url) => addr.with_relay_url(relay_url.clone()),
+        None => addr,
+    }
+}
+
 /// Add `data` to the blob store. Returns `{ hash, ticket }`.
 async fn add_blob_data(
     blob_store: &FsStore,
@@ -108,8 +128,7 @@ async fn add_blob_data(
     let size = data.len();
     check_blob_size(size as u64)?;
     let tag = blob_store.add_bytes(data).await?;
-    let addr = endpoint.addr();
-    let ticket = BlobTicket::new(addr, tag.hash, tag.format);
+    let ticket = BlobTicket::new(ticket_addr(endpoint), tag.hash, tag.format);
     log::info!("[blob] added blob {} ({size} bytes)", tag.hash);
     Ok(serde_json::json!({
         "hash": tag.hash.to_string(),
@@ -332,6 +351,14 @@ pub async fn fetch_blob_bytes(
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
         return Ok(Response::new(bytes));
     }
+    let _slot = DOWNLOAD_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| "blob download limit closed")?;
+    // Another request may have downloaded the blob while this one waited.
+    if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
+        return Ok(Response::new(bytes));
+    }
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
     let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit).await?;
@@ -355,6 +382,10 @@ pub async fn refetch_blob_bytes(
 ) -> CmdResult<Response> {
     let ticket = parse_ticket(&ticket)?;
     let hash = ticket.hash();
+    let _slot = DOWNLOAD_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| "blob download limit closed")?;
     log::info!("[blob] downloading {hash} from remote without using the local store...");
     let (conn, size) =
         connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
@@ -433,6 +464,8 @@ mod tests {
             .find(SocketAddr::is_ipv4)
             .unwrap()
             .port();
+        // Tickets the app creates hold no direct address.
+        assert_eq!(ticket_addr(&provider).ip_addrs().count(), 0);
         let addr = iroh::EndpointAddr::new(provider.id())
             .with_ip_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
         let ticket = BlobTicket::new(addr, hash, BlobFormat::Raw);

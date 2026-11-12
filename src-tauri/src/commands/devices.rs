@@ -91,8 +91,8 @@ pub async fn get_linked_devices(state: State<'_, Arc<AppState>>) -> CmdResult<Ve
 
 /// Remove the other device `node_id` from the identity: record its NodeId as removed,
 /// delete its row, send the new device list to followers, and start a device sync with
-/// the remaining devices, which copies the removal to them. The removed device deletes
-/// its data when a device sync shows it a list that removes it.
+/// the remaining devices, which copies the removal to them. The removed device asks its
+/// user whether to delete its data when a device sync shows it a list that removes it.
 ///
 /// Asks for confirmation in a native dialog and returns the error `"cancelled"` if it is
 /// declined.
@@ -120,10 +120,11 @@ pub async fn remove_linked_device(
         "Remove device",
         &format!(
             "Remove {} ({}) from this identity?\n\n\
-             The device deletes its data, including its copy of the master key, the next \
-             time it connects to one of your devices. Until then it can still post and \
-             message as you. A device that someone else controls can ignore the removal; \
-             only a new identity protects against it.",
+             Your other devices stop syncing with it. The next time it connects to one of \
+             your devices, it asks whether to delete its data, including its copy of the \
+             master key. Until then, and if that is declined, it can still post and \
+             message as you: only a new identity protects against a device that someone \
+             else controls.",
             crate::confirm::dialog_device_name(&device.device_name),
             short_id(&node_id)
         ),

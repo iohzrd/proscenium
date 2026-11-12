@@ -5,6 +5,33 @@ use sqlx::Row;
 
 use super::Storage;
 
+/// Conversations with strangers that are kept: peers the local user does not follow and
+/// has not written to in that conversation. A new one evicts the one with the oldest
+/// last message.
+pub const MAX_STRANGER_CONVERSATIONS: i64 = 100;
+/// Messages of a stranger stored in its conversation before further ones are refused.
+pub const MAX_STRANGER_MESSAGES: i64 = 50;
+
+/// Condition on a conversation `c` and the local user `?1`: the peer is not followed and
+/// the local user wrote no message in it.
+const STRANGER_CONVERSATION: &str = "NOT EXISTS (SELECT 1 FROM social_graph s
+         WHERE s.follower = ?1 AND s.followee = c.peer_pubkey
+           AND s.state = 'active' AND s.followed_at IS NOT NULL)
+     AND NOT EXISTS (SELECT 1 FROM dm_messages m
+         WHERE m.conversation_id = c.conversation_id AND m.from_pubkey = ?1)";
+
+/// Result of `Storage::receive_dm_message`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceivedDm {
+    /// The message was stored.
+    Stored,
+    /// A message with the same id is stored; nothing was written.
+    Duplicate,
+    /// The sender is a stranger with `MAX_STRANGER_MESSAGES` messages in the
+    /// conversation; nothing was written.
+    Refused,
+}
+
 /// Convert a millisecond timestamp to the SQLite integer type; values above `i64::MAX`
 /// become `i64::MAX`.
 fn to_db_millis(value: u64) -> i64 {
@@ -42,6 +69,9 @@ impl Storage {
         Ok(convos)
     }
 
+    /// Set the unread count of the conversation with `peer_pubkey` to 0 and mark the
+    /// messages received from `peer_pubkey` as read. The local user's own messages keep
+    /// their `read` flag, which the peer's read receipt sets.
     pub async fn mark_conversation_read(
         &self,
         peer_pubkey: &str,
@@ -53,10 +83,14 @@ impl Storage {
             .bind(&conv_id)
             .execute(&mut *tx)
             .await?;
-        sqlx::query("UPDATE dm_messages SET read = 1 WHERE conversation_id=?1 AND read = 0")
-            .bind(&conv_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE dm_messages SET read = 1
+             WHERE conversation_id=?1 AND from_pubkey=?2 AND read = 0",
+        )
+        .bind(&conv_id)
+        .bind(peer_pubkey)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -356,17 +390,34 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
+    /// True if a conversation with `peer_pubkey` is stored.
+    pub async fn has_conversation(&self, peer_pubkey: &str) -> Result<bool, AppError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM dm_conversations WHERE peer_pubkey = ?1)",
+        )
+        .bind(peer_pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// Store a message received from `peer_master_pubkey` and update its conversation:
     /// the preview and `last_message_at` follow the newest message, and `unread_count`
-    /// grows by one. Returns false, and writes nothing, if a message with the same id is
-    /// stored.
+    /// grows by one.
+    ///
+    /// For a stranger (see `MAX_STRANGER_CONVERSATIONS`), at most `MAX_STRANGER_MESSAGES`
+    /// messages are stored in its conversation, and a new stranger conversation beyond
+    /// `MAX_STRANGER_CONVERSATIONS` evicts the stranger conversation with the oldest last
+    /// message, with its messages and the cached identity of its peer if nothing else
+    /// refers to it. Messages from generated identities therefore cannot fill the
+    /// database.
     pub async fn receive_dm_message(
         &self,
         peer_master_pubkey: &str,
         message: &StoredMessage,
         preview: &str,
-    ) -> Result<bool, AppError> {
-        self.insert_dm_message(peer_master_pubkey, message, preview, 1)
+    ) -> Result<ReceivedDm, AppError> {
+        self.insert_dm_message(peer_master_pubkey, message, preview, 1, true)
             .await
     }
 
@@ -382,20 +433,24 @@ impl Storage {
     ) -> Result<bool, AppError> {
         let preview = crate::util::message_preview(&message.content);
         let unread = i64::from(incoming && !message.read);
-        self.insert_dm_message(peer_pubkey, message, &preview, unread)
-            .await
+        Ok(self
+            .insert_dm_message(peer_pubkey, message, &preview, unread, false)
+            .await?
+            == ReceivedDm::Stored)
     }
 
     /// Insert `message` and create or update its conversation with `peer_pubkey`, in one
-    /// transaction, adding `unread_increment` to `unread_count`. Returns false, and
-    /// writes nothing, if a message with the same id is stored.
+    /// transaction, adding `unread_increment` to `unread_count`. Writes nothing if a
+    /// message with the same id is stored. With `limit_strangers`, applies the limits of
+    /// `receive_dm_message` to a message from `peer_pubkey` to `message.to_pubkey`.
     async fn insert_dm_message(
         &self,
         peer_pubkey: &str,
         message: &StoredMessage,
         preview: &str,
         unread_increment: i64,
-    ) -> Result<bool, AppError> {
+        limit_strangers: bool,
+    ) -> Result<ReceivedDm, AppError> {
         let conv_id = &message.conversation_id;
         let media_json = serde_json::to_string(&message.media)?;
         let timestamp = to_db_millis(message.timestamp);
@@ -410,7 +465,15 @@ impl Storage {
             .await?;
         if exists {
             tx.commit().await?;
-            return Ok(false);
+            return Ok(ReceivedDm::Duplicate);
+        }
+        if limit_strangers
+            && !self
+                .admit_stranger_message_tx(&mut tx, peer_pubkey, message)
+                .await?
+        {
+            tx.commit().await?;
+            return Ok(ReceivedDm::Refused);
         }
 
         sqlx::query(
@@ -452,6 +515,77 @@ impl Storage {
         .await?;
 
         tx.commit().await?;
+        Ok(ReceivedDm::Stored)
+    }
+
+    /// The stranger limits of `receive_dm_message` for `message` from `peer_pubkey`.
+    /// Returns false if the message is refused; evicts a stranger conversation if a new
+    /// one would exceed `MAX_STRANGER_CONVERSATIONS`.
+    async fn admit_stranger_message_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        peer_pubkey: &str,
+        message: &StoredMessage,
+    ) -> Result<bool, AppError> {
+        let me = &message.to_pubkey;
+        let conv_id = &message.conversation_id;
+        let (exists, stranger): (bool, bool) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS (SELECT 1 FROM dm_conversations WHERE conversation_id = ?2),
+                    NOT EXISTS (SELECT 1 FROM dm_conversations c
+                        WHERE c.conversation_id = ?2 AND NOT ({STRANGER_CONVERSATION}))
+                    AND NOT EXISTS (SELECT 1 FROM social_graph s
+                        WHERE s.follower = ?1 AND s.followee = ?3
+                          AND s.state = 'active' AND s.followed_at IS NOT NULL)"
+        )))
+        .bind(me)
+        .bind(conv_id)
+        .bind(peer_pubkey)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !stranger {
+            return Ok(true);
+        }
+        if exists {
+            let from_peer: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM dm_messages WHERE conversation_id = ?1 AND from_pubkey = ?2",
+            )
+            .bind(conv_id)
+            .bind(peer_pubkey)
+            .fetch_one(&mut **tx)
+            .await?;
+            return Ok(from_peer < MAX_STRANGER_MESSAGES);
+        }
+        let strangers: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM dm_conversations c WHERE {STRANGER_CONVERSATION}"
+        )))
+        .bind(me)
+        .fetch_one(&mut **tx)
+        .await?;
+        if strangers < MAX_STRANGER_CONVERSATIONS {
+            return Ok(true);
+        }
+        let evicted: Vec<(String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT c.conversation_id, c.peer_pubkey FROM dm_conversations c
+             WHERE {STRANGER_CONVERSATION}
+             ORDER BY c.last_message_at ASC, c.conversation_id ASC LIMIT ?2"
+        )))
+        .bind(me)
+        .bind(strangers - MAX_STRANGER_CONVERSATIONS + 1)
+        .fetch_all(&mut **tx)
+        .await?;
+        let mut peers = Vec::with_capacity(evicted.len());
+        for (conversation, peer) in evicted {
+            sqlx::query("DELETE FROM dm_messages WHERE conversation_id = ?1")
+                .bind(&conversation)
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query("DELETE FROM dm_conversations WHERE conversation_id = ?1")
+                .bind(&conversation)
+                .execute(&mut **tx)
+                .await?;
+            peers.push(peer);
+        }
+        super::peer_identities::delete_unreferenced_identities_tx(tx, &peers).await?;
         Ok(true)
     }
 

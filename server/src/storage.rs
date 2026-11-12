@@ -1,7 +1,7 @@
 use futures_lite::Stream;
 use proscenium_types::{
     Interaction, InteractionKind, LinkedDevicesAnnouncement, MAX_SYNC_TOMBSTONES, Post, Profile,
-    ProfileUpdateRequest, RegistrationRequest, Visibility, announcement_cache_version, now_millis,
+    ProfileUpdateRequest, RegistrationRequest, Visibility, announcement_replaces, now_millis,
 };
 use serde::Serialize;
 use sqlx::sqlite::{
@@ -658,9 +658,8 @@ impl Storage {
     /// Store the device NodeIds of an announcement that passed
     /// `verify_linked_devices_announcement`, for an active registration.
     ///
-    /// The stored list is replaced only if its `announcement_cache_version` (the version,
-    /// at most `MAX_TIMESTAMP_DRIFT_MS` after the local clock) is greater than the stored
-    /// version. If the announcement removes the registering device, its NodeId is
+    /// A stored list is replaced only under the rule of
+    /// `proscenium_types::announcement_replaces`. If the announcement removes the registering device, its NodeId is
     /// cleared, so only the devices of the list are dialed.
     pub async fn cache_announcement(
         &self,
@@ -668,8 +667,15 @@ impl Storage {
     ) -> Result<AnnouncementOutcome, ChangeError> {
         let mut tx = self.begin_write().await?;
         let row = Self::load_active_row(&mut tx, &announcement.master_pubkey).await?;
-        let version = to_i64(announcement_cache_version(announcement));
-        if version <= row.announcement_version {
+        let version = to_i64(announcement.version);
+        // `announcement_version` is 0 while no list is stored.
+        if row.announcement_version > 0
+            && !announcement_replaces(
+                announcement.version,
+                row.announcement_version as u64,
+                now_millis(),
+            )
+        {
             return Ok(AnnouncementOutcome::NotNewer);
         }
         let node_ids: Vec<&str> = announcement
@@ -1023,8 +1029,12 @@ impl Storage {
         Ok(posts)
     }
 
-    /// Full-text search. `fts_query` must come from `content::fts_query`. The returned
-    /// total counts at most `MAX_SEARCH_COUNT` matches.
+    /// Full-text search. `fts_query` must come from `content::fts_query`.
+    ///
+    /// Only the `MAX_SEARCH_COUNT` most recently stored matches are considered: they are
+    /// sorted by timestamp and paged, so one query sorts at most that many rows, and an
+    /// `offset` past them returns nothing. The returned total counts at most
+    /// `MAX_SEARCH_COUNT` matches.
     pub async fn search_posts(
         &self,
         fts_query: &str,
@@ -1043,15 +1053,22 @@ impl Storage {
             .fetch_one(&self.pool)
             .await?;
 
+        if offset >= MAX_SEARCH_COUNT {
+            return Ok((Vec::new(), count));
+        }
         let sql = format!(
-            "SELECT p.* FROM posts_fts f JOIN posts p ON f.rowid = p.seq {PUBLIC_AUTHOR_JOIN}
-             WHERE f.content MATCH ?1
+            "SELECT p.* FROM (
+                 SELECT f.rowid AS seq FROM posts_fts f
+                 WHERE f.content MATCH ?1 ORDER BY f.rowid DESC LIMIT ?4
+             ) m
+             JOIN posts p ON p.seq = m.seq {PUBLIC_AUTHOR_JOIN}
              ORDER BY p.timestamp DESC, p.id DESC LIMIT ?2 OFFSET ?3"
         );
         let posts = sqlx::query_as::<_, StoredPost>(sqlx::AssertSqlSafe(sql))
             .bind(fts_query)
             .bind(limit)
             .bind(offset)
+            .bind(MAX_SEARCH_COUNT)
             .fetch_all(&self.pool)
             .await?;
 
@@ -1170,6 +1187,27 @@ impl Storage {
             .await?;
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete the interactions of `author` whose id is not in `ids`, the author's complete
+    /// interaction set received in a sync. Returns the number deleted.
+    pub async fn delete_interactions_not_in(
+        &self,
+        author: &str,
+        ids: &[String],
+    ) -> anyhow::Result<u64> {
+        let ids_json = serde_json::to_string(ids)?;
+        let mut tx = self.begin_write().await?;
+        let result = sqlx::query(
+            "DELETE FROM interactions WHERE author = ?1
+             AND id NOT IN (SELECT value FROM json_each(?2))",
+        )
+        .bind(author)
+        .bind(&ids_json)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     /// Interactions on the post `(target_author, target_post_id)`, newest first, and the

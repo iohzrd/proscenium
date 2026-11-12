@@ -30,6 +30,25 @@ pub enum DirectApproval {
     Denied,
 }
 
+/// Delete the pending rows other than the newest `MAX_PENDING_FOLLOW_REQUESTS`, by
+/// `created_at` and then `pubkey`: the rows `record_follow_request` evicts first. The
+/// cached identities of the evicted requesters are deleted unless something else refers
+/// to them.
+async fn evict_excess_pending_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), AppError> {
+    let evicted: Vec<String> = sqlx::query_scalar(
+        "DELETE FROM follow_requests WHERE status='pending' AND pubkey IN (
+             SELECT pubkey FROM follow_requests WHERE status='pending'
+             ORDER BY created_at DESC, pubkey DESC LIMIT -1 OFFSET ?1
+         ) RETURNING pubkey",
+    )
+    .bind(i64::try_from(MAX_PENDING_FOLLOW_REQUESTS).unwrap_or(i64::MAX))
+    .fetch_all(&mut **tx)
+    .await?;
+    super::peer_identities::delete_unreferenced_identities_tx(tx, &evicted).await
+}
+
 impl Storage {
     /// Record a verified follow request from `pubkey` and return the resulting row state.
     ///
@@ -38,7 +57,8 @@ impl Storage {
     /// denied requester stays denied until the denial expires. With
     /// `MAX_PENDING_FOLLOW_REQUESTS` pending rows, the oldest pending row is deleted before
     /// the new one is inserted, so requests from generated identities cannot block new
-    /// requests.
+    /// requests. The cached identities of deleted rows are deleted unless something else
+    /// refers to them.
     pub async fn record_follow_request(
         &self,
         pubkey: &str,
@@ -48,10 +68,14 @@ impl Storage {
     ) -> Result<FollowRequestOutcome, AppError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
-        sqlx::query("DELETE FROM follow_requests WHERE status != 'approved' AND expires_at <= ?1")
-            .bind(now as i64)
-            .execute(&mut *tx)
-            .await?;
+        let expired: Vec<String> = sqlx::query_scalar(
+            "DELETE FROM follow_requests WHERE status != 'approved' AND expires_at <= ?1
+             RETURNING pubkey",
+        )
+        .bind(now as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        super::peer_identities::delete_unreferenced_identities_tx(&mut tx, &expired).await?;
 
         let existing: Option<String> =
             sqlx::query_scalar("SELECT status FROM follow_requests WHERE pubkey=?1")
@@ -69,14 +93,16 @@ impl Storage {
                 .fetch_one(&mut *tx)
                 .await?;
                 if pending as u64 >= MAX_PENDING_FOLLOW_REQUESTS {
-                    sqlx::query(
+                    let evicted: Vec<String> = sqlx::query_scalar(
                         "DELETE FROM follow_requests WHERE pubkey = (
                              SELECT pubkey FROM follow_requests WHERE status='pending'
                              ORDER BY created_at ASC, pubkey ASC LIMIT 1
-                         )",
+                         ) RETURNING pubkey",
                     )
-                    .execute(&mut *tx)
+                    .fetch_all(&mut *tx)
                     .await?;
+                    super::peer_identities::delete_unreferenced_identities_tx(&mut tx, &evicted)
+                        .await?;
                 }
                 sqlx::query(
                     "INSERT INTO follow_requests (pubkey, timestamp, status, created_at, expires_at)
@@ -178,6 +204,34 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Withdraw the approval or pending request of `pubkey`, the follower of `me`: the row
+    /// becomes denied at `now` until `expires_at`, and `pubkey` is no longer stored as a
+    /// follower. Returns `false` if `pubkey` had no approved or pending row. Device sync
+    /// copies the denial to the other devices.
+    pub async fn revoke_follower(
+        &self,
+        me: &str,
+        pubkey: &str,
+        now: u64,
+        expires_at: u64,
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let revoked = sqlx::query(
+            "UPDATE follow_requests SET status='denied', decided_at=?2, expires_at=?3
+             WHERE pubkey=?1 AND status IN ('approved', 'pending')",
+        )
+        .bind(pubkey)
+        .bind(now as i64)
+        .bind(i64::try_from(expires_at).unwrap_or(i64::MAX))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        Self::delete_follower_tx(&mut tx, me, pubkey).await?;
+        tx.commit().await?;
+        Ok(revoked)
+    }
+
     /// All approved requests plus the pending and denied requests that have not expired.
     pub async fn get_follow_requests(&self, now: u64) -> Result<Vec<FollowRequestEntry>, AppError> {
         let rows = sqlx::query(
@@ -218,7 +272,9 @@ impl Storage {
     ///
     /// A received decision (approved or denied) replaces the local row only if its
     /// `decided_at` is greater; a pending row is inserted only if no row exists. A merged
-    /// approval also records `pubkey` as a follower of `me`. Entries with an invalid
+    /// approval also records `pubkey` as a follower of `me`, and a merged denial removes
+    /// that record. Afterwards only the newest `MAX_PENDING_FOLLOW_REQUESTS` pending rows
+    /// are kept, so rows that one device evicted do not return. Entries with an invalid
     /// pubkey or status, and expired pending or denied entries, are skipped. Returns the
     /// number of rows written.
     pub async fn merge_follow_requests(
@@ -267,10 +323,15 @@ impl Storage {
                 continue;
             }
             merged += 1;
-            if entry.status == "approved" {
-                Self::upsert_follower_tx(&mut tx, me, &entry.pubkey, now).await?;
+            match entry.status.as_str() {
+                "approved" => {
+                    Self::upsert_follower_tx(&mut tx, me, &entry.pubkey, now).await?;
+                }
+                "denied" => Self::delete_follower_tx(&mut tx, me, &entry.pubkey).await?,
+                _ => {}
             }
         }
+        evict_excess_pending_tx(&mut tx).await?;
         tx.commit().await?;
         Ok(merged)
     }
