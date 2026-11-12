@@ -108,10 +108,10 @@ impl DmHandler {
                     && !self.admit_new_stranger()
                 {
                     log::warn!(
-                        "[dm] refusing a new conversation from {}: limit of new conversations with unknown senders reached",
+                        "[dm] deferring a new conversation from {}: limit of new conversations with unknown senders reached",
                         short_id(&sender)
                     );
-                    return Ok(DmAck::Rejected);
+                    return Ok(DmAck::Deferred);
                 }
                 let now = now_millis();
                 let stored_msg = StoredMessage {

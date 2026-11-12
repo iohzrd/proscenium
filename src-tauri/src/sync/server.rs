@@ -1,6 +1,6 @@
 use crate::constants::{
-    BATCH_SIZE, PEER_CLOSE_WAIT, PEER_RESPONSE_WRITE_TIMEOUT, SYNC_FRAME_TARGET_BYTES,
-    SYNC_MAX_SUMMARY_BYTES, SYNC_STEP_TIMEOUT, SYNC_TOMBSTONE_BATCH,
+    BATCH_SIZE, MIRROR_PUBLIC_CONFIRMATION_TTL, PEER_CLOSE_WAIT, PEER_RESPONSE_WRITE_TIMEOUT,
+    SYNC_FRAME_TARGET_BYTES, SYNC_MAX_SUMMARY_BYTES, SYNC_STEP_TIMEOUT, SYNC_TOMBSTONE_BATCH,
 };
 use crate::error::AppError;
 use crate::framing::{read_to_end_timeout, wait_closed, write_all_timeout, write_frame};
@@ -13,8 +13,8 @@ use iroh::{
 };
 use proscenium_types::{
     LinkedDevicesAnnouncement, MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, Post, StageAnnouncement,
-    SyncFrame, SyncMode, SyncRequest, SyncSummary, Visibility, is_valid_id, post_ids_digest,
-    short_id, sign_stage_announcement, verify_linked_devices_announcement,
+    SyncFrame, SyncMode, SyncRequest, SyncSummary, Visibility, is_valid_id, now_millis,
+    post_ids_digest, short_id, sign_stage_announcement, verify_linked_devices_announcement,
 };
 
 /// Byte limit of the JSON id list a requester sends in `NeedIdDiff` mode:
@@ -407,15 +407,24 @@ async fn identify_unblocked_requester<'a>(
 }
 
 /// Return an error unless the local node serves, as a mirror, the content of `author`,
-/// another user, to the NodeId `remote_str`: the local user follows `author`, has not
-/// muted or blocked `author`, the stored profile of `author` is Public, and the requester
-/// is not blocked (see `identify_unblocked_requester`).
+/// another user, to the NodeId `remote_str`. Conditions:
+///
+/// - The local profile is Public and the local user shares its follow list: whether the
+///   node serves an author reveals that the local user follows it.
+/// - The local user follows `author` and has not muted or blocked `author`. A request
+///   for another stored author would reveal which profiles the local user viewed.
+/// - The stored profile of `author` is Public, and a device of `author` sent it as Public
+///   in a sync summary within `MIRROR_PUBLIC_CONFIRMATION_TTL`. A follower from the
+///   author's Public period that missed the author's switch to Listed or Private
+///   receives no push and no sync from the author, so it stops serving within that time.
+///   Every push of a non-Public author carries its profile (`GossipService::attempt_push`),
+///   so a mirror that holds non-Public posts also holds the non-Public profile.
+/// - The requester is not blocked (see `identify_unblocked_requester`). A requester
+///   sends no device list to a mirror, so only a NodeId mapped to a blocked user is
+///   recognized.
 ///
 /// The author signs its posts, deletions and profile, so a requester verifies a mirror's
-/// response as it verifies the author's. Only followed authors are served: a request for
-/// another stored author would reveal which profiles the local user viewed. Every push of
-/// a non-Public author carries its profile (`GossipService::attempt_push`), so a mirror
-/// that holds non-Public posts also holds the non-Public profile and refuses.
+/// response as it verifies the author's.
 async fn authorize_mirror_requester(
     storage: &Storage,
     my_pubkey: &str,
@@ -424,18 +433,28 @@ async fn authorize_mirror_requester(
     announcement: Option<&LinkedDevicesAnnouncement>,
 ) -> Result<(), AcceptError> {
     let map_err = AcceptError::from_err;
-    let public = storage
-        .get_profile(author)
-        .await
-        .map_err(map_err)?
-        .is_some_and(|p| p.visibility == Visibility::Public);
-    if !public
-        || !storage
+    let is_public = async |pubkey: &str| {
+        storage
+            .get_profile(pubkey)
+            .await
+            .map(|p| p.is_some_and(|p| p.visibility == Visibility::Public))
+    };
+    let ttl_ms = u64::try_from(MIRROR_PUBLIC_CONFIRMATION_TTL.as_millis()).unwrap_or(u64::MAX);
+    let confirmed_since = now_millis().saturating_sub(ttl_ms);
+    let serves = is_public(my_pubkey).await.map_err(map_err)?
+        && crate::preferences::get_share_follows(storage).await
+        && storage
             .is_following(my_pubkey, author)
             .await
             .map_err(map_err)?
-        || storage.is_hidden(author).await.map_err(map_err)?
-    {
+        && !storage.is_hidden(author).await.map_err(map_err)?
+        && is_public(author).await.map_err(map_err)?
+        && storage
+            .get_public_confirmed_at(author)
+            .await
+            .map_err(map_err)?
+            >= confirmed_since;
+    if !serves {
         log::debug!(
             "[sync-server] not a mirror of {} for {}",
             short_id(author),
@@ -693,7 +712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_serves_only_a_followed_unhidden_public_author_to_unblocked_requesters() {
+    async fn mirror_serves_only_under_every_condition() {
         let storage = Storage::open_in_memory().await.unwrap();
         let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
         let me = SecretKey::from_bytes(&[1u8; 32]).public().to_string();
@@ -725,6 +744,16 @@ mod tests {
             last_changed_at: at,
         };
 
+        let own_profile = |visibility: Visibility, updated_at: u64| Profile {
+            display_name: "me".to_string(),
+            bio: String::new(),
+            avatar_hash: None,
+            avatar_ticket: None,
+            visibility,
+            updated_at,
+            signature: String::new(),
+        };
+
         // No stored profile, then Public but not followed.
         assert!(!allowed(&storage).await);
         storage
@@ -733,9 +762,48 @@ mod tests {
             .unwrap();
         assert!(!allowed(&storage).await);
 
-        // Followed and Public: served.
+        // Followed, but not confirmed by a device of the author.
         storage
             .merge_follows_lww(&me, &[follow("active", 1)])
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+
+        // Confirmed, but the local profile is missing.
+        storage
+            .confirm_public_profile(&author, now_millis())
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+
+        // Local profile Public: served.
+        storage
+            .save_profile(&me, &own_profile(Visibility::Public, 1))
+            .await
+            .unwrap();
+        assert!(allowed(&storage).await);
+
+        // Follow list not shared.
+        storage
+            .set_bool_preference(crate::preferences::SHARE_FOLLOWS, false)
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+        storage
+            .set_bool_preference(crate::preferences::SHARE_FOLLOWS, true)
+            .await
+            .unwrap();
+        assert!(allowed(&storage).await);
+
+        // Confirmation older than the limit.
+        let ttl_ms = MIRROR_PUBLIC_CONFIRMATION_TTL.as_millis() as u64;
+        storage
+            .confirm_public_profile(&author, now_millis() - ttl_ms - 1_000)
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+        storage
+            .confirm_public_profile(&author, now_millis())
             .await
             .unwrap();
         assert!(allowed(&storage).await);
@@ -753,7 +821,17 @@ mod tests {
             .unwrap();
         assert!(allowed(&storage).await);
 
-        // Listed author.
+        // Listed local profile, then Listed author.
+        storage
+            .save_profile(&me, &own_profile(Visibility::Listed, 2))
+            .await
+            .unwrap();
+        assert!(!allowed(&storage).await);
+        storage
+            .save_profile(&me, &own_profile(Visibility::Public, 3))
+            .await
+            .unwrap();
+        assert!(allowed(&storage).await);
         storage
             .save_profile(&author, &profile(Visibility::Listed, 2))
             .await

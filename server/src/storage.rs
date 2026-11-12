@@ -1210,35 +1210,27 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete the interactions of `author` whose id is not in `ids`, the author's complete
-    /// interaction set received in a sync, and record their ids in
-    /// `interaction_tombstones` (up to `MAX_SYNC_TOMBSTONES` per author, as
-    /// `delete_interaction` does), so a re-sent signed original is not stored again.
-    /// Returns the number deleted.
+    /// Delete the interactions of `author` with a timestamp at or after `since` whose id is
+    /// not in `ids`: the interaction set of that window that one device of the author
+    /// sent in a sync. Returns the number deleted.
+    ///
+    /// No tombstone is recorded. A device can lack interactions that another device of
+    /// the author made and has not copied to it yet; a later sync from a device that holds
+    /// them stores them again. Only a signed deletion records a tombstone.
     pub async fn delete_interactions_not_in(
         &self,
         author: &str,
+        since: u64,
         ids: &[String],
     ) -> anyhow::Result<u64> {
         let ids_json = serde_json::to_string(ids)?;
         let mut tx = self.begin_write().await?;
-        sqlx::query(
-            "INSERT OR IGNORE INTO interaction_tombstones (author, id, deleted_at)
-             SELECT author, id, ?3 FROM interactions
-             WHERE author = ?1 AND id NOT IN (SELECT value FROM json_each(?2))
-             LIMIT MAX(0, ?4 - (SELECT COUNT(*) FROM interaction_tombstones WHERE author = ?1))",
-        )
-        .bind(author)
-        .bind(&ids_json)
-        .bind(to_i64(now_millis()))
-        .bind(MAX_SYNC_TOMBSTONES as i64)
-        .execute(&mut *tx)
-        .await?;
         let result = sqlx::query(
-            "DELETE FROM interactions WHERE author = ?1
-             AND id NOT IN (SELECT value FROM json_each(?2))",
+            "DELETE FROM interactions WHERE author = ?1 AND timestamp >= ?2
+             AND id NOT IN (SELECT value FROM json_each(?3))",
         )
         .bind(author)
+        .bind(to_i64(since))
         .bind(&ids_json)
         .execute(&mut *tx)
         .await?;

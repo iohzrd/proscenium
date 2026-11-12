@@ -1,9 +1,10 @@
 use crate::error::AppError;
 use crate::storage::{Storage, TombstoneOutcome};
 use proscenium_types::{
-    Interaction, Post, PostTombstone, Profile, is_valid_id, now_millis, parse_mentions, short_id,
-    validate_interaction, validate_post, validate_profile, verify_delete_post_signature,
-    verify_interaction_signature, verify_post_signature, verify_profile_signature,
+    Interaction, Post, PostTombstone, Profile, StageAnnouncement, StageEnd, is_valid_id,
+    now_millis, parse_mentions, short_id, validate_interaction, validate_post, validate_profile,
+    verify_delete_post_signature, verify_interaction_signature, verify_post_signature,
+    verify_profile_signature, verify_stage_announcement, verify_stage_ended,
 };
 use tauri::{AppHandle, Emitter, Runtime};
 
@@ -253,6 +254,72 @@ pub async fn verify_and_apply_post_tombstones(
             TombstoneOutcome::default()
         }
     }
+}
+
+/// Emit `stage-announced` for a stage announcement received from `author` in a sync
+/// summary or a push, only if `author` is its host and signed it.
+pub fn emit_verified_stage<R: Runtime>(
+    stage: &StageAnnouncement,
+    author: &str,
+    app_handle: &AppHandle<R>,
+    label: &str,
+) {
+    if stage.host_pubkey != author {
+        log::warn!("[{label}] ignored stage announcement with another host");
+        return;
+    }
+    if let Err(reason) = verify_stage_announcement(
+        &stage.stage_id,
+        &stage.title,
+        &stage.ticket,
+        &stage.host_pubkey,
+        stage.started_at,
+        &stage.signature,
+    ) {
+        log::warn!(
+            "[{label}] bad stage announcement from {}: {reason}",
+            short_id(author)
+        );
+        return;
+    }
+    log::info!(
+        "[{label}] live stage {} hosted by {}",
+        short_id(&stage.stage_id),
+        short_id(author),
+    );
+    let _ = app_handle.emit(
+        "stage-announced",
+        serde_json::json!({
+            "stage_id": stage.stage_id,
+            "title": stage.title,
+            "ticket": stage.ticket.to_string(),
+            "host_pubkey": stage.host_pubkey,
+            "started_at": stage.started_at,
+        }),
+    );
+}
+
+/// Emit `stage-ended-remote` for the end of a stage received from `author` in a push,
+/// only if `author` is its host and signed it.
+pub fn emit_verified_stage_end<R: Runtime>(
+    end: &StageEnd,
+    author: &str,
+    app_handle: &AppHandle<R>,
+    label: &str,
+) {
+    if end.host_pubkey != author {
+        log::warn!("[{label}] ignored stage end with another host");
+        return;
+    }
+    if let Err(reason) = verify_stage_ended(&end.stage_id, &end.host_pubkey, &end.signature) {
+        log::warn!(
+            "[{label}] bad stage end from {}: {reason}",
+            short_id(author)
+        );
+        return;
+    }
+    log::info!("[{label}] stage {} ended", short_id(&end.stage_id));
+    let _ = app_handle.emit("stage-ended-remote", &end.stage_id);
 }
 
 #[cfg(test)]

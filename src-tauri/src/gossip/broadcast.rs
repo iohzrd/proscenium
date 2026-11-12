@@ -3,8 +3,8 @@ use crate::error::AppError;
 use bytes::Bytes;
 use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
-    PushMessage, StageTicket, Visibility, now_millis, short_id, sign_stage_announcement,
-    sign_stage_ended,
+    PushMessage, StageAnnouncement, StageEnd, StageTicket, Visibility, now_millis, short_id,
+    sign_stage_announcement, sign_stage_ended,
 };
 
 /// A `PushMessage` of `author` without content.
@@ -16,6 +16,8 @@ fn empty_push(author: String) -> PushMessage {
         profile: None,
         announcement: None,
         tombstones: vec![],
+        stage: None,
+        stage_ended: None,
     }
 }
 
@@ -195,9 +197,10 @@ impl super::GossipService {
         Ok(())
     }
 
-    /// Announce a new Stage room on the host's own user-feed gossip topic so followers discover it.
-    /// The announcement is signed with the local master key; `host_pubkey` must be the
-    /// local master pubkey or receivers reject it.
+    /// Announce a Stage room on the host's own user-feed gossip topic so followers discover
+    /// it. Without a broadcast (the host is not Public), the announcement is pushed to the
+    /// push recipients if `push` is set. The announcement is signed with the local master
+    /// key; `host_pubkey` must be the local master pubkey or receivers reject it.
     pub async fn broadcast_stage_announcement(
         &self,
         stage_id: String,
@@ -205,6 +208,7 @@ impl super::GossipService {
         ticket: StageTicket,
         host_pubkey: String,
         started_at: u64,
+        push: bool,
     ) -> Result<(), AppError> {
         let signature = {
             let id = self.identity.read().await;
@@ -217,7 +221,7 @@ impl super::GossipService {
                 &id.master_key,
             )
         };
-        let msg = GossipMessage::StageAnnouncement {
+        let announcement = StageAnnouncement {
             stage_id,
             title,
             ticket,
@@ -225,12 +229,26 @@ impl super::GossipService {
             started_at,
             signature,
         };
-        self.broadcast_msg(&msg, "stage announcement").await?;
+        let msg = GossipMessage::StageAnnouncement {
+            stage_id: announcement.stage_id.clone(),
+            title: announcement.title.clone(),
+            ticket: announcement.ticket.clone(),
+            host_pubkey: announcement.host_pubkey.clone(),
+            started_at: announcement.started_at,
+            signature: announcement.signature.clone(),
+        };
+        if !self.broadcast_msg(&msg, "stage announcement").await? && push {
+            self.attempt_push(PushMessage {
+                stage: Some(announcement),
+                ..empty_push(self.my_master_pubkey().await)
+            })
+            .await;
+        }
         Ok(())
     }
 
-    /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic.
-    /// Signed with the local master key.
+    /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic, or
+    /// push it to the push recipients without a broadcast. Signed with the local master key.
     pub async fn broadcast_stage_ended(&self, stage_id: String) -> Result<(), AppError> {
         let (host_pubkey, signature) = {
             let id = self.identity.read().await;
@@ -240,11 +258,21 @@ impl super::GossipService {
             )
         };
         let msg = GossipMessage::StageEnded {
-            stage_id,
-            host_pubkey,
-            signature,
+            stage_id: stage_id.clone(),
+            host_pubkey: host_pubkey.clone(),
+            signature: signature.clone(),
         };
-        self.broadcast_msg(&msg, "stage ended").await?;
+        if !self.broadcast_msg(&msg, "stage ended").await? {
+            self.attempt_push(PushMessage {
+                stage_ended: Some(StageEnd {
+                    stage_id,
+                    host_pubkey: host_pubkey.clone(),
+                    signature,
+                }),
+                ..empty_push(host_pubkey)
+            })
+            .await;
+        }
         Ok(())
     }
 }

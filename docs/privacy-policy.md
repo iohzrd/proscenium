@@ -21,7 +21,7 @@ The app stores the following in its private storage on your device:
 - content received from other users;
 - settings and diagnostic logs.
 
-This data is excluded from Android cloud backups and device-to-device transfers. "Delete all data" in Preferences, or uninstalling the app, deletes it from the device. Data already sent to other devices or servers is not deleted from them.
+This data is excluded from Android cloud backups and device-to-device transfers. Uninstalling the app deletes it from the device. "Delete all data" in Preferences deletes it from the device except your identity (recovery phrase and keys), the list of your devices, and the diagnostic logs; your other devices then copy your follows, messages and posts back at the next device sync. Data already sent to other devices or servers is not deleted from them.
 
 ## Data you publish
 
@@ -32,6 +32,10 @@ Your profile visibility controls who receives your content:
 - Private: posts are sent only to users who follow you and whom you follow. Discovery servers do not list you.
 
 The lists of accounts you follow and of your followers are shared with the users who can receive your posts, unless you turn sharing off in Preferences. The list of your linked devices (their network identifiers) is signed with your identity and shared with other users so that they can connect to your devices.
+
+Media files (images and other attachments, also those of Listed or Private posts and of direct messages) are served by your device to any device that requests them by their content identifier, which is part of the post or message.
+
+When none of your devices is reachable and your profile is Public, devices of your followers can send your Public profile, posts and post deletions to other users who follow you. Your device does the same for Public users you follow, if your own profile is Public and you share your follow list.
 
 When you delete a post or undo a like or repost, the app sends a signed deletion notice. Devices and servers running Proscenium delete the content when they receive the notice. Copies saved by other means, such as screenshots, are not affected.
 
@@ -57,7 +61,7 @@ Every device your device connects to receives your IP address.
 
 ## Discovery servers
 
-Registration with a discovery server is optional, possible for Public and Listed profiles, and can be undone on the Servers page. The setup screen offers registration with discovery.identia.app, which we operate. When you register, the server stores:
+Registration with a discovery server is optional, possible for Public and Listed profiles, and can be undone on the Servers page. The setup screen offers registration with discovery.identia.app, which we operate; the option is switched on for Public and Listed profiles and can be switched off before you continue. When you register, the server stores:
 
 - your public key, the time of registration and the time of your last request;
 - your profile: display name, bio, avatar identifier and visibility;
@@ -72,7 +76,7 @@ Discovery servers operated by others follow the policies of their operators.
 
 - Camera: scans QR codes for linking devices and following users, only while the scanner is open. Images are not stored or sent.
 - Microphone: sends your voice in calls and while you speak in a stage, only during the call or stage.
-- Notifications: the app shows notifications for messages, calls and activity. No push notification service is used.
+- Notifications: the app shows notifications for direct messages and mentions. No push notification service is used.
 - Network access and network state: connects to other devices and detects network changes.
 
 Media you attach is read from the files you select.
@@ -92,7 +96,7 @@ Keys are stored in the app's private storage. Content is signed with your identi
 - Unregister from a discovery server on the Servers page.
 - Block or mute users.
 - Remove a linked device in Preferences.
-- Delete all data from a device in Preferences.
+- Delete the data of a device in Preferences, or uninstall the app to delete everything on that device.
 
 ## Requests
 

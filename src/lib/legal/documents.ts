@@ -56,3 +56,19 @@ export const LEGAL_DOCUMENTS: Record<LegalDocumentId, LegalBlock[]> = {
   terms: parseLegalMarkdown(termsSource),
   privacy: parseLegalMarkdown(privacySource),
 };
+
+const LAST_UPDATED = "Last updated: ";
+
+/**
+ * Version of the terms of use: the date of their "Last updated:" line. The app asks
+ * for acceptance again when it changes.
+ */
+export const TERMS_VERSION: string = (() => {
+  const line = LEGAL_DOCUMENTS.terms.find(
+    (b) => b.kind === "paragraph" && b.text.startsWith(LAST_UPDATED),
+  );
+  if (!line || line.kind !== "paragraph") {
+    throw new Error("terms-of-use.md has no 'Last updated:' line");
+  }
+  return line.text.slice(LAST_UPDATED.length);
+})();

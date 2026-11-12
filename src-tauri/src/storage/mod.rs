@@ -58,6 +58,11 @@ impl std::fmt::Debug for Storage {
     }
 }
 
+/// Tables that list the devices of the local identity: its linked devices, the NodeIds
+/// removed from it, and the devices this device linked that have not synced yet.
+const IDENTITY_DEVICE_TABLES: &[&str] =
+    &["linked_devices", "removed_devices", "pending_link_devices"];
+
 impl Storage {
     const MIGRATIONS: &'static [(&'static str, &'static str)] = &[
         (
@@ -156,6 +161,10 @@ impl Storage {
             "024_pending_link_devices",
             include_str!("../../migrations/024_pending_link_devices.sql"),
         ),
+        (
+            "025_profile_public_confirmed",
+            include_str!("../../migrations/025_profile_public_confirmed.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
@@ -197,6 +206,20 @@ impl Storage {
     /// truncate the log (`wal_checkpoint(TRUNCATE)`), so neither file keeps pages of the
     /// deleted rows.
     pub async fn wipe_all_data(&self) -> Result<(), AppError> {
+        self.wipe_tables_except(&[]).await
+    }
+
+    /// `wipe_all_data` except `IDENTITY_DEVICE_TABLES` and the highest version of the own
+    /// device lists, for "Delete all data", which keeps the keys. Without these rows the
+    /// device would publish a device list that names only itself and refuse device sync
+    /// with the other devices of the identity, which copy follows, messages and posts back.
+    pub async fn wipe_data_keep_devices(&self) -> Result<(), AppError> {
+        let version = self.get_own_announcement_version().await?;
+        self.wipe_tables_except(IDENTITY_DEVICE_TABLES).await?;
+        self.record_own_announcement_version(version).await
+    }
+
+    async fn wipe_tables_except(&self, kept: &[&str]) -> Result<(), AppError> {
         // Read before the transaction starts: its first statement must be a write, because
         // a transaction that starts with a read fails with SQLITE_BUSY when it needs the
         // write lock after another connection has committed.
@@ -206,6 +229,7 @@ impl Storage {
         )
         .fetch_all(&self.pool)
         .await?;
+        let tables = tables.into_iter().filter(|t| !kept.contains(&t.as_str()));
 
         let mut tx = self.pool.begin().await?;
         // Foreign keys are checked at commit, when every table is empty, so the order of

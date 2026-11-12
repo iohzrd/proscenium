@@ -16,7 +16,8 @@ const WIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 1. The network stack is stopped (`setup::stop_network`), so no peer request is
 ///    answered and no received message is stored while tables are empty (an absent own
 ///    profile row reads as public visibility).
-/// 2. Every database row is deleted in one transaction.
+/// 2. Every database row is deleted in one transaction, except the rows that list the
+///    devices of the identity (`Storage::wipe_data_keep_devices`).
 /// 3. The blob store is shut down and its directory is removed.
 /// 4. The process restarts. Key files are kept, so the identity is the same afterwards.
 ///
@@ -28,7 +29,7 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     let confirmed = crate::confirm::confirm_native(
         &app,
         "Delete all data",
-        "Delete all posts, messages, follows, media and settings stored on this device? This cannot be undone. The app restarts afterwards.",
+        "Delete all posts, messages, follows, media and settings stored on this device? Your identity and the list of your devices are kept, so your other devices copy your follows, messages and posts back at the next device sync. This cannot be undone. The app restarts afterwards.",
         "Delete everything",
     )
     .await;
@@ -51,7 +52,7 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
         log::warn!("[wipe] stopping the network stack timed out");
     }
 
-    if let Err(e) = state.storage.wipe_all_data().await {
+    if let Err(e) = state.storage.wipe_data_keep_devices().await {
         // Nothing was deleted (the deletes are one transaction). The network stack is
         // stopped, so the process restarts in either case.
         log::error!("[wipe] failed to delete database rows: {e}");
@@ -74,6 +75,31 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
 
     app.request_restart();
     Ok(())
+}
+
+/// Longest terms version `accept_terms` stores.
+const MAX_TERMS_VERSION_LEN: usize = 64;
+
+/// The version (the "Last updated" date) of the terms of use accepted on this device, or
+/// `None` if none was accepted.
+#[tauri::command]
+pub async fn get_terms_accepted(state: State<'_, Arc<AppState>>) -> CmdResult<Option<String>> {
+    state
+        .storage
+        .get_preference(preferences::TERMS_ACCEPTED)
+        .await
+}
+
+/// Record that the user accepted the terms of use with version `version`.
+#[tauri::command]
+pub async fn accept_terms(state: State<'_, Arc<AppState>>, version: String) -> CmdResult<()> {
+    if version.is_empty() || version.len() > MAX_TERMS_VERSION_LEN {
+        return Err("invalid terms version".into());
+    }
+    state
+        .storage
+        .set_preference(preferences::TERMS_ACCEPTED, &version)
+        .await
 }
 
 /// End the application. `RunEvent::ExitRequested` stops the network first. Closing the

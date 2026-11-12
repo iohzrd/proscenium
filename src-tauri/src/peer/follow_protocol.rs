@@ -69,9 +69,33 @@ impl PeerHandler {
         let now = now_millis();
         let expires_at = now.saturating_add(FOLLOW_REQUEST_TTL_MS);
         let mut reciprocate = false;
+        // A Private user approves a request directly only from a user it follows. Any
+        // other request is stored as pending, as for Listed: following the requester
+        // later approves it (`follow_user`), and the user sees it.
+        let follows_requester = visibility == Visibility::Private
+            && self
+                .storage
+                .is_following(&my_pubkey, requester)
+                .await
+                .map_err(AcceptError::from_err)?;
         let approved = match visibility {
             Visibility::Public => true,
-            Visibility::Listed => {
+            Visibility::Private if follows_requester => {
+                let approval = self
+                    .storage
+                    .approve_follower_directly(
+                        &my_pubkey,
+                        requester,
+                        req.timestamp,
+                        now,
+                        expires_at,
+                    )
+                    .await
+                    .map_err(AcceptError::from_err)?;
+                reciprocate = approval == DirectApproval::New;
+                approval != DirectApproval::Denied
+            }
+            Visibility::Listed | Visibility::Private => {
                 let outcome = self
                     .storage
                     .record_follow_request(requester, req.timestamp, now, expires_at)
@@ -101,36 +125,6 @@ impl PeerHandler {
                         return Self::respond(send, conn, &FollowResponse::Pending).await;
                     }
                 }
-            }
-            Visibility::Private => {
-                let follows_requester = self
-                    .storage
-                    .is_following(&my_pubkey, requester)
-                    .await
-                    .map_err(AcceptError::from_err)?;
-                if !follows_requester {
-                    // Not a decision of the user: the request is approved once the local
-                    // user follows the requester, whose follow is already stored. Nothing
-                    // is recorded, so that later request is not refused.
-                    log::info!(
-                        "[follow-req] {} is not followed; the request is approved when the local user follows it",
-                        short_id(requester)
-                    );
-                    return Self::respond(send, conn, &FollowResponse::Pending).await;
-                }
-                let approval = self
-                    .storage
-                    .approve_follower_directly(
-                        &my_pubkey,
-                        requester,
-                        req.timestamp,
-                        now,
-                        expires_at,
-                    )
-                    .await
-                    .map_err(AcceptError::from_err)?;
-                reciprocate = approval == DirectApproval::New;
-                approval != DirectApproval::Denied
             }
         };
 

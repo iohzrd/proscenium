@@ -1592,8 +1592,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.102.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f78267c0d936a3f51b8aa24419a7a267e42d1800ac99315f48045f2540c57922"
+source = "git+https://github.com/iohzrd/iroh-gossip?rev=fb253e0cd604829fc734a77a95b03c80f968d9cd#fb253e0cd604829fc734a77a95b03c80f968d9cd"
 dependencies = [
  "blake3",
  "bytes",
@@ -2710,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.49"
+version = "0.2.50"
 dependencies = [
  "hex",
  "iroh",

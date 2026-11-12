@@ -12,7 +12,8 @@ use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use proscenium_types::{
     FollowEntry, Interaction, InteractionKind, PEER_ALPN, PeerRequest, Post, PostTombstone,
-    Profile, Visibility, sign_delete_post, sign_interaction, sign_post, sign_profile,
+    Profile, SyncFrame, Visibility, now_millis, sign_delete_post, sign_interaction, sign_post,
+    sign_profile,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,6 +131,48 @@ async fn serve_one(
         .map_err(|e| e.to_string())
 }
 
+/// A mirror storage: the local user `mirror_pubkey` is Public and follows `author`, whose
+/// stored profile has `visibility` and was confirmed by a device of the author now.
+async fn mirror_storage(mirror_pubkey: &str, author: &Author, visibility: Visibility) -> Storage {
+    let storage = Storage::open_in_memory().await.unwrap();
+    storage
+        .save_profile(
+            mirror_pubkey,
+            &Profile {
+                display_name: "mirror".to_string(),
+                bio: String::new(),
+                avatar_hash: None,
+                avatar_ticket: None,
+                visibility: Visibility::Public,
+                updated_at: 1,
+                signature: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+    storage
+        .merge_follows_lww(
+            mirror_pubkey,
+            &[FollowEntry {
+                pubkey: author.pubkey.clone(),
+                followed_at: 1,
+                state: "active".to_string(),
+                last_changed_at: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    storage
+        .save_profile(&author.pubkey, &author.profile(visibility, 5))
+        .await
+        .unwrap();
+    storage
+        .confirm_public_profile(&author.pubkey, now_millis())
+        .await
+        .unwrap();
+    storage
+}
+
 /// Sync the content of `author` on `requester` from `mirror`, with `SyncSource::Mirror`.
 async fn sync_from_mirror(
     mirror: (&Arc<Storage>, &SharedIdentity, u8),
@@ -187,23 +230,7 @@ async fn mirror_serves_a_followed_public_author() {
 
     // The mirror follows the author and holds its Public profile, one post, the deletion
     // of the other post, and one like.
-    let mirror = Arc::new(Storage::open_in_memory().await.unwrap());
-    mirror
-        .merge_follows_lww(
-            &mirror_pubkey,
-            &[FollowEntry {
-                pubkey: author.pubkey.clone(),
-                followed_at: 1,
-                state: "active".to_string(),
-                last_changed_at: 1,
-            }],
-        )
-        .await
-        .unwrap();
-    mirror
-        .save_profile(&author.pubkey, &author.profile(Visibility::Public, 5))
-        .await
-        .unwrap();
+    let mirror = Arc::new(mirror_storage(&mirror_pubkey, &author, Visibility::Public).await);
     mirror.insert_post(&kept).await.unwrap();
     mirror
         .apply_post_tombstones(&author.pubkey, &[author.deletion(&deleted)], 1)
@@ -271,6 +298,60 @@ async fn mirror_serves_a_followed_public_author() {
             .unwrap(),
         None
     );
+    // The requester sent no device list: the mirror maps no NodeId to it.
+    let requester_node = SecretKey::from_bytes(&[23u8; 32]).public().to_string();
+    assert_eq!(
+        mirror
+            .try_get_master_pubkey_for_transport(&requester_node)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn interactions_from_a_mirror_are_discarded() {
+    let author = Author::new(1);
+    let storage = Storage::open_in_memory().await.unwrap();
+    let app = tauri::test::mock_app();
+    let like = author.like(&Author::new(4).post("other", 500), 1);
+    let frame = || SyncFrame::Interactions(vec![like.clone()]);
+
+    let mut from_mirror = super::processing::FrameIngest::new(
+        &storage,
+        &author.pubkey,
+        "test",
+        "me",
+        app.handle(),
+        false,
+        false,
+    );
+    from_mirror.process(frame()).await.unwrap();
+    assert_eq!(
+        storage
+            .count_interactions_by_author(&author.pubkey)
+            .await
+            .unwrap(),
+        0
+    );
+
+    let mut from_author = super::processing::FrameIngest::new(
+        &storage,
+        &author.pubkey,
+        "test",
+        "me",
+        app.handle(),
+        false,
+        true,
+    );
+    from_author.process(frame()).await.unwrap();
+    assert_eq!(
+        storage
+            .count_interactions_by_author(&author.pubkey)
+            .await
+            .unwrap(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -280,23 +361,7 @@ async fn mirror_refuses_a_listed_author() {
     let requester_identity = identity(3, 23);
     let mirror_pubkey = mirror_identity.read().await.master_pubkey.clone();
 
-    let mirror = Arc::new(Storage::open_in_memory().await.unwrap());
-    mirror
-        .merge_follows_lww(
-            &mirror_pubkey,
-            &[FollowEntry {
-                pubkey: author.pubkey.clone(),
-                followed_at: 1,
-                state: "active".to_string(),
-                last_changed_at: 1,
-            }],
-        )
-        .await
-        .unwrap();
-    mirror
-        .save_profile(&author.pubkey, &author.profile(Visibility::Listed, 5))
-        .await
-        .unwrap();
+    let mirror = Arc::new(mirror_storage(&mirror_pubkey, &author, Visibility::Listed).await);
     mirror
         .insert_post(&author.post("for followers", 1_000))
         .await

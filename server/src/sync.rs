@@ -364,13 +364,14 @@ impl IngestionManager {
             }
         }
 
-        // The stream ended with its end marker and carried the author's complete set.
+        // The stream ended with its end marker and carried the responding device's
+        // complete set of the requested window.
         if full_interaction_set
             && received_interaction_ids.len() as u64 == summary.server_interaction_count
         {
             stats.deleted_interactions = self
                 .storage
-                .delete_interactions_not_in(pubkey, &received_interaction_ids)
+                .delete_interactions_not_in(pubkey, cursor.since, &received_interaction_ids)
                 .await?;
         }
         Ok(())

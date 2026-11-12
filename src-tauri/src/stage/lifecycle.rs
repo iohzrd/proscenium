@@ -29,6 +29,9 @@ use tokio_util::sync::CancellationToken;
 const HOST_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Interval at which the host repeats the stage announcement on its feed topic.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+/// A host that is not Public pushes its announcement on every this many ticks of
+/// `ANNOUNCE_INTERVAL` (90 s): each push opens a connection per push recipient.
+const ANNOUNCE_PUSH_EVERY: u32 = 3;
 
 /// Send `command()` to the actor every `period` until `cancel` is cancelled or the
 /// actor is gone. The first command is sent after one period.
@@ -237,7 +240,9 @@ impl StageActor {
 
         // Announce the stage on our user feed so followers can discover and join.
         // Repeated every 30 s so followers who connect after the first
-        // announcement still see it.
+        // announcement still see it. A host that is not Public pushes it on every
+        // `ANNOUNCE_PUSH_EVERY`th repetition, below the 120 s after which the
+        // frontend drops an announcement.
         {
             let gs = self.gossip_service.clone();
             let ann_stage_id = stage_id.clone();
@@ -246,10 +251,13 @@ impl StageActor {
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(ANNOUNCE_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut tick: u32 = 0;
                 loop {
                     tokio::select! {
                         _ = ann_cancel.cancelled() => break,
                         _ = interval.tick() => {
+                            let push = tick.is_multiple_of(ANNOUNCE_PUSH_EVERY);
+                            tick = tick.wrapping_add(1);
                             if let Err(e) = gs
                                 .broadcast_stage_announcement(
                                     ann_stage_id.clone(),
@@ -257,6 +265,7 @@ impl StageActor {
                                     ann_ticket.clone(),
                                     my_pubkey.clone(),
                                     now,
+                                    push,
                                 )
                                 .await
                             {

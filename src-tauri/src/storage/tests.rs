@@ -2810,6 +2810,44 @@ async fn wipe_all_data_empties_every_table_in_one_transaction() {
 }
 
 #[tokio::test]
+async fn wipe_data_keep_devices_keeps_only_the_device_tables_and_list_version() {
+    let s = test_storage().await;
+    s.upsert_linked_device("self", "Linux", true, 1)
+        .await
+        .unwrap();
+    s.upsert_linked_device("phone", "Android", false, 2)
+        .await
+        .unwrap();
+    s.upsert_linked_device("old", "Linux", false, 3)
+        .await
+        .unwrap();
+    assert!(s.remove_linked_device("old", 4).await.unwrap());
+    s.record_pending_link("tablet", 5).await.unwrap();
+    s.record_own_announcement_version(1_000).await.unwrap();
+    s.save_profile("me", &make_profile("Me")).await.unwrap();
+    s.insert_post(&make_post("p1", "me", 1000)).await.unwrap();
+    follow(&s, "me", "friend").await;
+
+    s.wipe_data_keep_devices().await.unwrap();
+
+    let node_ids: Vec<String> = s
+        .get_linked_devices()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.node_id)
+        .collect();
+    assert_eq!(node_ids.len(), 2);
+    assert!(node_ids.contains(&"phone".to_string()));
+    assert!(s.is_removed_device("old").await.unwrap());
+    assert!(s.take_pending_link("tablet", 6).await.unwrap());
+    assert_eq!(s.get_own_announcement_version().await.unwrap(), 1_000);
+    assert!(s.get_profile("me").await.unwrap().is_none());
+    assert_eq!(s.count_posts_by_author("me").await.unwrap(), 0);
+    assert!(s.get_follows("me").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn count_followers_matches_get_followers() {
     let s = test_storage().await;
     assert_eq!(s.count_followers("me").await.unwrap(), 0);

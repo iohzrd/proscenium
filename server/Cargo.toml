@@ -28,3 +28,8 @@ futures-lite = "2"
 getrandom = "0.4"
 maud = { version = "0.27", features = ["axum"] }
 url = "2.5.8"
+
+# iroh-gossip 0.102.0 with the read_lp allocation fix (fb253e0 on the fork's branch
+# read-lp-allocation-0.102); remove once a release contains it.
+[patch.crates-io]
+iroh-gossip = { git = "https://github.com/iohzrd/iroh-gossip", rev = "fb253e0cd604829fc734a77a95b03c80f968d9cd" }

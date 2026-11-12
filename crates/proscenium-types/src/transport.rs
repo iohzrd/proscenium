@@ -14,8 +14,10 @@ pub const MAX_BIDI_STREAMS: u32 = 32;
 /// per topic that the two endpoints share and closes the connection when an open waits
 /// 15 s at this limit, so two nodes that share more topics than this, such as a client
 /// following many registered users and the discovery server, would reconnect
-/// repeatedly. Stage forwards one per speaker. Memory stays bounded by
-/// `CONNECTION_RECEIVE_WINDOW`.
+/// repeatedly. Stage forwards one per speaker. Received data counts toward
+/// `CONNECTION_RECEIVE_WINDOW`. The crates.io release of iroh-gossip 0.102.0 sizes a frame
+/// buffer to the declared frame length before the frame's bytes arrive; the
+/// `[patch.crates-io]` entry in Cargo.toml uses a build that grows it with the bytes.
 pub const MAX_UNI_STREAMS: u32 = 1024;
 
 /// iroh's default transport configuration with the limits above.

@@ -31,6 +31,29 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Record that a device of `pubkey` sent its profile with Public visibility at `now`,
+    /// in a sync summary. Does nothing unless the stored profile of `pubkey` is Public.
+    pub async fn confirm_public_profile(&self, pubkey: &str, now: u64) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE profiles SET public_confirmed_at = ?2 WHERE pubkey = ?1 AND visibility = 'public'",
+        )
+        .bind(pubkey)
+        .bind(i64::try_from(now).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Last time recorded by `confirm_public_profile` for `pubkey`; 0 if none.
+    pub async fn get_public_confirmed_at(&self, pubkey: &str) -> Result<u64, AppError> {
+        let at: Option<i64> =
+            sqlx::query_scalar("SELECT public_confirmed_at FROM profiles WHERE pubkey = ?1")
+                .bind(pubkey)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(at.map_or(0, |at| u64::try_from(at).unwrap_or(0)))
+    }
+
     pub async fn get_profile(&self, pubkey: &str) -> Result<Option<Profile>, AppError> {
         let row = sqlx::query(
             "SELECT display_name, bio, avatar_hash, avatar_ticket, visibility, signature, updated_at FROM profiles WHERE pubkey=?1",

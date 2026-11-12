@@ -34,6 +34,9 @@ pub(super) struct FrameIngest<'a, R: Runtime> {
     /// Ids of the valid interactions received. `Some` only while the responder sends its
     /// complete interaction set, which the caller then compares with the local rows.
     interaction_ids: Option<Vec<String>>,
+    /// False for a mirror, which sends no interactions: `Interactions` frames are then
+    /// discarded, so a mirror cannot store again an interaction its author deleted.
+    accept_interactions: bool,
 }
 
 impl<'a, R: Runtime> FrameIngest<'a, R> {
@@ -44,6 +47,7 @@ impl<'a, R: Runtime> FrameIngest<'a, R> {
         my_id: &'a str,
         app_handle: &'a AppHandle<R>,
         collect_interaction_ids: bool,
+        accept_interactions: bool,
     ) -> Self {
         Self {
             storage,
@@ -59,6 +63,7 @@ impl<'a, R: Runtime> FrameIngest<'a, R> {
             tombstones_added: 0,
             new_posts: Vec::new(),
             interaction_ids: collect_interaction_ids.then(Vec::new),
+            accept_interactions,
         }
     }
 
@@ -111,6 +116,9 @@ impl<'a, R: Runtime> FrameIngest<'a, R> {
                 if self.new_posts.len() > 2 * SYNC_RETURNED_POSTS_MAX {
                     self.trim_new_posts();
                 }
+            }
+            SyncFrame::Interactions(_) if !self.accept_interactions => {
+                log::warn!("[{}] discarded interactions sent by a mirror", self.label);
             }
             SyncFrame::Interactions(interactions) => {
                 self.interactions_received = self

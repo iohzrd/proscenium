@@ -203,6 +203,13 @@ pub async fn handle_push(
             }
         }
 
+        if let Some(stage) = &msg.stage {
+            crate::ingest::emit_verified_stage(stage, author, app_handle, "push-rx");
+        }
+        if let Some(end) = &msg.stage_ended {
+            crate::ingest::emit_verified_stage_end(end, author, app_handle, "push-rx");
+        }
+
         if removed > 0
             || !ack.received_post_ids.is_empty()
             || !ack.received_interaction_ids.is_empty()

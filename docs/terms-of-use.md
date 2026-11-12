@@ -2,7 +2,7 @@
 
 Last updated: 2026-11-12
 
-These terms apply to your use of the Proscenium app and of the discovery server at discovery.identia.app. Proscenium is developed by an individual developer ("we", "us"). By creating, recovering or linking an identity in the app, you accept these terms. If you do not accept them, do not use the app.
+These terms apply to your use of the Proscenium app and of the discovery server at discovery.identia.app. Proscenium is developed by an individual developer ("we", "us"). The app asks you to accept these terms before you use it, and again when they change. If you do not accept them, do not use the app.
 
 ## Eligibility
 

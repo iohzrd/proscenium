@@ -25,6 +25,8 @@
   import CallOverlay from "#lib/CallOverlay.svelte";
   import { applyAccent, DEFAULT_ACCENT } from "#lib/accent.ts";
   import { useEventListeners, useNodeInit } from "#lib/composables/index.ts";
+  import { TERMS_VERSION } from "#lib/legal/documents.ts";
+  import TermsAcceptance from "#lib/legal/TermsAcceptance.svelte";
   import {
     liveStages,
     stageStore,
@@ -224,6 +226,13 @@
     if (updated === node.pubkey) seedOwnProfile(updated);
   }
 
+  // True until the stored acceptance names the current terms. A failed read shows the
+  // terms again.
+  let termsRequired = $state(false);
+  invoke<string | null>("get_terms_accepted")
+    .then((accepted) => (termsRequired = accepted !== TERMS_VERSION))
+    .catch(() => (termsRequired = true));
+
   onMount(() => {
     const saved = localStorage.getItem(ZOOM_KEY);
     if (saved) {
@@ -284,7 +293,11 @@
   });
 </script>
 
-<div class="app-shell">
+{#if termsRequired}
+  <TermsAcceptance onaccepted={() => (termsRequired = false)} />
+{/if}
+
+<div class="app-shell" inert={termsRequired}>
   <Sidebar
     pubkey={node.pubkey}
     {status}

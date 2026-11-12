@@ -38,7 +38,13 @@ pub async fn sync_posts(
     }
 
     let ep = state.endpoint();
-    let mirrors = state.gossip().feed_neighbors(&pubkey);
+    // Mirrors serve only authors they follow; the local user's neighbors on the topic of
+    // a user it does not follow are not tracked.
+    let mirrors = if viewed {
+        Vec::new()
+    } else {
+        state.gossip().feed_neighbors(&pubkey)
+    };
     let result = crate::sync::sync_one_peer(
         &ep,
         &state.storage,

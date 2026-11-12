@@ -10,9 +10,8 @@ use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use proscenium_types::{
-    MAX_SYNC_IDS, PEER_ALPN, PeerRequest, StageAnnouncement, SyncFrame, SyncMode, SyncRequest,
-    SyncSummary, post_ids_digest, short_id, verify_linked_devices_announcement,
-    verify_stage_announcement,
+    MAX_SYNC_IDS, PEER_ALPN, PeerRequest, SyncFrame, SyncMode, SyncRequest, SyncSummary,
+    post_ids_digest, short_id, verify_linked_devices_announcement,
 };
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::time::Instant;
@@ -31,7 +30,7 @@ pub(super) enum SyncSource {
 
 /// Requester side of the sync protocol: fetch the content of `author` from the NodeId
 /// `target`, verifying and storing each frame when it arrives. The request carries the
-/// local signed device list.
+/// local signed device list, except to a mirror: any node can be a gossip neighbor.
 ///
 /// Frames stored before an error or before `deadline` stay stored; the next sync
 /// continues from there. An error is returned only if no summary was received or the
@@ -41,8 +40,10 @@ pub(super) enum SyncSource {
 /// `SyncSource::Author`: device sync exchanges device lists, and a mirror is not a device
 /// of the author. Local interactions of the author that the responder lacks are deleted
 /// only after a sync from `SyncSource::Author`: neither of two own devices holds the
-/// complete set, and a mirror sends no interactions. Posts are deleted only by signed
-/// tombstones, from any source.
+/// complete set, and a mirror sends no interactions (interactions in a mirror's frames
+/// are discarded). Posts are deleted only by signed tombstones, from any source. A
+/// Public profile in the summary of `SyncSource::Author` is recorded with
+/// `Storage::confirm_public_profile`.
 ///
 /// Emits `feed-updated` once at the end if a post row was inserted or deleted or a new
 /// tombstone was stored. Rows that already existed produce no event.
@@ -60,7 +61,11 @@ pub(super) async fn sync_from_peer<R: Runtime>(
 ) -> Result<SyncOneResult, AppError> {
     let start = Instant::now();
     let my_id = identity.read().await.master_pubkey.clone();
-    let my_devices = crate::announcement::build_own_announcement(storage, identity).await?;
+    let my_devices = if source == SyncSource::Mirror {
+        None
+    } else {
+        Some(crate::announcement::build_own_announcement(storage, identity).await?)
+    };
     let conn = tokio::time::timeout(
         SYNC_CONNECT_TIMEOUT,
         endpoint.connect(EndpointAddr::from(target), PEER_ALPN),
@@ -93,7 +98,7 @@ pub(super) async fn sync_from_peer<R: Runtime>(
         post_ids_digest: ids_digest,
         tombstone_count,
         since: 0,
-        announcement: Some(my_devices),
+        announcement: my_devices,
     });
     let request_bytes = serde_json::to_vec(&request)?;
 
@@ -124,16 +129,25 @@ pub(super) async fn sync_from_peer<R: Runtime>(
 
     if let Some(profile) = &summary.profile {
         match verify_and_store_profile(storage, author, profile).await {
-            Ok(true) => {
-                let _ = app_handle.emit("profile-updated", author);
+            Ok(changed) => {
+                if changed {
+                    let _ = app_handle.emit("profile-updated", author);
+                }
+                if from_author
+                    && profile.visibility == proscenium_types::Visibility::Public
+                    && let Err(e) = storage
+                        .confirm_public_profile(author, proscenium_types::now_millis())
+                        .await
+                {
+                    log::warn!("[{label}] failed to record the Public profile: {e}");
+                }
             }
-            Ok(false) => {}
             Err(e) => log::warn!("[{label}] rejected profile in sync summary: {e}"),
         }
     }
 
     if from_author && let Some(stage) = &summary.active_stage {
-        emit_verified_stage(stage, author, app_handle, label);
+        crate::ingest::emit_verified_stage(stage, author, app_handle, label);
     }
 
     log::info!(
@@ -170,6 +184,7 @@ pub(super) async fn sync_from_peer<R: Runtime>(
         &my_id,
         app_handle,
         full_interaction_set,
+        source != SyncSource::Mirror,
     );
     let complete = receive_frames(
         &conn,
@@ -291,47 +306,4 @@ async fn receive_frames<R: Runtime>(
             return false;
         }
     }
-}
-
-/// Emit `stage-announced` for a stage announcement from a sync summary, only if
-/// `author` is its host and signed it.
-fn emit_verified_stage<R: Runtime>(
-    stage: &StageAnnouncement,
-    author: &str,
-    app_handle: &AppHandle<R>,
-    label: &str,
-) {
-    if stage.host_pubkey != author {
-        log::warn!("[{label}] ignored stage announcement with another host");
-        return;
-    }
-    if let Err(reason) = verify_stage_announcement(
-        &stage.stage_id,
-        &stage.title,
-        &stage.ticket,
-        &stage.host_pubkey,
-        stage.started_at,
-        &stage.signature,
-    ) {
-        log::warn!(
-            "[{label}] bad stage announcement from {}: {reason}",
-            short_id(author)
-        );
-        return;
-    }
-    log::info!(
-        "[{label}] live stage {} hosted by {}",
-        short_id(&stage.stage_id),
-        short_id(author),
-    );
-    let _ = app_handle.emit(
-        "stage-announced",
-        serde_json::json!({
-            "stage_id": stage.stage_id,
-            "title": stage.title,
-            "ticket": stage.ticket.to_string(),
-            "host_pubkey": stage.host_pubkey,
-            "started_at": stage.started_at,
-        }),
-    );
 }

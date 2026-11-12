@@ -1,7 +1,5 @@
 <script lang="ts">
   import { useCopyFeedback } from "#lib/composables/index.ts";
-  import type { LegalDocumentId } from "#lib/legal/documents.ts";
-  import LegalDocumentModal from "#lib/legal/LegalDocumentModal.svelte";
 
   let {
     nodeId,
@@ -16,9 +14,6 @@
   } = $props();
 
   const copier = useCopyFeedback();
-  // Creating, recovering and linking an identity require accepting the terms.
-  let termsAccepted = $state(false);
-  let shownDocument = $state<LegalDocumentId | null>(null);
 </script>
 
 <div class="step">
@@ -60,41 +55,13 @@
       {/if}
     </div>
   {/if}
-  <label class="terms">
-    <input type="checkbox" bind:checked={termsAccepted} />
-    <span>
-      I agree to the
-      <button
-        type="button"
-        class="link-btn"
-        onclick={() => (shownDocument = "terms")}>Terms of Use</button
-      >
-      and have read the
-      <button
-        type="button"
-        class="link-btn"
-        onclick={() => (shownDocument = "privacy")}>Privacy Policy</button
-      >.
-    </span>
-  </label>
-  <button
-    class="btn-accent primary-btn"
-    onclick={oncontinue}
-    disabled={!termsAccepted}
-  >
+  <button class="btn-accent primary-btn" onclick={oncontinue}>
     Continue
   </button>
-  <button class="skip-btn" onclick={onrecover} disabled={!termsAccepted}>
+  <button class="skip-btn" onclick={onrecover}>
     Recover existing identity
   </button>
 </div>
-
-{#if shownDocument}
-  <LegalDocumentModal
-    docId={shownDocument}
-    onclose={() => (shownDocument = null)}
-  />
-{/if}
 
 <style>
   .step {
@@ -156,33 +123,6 @@
     margin-top: 0.3rem;
   }
 
-  .terms {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-    margin: 0 0 1rem;
-    text-align: left;
-    color: var(--text-secondary);
-    font-size: var(--text-sm);
-    line-height: 1.5;
-    cursor: pointer;
-  }
-
-  .terms input {
-    margin-top: 0.2rem;
-    accent-color: var(--accent);
-  }
-
-  .link-btn {
-    background: none;
-    border: none;
-    padding: 0;
-    color: var(--accent-light);
-    font: inherit;
-    text-decoration: underline;
-    cursor: pointer;
-  }
-
   .primary-btn {
     flex: 1;
     border-radius: var(--radius-lg);
@@ -201,7 +141,7 @@
     text-decoration: underline;
   }
 
-  .skip-btn:hover:not(:disabled) {
+  .skip-btn:hover {
     color: var(--text-secondary);
   }
 </style>

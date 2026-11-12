@@ -1,5 +1,7 @@
 use super::client::{SyncSource, sync_from_peer};
-use crate::constants::{MAX_MIRRORS_TRIED, MAX_NODE_IDS_TRIED, SYNC_PEER_TIMEOUT};
+use crate::constants::{
+    MAX_MIRRORS_TRIED, MAX_NODE_IDS_TRIED, MIRROR_SYNC_TIMEOUT, SYNC_PEER_TIMEOUT,
+};
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
@@ -23,11 +25,12 @@ pub struct SyncOneResult {
 ///
 /// Connects to at most `MAX_NODE_IDS_TRIED` NodeIds of the user in order. If none
 /// answers and the stored profile of `pubkey` is Public, connects to at most
-/// `MAX_MIRRORS_TRIED` of `mirrors` that are not in the user's device list: nodes of
-/// other users that follow `pubkey` and serve its posts and post deletions. Runs for at
-/// most `SYNC_PEER_TIMEOUT` in total (plus one frame timeout). Returns the result of the
-/// first node that answered with a usable summary. Nothing is requested for a muted or
-/// blocked user.
+/// `MAX_MIRRORS_TRIED` of `mirrors` that are neither in the user's device list nor the
+/// NodeId of a stored discovery server (which accepts only gossip): nodes of other users
+/// that follow `pubkey` and serve its posts and post deletions, each for at most
+/// `MIRROR_SYNC_TIMEOUT`. Runs for at most `SYNC_PEER_TIMEOUT` in total (plus one frame
+/// timeout). Returns the result of the first node that answered with a usable summary.
+/// Nothing is requested for a muted or blocked user.
 pub async fn sync_one_peer(
     endpoint: &Endpoint,
     storage: &Storage,
@@ -101,15 +104,25 @@ pub async fn sync_one_peer(
         .await?
         .is_some_and(|p| p.visibility == Visibility::Public);
     if public {
+        let server_node_ids: Vec<String> = storage
+            .get_servers()
+            .await?
+            .into_iter()
+            .map(|server| server.node_id)
+            .collect();
         let candidates = mirrors
             .iter()
-            .filter(|m| !node_ids.contains(&m.to_string()))
+            .filter(|m| {
+                let id = m.to_string();
+                !node_ids.contains(&id) && !server_node_ids.contains(&id)
+            })
             .take(MAX_MIRRORS_TRIED);
         for &mirror in candidates {
             if Instant::now() >= deadline {
                 last_err = "time limit reached".to_string();
                 break;
             }
+            let mirror_deadline = deadline.min(Instant::now() + MIRROR_SYNC_TIMEOUT);
             tried += 1;
             match sync_from_peer(
                 endpoint,
@@ -119,7 +132,7 @@ pub async fn sync_one_peer(
                 pubkey,
                 app_handle,
                 label,
-                deadline,
+                mirror_deadline,
                 SyncSource::Mirror,
             )
             .await

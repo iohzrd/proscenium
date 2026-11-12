@@ -67,6 +67,11 @@ pub const PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 pub const MAX_NODE_IDS_TRIED: usize = 4;
 /// Upper bound of the mirrors `sync_one_peer` connects to after the author's devices.
 pub const MAX_MIRRORS_TRIED: usize = 3;
+/// Upper bound of the run time of one sync from a mirror.
+pub const MIRROR_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+/// A node serves another author's posts as a mirror only if a device of the author sent
+/// a Public profile in a sync summary within this time.
+pub const MIRROR_PUBLIC_CONFIRMATION_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Entries stored per fetched follow or follower list.
 pub const MAX_REMOTE_LIST_ENTRIES: usize = 5_000;
 /// Largest list response a requester accepts.

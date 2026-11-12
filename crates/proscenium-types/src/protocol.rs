@@ -170,6 +170,22 @@ pub struct PushMessage {
     /// Signed deletions of the author's posts.
     #[serde(default)]
     pub tombstones: Vec<PostTombstone>,
+    /// A live stage of the author, signed. Hosts that are not Public announce stages by
+    /// push, as they have no gossip topic.
+    #[serde(default)]
+    pub stage: Option<StageAnnouncement>,
+    /// The end of a stage of the author, signed.
+    #[serde(default)]
+    pub stage_ended: Option<StageEnd>,
+}
+
+/// The end of a stage, signed by its host: `signature` is the output of
+/// `sign_stage_ended` and is verified with `verify_stage_ended`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StageEnd {
+    pub stage_id: String,
+    pub host_pubkey: String,
+    pub signature: String,
 }
 
 /// A signed deletion of one post. `signature` is the output of `sign_delete_post`

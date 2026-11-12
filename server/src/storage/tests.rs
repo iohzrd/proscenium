@@ -821,7 +821,7 @@ async fn deleted_interaction_is_not_stored_again() {
 }
 
 #[tokio::test]
-async fn interactions_missing_from_the_complete_set_are_deleted() {
+async fn interactions_missing_from_a_device_set_are_deleted_without_tombstone() {
     let storage = storage().await;
     let user = TestUser::new(1);
     let other_user = TestUser::new(2);
@@ -838,6 +838,12 @@ async fn interactions_missing_from_the_complete_set_are_deleted() {
         .unwrap();
     let likes: Vec<Interaction> = (0..3).map(|n| user.like(&target, n, 100)).collect();
     storage.insert_interactions(pk, &likes, 100).await.unwrap();
+    // Older than the requested window: kept although the set does not name it.
+    let old = user.like(&target, 9, 50);
+    storage
+        .insert_interactions(pk, std::slice::from_ref(&old), 100)
+        .await
+        .unwrap();
     let foreign = other_user.like(&target, 0, 100);
     storage
         .insert_interactions(
@@ -848,20 +854,24 @@ async fn interactions_missing_from_the_complete_set_are_deleted() {
         .await
         .unwrap();
 
-    // The author's set no longer holds the second like.
+    // The device's set of the window from 100 lacks the second like.
     let kept = vec![likes[0].id.clone(), likes[2].id.clone()];
     assert_eq!(
-        storage.delete_interactions_not_in(pk, &kept).await.unwrap(),
+        storage
+            .delete_interactions_not_in(pk, 100, &kept)
+            .await
+            .unwrap(),
         1
     );
-    assert!(!storage.delete_interaction(&likes[1].id, pk).await.unwrap());
-    assert!(storage.delete_interaction(&likes[0].id, pk).await.unwrap());
-    // The deleted like is not stored again when its signed original is sent again.
+    // A sync from another device that holds the second like stores it again: no
+    // tombstone was recorded. (`delete_interaction`, the signed deletion, records one.)
     let stored = storage
         .insert_interactions(pk, std::slice::from_ref(&likes[1]), 100)
         .await
         .unwrap();
-    assert_eq!(stored.stored, 0);
+    assert_eq!(stored.stored, 1);
+    assert!(storage.delete_interaction(&likes[0].id, pk).await.unwrap());
+    assert!(storage.delete_interaction(&old.id, pk).await.unwrap());
     // Interactions of other authors are kept.
     assert!(
         storage

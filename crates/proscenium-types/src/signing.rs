@@ -75,9 +75,15 @@ pub fn signature_to_hex(sig: &Signature) -> String {
     hex::encode(sig.to_bytes())
 }
 
+/// Parse a signature in the form `signature_to_hex` writes: 128 lowercase hex digits.
+/// Uppercase digits are refused, so every signature has one string form; replacement
+/// rules that compare signature strings depend on it.
 pub fn hex_to_signature(hex_str: &str) -> Result<Signature, String> {
     if hex_str.len() != 128 {
         return Err(format!("invalid signature hex length: {}", hex_str.len()));
+    }
+    if hex_str.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err("signature hex contains uppercase digits".to_string());
     }
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
     let arr: [u8; 64] = bytes
@@ -522,6 +528,16 @@ mod tests {
         assert!(!r(ahead, ahead + 1));
         // A version within the drift limit counts as current.
         assert!(r(now + drift, now));
+    }
+
+    #[test]
+    fn uppercase_signature_hex_is_refused() {
+        let a = identity(1);
+        let mut list = announcement(&a, &[node_id(50)]);
+        sign_linked_devices_announcement(&mut list, &a.key);
+        assert!(verify_linked_devices_announcement(&list).is_ok());
+        list.signature = list.signature.to_uppercase();
+        assert!(verify_linked_devices_announcement(&list).is_err());
     }
 
     #[test]

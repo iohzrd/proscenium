@@ -266,6 +266,8 @@ pub fn run() {
             get_accent_color,
             set_accent_color,
             wipe_all_data,
+            get_terms_accepted,
+            accept_terms,
             quit_app,
         ])
         .build(tauri::generate_context!())

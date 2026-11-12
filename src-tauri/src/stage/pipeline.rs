@@ -28,6 +28,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// A stream that delivers no frame for this long is treated as failed.
 pub(super) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Interval of the silent frames a speaker without a microphone sends, below
+/// `STREAM_IDLE_TIMEOUT`.
+const SILENCE_INTERVAL: Duration = Duration::from_secs(1);
 /// Largest hello (a signed `Presence` as JSON) accepted on an audio connection.
 const MAX_HELLO_LEN: usize = 4096;
 
@@ -699,6 +702,22 @@ async fn speaker_mic_send(
     log::info!("[stage-speaker] mic send stopped ({seq} frames)");
 }
 
+/// Send one frame of zero samples to `tx` per `SILENCE_INTERVAL` until `cancel` or until
+/// the receiver is dropped.
+async fn send_silence(tx: mpsc::Sender<Vec<f32>>, cancel: CancellationToken) {
+    let mut interval = tokio::time::interval(SILENCE_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {
+                if tx.send(vec![0.0; SAMPLES_PER_FRAME]).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Parameters of the speaker audio pipeline.
 pub(super) struct SpeakerConfig {
     pub(super) endpoint: Endpoint,
@@ -816,9 +835,11 @@ async fn run_speaker_once(config: &SpeakerConfig, host_id: EndpointId) -> Sessio
         Ok(Err(e)) => Some(e),
         Err(_) => Some("microphone thread did not start".to_string()),
     };
-    // Without a microphone the session receives the other speakers and sends nothing:
-    // closing it would also stop the audio the user hears, as the listener pipeline of
-    // a speaker is stopped.
+    // Without a microphone the session receives the other speakers and sends one frame
+    // of silence per `SILENCE_INTERVAL`: the host closes a speaker stream that sends no
+    // frame for `STREAM_IDLE_TIMEOUT`, and with it the connection that carries the other
+    // speakers' audio. Closing the session would also stop the audio the user hears, as
+    // the listener pipeline of a speaker is stopped.
     let mic_opened = match mic_error {
         Some(e) => {
             log::error!("[stage-speaker] mic capture failed, receiving only: {e}");
@@ -826,7 +847,9 @@ async fn run_speaker_once(config: &SpeakerConfig, host_id: EndpointId) -> Sessio
                 "stage-event",
                 StageEvent::MicrophoneUnavailable { reason: e },
             );
-            drop(send);
+            let (silence_tx, silence_rx) = mpsc::channel(1);
+            tokio::spawn(send_silence(silence_tx, session_cancel.clone()));
+            tokio::spawn(speaker_mic_send(send, silence_rx, session_cancel.clone()));
             false
         }
         None => {
