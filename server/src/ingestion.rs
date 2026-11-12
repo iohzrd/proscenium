@@ -371,7 +371,7 @@ impl IngestionManager {
     }
 
     /// Lowest timestamp of content that is stored, from the retention setting.
-    fn min_timestamp(&self) -> u64 {
+    pub(crate) fn min_timestamp(&self) -> u64 {
         self.limits
             .retention_ms
             .map_or(0, |retention| now_millis().saturating_sub(retention))

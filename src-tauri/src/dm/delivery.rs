@@ -30,7 +30,7 @@ enum Delivery {
 enum Target {
     /// Every device of the cached device list, at the same time.
     AllDevices,
-    /// The devices of the cached device list in order, until one answers.
+    /// The devices of the cached device list in order, until one answers `DmAck::Ok`.
     FirstDevice,
     /// One device.
     Device(EndpointId),
@@ -336,9 +336,9 @@ impl DmHandler {
     /// device list.
     ///
     /// Returns `Acknowledged` as soon as a device answers `DmAck::Ok`; the sends to the
-    /// other devices continue in the background. Returns `Rejected` if no device answered
-    /// `DmAck::Ok` and one answered `DmAck::Rejected`, and the last error if no device
-    /// answered.
+    /// other devices continue in the background. `Target::FirstDevice` tries the devices
+    /// in order until one answers `DmAck::Ok`. Returns `Rejected` only if every device
+    /// answered `DmAck::Rejected`; otherwise the error of a device that did not answer.
     async fn deliver(
         &self,
         peer_master_pubkey: &str,
@@ -374,7 +374,7 @@ impl DmHandler {
                     for device in &devices {
                         match self.send_frame(*device, &seal(device)?).await {
                             Ok(DmAck::Ok) => return Ok(Delivery::Acknowledged),
-                            Ok(DmAck::Rejected) => return Ok(Delivery::Rejected),
+                            Ok(DmAck::Rejected) => rejected = true,
                             Err(e) => last_error = Some(e),
                         }
                     }
@@ -401,15 +401,15 @@ impl DmHandler {
                     }
                 }
             }
-            if rejected {
-                Ok(Delivery::Rejected)
-            } else {
-                Err(last_error.unwrap_or_else(|| {
-                    AppError::Other(format!(
-                        "no device of {} answered",
-                        short_id(peer_master_pubkey)
-                    ))
-                }))
+            // A device that did not answer can still accept the envelope later, so the
+            // envelope counts as rejected only if every device answered `Rejected`.
+            match last_error {
+                Some(e) => Err(e),
+                None if rejected => Ok(Delivery::Rejected),
+                None => Err(AppError::Other(format!(
+                    "no device of {} answered",
+                    short_id(peer_master_pubkey)
+                ))),
             }
         })
         .await

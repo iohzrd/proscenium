@@ -8,7 +8,7 @@ use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePool, SqlitePoolOptions,
 };
 use sqlx::{Sqlite, Transaction};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -213,7 +213,9 @@ pub enum AnnouncementOutcome {
 /// What the server stores for one author, as sent in a `SyncRequest`.
 #[derive(Debug, Clone, Default)]
 pub struct SyncCursor {
-    /// Ids of all stored posts, newest first.
+    /// Earliest timestamp of the posts and interactions requested, `SyncRequest::since`.
+    pub since: u64,
+    /// Ids of the stored posts with a timestamp at or after `since`, newest first.
     pub post_ids: Vec<String>,
     pub newest_post_timestamp: u64,
     pub interaction_count: u64,
@@ -297,12 +299,21 @@ fn escape_like(input: &str) -> String {
     out
 }
 
+/// Matches counted by `search_posts`.
+const MAX_SEARCH_COUNT: i64 = 10_000;
+/// Rows deleted per transaction by `prune_older_than`.
+const PRUNE_BATCH: i64 = 1_000;
+
 impl Storage {
     const MIGRATIONS: &'static [(&'static str, &'static str)] = &[
         ("001_initial", include_str!("../migrations/001_initial.sql")),
         (
             "002_protocol_v2",
             include_str!("../migrations/002_protocol_v2.sql"),
+        ),
+        (
+            "003_interaction_tombstones",
+            include_str!("../migrations/003_interaction_tombstones.sql"),
         ),
     ];
 
@@ -410,6 +421,7 @@ impl Storage {
             "DELETE FROM interactions WHERE author = ?1",
             "DELETE FROM posts WHERE author = ?1",
             "DELETE FROM post_tombstones WHERE author = ?1",
+            "DELETE FROM interaction_tombstones WHERE author = ?1",
         ] {
             sqlx::query(sql).bind(pubkey).execute(&mut *conn).await?;
         }
@@ -423,11 +435,13 @@ impl Storage {
         pubkey: &str,
         now: i64,
     ) -> Result<(), sqlx::Error> {
+        // The device list is cleared with its version, so the list a device sends after
+        // a new registration is stored even if its version is not higher.
         sqlx::query(
             "UPDATE registrations
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
                  bio = NULL, avatar_hash = NULL, transport_node_id = NULL,
-                 device_node_ids_json = NULL
+                 device_node_ids_json = NULL, announcement_version = 0
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -750,8 +764,10 @@ impl Storage {
     /// Insert verified posts of `author` in one transaction.
     ///
     /// Nothing is inserted unless `author` has an active public registration. A post is
-    /// skipped if its author differs from `author`, a tombstone exists for its id, it is
-    /// already stored, or `author` already has `max_posts` posts.
+    /// skipped if its author differs from `author`, a tombstone exists for its id, or it is
+    /// already stored. If `author` then has more than `max_posts` posts, the oldest one is
+    /// deleted, so the newest `max_posts` are kept. A post of `posts` deleted that way
+    /// counts as `over_limit`, not as `stored`.
     pub async fn insert_posts(
         &self,
         author: &str,
@@ -773,11 +789,9 @@ impl Storage {
                 .fetch_one(&mut *tx)
                 .await?;
 
+        // Posts of this call that are still stored.
+        let mut inserted: HashSet<&str> = HashSet::new();
         for post in posts.iter().filter(|p| p.author == author) {
-            if stored_total >= i64::from(max_posts) {
-                count.over_limit += 1;
-                continue;
-            }
             let media_json = if post.media.is_empty() {
                 None
             } else {
@@ -803,10 +817,34 @@ impl Storage {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            if result.rows_affected() > 0 {
-                stored_total += 1;
-                count.stored += 1;
+            if result.rows_affected() == 0 {
+                continue;
             }
+            stored_total += 1;
+            if stored_total > i64::from(max_posts) {
+                let evicted: Option<String> = sqlx::query_scalar(
+                    "DELETE FROM posts WHERE seq = (
+                         SELECT seq FROM posts WHERE author = ?1
+                         ORDER BY timestamp ASC, id ASC LIMIT 1
+                     ) RETURNING id",
+                )
+                .bind(author)
+                .fetch_optional(&mut *tx)
+                .await?;
+                stored_total -= 1;
+                if evicted.as_deref() == Some(post.id.as_str()) {
+                    count.over_limit += 1;
+                    continue;
+                }
+                if let Some(evicted) = evicted
+                    && inserted.remove(evicted.as_str())
+                {
+                    count.stored -= 1;
+                    count.over_limit += 1;
+                }
+            }
+            inserted.insert(&post.id);
+            count.stored += 1;
         }
         tx.commit().await?;
         Ok(count)
@@ -860,19 +898,42 @@ impl Storage {
     /// Delete posts and interactions with a timestamp below `before_ms`.
     /// Returns the numbers of deleted posts and interactions.
     pub async fn prune_older_than(&self, before_ms: i64) -> anyhow::Result<(u64, u64)> {
-        let mut tx = self.begin_write().await?;
-        let posts = sqlx::query("DELETE FROM posts WHERE timestamp < ?1")
-            .bind(before_ms)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        let interactions = sqlx::query("DELETE FROM interactions WHERE timestamp < ?1")
-            .bind(before_ms)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        tx.commit().await?;
+        let posts = self
+            .delete_in_batches(
+                "DELETE FROM posts WHERE seq IN
+                     (SELECT seq FROM posts WHERE timestamp < ?1 LIMIT ?2)",
+                before_ms,
+            )
+            .await?;
+        let interactions = self
+            .delete_in_batches(
+                "DELETE FROM interactions WHERE rowid IN
+                     (SELECT rowid FROM interactions WHERE timestamp < ?1 LIMIT ?2)",
+                before_ms,
+            )
+            .await?;
         Ok((posts, interactions))
+    }
+
+    /// Run `sql` (bound to `before_ms` and `PRUNE_BATCH`) in one write transaction per
+    /// batch until it deletes fewer than `PRUNE_BATCH` rows, so other writers wait for one
+    /// batch at most. Returns the number of deleted rows.
+    async fn delete_in_batches(&self, sql: &'static str, before_ms: i64) -> anyhow::Result<u64> {
+        let mut total = 0;
+        loop {
+            let mut tx = self.begin_write().await?;
+            let deleted = sqlx::query(sql)
+                .bind(before_ms)
+                .bind(PRUNE_BATCH)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            total += deleted;
+            if deleted < PRUNE_BATCH as u64 {
+                return Ok(total);
+            }
+        }
     }
 
     /// The post `(author, id)`, if its author has an active public registration.
@@ -950,7 +1011,8 @@ impl Storage {
         Ok(posts)
     }
 
-    /// Full-text search. `fts_query` must come from `content::fts_query`.
+    /// Full-text search. `fts_query` must come from `content::fts_query`. The returned
+    /// total counts at most `MAX_SEARCH_COUNT` matches.
     pub async fn search_posts(
         &self,
         fts_query: &str,
@@ -958,11 +1020,14 @@ impl Storage {
         offset: i64,
     ) -> anyhow::Result<(Vec<StoredPost>, i64)> {
         let count_sql = format!(
-            "SELECT COUNT(*) FROM posts_fts f JOIN posts p ON f.rowid = p.seq {PUBLIC_AUTHOR_JOIN}
-             WHERE f.content MATCH ?1"
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM posts_fts f JOIN posts p ON f.rowid = p.seq {PUBLIC_AUTHOR_JOIN}
+                 WHERE f.content MATCH ?1 LIMIT ?2
+             )"
         );
         let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count_sql))
             .bind(fts_query)
+            .bind(MAX_SEARCH_COUNT)
             .fetch_one(&self.pool)
             .await?;
 
@@ -1009,8 +1074,8 @@ impl Storage {
     /// Insert verified interactions of `author` in one transaction.
     ///
     /// Nothing is inserted unless `author` has an active public registration. An
-    /// interaction is skipped if its author differs from `author`, it is already stored,
-    /// or `author` already has `max_interactions` interactions.
+    /// interaction is skipped if its author differs from `author`, it is already stored, a
+    /// deletion of it is stored, or `author` already has `max_interactions` interactions.
     pub async fn insert_interactions(
         &self,
         author: &str,
@@ -1040,7 +1105,10 @@ impl Storage {
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO interactions
                     (id, author, kind, target_post_id, target_author, timestamp, signature, indexed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM interaction_tombstones WHERE author = ?2 AND id = ?1
+                 )",
             )
             .bind(&interaction.id)
             .bind(&interaction.author)
@@ -1061,12 +1129,34 @@ impl Storage {
         Ok(count)
     }
 
+    /// Record that `author` deleted the interaction `id`, and delete it, in one
+    /// transaction. Returns `true` if a stored interaction was deleted.
+    ///
+    /// Nothing is changed unless `author` has an active public registration. At most
+    /// `MAX_SYNC_TOMBSTONES` deletions are kept per author; beyond that the interaction is
+    /// still deleted but no deletion is recorded.
     pub async fn delete_interaction(&self, id: &str, author: &str) -> anyhow::Result<bool> {
+        let mut tx = self.begin_write().await?;
+        if !Self::is_active_public(&mut tx, author).await? {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO interaction_tombstones (author, id, deleted_at)
+             SELECT ?1, ?2, ?3
+             WHERE (SELECT COUNT(*) FROM interaction_tombstones WHERE author = ?1) < ?4",
+        )
+        .bind(author)
+        .bind(id)
+        .bind(to_i64(now_millis()))
+        .bind(MAX_SYNC_TOMBSTONES as i64)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM interactions WHERE id = ?1 AND author = ?2")
             .bind(id)
             .bind(author)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1250,18 +1340,35 @@ impl Storage {
     // --- Sync ---
 
     /// The values a `SyncRequest` for `author` carries, read in one transaction.
-    pub async fn get_sync_cursor(&self, author: &str) -> anyhow::Result<SyncCursor> {
+    ///
+    /// `since` is `min_timestamp` (the retention floor), or the timestamp of the oldest of
+    /// the newest `max_posts` stored posts if that is later: at the limit, an older post
+    /// would be removed again by `insert_posts`, so it is not requested.
+    pub async fn get_sync_cursor(
+        &self,
+        author: &str,
+        min_timestamp: u64,
+        max_posts: u32,
+    ) -> anyhow::Result<SyncCursor> {
         let mut tx = self.pool.begin().await?;
-        let posts: Vec<(String, i64)> = sqlx::query_as(
+        let mut posts: Vec<(String, i64)> = sqlx::query_as(
             "SELECT id, timestamp FROM posts WHERE author = ?1 ORDER BY timestamp DESC, id DESC",
         )
         .bind(author)
         .fetch_all(&mut *tx)
         .await?;
+        let limit_floor = (max_posts as usize)
+            .checked_sub(1)
+            .and_then(|index| posts.get(index))
+            .map_or(0, |(_, timestamp)| to_u64(*timestamp));
+        let since = min_timestamp.max(limit_floor);
+        posts.retain(|(_, timestamp)| to_u64(*timestamp) >= since);
         let (interaction_count, newest_interaction): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM interactions WHERE author = ?1",
+            "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM interactions
+             WHERE author = ?1 AND timestamp >= ?2",
         )
         .bind(author)
+        .bind(to_i64(since))
         .fetch_one(&mut *tx)
         .await?;
         let tombstone_count: i64 =
@@ -1272,6 +1379,7 @@ impl Storage {
         tx.commit().await?;
 
         Ok(SyncCursor {
+            since,
             newest_post_timestamp: posts.first().map_or(0, |(_, ts)| to_u64(*ts)),
             post_ids: posts.into_iter().map(|(id, _)| id).collect(),
             interaction_count: to_u64(interaction_count),

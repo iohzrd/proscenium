@@ -2,11 +2,13 @@
 //!
 //! The existing device shows a QR code with its NodeId and a one-time secret. The new
 //! device dials that NodeId, so QUIC authenticates the existing device; the secret
-//! authenticates the new device. The new device keeps its transport key, so the existing
-//! device stores the NodeId of the connection as the new device.
+//! authenticates the new device. The new device generates a new transport key for the
+//! identity, so a key that a device list of a previous identity names is not reused, and
+//! sends its NodeId; the existing device stores that NodeId as the new device.
 //!
 //! One bi-stream, opened by the new device:
-//! - new device: JSON `PeerRequest::LinkRequest { secret, device_name }`, then finish.
+//! - new device: JSON `PeerRequest::LinkRequest { secret, node_id, device_name }`, then
+//!   finish.
 //! - existing device: compares the secret in constant time and removes the session, then
 //!   writes the `LinkBundleData` JSON and finishes.
 //!
@@ -23,8 +25,10 @@ use iroh::{
     protocol::AcceptError,
 };
 use proscenium_types::{
-    LinkBundleData, LinkQrPayload, MAX_LINKED_DEVICES, PEER_ALPN, PeerRequest, now_millis, short_id,
+    LinkBundleData, LinkQrPayload, MAX_LINKED_DEVICES, PEER_ALPN, PeerRequest, now_millis,
+    parse_pubkey, short_id,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -36,19 +40,33 @@ use super::PeerHandler;
 /// Device-link session on the existing device, created by `start_link_session`.
 ///
 /// It is removed when a request presents its secret, when a request arrives after it
-/// expired, when it is cancelled or replaced, or by the request that follows
-/// `MAX_LINK_ATTEMPTS` attempts.
+/// expired, or when it is cancelled or replaced. A remote NodeId that made
+/// `MAX_LINK_ATTEMPTS` attempts is refused; other remotes can still present the secret.
 pub(super) struct PendingLink {
     secret: [u8; 32],
     expires_at: u64,
-    attempts: u32,
+    /// Attempts per remote NodeId, for at most `MAX_LINK_REMOTES` remotes.
+    attempts: HashMap<EndpointId, u32>,
+}
+
+impl PendingLink {
+    fn new(secret: [u8; 32], expires_at: u64) -> Self {
+        Self {
+            secret,
+            expires_at,
+            attempts: HashMap::new(),
+        }
+    }
 }
 
 pub(super) type PendingLinkState = Arc<tokio::sync::Mutex<Option<PendingLink>>>;
 
 pub(super) const LINK_SESSION_TTL_MS: u64 = 60_000; // 60 seconds
-/// Link requests served per session. A request with a wrong secret counts as one.
+/// Link requests served per session and remote NodeId. A request with a wrong secret
+/// counts as one. The secret has 256 random bits, so the limit bounds work, not guessing.
 const MAX_LINK_ATTEMPTS: u32 = 5;
+/// Remote NodeIds counted per session; requests of further remotes are refused.
+const MAX_LINK_REMOTES: usize = 32;
 /// Time limit for each network step of the link exchange except the bundle transfer.
 const LINK_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time limit for writing or reading the link bundle.
@@ -63,23 +81,29 @@ const LINK_CLOSE_DONE: u32 = 1;
 /// QUIC close code sent by either device when the exchange failed.
 const LINK_CLOSE_FAILED: u32 = 2;
 
-/// Count one link attempt against the session in `slot` and return its secret.
-/// Removes the session if it expired or already served `MAX_LINK_ATTEMPTS` requests.
-fn begin_link_attempt(slot: &mut Option<PendingLink>, now: u64) -> Result<[u8; 32], AppError> {
+/// Count one link attempt of `remote` against the session in `slot` and return its
+/// secret. Removes the session if it expired. Refuses a remote that made
+/// `MAX_LINK_ATTEMPTS` attempts, and a new remote once `MAX_LINK_REMOTES` are counted.
+fn begin_link_attempt(
+    slot: &mut Option<PendingLink>,
+    remote: EndpointId,
+    now: u64,
+) -> Result<[u8; 32], AppError> {
     let Some(session) = slot.as_mut() else {
         return Err("no pending link session".into());
     };
-    let expired = now > session.expires_at;
-    let exhausted = session.attempts >= MAX_LINK_ATTEMPTS;
-    if expired || exhausted {
+    if now > session.expires_at {
         *slot = None;
-        return Err(if expired {
-            "link session expired".into()
-        } else {
-            "too many link attempts for this session".into()
-        });
+        return Err("link session expired".into());
     }
-    session.attempts += 1;
+    if !session.attempts.contains_key(&remote) && session.attempts.len() >= MAX_LINK_REMOTES {
+        return Err("too many devices tried this link session".into());
+    }
+    let attempts = session.attempts.entry(remote).or_insert(0);
+    if *attempts >= MAX_LINK_ATTEMPTS {
+        return Err("too many link attempts from this device".into());
+    }
+    *attempts += 1;
     Ok(session.secret)
 }
 
@@ -180,12 +204,17 @@ async fn link_step<T>(
         .map_err(|_| AppError::Other(format!("device link: {what} timed out")))
 }
 
-/// Existing-device side: check that `presented` equals the session secret and remove
-/// the session. The comparison takes the same time for every presented value.
-async fn check_link_secret(pending: &PendingLinkState, presented: &str) -> Result<(), AppError> {
+/// Existing-device side: check that `presented`, sent by `remote`, equals the session
+/// secret and remove the session. The comparison takes the same time for every presented
+/// value.
+async fn check_link_secret(
+    pending: &PendingLinkState,
+    remote: EndpointId,
+    presented: &str,
+) -> Result<(), AppError> {
     let secret = {
         let mut slot = pending.lock().await;
-        begin_link_attempt(&mut slot, now_millis())?
+        begin_link_attempt(&mut slot, remote, now_millis())?
     };
     let mut presented = decode_secret(presented)?;
     let matches: bool = presented.ct_eq(&secret).into();
@@ -244,11 +273,7 @@ impl PeerHandler {
         let transport_node_id = self.identity.read().await.transport_node_id.clone();
         let expires_at = now_millis() + LINK_SESSION_TTL_MS;
 
-        *self.pending_link.lock().await = Some(PendingLink {
-            secret,
-            expires_at,
-            attempts: 0,
-        });
+        *self.pending_link.lock().await = Some(PendingLink::new(secret, expires_at));
 
         let payload = LinkQrPayload {
             node_id: transport_node_id,
@@ -283,12 +308,13 @@ impl PeerHandler {
         &self,
         send: SendStream,
         secret: String,
+        node_id: &str,
         device_name: &str,
         conn: &Connection,
     ) -> Result<(), AcceptError> {
         let mut secret = secret;
         let served = self
-            .serve_link_request(send, &secret, device_name, conn)
+            .serve_link_request(send, &secret, node_id, device_name, conn)
             .await;
         secret.zeroize();
         match served {
@@ -305,20 +331,23 @@ impl PeerHandler {
     }
 
     /// Serve one link request: check the secret and remove the session, send the
-    /// bundle, and store the NodeId of `conn` as the device `device_name` and announce it
-    /// after the new device closed the connection with `LINK_CLOSE_DONE`.
+    /// bundle, and store `new_node_id` as the device `device_name` and announce it after
+    /// the new device closed the connection with `LINK_CLOSE_DONE`.
     async fn serve_link_request(
         &self,
         mut send: SendStream,
         secret: &str,
+        new_node_id: &str,
         device_name: &str,
         conn: &Connection,
     ) -> Result<(), AppError> {
-        check_link_secret(&self.pending_link, secret).await?;
+        check_link_secret(&self.pending_link, conn.remote_id(), secret).await?;
 
-        let new_node_id = conn.remote_id().to_string();
+        let new_node_id = parse_pubkey(new_node_id)
+            .map_err(AppError::Other)?
+            .to_string();
         if new_node_id == self.identity.read().await.transport_node_id {
-            return Err("link request from a device with the local NodeId".into());
+            return Err("link request names the local NodeId".into());
         }
         let devices = self.storage.get_linked_devices().await?;
         if devices.len() >= MAX_LINKED_DEVICES && !devices.iter().any(|d| d.node_id == new_node_id)
@@ -328,23 +357,28 @@ impl PeerHandler {
             )));
         }
 
-        let (master_secret_key_bytes, master_pubkey) = {
-            let id = self.identity.read().await;
-            (id.master_secret_key_bytes, id.master_pubkey.clone())
-        };
+        let master_pubkey = self.identity.read().await.master_pubkey.clone();
         let lww = self.storage.load_lww_state(&master_pubkey).await?;
+        let announcement = build_own_announcement(&self.storage, &self.identity).await?;
+        let profile = self.storage.get_profile(&master_pubkey).await?;
+        let peer_announcements = self
+            .storage
+            .get_followed_peer_announcements(&master_pubkey)
+            .await?;
+        // The copy of the master key exists only while it is encoded.
+        let mut master_secret_key_bytes = self.identity.read().await.master_secret_key_bytes;
+        let master_secret_key =
+            base64::engine::general_purpose::STANDARD.encode(master_secret_key_bytes);
+        master_secret_key_bytes.zeroize();
         let mut bundle = LinkBundleData {
-            master_secret_key: base64::engine::general_purpose::STANDARD
-                .encode(master_secret_key_bytes),
-            announcement: build_own_announcement(&self.storage, &self.identity).await?,
-            profile: self.storage.get_profile(&master_pubkey).await?,
+            master_secret_key,
+            announcement,
+            profile,
             follows: lww.follows,
             moderation: lww.moderation,
             bookmarks: lww.bookmarks,
-            peer_announcements: self
-                .storage
-                .get_followed_peer_announcements(&master_pubkey)
-                .await?,
+            follow_requests: lww.follow_requests,
+            peer_announcements,
         };
         let bundle_json = serde_json::to_vec(&bundle);
         bundle.master_secret_key.zeroize();
@@ -380,9 +414,10 @@ impl PeerHandler {
 
     /// New-device side of device linking.
     ///
-    /// Connects to the device named in `payload`, sends the secret, and receives and
-    /// validates the link bundle. Returns the keys of the identity to install and the
-    /// bundle (with `master_secret_key` cleared). Writes nothing to disk.
+    /// Generates the transport key of the new identity, connects to the device named in
+    /// `payload`, sends the secret and the NodeId of that key, and receives and validates
+    /// the link bundle. Returns the keys of the identity to install and the bundle (with
+    /// `master_secret_key` cleared). Writes nothing to disk.
     pub async fn request_link(
         &self,
         endpoint: &Endpoint,
@@ -394,7 +429,7 @@ impl PeerHandler {
             target.secret.zeroize();
             return Err("this device already belongs to the identity of that device".into());
         }
-        let mut transport_secret_key = self.identity.read().await.transport_key.to_bytes();
+        let mut transport_secret_key = crate::setup::random_key()?;
 
         // QUIC authenticates the NodeId of the link code.
         let connected = link_step(
@@ -428,7 +463,8 @@ impl PeerHandler {
 }
 
 /// Run the new-device side of the link exchange on an established connection: send
-/// `secret` and the local device name, then read and validate the bundle.
+/// `secret`, the NodeId of `transport_secret_key` and the local device name, then read
+/// and validate the bundle.
 async fn exchange_link(
     conn: &Connection,
     secret: &[u8; 32],
@@ -440,6 +476,9 @@ async fn exchange_link(
     let mut encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
     let request = serde_json::to_vec(&PeerRequest::LinkRequest {
         secret: encoded.clone(),
+        node_id: SecretKey::from_bytes(&transport_secret_key)
+            .public()
+            .to_string(),
         device_name: local_device_name(),
     });
     encoded.zeroize();
@@ -504,6 +543,7 @@ mod tests {
             follows: vec![],
             moderation: vec![],
             bookmarks: vec![],
+            follow_requests: vec![],
             peer_announcements: vec![],
         }
     }
@@ -520,11 +560,10 @@ mod tests {
         secret: [u8; 32],
         bundle_json: Vec<u8>,
     ) -> Result<(), AppError> {
-        let pending: PendingLinkState = Arc::new(tokio::sync::Mutex::new(Some(PendingLink {
+        let pending: PendingLinkState = Arc::new(tokio::sync::Mutex::new(Some(PendingLink::new(
             secret,
-            expires_at: now_millis() + LINK_SESSION_TTL_MS,
-            attempts: 0,
-        })));
+            now_millis() + LINK_SESSION_TTL_MS,
+        ))));
         let incoming = endpoint.accept().await.ok_or("endpoint closed")?;
         let conn = incoming.await.map_err(|e| AppError::Other(e.to_string()))?;
         let (mut send, mut recv) = conn.accept_bi().await?;
@@ -532,7 +571,7 @@ mod tests {
         let PeerRequest::LinkRequest { secret, .. } = serde_json::from_slice(&request)? else {
             return Err("unexpected request".into());
         };
-        let checked = check_link_secret(&pending, &secret).await;
+        let checked = check_link_secret(&pending, conn.remote_id(), &secret).await;
         if checked.is_err() {
             conn.close(VarInt::from_u32(LINK_CLOSE_FAILED), b"link failed");
         }
@@ -659,65 +698,76 @@ mod tests {
         assert!(pair.close(0).await.is_err());
     }
 
+    fn remote(seed: u8) -> EndpointId {
+        SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
     #[tokio::test]
     async fn a_wrong_secret_counts_as_an_attempt_and_keeps_the_session() {
         let secret = [9u8; 32];
-        let pending: PendingLinkState = Arc::new(tokio::sync::Mutex::new(Some(PendingLink {
+        let pending: PendingLinkState = Arc::new(tokio::sync::Mutex::new(Some(PendingLink::new(
             secret,
-            expires_at: now_millis() + LINK_SESSION_TTL_MS,
-            attempts: 0,
-        })));
+            now_millis() + LINK_SESSION_TTL_MS,
+        ))));
+        let device = remote(1);
         assert!(
-            check_link_secret(&pending, &encoded(&[8u8; 32]))
+            check_link_secret(&pending, device, &encoded(&[8u8; 32]))
                 .await
                 .is_err()
         );
-        assert!(check_link_secret(&pending, "not base64!").await.is_err());
-        assert_eq!(pending.lock().await.as_ref().unwrap().attempts, 2);
-        assert!(check_link_secret(&pending, &encoded(&secret)).await.is_ok());
+        assert!(
+            check_link_secret(&pending, device, "not base64!")
+                .await
+                .is_err()
+        );
+        assert_eq!(pending.lock().await.as_ref().unwrap().attempts[&device], 2);
+        assert!(
+            check_link_secret(&pending, device, &encoded(&secret))
+                .await
+                .is_ok()
+        );
         assert!(pending.lock().await.is_none());
         assert!(
-            check_link_secret(&pending, &encoded(&secret))
+            check_link_secret(&pending, device, &encoded(&secret))
                 .await
                 .is_err()
         );
     }
 
     #[test]
-    fn session_allows_five_attempts_and_survives_failed_ones() {
+    fn attempts_are_limited_per_remote_and_keep_the_session_for_others() {
         let secret = [4u8; 32];
-        let mut slot = Some(PendingLink {
-            secret,
-            expires_at: 1_000,
-            attempts: 0,
-        });
+        let mut slot = Some(PendingLink::new(secret, 1_000));
         for _ in 0..MAX_LINK_ATTEMPTS {
-            assert_eq!(begin_link_attempt(&mut slot, 500).unwrap(), secret);
-            assert!(slot.is_some());
+            assert_eq!(
+                begin_link_attempt(&mut slot, remote(1), 500).unwrap(),
+                secret
+            );
         }
-        assert!(begin_link_attempt(&mut slot, 500).is_err());
-        assert!(slot.is_none());
-        assert!(begin_link_attempt(&mut slot, 500).is_err());
+        assert!(begin_link_attempt(&mut slot, remote(1), 500).is_err());
+        assert!(slot.is_some());
+        // Another device can still present the secret.
+        assert_eq!(
+            begin_link_attempt(&mut slot, remote(2), 500).unwrap(),
+            secret
+        );
+        // The number of remotes is bounded.
+        for seed in 3..(MAX_LINK_REMOTES as u8 + 1) {
+            begin_link_attempt(&mut slot, remote(seed), 500).unwrap();
+        }
+        assert!(begin_link_attempt(&mut slot, remote(200), 500).is_err());
     }
 
     #[test]
     fn expired_session_is_removed() {
-        let mut slot = Some(PendingLink {
-            secret: [4u8; 32],
-            expires_at: 1_000,
-            attempts: 0,
-        });
-        assert!(begin_link_attempt(&mut slot, 1_001).is_err());
+        let mut slot = Some(PendingLink::new([4u8; 32], 1_000));
+        assert!(begin_link_attempt(&mut slot, remote(1), 1_001).is_err());
         assert!(slot.is_none());
     }
 
     #[test]
     fn session_is_consumed_once_and_only_by_its_secret() {
-        let mut slot = Some(PendingLink {
-            secret: [4u8; 32],
-            expires_at: 1_000,
-            attempts: 1,
-        });
+        let mut slot = Some(PendingLink::new([4u8; 32], 1_000));
         assert!(!consume_link_session(&mut slot, &[5u8; 32]));
         assert!(slot.is_some());
         assert!(consume_link_session(&mut slot, &[4u8; 32]));

@@ -108,10 +108,12 @@ export function createBlobCache(options: BlobCacheOptions = {}) {
   async function load(
     command: "fetch_blob_bytes" | "refetch_blob_bytes",
     attachment: MediaAttachment,
+    maxSize?: number,
   ): Promise<string> {
     const startedIn = generation;
     const bytes = await invoke<ArrayBuffer>(command, {
       ticket: attachment.ticket,
+      maxSize,
     });
     if (startedIn !== generation) throw new Error("blob cache was cleared");
     const key = cacheKey(attachment);
@@ -137,11 +139,22 @@ export function createBlobCache(options: BlobCacheOptions = {}) {
     return started;
   }
 
-  function getBlobUrl(attachment: MediaAttachment): Promise<string> {
+  /**
+   * Object URL of the attachment. With `automatic`, a download from the network
+   * fails unless the provider proves a size of at most `AUTO_FETCH_MAX_BYTES`:
+   * the declared size that selected the automatic load is not verified.
+   */
+  function getBlobUrl(
+    attachment: MediaAttachment,
+    automatic = false,
+  ): Promise<string> {
     const key = cacheKey(attachment);
     const cached = cache.get(key);
     if (cached) return Promise.resolve(cached);
-    return loadOnce(key, () => load("fetch_blob_bytes", attachment));
+    const maxSize = automatic ? AUTO_FETCH_MAX_BYTES : undefined;
+    return loadOnce(`${automatic}\n${key}`, () =>
+      load("fetch_blob_bytes", attachment, maxSize),
+    );
   }
 
   function refetchBlobUrl(attachment: MediaAttachment): Promise<string> {

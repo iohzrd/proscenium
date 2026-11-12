@@ -1,7 +1,7 @@
 use crate::audio::{
-    AudioPlayback, MicConfig, OpusDecoder, OpusEncoder, PCM_CHANNEL_CAPACITY, SAMPLES_PER_FRAME,
-    SharedPlayback, TAG_NORMAL, android, lock, read_audio_frame, spawn_mic_thread,
-    write_audio_frame,
+    AudioPlayback, MicConfig, OpusDecoder, OpusEncoder, PCM_CHANNEL_CAPACITY,
+    PLAYBACK_CAPACITY_FRAMES, SAMPLES_PER_FRAME, SharedPlayback, TAG_NORMAL, android, lock,
+    read_audio_frame, spawn_mic_thread, write_audio_frame,
 };
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use proscenium_types::{CallState, short_id};
@@ -177,13 +177,14 @@ async fn recv_audio_loop(
         }
     };
 
-    let (mut prod, playback) = match AudioPlayback::start_blocking(output_device).await {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("[call] failed to start audio playback: {e}");
-            return;
-        }
-    };
+    let (mut prod, playback) =
+        match AudioPlayback::start_blocking(output_device, PLAYBACK_CAPACITY_FRAMES).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[call] failed to start audio playback: {e}");
+                return;
+            }
+        };
 
     // Store in shared handle so switch_output_device can reach it
     *lock(&shared_playback) = Some(playback);

@@ -13,7 +13,7 @@
   import MediaFilterBar from "#lib/profile/MediaFilterBar.svelte";
   import { createBlobCache, setBlobContext } from "#lib/blobs.ts";
   import type {
-    FollowRequestOutcome,
+    FollowOutcome,
     Post,
     Profile,
     SocialGraphEntry,
@@ -25,6 +25,7 @@
   import {
     coalesce,
     dedupeById,
+    followRequestNotice,
     mergeFirstPage,
     seedOwnProfile,
     shortId,
@@ -177,13 +178,22 @@
       if (filter !== mediaFilter) return;
       const merged = mergeFirstPage(posts, fresh, limit, "desc");
       posts = merged.items;
-      if (merged.exhausted) scroll.setNoMore();
-      else if (!merged.keptExisting) scroll.reset();
+      if (merged.exhausted) {
+        // Fewer stored rows than requested: the peer can hold more.
+        // `fetchFromRemote` calls this function, so it is started, not awaited.
+        if (canFetchRemote()) void fetchFromRemote();
+        else scroll.setNoMore();
+      } else if (!merged.keptExisting) scroll.reset();
     } catch (e) {
       toast.show("Failed to load posts");
       console.error("Failed to load posts:", e);
     }
   });
+
+  /** True if this profile's posts have not been requested from the peer yet. */
+  function canFetchRemote(): boolean {
+    return !isSelf && !peerOffline && !remoteSyncTried && mediaFilter === "all";
+  }
 
   function changeMediaFilter(value: string) {
     if (value === mediaFilter) return;
@@ -215,12 +225,7 @@
         if (added.length > 0) {
           posts = [...posts, ...added];
           scroll.setHasMore(older.length);
-        } else if (
-          !isSelf &&
-          !peerOffline &&
-          !remoteSyncTried &&
-          mediaFilter === "all"
-        ) {
+        } else if (canFetchRemote()) {
           await fetchFromRemote();
         } else {
           scroll.setNoMore();
@@ -284,23 +289,15 @@
       return;
     }
     try {
-      // A profile that is not public accepts followers only on request.
-      if (profile && profile.visibility !== "public") {
-        const outcome: FollowRequestOutcome = await invoke(
-          "send_follow_request_to_peer",
-          { pubkey },
-        );
-        if (outcome === "pending") {
-          toast.show("Follow request sent. Waiting for approval.", "success");
-          return;
-        }
-        if (outcome === "denied") {
-          toast.show("Follow request denied");
-          return;
-        }
-      }
       // `follow_user` fails if the node reports a master pubkey other than `pubkey`.
-      await invoke("follow_user", { nodeId, expectedPubkey: pubkey });
+      const outcome: FollowOutcome = await invoke("follow_user", {
+        nodeId,
+        expectedPubkey: pubkey,
+      });
+      if (outcome !== "followed") {
+        toast.show(...followRequestNotice(outcome));
+        return;
+      }
       isFollowing = true;
       await reloadProfile();
       await loadSyncStatus();

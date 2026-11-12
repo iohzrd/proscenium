@@ -27,3 +27,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-lite = "2"
 getrandom = "0.4"
 maud = { version = "0.27", features = ["axum"] }
+url = "2.5.8"

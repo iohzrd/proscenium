@@ -3,7 +3,8 @@ use crate::error::AppError;
 use bytes::Bytes;
 use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, Post, PostTombstone, Profile,
-    PushMessage, StageTicket, now_millis, short_id, sign_stage_announcement, sign_stage_ended,
+    PushMessage, StageTicket, Visibility, now_millis, short_id, sign_stage_announcement,
+    sign_stage_ended,
 };
 
 /// A `PushMessage` of `author` without content.
@@ -21,9 +22,10 @@ fn empty_push(author: String) -> PushMessage {
 impl super::GossipService {
     /// Serialize `msg` and broadcast it on the own feed topic.
     ///
-    /// Returns `Ok(false)` without broadcasting if no own feed topic is open, or if the
-    /// serialized message does not fit in one gossip frame (iroh-gossip ends the send loop
-    /// to a neighbor when asked to write a larger frame).
+    /// Returns `Ok(false)` without broadcasting if no own feed topic is open, if the stored
+    /// visibility is not Public (the topic is then closed; another device of the user can
+    /// have changed it), or if the serialized message does not fit in one gossip frame
+    /// (iroh-gossip ends the send loop to a neighbor when asked to write a larger frame).
     pub(super) async fn broadcast_msg(
         &self,
         msg: &GossipMessage,
@@ -33,6 +35,10 @@ impl super::GossipService {
         let Some(sender) = sender else {
             return Ok(false);
         };
+        if self.my_visibility().await? != Visibility::Public {
+            self.stop_own_feed().await;
+            return Ok(false);
+        }
         let payload = serde_json::to_vec(msg)?;
         let max_payload = GOSSIP_MAX_MESSAGE_SIZE - GOSSIP_FRAME_OVERHEAD;
         if payload.len() > max_payload {

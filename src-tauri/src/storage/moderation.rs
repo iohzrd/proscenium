@@ -5,37 +5,28 @@ use sqlx::Row;
 use super::Storage;
 
 impl Storage {
-    /// Flip the bookmark state of `post_id`. Returns the new state (`true` = bookmarked).
-    /// A removed bookmark is kept as a row with `state='removed'` so that device sync
-    /// delivers the removal to the user's other devices.
+    /// Flip the bookmark state of `post_id` in one statement. Returns the new state (`true`
+    /// = bookmarked). A removed bookmark is kept as a row with `state='removed'` so that
+    /// device sync delivers the removal to the user's other devices; `last_changed_at` is
+    /// set above the stored value, so device sync keeps this change even if the clock
+    /// moved backwards.
     pub async fn toggle_bookmark(&self, post_id: &str) -> Result<bool, AppError> {
         let now = now_millis() as i64;
-        let exists: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM bookmarks WHERE post_id=?1 AND state='active'",
+        let state: String = sqlx::query_scalar(
+            "INSERT INTO bookmarks (post_id, created_at, state, last_changed_at)
+             VALUES (?1, ?2, 'active', ?2)
+             ON CONFLICT(post_id) DO UPDATE SET
+                state = CASE WHEN bookmarks.state = 'active' THEN 'removed' ELSE 'active' END,
+                created_at = CASE WHEN bookmarks.state = 'active'
+                                  THEN bookmarks.created_at ELSE ?2 END,
+                last_changed_at = MAX(?2, bookmarks.last_changed_at + 1)
+             RETURNING state",
         )
         .bind(post_id)
+        .bind(now)
         .fetch_one(&self.pool)
         .await?;
-        if exists {
-            sqlx::query(
-                "UPDATE bookmarks SET state='removed', last_changed_at=?2 WHERE post_id=?1",
-            )
-            .bind(post_id)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-            Ok(false)
-        } else {
-            sqlx::query(
-                "INSERT INTO bookmarks (post_id, created_at, state, last_changed_at) VALUES (?1, ?2, 'active', ?2)
-                 ON CONFLICT(post_id) DO UPDATE SET created_at=?2, state='active', last_changed_at=?2",
-            )
-            .bind(post_id)
-            .bind(now)
-            .execute(&self.pool)
-            .await?;
-            Ok(true)
-        }
+        Ok(state == "active")
     }
 
     pub async fn is_bookmarked(&self, post_id: &str) -> Result<bool, AppError> {

@@ -1,5 +1,5 @@
 use crate::error::CmdResult;
-use crate::setup::{IdentityKeys, SEED_BACKED_UP_FILE};
+use crate::setup::{IdentityKeys, SEED_BACKED_UP_FILE, SEED_CONFIRM_FILE};
 use crate::state::AppState;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -15,14 +15,14 @@ const MAX_FAILED_VERIFICATIONS: u32 = 10;
 /// Failed `verify_seed_phrase_words` calls since the process started.
 static FAILED_VERIFICATIONS: AtomicU32 = AtomicU32::new(0);
 
-/// True if `get_seed_phrase` must ask for native confirmation: the backup marker file
-/// exists (or its presence cannot be determined), or the local user has a profile.
+/// True if `get_seed_phrase` must ask for native confirmation: the backup marker file or
+/// the marker written by `wipe_all_data` exists (or its presence cannot be determined),
+/// or the local user has a profile.
 async fn seed_phrase_requires_confirmation(state: &AppState) -> CmdResult<bool> {
     let data_dir = state.app_handle.path().app_data_dir()?;
-    if data_dir
-        .join(SEED_BACKED_UP_FILE)
-        .try_exists()
-        .unwrap_or(true)
+    if [SEED_BACKED_UP_FILE, SEED_CONFIRM_FILE]
+        .iter()
+        .any(|name| data_dir.join(name).try_exists().unwrap_or(true))
     {
         return Ok(true);
     }
@@ -49,9 +49,10 @@ pub async fn get_seed_phrase(state: State<'_, Arc<AppState>>) -> CmdResult<Strin
             return Err("cancelled".into());
         }
     }
-    let master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
-    let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes)?;
-    Ok(mnemonic.to_string())
+    let mut master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
+    let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes);
+    master_secret_key_bytes.zeroize();
+    Ok(mnemonic?.to_string())
 }
 
 #[tauri::command]
@@ -82,8 +83,10 @@ pub async fn verify_seed_phrase_words(
     if FAILED_VERIFICATIONS.load(Ordering::Relaxed) >= MAX_FAILED_VERIFICATIONS {
         return Err("Too many failed attempts. Restart the app to verify the phrase again.".into());
     }
-    let master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
-    let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes)?;
+    let mut master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
+    let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes);
+    master_secret_key_bytes.zeroize();
+    let mnemonic = mnemonic?;
     let words: Vec<&str> = mnemonic.words().collect();
     let verified = seed_words_match(&words, &checks);
     if !verified {
@@ -134,7 +137,10 @@ pub async fn recover_from_seed_phrase(
         "Recover identity",
         "Replace the identity on this device with the identity of the recovery phrase?\n\n\
          The keys, posts, messages, follows, media and settings stored on this device are \
-         deleted. This cannot be undone.",
+         deleted. This cannot be undone.\n\n\
+         This device then announces itself as the only device of the identity, so others \
+         stop reaching your other devices. To add a device while you still have one, link \
+         it instead.",
         "Replace identity",
     )
     .await;

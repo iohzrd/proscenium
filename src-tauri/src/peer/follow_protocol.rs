@@ -80,10 +80,6 @@ impl PeerHandler {
                 match outcome {
                     FollowRequestOutcome::Approved => true,
                     FollowRequestOutcome::Denied => false,
-                    FollowRequestOutcome::Full => {
-                        log::warn!("[follow-req] pending request limit reached");
-                        return Err(reject("too many pending follow requests"));
-                    }
                     FollowRequestOutcome::NewPending | FollowRequestOutcome::StillPending => {
                         // The identity is stored so the requester can be reached and
                         // verified after approval.

@@ -9,8 +9,8 @@ use crate::constants::{
     PEER_ACCEPT_STREAM_TIMEOUT, PEER_CLOSE_WAIT, PEER_MAX_CONNECTIONS,
     PEER_MAX_CONNECTIONS_PER_NODE, PEER_MAX_DEVICE_SYNC_REQUEST_BYTES,
     PEER_MAX_FOLLOW_REQUEST_BYTES, PEER_MAX_LINK_REQUEST_BYTES, PEER_MAX_PUSH_BYTES,
-    PEER_MAX_SMALL_REQUEST_BYTES, PEER_REQUEST_READ_TIMEOUT, PEER_RESPONSE_WRITE_TIMEOUT,
-    SYNC_SERVER_CONCURRENCY,
+    PEER_MAX_SMALL_REQUEST_BYTES, PEER_MAX_SYNC_REQUEST_BYTES, PEER_REQUEST_READ_TIMEOUT,
+    PEER_RESPONSE_WRITE_TIMEOUT, SYNC_SERVE_TIMEOUT, SYNC_SERVER_CONCURRENCY,
 };
 use crate::error::AppError;
 use crate::framing::{wait_closed, write_all_timeout};
@@ -18,13 +18,14 @@ use crate::gossip::GossipService;
 use crate::stage::StageActorHandle;
 use crate::state::SharedIdentity;
 use crate::storage::{RemoteListKind, Storage};
+use crate::util::NodeSlot;
 use iroh::{
     EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
 };
 use linking::PendingLinkState;
-use proscenium_types::{IdentityResponse, PeerRequest, PeerResponse, short_id};
+use proscenium_types::{IdentityResponse, PeerRequest, PeerResponse, Visibility, short_id};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
@@ -50,7 +51,8 @@ fn request_size_limit(head: &[u8]) -> Option<usize> {
     let rest = rest.strip_prefix(b"\"")?;
     let end = rest.iter().position(|b| *b == b'"')?;
     match rest.get(..end)? {
-        b"Sync" | b"IdentityRequest" | b"FollowsListRequest" | b"FollowersListRequest" => {
+        b"Sync" => Some(PEER_MAX_SYNC_REQUEST_BYTES),
+        b"IdentityRequest" | b"FollowsListRequest" | b"FollowersListRequest" => {
             Some(PEER_MAX_SMALL_REQUEST_BYTES)
         }
         b"FollowRequest" => Some(PEER_MAX_FOLLOW_REQUEST_BYTES),
@@ -117,41 +119,6 @@ async fn read_request(recv: &mut RecvStream) -> Result<Vec<u8>, AppError> {
     Ok(body)
 }
 
-/// Decrements the connection count of one remote NodeId when dropped.
-struct NodeSlot {
-    counts: Arc<Mutex<HashMap<EndpointId, usize>>>,
-    node: EndpointId,
-}
-
-impl NodeSlot {
-    /// Count one more connection of `node`. Returns `None` if `node` already has
-    /// `PEER_MAX_CONNECTIONS_PER_NODE` connections.
-    fn acquire(counts: &Arc<Mutex<HashMap<EndpointId, usize>>>, node: EndpointId) -> Option<Self> {
-        let mut map = counts.lock().unwrap_or_else(|e| e.into_inner());
-        let count = map.entry(node).or_insert(0);
-        if *count >= PEER_MAX_CONNECTIONS_PER_NODE {
-            return None;
-        }
-        *count += 1;
-        Some(Self {
-            counts: counts.clone(),
-            node,
-        })
-    }
-}
-
-impl Drop for NodeSlot {
-    fn drop(&mut self) {
-        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(count) = map.get_mut(&self.node) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                map.remove(&self.node);
-            }
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct PeerHandler {
     storage: Arc<Storage>,
@@ -166,6 +133,8 @@ pub struct PeerHandler {
     connections_per_node: Arc<Mutex<HashMap<EndpointId, usize>>>,
     /// Limits the sync requests served at the same time.
     sync_limit: Arc<Semaphore>,
+    /// Sync requests currently served per remote NodeId (at most one).
+    syncs_per_node: Arc<Mutex<HashMap<EndpointId, usize>>>,
 }
 
 impl PeerHandler {
@@ -186,6 +155,7 @@ impl PeerHandler {
             connection_limit: Arc::new(Semaphore::new(PEER_MAX_CONNECTIONS)),
             connections_per_node: Arc::new(Mutex::new(HashMap::new())),
             sync_limit: Arc::new(Semaphore::new(SYNC_SERVER_CONCURRENCY)),
+            syncs_per_node: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -209,16 +179,57 @@ impl PeerHandler {
         Ok(())
     }
 
+    /// Answer an `IdentityRequest` with the signed device list, and with the profile only
+    /// if it is Public or `may_see_profile` allows the requester `remote_str`.
     async fn handle_identity_request(
         &self,
+        remote_str: &str,
         send: SendStream,
         conn: &Connection,
     ) -> Result<(), AcceptError> {
-        let identity = self
+        let mut identity = self
             .identity_response()
             .await
             .map_err(AcceptError::from_err)?;
+        if let Some(profile) = &identity.profile
+            && profile.visibility != Visibility::Public
+            && !self.may_see_profile(remote_str, profile.visibility).await?
+        {
+            identity.profile = None;
+        }
         Self::respond(send, conn, &PeerResponse::Identity(identity)).await
+    }
+
+    /// True if the NodeId `remote_str` may read a profile with `visibility`: another
+    /// device of the local user, or the device of an approved follower (Listed) or of a
+    /// mutual (Private).
+    async fn may_see_profile(
+        &self,
+        remote_str: &str,
+        visibility: Visibility,
+    ) -> Result<bool, AcceptError> {
+        if self
+            .storage
+            .is_other_device(remote_str)
+            .await
+            .map_err(AcceptError::from_err)?
+        {
+            return Ok(true);
+        }
+        let Some(remote_pubkey) = self
+            .storage
+            .try_get_master_pubkey_for_transport(remote_str)
+            .await
+            .map_err(AcceptError::from_err)?
+        else {
+            return Ok(false);
+        };
+        let my_pubkey = self.identity.read().await.master_pubkey.clone();
+        match visibility {
+            Visibility::Private => self.storage.is_mutual(&my_pubkey, &remote_pubkey).await,
+            _ => self.storage.is_approved_follower(&remote_pubkey).await,
+        }
+        .map_err(AcceptError::from_err)
     }
 }
 
@@ -246,7 +257,11 @@ impl ProtocolHandler for PeerHandler {
             conn.close(1u32.into(), b"busy");
             return Err(reject("connection limit reached"));
         };
-        let Some(_node_slot) = NodeSlot::acquire(&self.connections_per_node, remote) else {
+        let Some(_node_slot) = NodeSlot::acquire(
+            &self.connections_per_node,
+            remote,
+            PEER_MAX_CONNECTIONS_PER_NODE,
+        ) else {
             conn.close(1u32.into(), b"busy");
             return Err(reject("per-node connection limit reached"));
         };
@@ -299,20 +314,31 @@ impl ProtocolHandler for PeerHandler {
 
         match req {
             PeerRequest::Sync(sync_req) => {
+                let Some(_sync_slot) = NodeSlot::acquire(&self.syncs_per_node, remote, 1) else {
+                    conn.close(1u32.into(), b"busy");
+                    return Err(reject("a sync of this node is already served"));
+                };
                 let Ok(_sync_permit) = self.sync_limit.clone().try_acquire_owned() else {
                     conn.close(1u32.into(), b"busy");
                     return Err(reject("sync limit reached"));
                 };
-                crate::sync::handle_sync(
-                    &self.storage,
-                    &self.identity,
-                    &remote_str,
-                    &conn,
-                    send,
-                    sync_req,
-                    &self.stage_handle,
+                let served = tokio::time::timeout(
+                    SYNC_SERVE_TIMEOUT,
+                    crate::sync::handle_sync(
+                        &self.storage,
+                        &self.identity,
+                        &remote_str,
+                        &conn,
+                        send,
+                        sync_req,
+                        &self.stage_handle,
+                    ),
                 )
-                .await
+                .await;
+                served.unwrap_or_else(|_| {
+                    conn.close(1u32.into(), b"sync timed out");
+                    Err(reject("sync not completed in time"))
+                })
             }
             PeerRequest::Push(push_msg) => {
                 crate::push::handle_push(
@@ -330,7 +356,9 @@ impl ProtocolHandler for PeerHandler {
                 self.handle_follow_request(&remote_str, send, *follow_req, &conn)
                     .await
             }
-            PeerRequest::IdentityRequest => self.handle_identity_request(send, &conn).await,
+            PeerRequest::IdentityRequest => {
+                self.handle_identity_request(&remote_str, send, &conn).await
+            }
             PeerRequest::FollowsListRequest => {
                 self.handle_list_request(
                     RemoteListKind::Follows,
@@ -353,9 +381,10 @@ impl ProtocolHandler for PeerHandler {
             }
             PeerRequest::LinkRequest {
                 secret,
+                node_id,
                 device_name,
             } => {
-                self.handle_link_request(send, secret, &device_name, &conn)
+                self.handle_link_request(send, secret, &node_id, &device_name, &conn)
                     .await
             }
             PeerRequest::DeviceSyncRequest { announcement } => {
@@ -379,23 +408,40 @@ mod tests {
     use super::*;
     use proscenium_types::{SyncRequest, post_ids_digest};
 
+    /// The largest device list that passes `verify_linked_devices_announcement`: names of
+    /// control characters, which JSON escapes as `\u00XX`.
+    fn largest_announcement() -> proscenium_types::LinkedDevicesAnnouncement {
+        use proscenium_types::{DeviceEntry, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES};
+        proscenium_types::LinkedDevicesAnnouncement {
+            master_pubkey: "a".repeat(64),
+            devices: (0..MAX_LINKED_DEVICES)
+                .map(|_| DeviceEntry {
+                    node_id: "b".repeat(64),
+                    device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
+                    added_at: u64::MAX,
+                })
+                .collect(),
+            version: u64::MAX,
+            signature: "c".repeat(128),
+        }
+    }
+
     #[test]
     fn request_size_limit_selects_by_variant_name() {
         let sync = serde_json::to_vec(&PeerRequest::Sync(SyncRequest {
             author: "a".repeat(64),
-            post_count: 0,
-            interaction_count: 0,
-            newest_timestamp: 0,
-            newest_interaction_timestamp: 0,
+            post_count: u64::MAX,
+            interaction_count: u64::MAX,
+            newest_timestamp: u64::MAX,
+            newest_interaction_timestamp: u64::MAX,
             post_ids_digest: post_ids_digest(&mut []),
-            tombstone_count: 0,
+            tombstone_count: u64::MAX,
+            since: u64::MAX,
+            announcement: Some(largest_announcement()),
         }))
         .unwrap();
-        assert!(sync.len() <= PEER_MAX_SMALL_REQUEST_BYTES);
-        assert_eq!(
-            request_size_limit(&sync),
-            Some(PEER_MAX_SMALL_REQUEST_BYTES)
-        );
+        assert!(sync.len() <= PEER_MAX_SYNC_REQUEST_BYTES);
+        assert_eq!(request_size_limit(&sync), Some(PEER_MAX_SYNC_REQUEST_BYTES));
 
         for request in [
             PeerRequest::IdentityRequest,
@@ -430,23 +476,8 @@ mod tests {
 
     #[test]
     fn largest_device_sync_request_fits_its_limit() {
-        use proscenium_types::{
-            DeviceEntry, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
-        };
-        // Names of control characters, which JSON escapes as `\u00XX`.
         let request = PeerRequest::DeviceSyncRequest {
-            announcement: LinkedDevicesAnnouncement {
-                master_pubkey: "a".repeat(64),
-                devices: (0..MAX_LINKED_DEVICES)
-                    .map(|_| DeviceEntry {
-                        node_id: "b".repeat(64),
-                        device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
-                        added_at: u64::MAX,
-                    })
-                    .collect(),
-                version: u64::MAX,
-                signature: "c".repeat(128),
-            },
+            announcement: largest_announcement(),
         };
         let bytes = serde_json::to_vec(&request).unwrap();
         assert!(bytes.len() <= PEER_MAX_DEVICE_SYNC_REQUEST_BYTES);
@@ -470,11 +501,11 @@ mod tests {
         let counts = Arc::new(Mutex::new(HashMap::new()));
         let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
         let mut slots: Vec<NodeSlot> = (0..PEER_MAX_CONNECTIONS_PER_NODE)
-            .map(|_| NodeSlot::acquire(&counts, node).unwrap())
+            .map(|_| NodeSlot::acquire(&counts, node, PEER_MAX_CONNECTIONS_PER_NODE).unwrap())
             .collect();
-        assert!(NodeSlot::acquire(&counts, node).is_none());
+        assert!(NodeSlot::acquire(&counts, node, PEER_MAX_CONNECTIONS_PER_NODE).is_none());
         slots.pop();
-        assert!(NodeSlot::acquire(&counts, node).is_some());
+        assert!(NodeSlot::acquire(&counts, node, PEER_MAX_CONNECTIONS_PER_NODE).is_some());
         drop(slots);
         assert!(counts.lock().unwrap().is_empty());
     }

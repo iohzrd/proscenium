@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use zeroize::Zeroize;
 
 /// Commands sent to the peer sync task to trigger on-demand syncs.
 pub enum SyncCommand {
@@ -46,6 +47,13 @@ impl Identity {
             transport_node_id: transport_key.public().to_string(),
             transport_key,
         }
+    }
+}
+
+/// Overwrites the master key bytes with zeros. `SecretKey` zeroizes its own bytes.
+impl Drop for Identity {
+    fn drop(&mut self) {
+        self.master_secret_key_bytes.zeroize();
     }
 }
 

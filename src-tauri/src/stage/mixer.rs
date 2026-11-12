@@ -220,7 +220,12 @@ async fn run_mixer(
                 let full_mix: Vec<f32> = total.iter().map(|s| s.clamp(-1.0, 1.0)).collect();
                 let packets = listener_encoder.push_samples(&full_mix);
                 for packet in &packets {
-                    let (tag, wire_payload) = auth.process(listener_seq, listener_ts, packet);
+                    let (tag, wire_payload) = auth.process(
+                        listener_seq,
+                        listener_ts,
+                        packet,
+                        proscenium_types::now_millis(),
+                    );
                     listener_fanout.send_frame(listener_seq, listener_ts, tag, wire_payload);
                     listener_seq = listener_seq.wrapping_add(1);
                     listener_ts = listener_ts.wrapping_add(SAMPLES_PER_FRAME as u32);

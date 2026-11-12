@@ -158,9 +158,14 @@ impl Default for TrendingConfig {
     }
 }
 
-/// Remove one trailing `/` so that `https://host` and `https://host/` compare equal.
-pub fn normalize_url(url: &str) -> &str {
-    url.strip_suffix('/').unwrap_or(url)
+/// Normalize `url` as the client does before it signs a request: parse it (which lowercases
+/// the scheme and host and drops a default port) and remove trailing `/`. A string that
+/// does not parse is returned with trailing `/` removed.
+pub fn normalize_url(url: &str) -> String {
+    match url::Url::parse(url.trim()) {
+        Ok(parsed) => parsed.as_str().trim_end_matches('/').to_string(),
+        Err(_) => url.trim().trim_end_matches('/').to_string(),
+    }
 }
 
 impl Config {
@@ -177,7 +182,7 @@ impl Config {
     }
 
     fn validate(&mut self) -> anyhow::Result<()> {
-        let url = normalize_url(self.server.public_url.trim()).to_string();
+        let url = normalize_url(&self.server.public_url);
         let host = url
             .strip_prefix("https://")
             .or_else(|| url.strip_prefix("http://"))
@@ -275,9 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn normalize_url_trims_one_trailing_slash() {
+    fn normalize_url_matches_the_client_normalization() {
         assert_eq!(normalize_url("https://a.test/"), "https://a.test");
         assert_eq!(normalize_url("https://a.test"), "https://a.test");
-        assert_eq!(normalize_url("https://a.test//"), "https://a.test/");
+        assert_eq!(normalize_url("https://a.test//"), "https://a.test");
+        assert_eq!(
+            normalize_url("HTTPS://A.Test:443/base/"),
+            "https://a.test/base"
+        );
+        assert_eq!(normalize_url(" http://a.test:8080 "), "http://a.test:8080");
     }
 }

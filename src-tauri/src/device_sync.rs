@@ -15,8 +15,9 @@
 //! 2. responder: `Vector`, its data frames, a zero-length frame, then finish.
 //! 3. requester: its data frames, a zero-length frame, then finish.
 //!
-//! Data frames: all follow, moderation and bookmark rows unless both vectors carry the
-//! same `lww_digest`; the direct messages among the sender's newest
+//! Data frames: all follow, moderation and bookmark rows and the device lists of the
+//! followed users unless both vectors carry the same `lww_digest`; the direct messages
+//! among the sender's newest
 //! `MAX_DEVICE_SYNC_DM_IDS`, and the deletions of own interactions among the sender's
 //! newest `MAX_SYNC_TOMBSTONES`, whose ids the receiver's vector does not list.
 //!
@@ -36,9 +37,10 @@ use iroh::{
 };
 use proscenium_types::{
     BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, DirectMessage, FollowEntry,
-    LinkedDevicesAnnouncement, MAX_ANNOUNCEMENT_JSON_LEN, MAX_DEVICE_SYNC_DM_IDS,
-    MAX_SYNC_TOMBSTONES, ModerationEntry, PEER_ALPN, PeerRequest, StoredMessage, is_valid_id,
-    is_valid_pubkey, now_millis, short_id,
+    FollowRequestEntry, LinkedDevicesAnnouncement, MAX_ANNOUNCEMENT_JSON_LEN,
+    MAX_DEVICE_SYNC_DM_IDS, MAX_SYNC_TOMBSTONES, ModerationEntry, PEER_ALPN, PeerRequest,
+    StoredMessage, is_valid_id, is_valid_pubkey, now_millis, short_id,
+    verify_linked_devices_announcement,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -61,16 +63,21 @@ const LWW_BATCH_SIZE: usize = 500;
 const DM_BATCH_SIZE: usize = 100;
 /// Tombstones per frame.
 const TOMBSTONE_BATCH_SIZE: usize = 1_000;
+/// Device lists of followed users per frame. One list is at most
+/// `MAX_ANNOUNCEMENT_JSON_LEN` bytes of JSON.
+const ANNOUNCEMENT_BATCH_SIZE: usize = 50;
 /// QUIC close code for a rejected or failed device sync.
 const CLOSE_FAILED: u32 = 1;
 
 /// The last-writer-wins rows that device sync and device linking replicate: follows,
-/// moderation entries (mutes and blocks) and bookmarks, removed rows included.
+/// moderation entries (mutes and blocks) and bookmarks, removed rows included, and the
+/// follow requests of other users (the later decision wins).
 #[derive(Debug, Clone, Default)]
 pub struct LwwState {
     pub follows: Vec<FollowEntry>,
     pub moderation: Vec<ModerationEntry>,
     pub bookmarks: Vec<BookmarkEntry>,
+    pub follow_requests: Vec<FollowRequestEntry>,
 }
 
 impl LwwState {
@@ -97,6 +104,9 @@ impl LwwState {
                 b.post_id, b.state, b.last_changed_at
             ));
         }
+        for r in &self.follow_requests {
+            hasher.update(format!("r\n{}\n{}\n{}\n", r.pubkey, r.status, r.decided_at));
+        }
         hex::encode(hasher.finalize())
     }
 }
@@ -104,11 +114,16 @@ impl LwwState {
 /// Stats from a device sync operation.
 #[derive(Debug, Default)]
 pub struct DeviceSyncStats {
-    /// Direct messages and interaction deletions that failed validation.
+    /// Direct messages, interaction deletions and device lists that failed validation, or
+    /// device lists of users the local user does not follow.
     pub rejected: u32,
-    pub follows_merged: u32,
+    /// Users followed by a merged row.
+    pub followed: Vec<String>,
+    /// Users that were followed before a merged row removed the follow.
+    pub unfollowed: Vec<String>,
     pub moderation_merged: u32,
     pub bookmarks_merged: u32,
+    pub follow_requests_merged: u32,
     pub devices_added: u32,
     /// Direct messages stored for the first time, by the other user of the conversation.
     pub dms_imported: BTreeMap<String, Vec<StoredMessage>>,
@@ -147,8 +162,10 @@ fn frame_item_count(frame: &DeviceSyncFrame) -> usize {
     match frame {
         DeviceSyncFrame::Vector(_) => 0,
         DeviceSyncFrame::Follows(items) => items.len(),
+        DeviceSyncFrame::PeerAnnouncements(items) => items.len(),
         DeviceSyncFrame::Moderation(items) => items.len(),
         DeviceSyncFrame::Bookmarks(items) => items.len(),
+        DeviceSyncFrame::FollowRequests(items) => items.len(),
         DeviceSyncFrame::DirectMessages(items) => items.len(),
         DeviceSyncFrame::InteractionTombstones(items) => items.len(),
     }
@@ -257,11 +274,21 @@ impl DeviceSync<'_> {
             for chunk in lww.follows.chunks(LWW_BATCH_SIZE) {
                 write_sync_frame(send, &DeviceSyncFrame::Follows(chunk.to_vec())).await?;
             }
+            let announcements = self
+                .storage
+                .get_followed_peer_announcements(master_pubkey)
+                .await?;
+            for chunk in announcements.chunks(ANNOUNCEMENT_BATCH_SIZE) {
+                write_sync_frame(send, &DeviceSyncFrame::PeerAnnouncements(chunk.to_vec())).await?;
+            }
             for chunk in lww.moderation.chunks(LWW_BATCH_SIZE) {
                 write_sync_frame(send, &DeviceSyncFrame::Moderation(chunk.to_vec())).await?;
             }
             for chunk in lww.bookmarks.chunks(LWW_BATCH_SIZE) {
                 write_sync_frame(send, &DeviceSyncFrame::Bookmarks(chunk.to_vec())).await?;
+            }
+            for chunk in lww.follow_requests.chunks(LWW_BATCH_SIZE) {
+                write_sync_frame(send, &DeviceSyncFrame::FollowRequests(chunk.to_vec())).await?;
             }
         }
 
@@ -304,8 +331,9 @@ impl DeviceSync<'_> {
     /// Read data frames until the zero-length frame and store their content.
     ///
     /// A direct message is stored only if `own_dm_peer` accepts it; an interaction
-    /// tombstone is applied only if its id is valid. At most `MAX_SYNC_FRAMES` frames and
-    /// `MAX_SYNC_ITEMS` items are accepted.
+    /// tombstone only if its id is valid; a device list only if it verifies and its user is
+    /// followed (it is cached as received from no device, so it maps no NodeId). At most
+    /// `MAX_SYNC_FRAMES` frames and `MAX_SYNC_ITEMS` items are accepted.
     async fn import_frames(
         &self,
         recv: &mut RecvStream,
@@ -329,16 +357,55 @@ impl DeviceSync<'_> {
                     return Err("device sync: unexpected vector frame".into());
                 }
                 DeviceSyncFrame::Follows(entries) => {
-                    stats.follows_merged += self
+                    let mut was_followed = HashSet::new();
+                    for entry in &entries {
+                        if self
+                            .storage
+                            .is_following(master_pubkey, &entry.pubkey)
+                            .await?
+                        {
+                            was_followed.insert(entry.pubkey.clone());
+                        }
+                    }
+                    let changed = self
                         .storage
                         .merge_follows_lww(master_pubkey, &entries)
                         .await?;
+                    for entry in changed {
+                        if entry.state == "active" {
+                            stats.followed.push(entry.pubkey);
+                        } else if was_followed.contains(&entry.pubkey) {
+                            stats.unfollowed.push(entry.pubkey);
+                        }
+                    }
+                }
+                DeviceSyncFrame::PeerAnnouncements(announcements) => {
+                    for announcement in announcements {
+                        if !self
+                            .storage
+                            .is_following(master_pubkey, &announcement.master_pubkey)
+                            .await?
+                            || verify_linked_devices_announcement(&announcement).is_err()
+                        {
+                            stats.rejected += 1;
+                            continue;
+                        }
+                        self.storage
+                            .cache_peer_announcement(&announcement, None)
+                            .await?;
+                    }
                 }
                 DeviceSyncFrame::Moderation(entries) => {
                     stats.moderation_merged += self.storage.merge_moderation_lww(&entries).await?;
                 }
                 DeviceSyncFrame::Bookmarks(entries) => {
                     stats.bookmarks_merged += self.storage.merge_bookmarks_lww(&entries).await?;
+                }
+                DeviceSyncFrame::FollowRequests(entries) => {
+                    stats.follow_requests_merged += self
+                        .storage
+                        .merge_follow_requests(master_pubkey, &entries)
+                        .await?;
                 }
                 DeviceSyncFrame::DirectMessages(messages) => {
                     for message in messages {
@@ -460,9 +527,11 @@ impl DeviceSync<'_> {
 
 /// Apply the results of a completed exchange that need more than the database.
 ///
-/// Emits `feed-updated` if interactions were removed, `dm-synced` (`{ peer, messages }`)
-/// for each conversation with imported direct messages, and broadcasts the device
-/// announcement if the device list changed.
+/// A user followed by a merged row is queued for a gossip subscription; for a user that
+/// was followed before a merged row removed the follow, the subscription is closed and
+/// the user's posts are deleted, as `commands::social::unfollow_user` does. Emits `feed-updated` if interactions or posts
+/// were removed, `dm-synced` (`{ peer, messages }`) for each conversation with imported
+/// direct messages, and broadcasts the device announcement if the device list changed.
 async fn after_sync(
     storage: &Storage,
     identity: &SharedIdentity,
@@ -470,7 +539,23 @@ async fn after_sync(
     app_handle: &AppHandle,
     stats: &DeviceSyncStats,
 ) {
-    if stats.interactions_removed > 0 {
+    // The reconnect loop subscribes once the user's NodeIds are cached.
+    for pubkey in &stats.followed {
+        let _ = gossip.reconnect_tx.send(pubkey.clone());
+    }
+    let mut feed_changed = stats.interactions_removed > 0;
+    for pubkey in &stats.unfollowed {
+        gossip.unfollow_user(pubkey).await;
+        match storage.delete_posts_by_author(pubkey).await {
+            Ok(0) => {}
+            Ok(_) => feed_changed = true,
+            Err(e) => log::error!(
+                "[device-sync] failed to delete posts of unfollowed {}: {e}",
+                short_id(pubkey)
+            ),
+        }
+    }
+    if feed_changed {
         let _ = app_handle.emit("feed-updated", ());
     }
     for (peer, messages) in &stats.dms_imported {
@@ -494,35 +579,41 @@ async fn after_sync(
 
 fn log_stats(role: &str, node_id: &str, stats: &DeviceSyncStats) {
     log::info!(
-        "[device-sync] {role} sync with {}: dms={}, interactions removed={}, rejected={}, follows={}, moderation={}, bookmarks={}, devices={}",
+        "[device-sync] {role} sync with {}: dms={}, interactions removed={}, rejected={}, followed={}, unfollowed={}, moderation={}, bookmarks={}, follow requests={}, devices={}",
         short_id(node_id),
         stats.dms_imported.values().map(Vec::len).sum::<usize>(),
         stats.interactions_removed,
         stats.rejected,
-        stats.follows_merged,
+        stats.followed.len(),
+        stats.unfollowed.len(),
         stats.moderation_merged,
         stats.bookmarks_merged,
+        stats.follow_requests_merged,
         stats.devices_added,
     );
 }
 
-/// Fetch the own posts, interactions and post deletions of the device `target` and log
-/// the result.
+/// Fetch the own posts, interactions, post deletions and profile of the device `target`,
+/// then open or close the own feed topic for the stored visibility, which the profile of
+/// `target` can have changed.
 async fn fetch_own_content(
-    endpoint: &Endpoint,
+    gossip: &GossipService,
     storage: &Storage,
     identity: &SharedIdentity,
     app_handle: &AppHandle,
     target: EndpointId,
 ) {
-    let my_id = identity.read().await.master_pubkey.clone();
     if let Err(e) =
-        crate::sync::sync_from_own_device(endpoint, storage, target, &my_id, app_handle).await
+        crate::sync::sync_from_own_device(&gossip.endpoint, storage, identity, target, app_handle)
+            .await
     {
         log::warn!(
             "[device-sync] failed to fetch own posts from {}: {e}",
             target.fmt_short()
         );
+    }
+    if let Err(e) = gossip.apply_stored_visibility().await {
+        log::error!("[device-sync] failed to apply the visibility to the own feed: {e}");
     }
 }
 
@@ -558,14 +649,7 @@ pub async fn handle_device_sync(
             after_sync(storage, identity, gossip, app_handle, &stats).await;
             // The requester closes the connection after its last frame was acknowledged.
             let _ = tokio::time::timeout(STEP_TIMEOUT, conn.closed()).await;
-            fetch_own_content(
-                &gossip.endpoint,
-                storage,
-                identity,
-                app_handle,
-                conn.remote_id(),
-            )
-            .await;
+            fetch_own_content(gossip, storage, identity, app_handle, conn.remote_id()).await;
             Ok(())
         }
         Err(e) => {
@@ -647,7 +731,7 @@ pub async fn sync_all_devices(state: &AppState) {
                 )
                 .await;
                 fetch_own_content(
-                    &endpoint,
+                    &gossip,
                     &state.storage,
                     &state.identity,
                     &state.app_handle,
@@ -766,21 +850,44 @@ mod tests {
             last_changed_at: changed,
         };
         let unliked = "ef".repeat(16);
+        let dropped = SecretKey::from_bytes(&[4u8; 32]).public().to_string();
+        let follow = |pubkey: &str, state: &str, changed: u64| FollowEntry {
+            pubkey: pubkey.to_string(),
+            followed_at: 1,
+            state: state.to_string(),
+            last_changed_at: changed,
+        };
+        let mut followed_devices = proscenium_types::LinkedDevicesAnnouncement {
+            master_pubkey: followed.clone(),
+            devices: vec![proscenium_types::DeviceEntry {
+                node_id: node_id(40),
+                device_name: "Linux".to_string(),
+                added_at: 1,
+            }],
+            version: 1,
+            signature: String::new(),
+        };
+        proscenium_types::sign_linked_devices_announcement(
+            &mut followed_devices,
+            &SecretKey::from_bytes(&[2u8; 32]),
+        );
 
-        // Device A: a follow, a removed bookmark, a like that device B removed, its own
-        // row and the row of device B.
+        // Device A: a follow with the followee's device list, a follow that it removed, a
+        // removed bookmark, a like that device B removed, its own row and the row of
+        // device B.
         let a = Arc::new(Storage::open_in_memory().await.unwrap());
         a.merge_follows_lww(
             &me,
-            &[FollowEntry {
-                pubkey: followed.clone(),
-                followed_at: 1,
-                state: "active".to_string(),
-                last_changed_at: 100,
-            }],
+            &[
+                follow(&followed, "active", 100),
+                follow(&dropped, "removed", 300),
+            ],
         )
         .await
         .unwrap();
+        a.cache_peer_announcement(&followed_devices, None)
+            .await
+            .unwrap();
         a.merge_bookmarks_lww(&[bookmark("removed", 200)])
             .await
             .unwrap();
@@ -809,9 +916,12 @@ mod tests {
                 .unwrap()
         );
 
-        // Device B: a mute, the same bookmark in its older active state, its own row and
-        // the row of device C, which device A does not know.
+        // Device B: the follow that A removed, in its older active state, a mute, the same bookmark in its older active state, its own row and the
+        // row of device C, which device A does not know.
         let b = Arc::new(Storage::open_in_memory().await.unwrap());
+        b.merge_follows_lww(&me, &[follow(&dropped, "active", 100)])
+            .await
+            .unwrap();
         b.merge_moderation_lww(&[ModerationEntry {
             pubkey: muted.clone(),
             kind: "mute".to_string(),
@@ -848,6 +958,17 @@ mod tests {
         )
         .await;
         let (stats_b, stats_a) = (stats_b.expect("requester"), stats_a.expect("responder"));
+
+        // B followed the user with the device list A held, and removed the follow A had
+        // removed.
+        assert_eq!(stats_b.followed, vec![followed.clone()]);
+        assert_eq!(
+            b.get_peer_transport_node_ids(&followed).await.unwrap(),
+            vec![node_id(40)]
+        );
+        assert_eq!(stats_b.unfollowed, vec![dropped.clone()]);
+        assert!(!b.is_following(&me, &dropped).await.unwrap());
+        assert!(stats_a.followed.is_empty() && stats_a.unfollowed.is_empty());
 
         // A applied the deletion of the like.
         assert_eq!(stats_a.interactions_removed, 1);

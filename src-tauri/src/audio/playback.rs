@@ -10,7 +10,8 @@ use super::capture::{STREAM_OPEN_TIMEOUT, device_name};
 use super::codec::{FRAME_SIZE, SAMPLE_RATE};
 use super::device::{DeviceFormat, LinearResampler, choose_format, lock};
 
-/// Ring buffer capacity in frames. Callers cannot exceed this depth.
+/// Ring buffer capacity in frames for a stream decoded as it arrives (calls, the stage
+/// host and speakers). A caller cannot buffer more than the capacity it chose.
 pub const PLAYBACK_CAPACITY_FRAMES: usize = 16;
 
 /// Counters shared between the producer side and the output callback.
@@ -20,6 +21,8 @@ struct PlaybackShared {
     /// Samples that must be buffered before the callback starts reading the ring,
     /// at stream start and again after each underrun. Zero disables the wait.
     prefill_samples: AtomicUsize,
+    /// Ring buffer capacity in frames, kept when the output device is switched.
+    capacity_frames: usize,
 }
 
 /// Producer handle returned by [`AudioPlayback::start`].
@@ -48,7 +51,7 @@ impl PlaybackProducer {
     /// ring. The callback writes silence until that depth is reached, at stream start and
     /// again after each underrun.
     pub fn set_prefill_frames(&self, frames: usize) {
-        let frames = frames.min(PLAYBACK_CAPACITY_FRAMES - 1);
+        let frames = frames.min(self.shared.capacity_frames - 1);
         self.shared
             .prefill_samples
             .store(frames * FRAME_SIZE, Ordering::Relaxed);
@@ -172,7 +175,7 @@ fn build_playback_stream(
         format.sample_format
     );
 
-    let (prod, cons) = ringbuf::HeapRb::<f32>::new(PLAYBACK_CAPACITY_FRAMES * FRAME_SIZE).split();
+    let (prod, cons) = ringbuf::HeapRb::<f32>::new(shared.capacity_frames * FRAME_SIZE).split();
     let source = RingSource {
         cons,
         shared: shared.clone(),
@@ -197,12 +200,17 @@ fn build_playback_stream(
 }
 
 impl AudioPlayback {
-    /// Start playing audio on the specified device (or default if None).
+    /// Start playing audio on the specified device (or default if None), with a ring
+    /// buffer of `capacity_frames` frames (at least 2).
     /// Opens the device on the calling thread; call it from a thread that may block.
-    pub fn start(device_name_pref: Option<&str>) -> Result<(PlaybackProducer, Self), cpal::Error> {
+    pub fn start(
+        device_name_pref: Option<&str>,
+        capacity_frames: usize,
+    ) -> Result<(PlaybackProducer, Self), cpal::Error> {
         let shared = Arc::new(PlaybackShared {
             underruns: AtomicUsize::new(0),
             prefill_samples: AtomicUsize::new(0),
+            capacity_frames: capacity_frames.max(2),
         });
         let (prod, stream) = build_playback_stream(device_name_pref, &shared)?;
 
@@ -225,11 +233,14 @@ impl AudioPlayback {
     /// Open the output device on a blocking thread of the Tokio runtime.
     pub async fn start_blocking(
         device_name_pref: Option<String>,
+        capacity_frames: usize,
     ) -> Result<(PlaybackProducer, Self), String> {
-        tokio::task::spawn_blocking(move || Self::start(device_name_pref.as_deref()))
-            .await
-            .map_err(|e| format!("playback start task failed: {e}"))?
-            .map_err(|e| e.to_string())
+        tokio::task::spawn_blocking(move || {
+            Self::start(device_name_pref.as_deref(), capacity_frames)
+        })
+        .await
+        .map_err(|e| format!("playback start task failed: {e}"))?
+        .map_err(|e| e.to_string())
     }
 
     /// Switch to a different output device mid-stream. Builds a new stream
@@ -256,6 +267,7 @@ mod tests {
         let shared = Arc::new(PlaybackShared {
             underruns: AtomicUsize::new(0),
             prefill_samples: AtomicUsize::new(prefill_frames * FRAME_SIZE),
+            capacity_frames: PLAYBACK_CAPACITY_FRAMES,
         });
         let (prod, cons) =
             ringbuf::HeapRb::<f32>::new(PLAYBACK_CAPACITY_FRAMES * FRAME_SIZE).split();

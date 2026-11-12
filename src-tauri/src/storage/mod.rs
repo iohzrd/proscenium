@@ -130,15 +130,29 @@ impl Storage {
             "018_random_transport_keys",
             include_str!("../../migrations/018_random_transport_keys.sql"),
         ),
+        (
+            "019_server_profile_sync",
+            include_str!("../../migrations/019_server_profile_sync.sql"),
+        ),
+        (
+            "020_follow_request_decisions",
+            include_str!("../../migrations/020_follow_request_decisions.sql"),
+        ),
+        (
+            "021_dm_messages_time_index",
+            include_str!("../../migrations/021_dm_messages_time_index.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {
+        // `secure_delete` overwrites the content of deleted rows with zeros.
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(5))
+            .pragma("secure_delete", "ON");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -153,7 +167,9 @@ impl Storage {
     #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self, AppError> {
         use std::str::FromStr;
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
+            .foreign_keys(true)
+            .pragma("secure_delete", "ON");
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -162,7 +178,10 @@ impl Storage {
         Ok(Self { pool })
     }
 
-    /// Delete every row of every table except `schema_migrations`, in one transaction.
+    /// Delete every row of every table except `schema_migrations`, in one transaction, then
+    /// rebuild the database file (`VACUUM`) and copy the write-ahead log into it and
+    /// truncate the log (`wal_checkpoint(TRUNCATE)`), so neither file keeps pages of the
+    /// deleted rows.
     pub async fn wipe_all_data(&self) -> Result<(), AppError> {
         // Read before the transaction starts: its first statement must be a write, because
         // a transaction that starts with a read fails with SQLITE_BUSY when it needs the
@@ -188,6 +207,16 @@ impl Storage {
                 .await?;
         }
         tx.commit().await?;
+
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        // Result row: (busy, WAL frames, frames checkpointed). `busy` is 1 if another
+        // connection prevented the checkpoint from completing.
+        let (busy, _, _): (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.pool)
+            .await?;
+        if busy != 0 {
+            log::warn!("[storage] the write-ahead log was not truncated after the wipe");
+        }
         Ok(())
     }
 

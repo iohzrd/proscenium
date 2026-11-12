@@ -84,8 +84,9 @@ impl super::CallHandler {
     ///
     /// The call enters phase `Connecting` before the answer is sent, because the
     /// caller can dial before the delivery is confirmed. If the answer cannot be
-    /// delivered the call returns to phase `Incoming` with its ring timeout still
-    /// running, and the error is returned.
+    /// delivered and the caller's audio connection has not arrived, the call returns to
+    /// phase `Incoming` with its ring timeout still running, and the error is returned. If
+    /// the audio connection arrived (phase `Active`), the call is reported active.
     pub async fn accept_call(&self, call_id: &str) -> Result<(), AppError> {
         let (peer_pubkey, peer_device) = {
             let mut lock = self.active_call.lock().await;
@@ -116,7 +117,11 @@ impl super::CallHandler {
         let Some(call) = lock.as_mut().filter(|c| c.call_id == call_id) else {
             return Err(AppError::Other("call ended".into()));
         };
-        if let Err(e) = sent {
+        // A caller that opened the audio connection received the answer, so a failed send
+        // counts as delivered once the call is `Active`; the microphone is already on.
+        if let Err(e) = sent
+            && call.phase != CallPhase::Active
+        {
             if call.phase == CallPhase::Connecting {
                 call.phase = CallPhase::Incoming;
             }

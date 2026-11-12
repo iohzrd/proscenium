@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: ['**']
   pull_request:
-    branches: [master]
+  # The release workflow runs these jobs before it builds.
+  workflow_call:
 
 permissions:
   contents: read
@@ -87,3 +88,22 @@ jobs:
 
       - name: Test
         run: cargo test --manifest-path server/Cargo.toml --locked
+
+  audit:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit client dependencies
+        run: cargo audit --file Cargo.lock
+
+      - name: Audit server dependencies
+        run: cargo audit --file server/Cargo.lock

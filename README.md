@@ -23,11 +23,11 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 Each user has one master key, and each device its own transport key:
 
 - **Master key** (Ed25519) -- The identity. The master public key is what others follow. The master key signs all of the user's content: posts, interactions, profiles, deletions, device lists, follow requests, server registrations and Stage messages. Stored in `master_key.key` (mode 0600) on every device of the user. A 24-word BIP39 recovery phrase encodes it.
-- **Transport key** (Ed25519) -- Generated at random on each device and stored in `transport_key.key` (mode 0600). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content. Recovery from the phrase generates a new one.
+- **Transport key** (Ed25519) -- Generated at random on each device and stored in `transport_key.key` (mode 0600). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content. Recovery from the phrase and linking generate a new one.
 
 Content is verified against the public key in its `author` field, so it verifies without other cached data. There is no key rotation: a leaked master key can only be replaced by a new identity.
 
-A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the master key. An identity response is accepted only if the device list verifies and contains the NodeId that sent the response. A NodeId is therefore bound to a master key by signature, not by claim.
+A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the master key. The signature proves only that the master named those NodeIds, not that the devices agreed, so a NodeId is mapped to a master (for blocking, push, sync authorization and calls) only when that NodeId itself delivered a list of that master that lists it, over a connection QUIC authenticates. Lists from gossip or a link bundle are used to dial a user's devices, never to identify an incoming connection.
 
 Every signed byte string is a JSON array that starts with a type tag (`proscenium/<type>/2`), so a signature made for one message type does not verify as another. Post ids are a SHA-256 hash over the post's other fields, including the author. Profiles carry a signed `updated_at`; an older profile does not replace a newer one.
 
@@ -36,9 +36,9 @@ Every signed byte string is a JSON array that starts with a type tag (`prosceniu
 All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
 
 - **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and Stage announcements. A message is stored only if the topic owner is its author and signed it.
-- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to the user's other devices and to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
-- **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows.
-- **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is checked before download; blobs over 50 MiB are rejected. Media over 10 MiB is fetched only after a click.
+- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to the user's other devices and to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends its signed device list, counts and a digest of the post ids it holds, and the earliest timestamp it stores (`since`); the responder considers only content at or after `since`. One sync per NodeId is served at a time, for at most 5 minutes. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
+- **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows, and a Private node only from a mutual.
+- **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is proven by the provider before download; blobs over 50 MiB are rejected. Media and avatars load without a click only if the declared size and the proven size are at most 10 MiB.
 - **DM** -- End-to-end encrypted direct messages. See "Direct Messaging".
 - **Call** -- 1:1 voice calls. Opus at 48 kHz mono in 20 ms frames over a QUIC bi-stream. Signaling travels as DMs. The audio connection is accepted only after the local user accepted the call, and both sides prove knowledge of the call id before audio starts.
 - **Stage** -- Live audio rooms. See "Stage (Live Audio Rooms)".
@@ -52,7 +52,7 @@ All data is persisted in a local SQLite database. The app works offline and sync
 - Create and delete posts (text + media attachments)
 - Likes, reposts, and replies with real-time interaction counts
 - Follow/unfollow users by Node ID, with the expected identity checked
-- Follow requests for Listed and Private profiles. A Private user approves requests from users they follow, then sends a follow request back, so two Private users who follow each other become mutuals in either order.
+- Follow requests for Listed and Private profiles. A Private user approves requests from users they follow, then sends a follow request back, so two Private users who follow each other become mutuals in either order. A node returns a Listed or Private profile only to approved followers (Private: mutuals) and the user's other devices. At most 500 pending requests are kept; a new request replaces the oldest.
 - View user profiles with their post history and media filters
 - Profile page with your own post history
 - Thread view with inline reply composer
@@ -178,6 +178,7 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 - Network change detection does not work natively on Android with iroh -- the app polls `endpoint.network_change()` every 30 seconds to keep connectivity alive
 - QR code scanning uses `tauri-plugin-barcode-scanner` which requires the CAMERA permission (declared in the manifest)
 - Deep links use the `proscenium://` scheme
+- App data, which holds the master and transport keys, is excluded from cloud backup and device-to-device transfer (`android:allowBackup="false"` and `res/xml/data_extraction_rules.xml`)
 
 ## Discovery Server
 
@@ -209,7 +210,7 @@ The server speaks plain HTTP/1. Terminate TLS in a reverse proxy and set `trust_
 DEPLOY_HOST=user@host DEPLOY_HEALTH_URL=https://example.org/api/v1/info scripts/deploy-server.sh
 ```
 
-Builds a static musl binary, uploads it to a temporary directory on the host, verifies its checksum, replaces the binary, restarts the systemd service, and restores the previous binary if the health check fails. Optional: `DEPLOY_SSH_KEY`, `DEPLOY_DIR`, `DEPLOY_SERVICE`.
+Builds a static musl binary, uploads it to a temporary directory on the host, verifies its checksum, stops the systemd service, copies the database files, replaces the binary and starts the service. If the service does not start or the health check fails, the previous binary and the copied database are restored. Optional: `DEPLOY_SSH_KEY`, `DEPLOY_DIR`, `DEPLOY_DATA_DIR` (default `$DEPLOY_DIR/data`), `DEPLOY_SERVICE`.
 
 ### API
 
@@ -232,7 +233,7 @@ Signed requests are rejected if the timestamp is more than 5 minutes from the se
 
 ### Registration Visibility
 
-- **Public** -- Profile and posts are stored and served.
+- **Public** -- Profile and posts are stored and served. At `max_posts_per_user` the newest posts are kept: the server requests only posts at or after its oldest kept post and its retention floor. Signed deletions of posts and interactions are kept, so a replayed original is not stored again.
 - **Listed** -- Profile is in the directory; posts are not stored.
 - **Private** -- Rejected. A Private profile received later removes the registration.
 
@@ -286,18 +287,19 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 - **Control plane**: iroh-gossip on a per-room topic. Signatures cover the stage id and a timestamp that must increase per signer.
 - **Audio plane**: speakers stream Opus to the host. The host accepts a speaker connection only from the NodeId of a participant with a speaking role, mixes the streams and fans the mix out to listeners. Speakers receive individual forwarded streams.
 - **Relays**: a speaker or co-host can relay the mixed stream to additional listeners.
-- **Stream authentication**: a SHA-256 hash chain over frames with signed checkpoints that cover the stage id and a sequence number. A listener stops playback from a source that sends too many frames without a verifiable checkpoint, and does not return to a relay that failed verification.
+- **Stream authentication**: a SHA-256 hash chain over frames with a checkpoint every 10 frames (200 ms), signed over the stage id, a sequence number and the host time. A listener plays a frame only after a checkpoint that extends a verified chain covers it, so frames after a sequence gap are not played until the chain is verified again; this adds up to 200 ms of delay. A checkpoint more than 60 s from the listener's clock, with an earlier time than the previous one, or below a sequence already verified is rejected as a replay. A listener stops playback from a source that sends too many frames without a verifiable checkpoint, and does not return to a relay that failed verification or answered with the ban code.
 - **Moderation**: hand raising, promote and demote, host mute, kick, ban, in-room chat. Demotion stops the speaker's capture.
+- **Admission**: when the participant or sender table is full, a newcomer replaces the least recently seen entry that has no speaking role and no audio connection. The host keeps 16 of its 80 listener connections for identities with a speaking role (relays).
 - **Announcements**: signed by the host and broadcast on the host's feed topic.
 
 ## Linked Devices
 
 Several devices can share one identity.
 
-- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device dials that NodeId, so QUIC authenticates the existing device, and sends the secret and its device name. The existing device compares the secret in constant time, sends the link bundle, and registers the NodeId of the connection as the new device after the new device reported that it stored the bundle.
-- **Bundle**: the master key, the signed device list, profile, follows, moderation entries, bookmarks and the device lists of followed users. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog. The new device keeps its transport key.
+- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device generates a new transport key, dials that NodeId, so QUIC authenticates the existing device, and sends the secret, the NodeId of the new key and its device name. The existing device compares the secret in constant time, sends the link bundle, and registers that NodeId as the new device after the new device reported that it stored the bundle.
+- **Bundle**: the master key, the signed device list, profile, follows, moderation entries, bookmarks and the device lists of followed users. Linking replaces the identity, the transport key and all local data of the new device, after confirmation in a native dialog.
 - **Keys**: every device holds the master key and its own random transport key. A device cannot be removed from the identity.
-- **Device sync**: each side sends its device list signed by the master key, and the other side continues only if the list is signed by its own master key and contains the NodeId of the connection. Both sides store the devices of the other's list. Devices exchange follows, moderation entries and bookmarks (last writer wins), direct messages (by id, among the newest 50,000) and deletions of own interactions. After that, each side fetches the other's own posts, interactions and post deletions with the sync protocol; a device serves that sync to its other devices whatever its visibility.
+- **Device sync**: each side sends its device list signed by the master key, and the other side continues only if the list is signed by its own master key and contains the NodeId of the connection. Both sides store the devices of the other's list. Devices exchange follows with the device lists of the followed users, moderation entries, bookmarks and follow requests (last writer wins; for a follow request, the later approval or denial), direct messages (by id, among the newest 50,000) and deletions of own interactions. After that, each side fetches the other's own posts, interactions and post deletions with the sync protocol; a device serves that sync to its other devices whatever its visibility.
 - **Not replicated**: read state of direct messages.
 
 ## Recommended IDE Setup

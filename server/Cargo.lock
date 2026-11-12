@@ -2790,11 +2790,12 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.40"
+version = "0.2.41"
 dependencies = [
  "hex",
  "iroh",

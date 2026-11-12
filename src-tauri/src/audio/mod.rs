@@ -11,7 +11,7 @@ pub use capture::SharedCapture;
 pub use codec::{FRAME_SIZE, OpusDecoder, OpusEncoder, SAMPLES_PER_FRAME};
 pub use device::lock;
 pub use mic::{MicConfig, PCM_CHANNEL_CAPACITY, spawn_mic_thread};
-pub use playback::{AudioPlayback, SharedPlayback};
+pub use playback::{AudioPlayback, PLAYBACK_CAPACITY_FRAMES, SharedPlayback};
 pub use transport::{TAG_CHECKPOINT, TAG_NORMAL, WireFrame, read_audio_frame, write_audio_frame};
 
 use capture::device_name;

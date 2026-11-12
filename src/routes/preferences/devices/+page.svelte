@@ -42,7 +42,8 @@
       linkPayload = await invoke<LinkQrPayload>("start_device_link");
       showLinkQr = true;
     } catch (e) {
-      error = `Failed to start link: ${e}`;
+      // "cancelled": the native confirmation was declined.
+      if (String(e) !== "cancelled") error = `Failed to start link: ${e}`;
     }
   }
 
@@ -101,7 +102,7 @@
   onMount(() => {
     loadDevices();
 
-    return useEventListeners({
+    const unlisten = useEventListeners({
       "device-link-progress": (payload) => {
         if (payload === "bundle_sent") {
           showLinkQr = false;
@@ -111,6 +112,11 @@
         }
       },
     });
+    return () => {
+      unlisten();
+      // A link code shown on this page stops being accepted when the page is left.
+      if (linkPayload) invoke("cancel_device_link").catch(() => {});
+    };
   });
 </script>
 

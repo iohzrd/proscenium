@@ -118,6 +118,38 @@ impl Storage {
         Ok(())
     }
 
+    /// Record that the server `url` accepted the own profile with `updated_at`.
+    pub async fn mark_server_profile_synced(
+        &self,
+        url: &str,
+        updated_at: u64,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE servers SET profile_synced_at = MAX(profile_synced_at, ?2) WHERE url = ?1",
+        )
+        .bind(url)
+        .bind(i64::try_from(updated_at).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// URLs of the servers the local user is registered with that have not accepted the
+    /// own profile with `updated_at`.
+    pub async fn get_servers_without_profile(
+        &self,
+        updated_at: u64,
+    ) -> Result<Vec<String>, AppError> {
+        let urls = sqlx::query_scalar(
+            "SELECT url FROM servers
+             WHERE registered_at IS NOT NULL AND profile_synced_at < ?1 ORDER BY url",
+        )
+        .bind(i64::try_from(updated_at).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(urls)
+    }
+
     /// Record that the local user is not registered with the server.
     /// Returns an error if no row has this URL.
     pub async fn mark_server_unregistered(&self, url: &str) -> Result<(), AppError> {

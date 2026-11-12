@@ -656,9 +656,33 @@ async fn post_and_interaction_limits_per_user() {
         }
     );
     assert_eq!(post_count(&storage, pk).await, 3);
-    // At the limit, a further call stores nothing.
+    // The newest posts are kept.
+    for (i, post) in posts.iter().enumerate() {
+        let kept = storage.get_post(pk, &post.id).await.unwrap().is_some();
+        assert_eq!(kept, i >= 2, "post {i}");
+    }
+    // At the limit, older posts are not stored again.
     let stored = storage.insert_posts(pk, &posts, 3).await.unwrap();
     assert_eq!(stored.stored, 0);
+    // A newer post replaces the oldest one.
+    let newer = user.post("post 5", 105);
+    let stored = storage
+        .insert_posts(pk, std::slice::from_ref(&newer), 3)
+        .await
+        .unwrap();
+    assert_eq!(stored.stored, 1);
+    assert!(storage.get_post(pk, &posts[2].id).await.unwrap().is_none());
+    // At the limit, the cursor requests no post older than the oldest kept one, nor one
+    // older than the retention floor.
+    let cursor = storage.get_sync_cursor(pk, 0, 3).await.unwrap();
+    assert_eq!(cursor.since, 103);
+    assert_eq!(
+        cursor.post_ids,
+        vec![newer.id.clone(), posts[4].id.clone(), posts[3].id.clone()]
+    );
+    let cursor = storage.get_sync_cursor(pk, 104, 3).await.unwrap();
+    assert_eq!(cursor.since, 104);
+    assert_eq!(cursor.post_ids, vec![newer.id.clone(), posts[4].id.clone()]);
 
     let target = posts.first().unwrap();
     let likes: Vec<Interaction> = (0..4).map(|n| user.like(target, n, 100)).collect();
@@ -670,6 +694,36 @@ async fn post_and_interaction_limits_per_user() {
             over_limit: 2
         }
     );
+}
+
+#[tokio::test]
+async fn deleted_interaction_is_not_stored_again() {
+    let storage = storage().await;
+    let user = TestUser::new(1);
+    let pk = &user.master_pubkey;
+    register(&storage, &user, 1_000, Visibility::Public)
+        .await
+        .unwrap();
+    let target = user.post("target", 100);
+    storage
+        .insert_posts(pk, std::slice::from_ref(&target), 100)
+        .await
+        .unwrap();
+    let like = user.like(&target, 0, 100);
+    let other = user.like(&target, 1, 100);
+    storage
+        .insert_interactions(pk, std::slice::from_ref(&like), 100)
+        .await
+        .unwrap();
+
+    assert!(storage.delete_interaction(&like.id, pk).await.unwrap());
+    // The signed original is sent again, for example by a sync or a gossip relay.
+    let stored = storage
+        .insert_interactions(pk, &[like.clone(), other], 100)
+        .await
+        .unwrap();
+    assert_eq!(stored.stored, 1);
+    assert!(!storage.delete_interaction(&like.id, pk).await.unwrap());
 }
 
 #[tokio::test]
@@ -706,7 +760,7 @@ async fn tombstone_deletes_post_and_blocks_reinsertion() {
         storage.apply_tombstones(pk, &[&deleted.id]).await.unwrap(),
         0
     );
-    let cursor = storage.get_sync_cursor(pk).await.unwrap();
+    let cursor = storage.get_sync_cursor(pk, 0, u32::MAX).await.unwrap();
     assert_eq!(cursor.tombstone_count, 1);
     assert_eq!(cursor.post_ids, vec![kept.id.clone()]);
 
@@ -754,7 +808,7 @@ async fn sync_cursor_reports_stored_rows() {
         .await
         .unwrap();
 
-    let empty = storage.get_sync_cursor(pk).await.unwrap();
+    let empty = storage.get_sync_cursor(pk, 0, u32::MAX).await.unwrap();
     assert!(empty.post_ids.is_empty());
     assert_eq!(empty.newest_post_timestamp, 0);
     assert_eq!(empty.interaction_count, 0);
@@ -775,7 +829,7 @@ async fn sync_cursor_reports_stored_rows() {
         .await
         .unwrap();
 
-    let cursor = storage.get_sync_cursor(pk).await.unwrap();
+    let cursor = storage.get_sync_cursor(pk, 0, u32::MAX).await.unwrap();
     assert_eq!(cursor.post_ids, vec![newer.id, older.id]);
     assert_eq!(cursor.newest_post_timestamp, 200);
     assert_eq!(cursor.interaction_count, 2);
@@ -806,7 +860,11 @@ async fn prune_deletes_old_posts_and_interactions() {
     assert!(storage.get_post(pk, &old.id).await.unwrap().is_none());
     assert!(storage.get_post(pk, &new.id).await.unwrap().is_some());
     assert_eq!(
-        storage.get_sync_cursor(pk).await.unwrap().interaction_count,
+        storage
+            .get_sync_cursor(pk, 0, u32::MAX)
+            .await
+            .unwrap()
+            .interaction_count,
         1
     );
     // The deleted post is also removed from the full-text index.

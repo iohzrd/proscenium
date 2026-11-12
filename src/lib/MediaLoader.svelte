@@ -44,7 +44,11 @@
   // result only while its own value is still the latest.
   let generation = 0;
 
-  function run(fetchUrl: () => Promise<string>) {
+  /** A failure shows `onFailure`: "idle" offers the click-to-load button. */
+  function run(
+    fetchUrl: () => Promise<string>,
+    onFailure: "error" | "idle" = "error",
+  ) {
     const current = ++generation;
     load = { status: "loading" };
     fetchUrl().then(
@@ -53,13 +57,18 @@
       },
       (e) => {
         console.error("Failed to load attachment:", e);
-        if (current === generation) load = { status: "error" };
+        if (current === generation) load = { status: onFailure };
       },
     );
   }
 
   function fetchCached() {
     run(() => blobs.getBlobUrl(att));
+  }
+
+  /** Without a click: a blob larger than its declared size is not downloaded. */
+  function fetchAutomatically() {
+    run(() => blobs.getBlobUrl(att, true), "idle");
   }
 
   function refetch() {
@@ -76,7 +85,7 @@
     const start = autoFetch;
     untrack(() => {
       if (start) {
-        fetchCached();
+        fetchAutomatically();
       } else {
         generation++;
         load = { status: "idle" };

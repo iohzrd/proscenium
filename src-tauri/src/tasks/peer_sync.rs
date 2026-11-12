@@ -175,12 +175,11 @@ async fn wait_for_relay(state: &AppState) {
 }
 
 async fn sync_one(state: Arc<AppState>, pubkey: &str, label: &str) {
-    let my_id = state.identity.read().await.master_pubkey.clone();
     match crate::sync::sync_one_peer(
         &state.endpoint(),
         &state.storage,
+        &state.identity,
         pubkey,
-        &my_id,
         &state.app_handle,
         label,
     )

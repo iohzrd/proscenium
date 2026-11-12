@@ -11,6 +11,7 @@ mod incoming;
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
+use crate::util::NodeSlot;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::Connection,
@@ -20,11 +21,12 @@ use proscenium_types::{
     DM_ALPN, DirectMessage, DmEnvelope, MAX_ANNOUNCEMENT_JSON_LEN, is_valid_id, short_id,
     validate_media_list,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tauri::AppHandle;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 
 /// Maximum byte length of `DirectMessage.content`.
 pub(crate) const MAX_DM_CONTENT_LEN: usize = 10_000;
@@ -42,6 +44,10 @@ const MAX_DM_CIPHERTEXT_LEN: usize = MAX_DM_PAYLOAD_LEN + 16;
 /// `MAX_DM_CIPHERTEXT_LEN` bytes in hex, and a device list of at most
 /// `MAX_ANNOUNCEMENT_JSON_LEN` bytes. The other fields take under 1 KiB.
 const MAX_DM_FRAME_LEN: usize = 2 * MAX_DM_CIPHERTEXT_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
+
+/// Incoming DM connections handled at the same time, in total and per remote NodeId.
+const DM_MAX_CONNECTIONS: usize = 64;
+const DM_MAX_CONNECTIONS_PER_NODE: usize = 4;
 
 /// Maximum byte length of the answer the sender reads (a `DmAck`).
 const MAX_DM_ANSWER_LEN: usize = 64;
@@ -84,6 +90,10 @@ pub struct DmHandler {
     /// retry delay has not elapsed.
     outbox_ignore_delay: Arc<AtomicBool>,
     pub(crate) call_signal_tx: mpsc::UnboundedSender<CallSignal>,
+    /// Limits the incoming connections handled at the same time.
+    connection_limit: Arc<Semaphore>,
+    /// Incoming connections currently handled per remote NodeId.
+    connections_per_node: Arc<StdMutex<HashMap<EndpointId, usize>>>,
 }
 
 impl std::fmt::Debug for DmHandler {
@@ -108,6 +118,8 @@ impl DmHandler {
             outbox_notify: Arc::new(Notify::new()),
             outbox_ignore_delay: Arc::new(AtomicBool::new(false)),
             call_signal_tx,
+            connection_limit: Arc::new(Semaphore::new(DM_MAX_CONNECTIONS)),
+            connections_per_node: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -235,12 +247,30 @@ pub(crate) fn validate_direct_message(message: &DirectMessage) -> Result<(), Str
 }
 
 impl ProtocolHandler for DmHandler {
+    /// Serve one incoming envelope. At most `DM_MAX_CONNECTIONS` connections are handled at
+    /// once, and `DM_MAX_CONNECTIONS_PER_NODE` per remote NodeId; others are closed.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
         log::debug!(
             "[dm] incoming connection from {}",
             short_id(&remote.to_string())
         );
+        let Ok(_permit) = self.connection_limit.clone().try_acquire_owned() else {
+            conn.close(1u32.into(), b"busy");
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "DM connection limit reached",
+            )));
+        };
+        let Some(_node_slot) = NodeSlot::acquire(
+            &self.connections_per_node,
+            remote,
+            DM_MAX_CONNECTIONS_PER_NODE,
+        ) else {
+            conn.close(1u32.into(), b"busy");
+            return Err(AcceptError::from_err(std::io::Error::other(
+                "per-node DM connection limit reached",
+            )));
+        };
         match self.serve(&conn, remote).await {
             Ok(()) => Ok(()),
             Err(e) => {

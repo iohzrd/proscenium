@@ -243,6 +243,17 @@ impl super::GossipService {
         Ok(())
     }
 
+    /// Open the own feed topic if the stored visibility is Public, and close it otherwise.
+    /// Used after a profile from another device of the user was stored.
+    pub async fn apply_stored_visibility(&self) -> Result<(), AppError> {
+        if self.my_visibility().await? == Visibility::Public {
+            self.start_own_feed_unconditional().await
+        } else {
+            self.stop_own_feed().await;
+            Ok(())
+        }
+    }
+
     /// Open the own feed topic if the local user's visibility is Public.
     /// Returns an error, and opens nothing, if the visibility cannot be read.
     pub async fn start_own_feed(&self) -> Result<(), AppError> {

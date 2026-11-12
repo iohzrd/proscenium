@@ -175,6 +175,8 @@ impl Storage {
             .await?;
         self.merge_moderation_lww(&bundle.moderation).await?;
         self.merge_bookmarks_lww(&bundle.bookmarks).await?;
+        self.merge_follow_requests(master_pubkey, &bundle.follow_requests)
+            .await?;
 
         let followed: HashSet<&str> = bundle
             .follows
@@ -193,7 +195,7 @@ impl Storage {
                 );
                 continue;
             }
-            if let Err(e) = self.cache_peer_announcement(announcement).await {
+            if let Err(e) = self.cache_peer_announcement(announcement, None).await {
                 log::warn!(
                     "[link] announcement of {} in bundle not stored: {e}",
                     short_id(&announcement.master_pubkey)

@@ -56,13 +56,8 @@ pub async fn save_my_profile(
     sign_profile(&mut profile, &node_id, &master_key);
 
     let old_visibility = state.storage.get_visibility(&node_id).await?;
-
-    if old_visibility != new_visibility {
-        state
-            .gossip()
-            .handle_visibility_change(old_visibility, new_visibility, &profile)
-            .await?;
-        log::info!("[profile] visibility transition: {old_visibility} -> {new_visibility}");
+    if old_visibility == Visibility::Public && new_visibility != Visibility::Public {
+        state.gossip().leave_public(&profile).await?;
     }
 
     if !state.storage.save_profile(&node_id, &profile).await? {
@@ -70,6 +65,7 @@ pub async fn save_my_profile(
     }
     log::info!("[profile] saved profile: {display_name} (visibility={new_visibility})");
 
+    state.gossip().apply_stored_visibility().await?;
     state.gossip().broadcast_profile(&profile).await?;
 
     if let Ok(servers) = state.storage.get_servers().await {

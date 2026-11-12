@@ -46,6 +46,12 @@
     Enter your 24-word recovery phrase to restore your identity on this device.
     This replaces the identity and deletes all data stored on this device.
   </p>
+  <p class="desc">
+    Use recovery when your other devices are lost. The recovered device
+    announces itself as your only device, so others stop reaching your other
+    devices. To add a device while you still have one, link it from Linked
+    Devices instead.
+  </p>
 
   <label class="field">
     <span class="field-label">Recovery Phrase</span>

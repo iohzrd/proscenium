@@ -318,11 +318,14 @@ pub async fn add_blob_from_path(
 ///
 /// A complete local copy is returned without network access. Otherwise the blob is
 /// downloaded from the node in the ticket into the local store, after that node proved
-/// that its size is at most `MAX_BLOB_SIZE`.
+/// that its size is at most `max_size` (if given) and at most `MAX_BLOB_SIZE`. The
+/// webview passes `max_size` for downloads that start without a click, because the size
+/// declared in an attachment is not verified.
 #[tauri::command]
 pub async fn fetch_blob_bytes(
     state: State<'_, Arc<AppState>>,
     ticket: String,
+    max_size: Option<u64>,
 ) -> CmdResult<Response> {
     let ticket = parse_ticket(&ticket)?;
     let hash = ticket.hash();
@@ -330,8 +333,8 @@ pub async fn fetch_blob_bytes(
         return Ok(Response::new(bytes));
     }
     log::info!("[blob] fetching {hash} from remote...");
-    let (conn, size) =
-        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
+    let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
+    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit).await?;
     download_to_store(state.blobs().remote(), conn, hash, size).await?;
     let bytes = read_local_blob(&state.blob_store(), hash)
         .await?

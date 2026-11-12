@@ -1,5 +1,6 @@
 <script lang="ts" module>
   import { invoke } from "@tauri-apps/api/core";
+  import { AUTO_FETCH_MAX_BYTES } from "#lib/blobs.ts";
   import { detectImageMime } from "#lib/utils.ts";
 
   /** A ticket whose fetch failed is not fetched again for this long. */
@@ -52,7 +53,11 @@
     if (failed !== undefined && Date.now() - failed < RETRY_AFTER_MS) {
       return Promise.reject(new Error("avatar fetch failed recently"));
     }
-    const request = invoke<ArrayBuffer>("fetch_blob_bytes", { ticket })
+    // Avatars load without a click.
+    const request = invoke<ArrayBuffer>("fetch_blob_bytes", {
+      ticket,
+      maxSize: AUTO_FETCH_MAX_BYTES,
+    })
       .then((buffer) => {
         const data = new Uint8Array(buffer);
         // The Blob type comes from the leading bytes, never from the peer.

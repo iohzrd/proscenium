@@ -16,8 +16,15 @@
     UserSearchResponse,
     PostSearchResponse,
     SocialGraphEntry,
+    FollowOutcome,
   } from "#lib/types.ts";
-  import { dedupeBy, dedupeById, isPubkeyFormat, shortId } from "#lib/utils.ts";
+  import {
+    dedupeBy,
+    dedupeById,
+    followRequestNotice,
+    isPubkeyFormat,
+    shortId,
+  } from "#lib/utils.ts";
 
   type Tab = "users" | "posts" | "trending";
 
@@ -77,15 +84,23 @@
     }
   }
 
+  // Number of the latest request per result list. A response to an older
+  // request is not applied, so a slow earlier search cannot replace a later one.
+  const latestRequest = { users: 0, posts: 0 };
+
   async function searchRequest<T>(
+    list: keyof typeof latestRequest,
     failure: string,
     request: (url: string) => Promise<T>,
     apply: (result: T) => void,
   ) {
+    const id = ++latestRequest[list];
     activeSearches += 1;
     searching = true;
     try {
-      await withServer(failure, request, apply);
+      await withServer(failure, request, (result) => {
+        if (id === latestRequest[list]) apply(result);
+      });
     } finally {
       activeSearches -= 1;
       searching = activeSearches > 0;
@@ -98,6 +113,7 @@
 
   function loadUsers() {
     return searchRequest(
+      "users",
       "Failed to load users",
       (url) =>
         invoke<UserSearchResponse>("server_list_users", { url, limit: 50 }),
@@ -109,6 +125,7 @@
     if (!activeServer) return;
     if (users.length === 0) await loadUsers();
     await searchRequest(
+      "posts",
       "Failed to load posts",
       (url) =>
         invoke<{ posts: ServerSearchPost[] }>("server_get_feed", {
@@ -139,6 +156,7 @@
     if (!activeServer || !query) return;
     if (activeTab === "users") {
       await searchRequest(
+        "users",
         "Search failed",
         (url) =>
           invoke<UserSearchResponse>("server_search_users", {
@@ -150,6 +168,7 @@
       );
     } else if (activeTab === "posts") {
       await searchRequest(
+        "posts",
         "Search failed",
         (url) =>
           invoke<PostSearchResponse>("server_search_posts", {
@@ -202,11 +221,15 @@
       return;
     }
     // `follow_user` fails if the node reports a master pubkey other than `pubkey`.
-    const followed: string = await invoke("follow_user", {
+    const outcome: FollowOutcome = await invoke("follow_user", {
       nodeId,
       expectedPubkey: pubkey,
     });
-    followedPubkeys = new Set([...followedPubkeys, followed]);
+    if (outcome !== "followed") {
+      toast.show(...followRequestNotice(outcome));
+      return;
+    }
+    followedPubkeys = new Set([...followedPubkeys, pubkey]);
   }
 
   async function toggleFollow(pubkey: string) {

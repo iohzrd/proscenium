@@ -7,9 +7,14 @@
   import PersonItem from "#lib/PersonItem.svelte";
   import ScannerModal from "#lib/ScannerModal.svelte";
   import { hapticImpact } from "#lib/haptics.ts";
-  import type { SocialGraphEntry, FollowRequestEntry } from "#lib/types.ts";
+  import type {
+    SocialGraphEntry,
+    FollowOutcome,
+    FollowRequestEntry,
+  } from "#lib/types.ts";
   import {
     dedupeBy,
+    followRequestNotice,
     getCachedDisplayName,
     isPubkeyFormat,
   } from "#lib/utils.ts";
@@ -169,7 +174,14 @@
     if (addingFollow) return false;
     addingFollow = true;
     try {
-      await invoke("follow_user", { nodeId, expectedPubkey });
+      const outcome: FollowOutcome = await invoke("follow_user", {
+        nodeId,
+        expectedPubkey,
+      });
+      if (outcome !== "followed") {
+        toast.show(...followRequestNotice(outcome));
+        return outcome === "pending";
+      }
       await loadFollows();
       hapticImpact("light");
       toast.show("Followed", "success");

@@ -196,7 +196,10 @@ impl IngestionManager {
         pubkey: &str,
         stats: &mut SyncStats,
     ) -> anyhow::Result<()> {
-        let cursor = self.storage.get_sync_cursor(pubkey).await?;
+        let cursor = self
+            .storage
+            .get_sync_cursor(pubkey, self.min_timestamp(), self.limits.max_posts_per_user)
+            .await?;
         let mut sorted_ids = cursor.post_ids.clone();
         let request = PeerRequest::Sync(SyncRequest {
             author: pubkey.to_string(),
@@ -206,6 +209,8 @@ impl IngestionManager {
             newest_interaction_timestamp: cursor.newest_interaction_timestamp,
             post_ids_digest: post_ids_digest(&mut sorted_ids),
             tombstone_count: cursor.tombstone_count,
+            since: cursor.since,
+            announcement: None,
         });
         let request_bytes = serde_json::to_vec(&request)?;
 

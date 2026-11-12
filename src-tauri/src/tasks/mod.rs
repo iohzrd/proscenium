@@ -1,5 +1,6 @@
 mod device_sync;
 mod peer_sync;
+mod server_profile;
 
 use crate::state::{AppState, SyncCommand};
 use std::sync::Arc;
@@ -10,5 +11,6 @@ use tokio::sync::mpsc;
 /// This function handles timer/external-command-driven cross-cutting tasks.
 pub fn spawn_all(state: Arc<AppState>, sync_rx: mpsc::Receiver<SyncCommand>) {
     peer_sync::spawn(state.clone(), sync_rx);
-    device_sync::spawn(state);
+    device_sync::spawn(state.clone());
+    server_profile::spawn(state);
 }

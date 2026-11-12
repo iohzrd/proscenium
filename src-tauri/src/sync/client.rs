@@ -6,6 +6,7 @@ use crate::constants::{
 use crate::error::AppError;
 use crate::framing::{read_frame_limited, read_to_end_timeout, write_all_timeout};
 use crate::ingest::verify_and_store_profile;
+use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use proscenium_types::{
@@ -17,13 +18,14 @@ use tauri::{AppHandle, Emitter};
 use tokio::time::Instant;
 
 /// Requester side of the sync protocol: fetch the content of `author` from the NodeId
-/// `target`, verifying and storing each frame when it arrives.
+/// `target`, verifying and storing each frame when it arrives. The request carries the
+/// local signed device list.
 ///
 /// Frames stored before an error or before `deadline` stay stored; the next sync
 /// continues from there. An error is returned only if no summary was received or the
 /// summary could not be used.
 ///
-/// If `author` is `my_id`, `target` is another device of the local user: the device list
+/// If `author` is the local user, `target` is another device of the local user: the device list
 /// and stage announcement of the summary are ignored (device sync exchanges device
 /// lists), and local interactions that `target` lacks are kept, because neither device
 /// holds the complete set.
@@ -34,14 +36,16 @@ use tokio::time::Instant;
 pub(super) async fn sync_from_peer(
     endpoint: &Endpoint,
     storage: &Storage,
+    identity: &SharedIdentity,
     target: EndpointId,
     author: &str,
-    my_id: &str,
     app_handle: &AppHandle,
     label: &str,
     deadline: Instant,
 ) -> Result<SyncOneResult, AppError> {
     let start = Instant::now();
+    let my_id = identity.read().await.master_pubkey.clone();
+    let my_devices = crate::announcement::build_own_announcement(storage, identity).await?;
     let conn = tokio::time::timeout(
         SYNC_CONNECT_TIMEOUT,
         endpoint.connect(EndpointAddr::from(target), PEER_ALPN),
@@ -73,6 +77,8 @@ pub(super) async fn sync_from_peer(
         newest_interaction_timestamp,
         post_ids_digest: ids_digest,
         tombstone_count,
+        since: 0,
+        announcement: Some(my_devices),
     });
     let request_bytes = serde_json::to_vec(&request)?;
 
@@ -91,7 +97,10 @@ pub(super) async fn sync_from_peer(
             log::warn!("[{label}] sync summary carries a device list of another user");
         } else if let Err(reason) = verify_linked_devices_announcement(announcement) {
             log::warn!("[{label}] invalid device announcement in sync summary: {reason}");
-        } else if let Err(e) = storage.cache_peer_announcement(announcement).await {
+        } else if let Err(e) = storage
+            .cache_peer_announcement(announcement, Some(&target.to_string()))
+            .await
+        {
             log::warn!("[{label}] rejected device announcement in sync summary: {e}");
         }
     }
@@ -141,7 +150,7 @@ pub(super) async fn sync_from_peer(
         storage,
         author,
         label,
-        my_id,
+        &my_id,
         app_handle,
         full_interaction_set,
     );

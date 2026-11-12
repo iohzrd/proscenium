@@ -243,7 +243,10 @@ pub fn sign_linked_devices_announcement(
 
 /// Verify a LinkedDevicesAnnouncement: the list holds 1 to `MAX_LINKED_DEVICES` devices,
 /// every NodeId is a canonical public key, every device name is at most
-/// `MAX_DEVICE_NAME_LEN` bytes, and the signature was made by `master_pubkey`.
+/// `MAX_DEVICE_NAME_LEN` bytes, the version (a creation time) is at most
+/// `MAX_TIMESTAMP_DRIFT_MS` after the local clock, so a device with a fast clock cannot
+/// publish a list that outranks every later one, and the signature was made by
+/// `master_pubkey`.
 ///
 /// Does not compare the version with previously stored values; the caller does that when
 /// it stores the announcement.
@@ -255,6 +258,11 @@ pub fn verify_linked_devices_announcement(
             "announcement lists {} devices (allowed 1..={MAX_LINKED_DEVICES})",
             announcement.devices.len()
         ));
+    }
+    if announcement.version
+        > crate::validation::now_millis().saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS)
+    {
+        return Err("announcement version is later than the local clock".to_string());
     }
     for device in &announcement.devices {
         if !is_valid_pubkey(&device.node_id) {
@@ -279,6 +287,8 @@ pub struct VerifiedIdentity {
     pub master_pubkey: String,
     pub announcement: LinkedDevicesAnnouncement,
     pub profile: Option<Profile>,
+    /// The NodeId that sent the response. `announcement` lists it.
+    pub node_id: String,
 }
 
 impl VerifiedIdentity {
@@ -322,6 +332,7 @@ pub fn verify_identity_response(
         master_pubkey,
         announcement: response.announcement,
         profile: response.profile,
+        node_id: remote_node_id.to_string(),
     })
 }
 
@@ -450,6 +461,70 @@ mod tests {
         assert!(verify_delete_interaction_signature(&id, &a.master_pubkey, &sig).is_err());
         let sig = sign_delete_interaction(&id, &a.master_pubkey, &a.key);
         assert!(verify_delete_interaction_signature(&id, &a.master_pubkey, &sig).is_ok());
+    }
+
+    #[test]
+    fn announcement_version_after_the_local_clock_is_rejected() {
+        let a = identity(1);
+        let mut list = announcement(&a, &[node_id(50)]);
+        list.version = crate::validation::now_millis();
+        sign_linked_devices_announcement(&mut list, &a.key);
+        assert!(verify_linked_devices_announcement(&list).is_ok());
+        list.version += crate::validation::MAX_TIMESTAMP_DRIFT_MS + 60_000;
+        sign_linked_devices_announcement(&mut list, &a.key);
+        assert!(verify_linked_devices_announcement(&list).is_err());
+    }
+
+    #[test]
+    fn stage_announcement_requires_a_matching_ticket_and_a_recent_start() {
+        use crate::protocol::{
+            MAX_STAGE_ANNOUNCEMENT_AGE_MS, sign_stage_announcement, verify_stage_announcement,
+        };
+        use crate::stage::StageTicket;
+        let host = identity(1);
+        let ticket = StageTicket {
+            stage_id: "ab".repeat(16),
+            host_pubkey: host.master_pubkey.clone(),
+            host_node_id: node_id(50),
+            title: "room".to_string(),
+        };
+        let check = |ticket: &StageTicket, title: &str, started_at: u64| {
+            let sig = sign_stage_announcement(
+                &ticket.stage_id,
+                title,
+                ticket,
+                &host.master_pubkey,
+                started_at,
+                &host.key,
+            );
+            verify_stage_announcement(
+                &ticket.stage_id,
+                title,
+                ticket,
+                &host.master_pubkey,
+                started_at,
+                &sig,
+            )
+        };
+        let now = crate::validation::now_millis();
+        assert!(check(&ticket, "room", now).is_ok());
+        // A title other than the ticket's, a start older than the limit or far ahead.
+        assert!(check(&ticket, "other", now).is_err());
+        assert!(check(&ticket, "room", now - MAX_STAGE_ANNOUNCEMENT_AGE_MS - 1).is_err());
+        assert!(
+            check(
+                &ticket,
+                "room",
+                now + crate::validation::MAX_TIMESTAMP_DRIFT_MS + 60_000
+            )
+            .is_err()
+        );
+        // A ticket of another host.
+        let foreign = StageTicket {
+            host_pubkey: identity(2).master_pubkey,
+            ..ticket.clone()
+        };
+        assert!(check(&foreign, "room", now).is_err());
     }
 
     #[test]

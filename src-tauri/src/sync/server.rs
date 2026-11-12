@@ -12,8 +12,9 @@ use iroh::{
     protocol::AcceptError,
 };
 use proscenium_types::{
-    MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, Post, StageAnnouncement, SyncFrame, SyncMode, SyncRequest,
-    SyncSummary, Visibility, is_valid_id, post_ids_digest, short_id, sign_stage_announcement,
+    LinkedDevicesAnnouncement, MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, Post, StageAnnouncement,
+    SyncFrame, SyncMode, SyncRequest, SyncSummary, Visibility, is_valid_id, post_ids_digest,
+    short_id, sign_stage_announcement, verify_linked_devices_announcement,
 };
 
 /// Byte limit of the JSON id list a requester sends in `NeedIdDiff` mode:
@@ -52,30 +53,35 @@ pub async fn handle_sync(
         return Err(reject("author is not served by this node"));
     }
 
-    authorize_requester(storage, &my_pubkey, remote_str).await?;
+    authorize_requester(storage, &my_pubkey, remote_str, req.announcement.as_ref()).await?;
 
     let map_err = |e: AppError| AcceptError::from_err(e);
 
-    // Local state for the requested author.
-    let id_timestamps = storage
+    // Local state for the requested author: posts and interactions with a timestamp at or
+    // after `req.since`, which is `timestamp > req.since - 1` (all for 0).
+    let lower = req.since.checked_sub(1);
+    let after = |newest: u64| lower.map_or(newest, |lower| newest.max(lower));
+    let mut id_timestamps = storage
         .get_post_ids_with_timestamps(&my_pubkey)
         .await
         .map_err(map_err)?;
+    id_timestamps.retain(|(_, timestamp)| *timestamp >= req.since);
     let server_post_count = id_timestamps.len() as u64;
-    let server_interaction_count = storage
-        .count_interactions_by_author(&my_pubkey)
-        .await
-        .map_err(map_err)?;
+    let server_interaction_count = match lower {
+        None => storage.count_interactions_by_author(&my_pubkey).await,
+        Some(lower) => storage.count_interactions_after(&my_pubkey, lower).await,
+    }
+    .map_err(map_err)?;
     let server_tombstone_count = storage
         .count_post_tombstones(&my_pubkey)
         .await
         .map_err(map_err)?;
     let posts_after_count = storage
-        .count_posts_after(&my_pubkey, req.newest_timestamp)
+        .count_posts_after(&my_pubkey, after(req.newest_timestamp))
         .await
         .map_err(map_err)?;
     let interactions_after_count = storage
-        .count_interactions_after(&my_pubkey, req.newest_interaction_timestamp)
+        .count_interactions_after(&my_pubkey, after(req.newest_interaction_timestamp))
         .await
         .map_err(map_err)?;
 
@@ -145,10 +151,14 @@ pub async fn handle_sync(
             if known_ids.len() > MAX_SYNC_IDS || !known_ids.iter().all(|id| is_valid_id(id)) {
                 return Err(reject("invalid post id list"));
             }
-            storage
+            let wanted: std::collections::HashSet<&str> =
+                id_timestamps.iter().map(|(id, _)| id.as_str()).collect();
+            let mut missing = storage
                 .get_missing_post_ids(&my_pubkey, &known_ids)
                 .await
-                .map_err(map_err)?
+                .map_err(map_err)?;
+            missing.retain(|id| wanted.contains(id.as_str()));
+            missing
         }
         _ => id_timestamps
             .iter()
@@ -194,19 +204,27 @@ pub async fn handle_sync(
         );
         let mut offset = 0usize;
         loop {
-            let batch = if only_newer {
-                storage
-                    .get_interactions_after(
-                        &my_pubkey,
-                        req.newest_interaction_timestamp,
-                        BATCH_SIZE,
-                        offset,
-                    )
-                    .await
-            } else {
-                storage
-                    .get_interactions_paged(&my_pubkey, BATCH_SIZE, offset)
-                    .await
+            let batch = match (only_newer, lower) {
+                (false, None) => {
+                    storage
+                        .get_interactions_paged(&my_pubkey, BATCH_SIZE, offset)
+                        .await
+                }
+                (false, Some(lower)) => {
+                    storage
+                        .get_interactions_after(&my_pubkey, lower, BATCH_SIZE, offset)
+                        .await
+                }
+                (true, _) => {
+                    storage
+                        .get_interactions_after(
+                            &my_pubkey,
+                            after(req.newest_interaction_timestamp),
+                            BATCH_SIZE,
+                            offset,
+                        )
+                        .await
+                }
             }
             .map_err(map_err)?;
             if batch.is_empty() {
@@ -270,11 +288,15 @@ fn select_mode(
 /// the local visibility allows it to sync.
 ///
 /// Public: anyone. Listed: approved followers. Private: approved followers that the local
-/// user follows. A failed device, visibility or follower lookup rejects the request.
+/// user follows. The requester is the master of `announcement` if that list verifies and
+/// lists `remote_str`, which QUIC authenticates; otherwise the master that `remote_str` is
+/// mapped to. The list is cached only for an allowed requester, so unknown requesters do
+/// not add rows. A failed device, visibility or follower lookup rejects the request.
 async fn authorize_requester(
     storage: &Storage,
     my_pubkey: &str,
     remote_str: &str,
+    announcement: Option<&LinkedDevicesAnnouncement>,
 ) -> Result<(), AcceptError> {
     if storage
         .is_other_device(remote_str)
@@ -290,16 +312,27 @@ async fn authorize_requester(
     if visibility == Visibility::Public {
         return Ok(());
     }
-    let Some(remote_pubkey) = storage
-        .try_get_master_pubkey_for_transport(remote_str)
-        .await
-        .map_err(AcceptError::from_err)?
-    else {
-        log::warn!(
-            "[sync-server] rejecting unknown NodeId {} ({visibility} profile)",
-            short_id(remote_str)
-        );
-        return Err(reject("not authorized"));
+    let presented = announcement.filter(|a| {
+        a.master_pubkey != my_pubkey
+            && a.devices.iter().any(|d| d.node_id == remote_str)
+            && verify_linked_devices_announcement(a).is_ok()
+    });
+    let remote_pubkey = match presented {
+        Some(a) => a.master_pubkey.clone(),
+        None => match storage
+            .try_get_master_pubkey_for_transport(remote_str)
+            .await
+            .map_err(AcceptError::from_err)?
+        {
+            Some(pubkey) => pubkey,
+            None => {
+                log::warn!(
+                    "[sync-server] rejecting unknown NodeId {} ({visibility} profile)",
+                    short_id(remote_str)
+                );
+                return Err(reject("not authorized"));
+            }
+        },
     };
     let allowed = match visibility {
         Visibility::Private => storage.is_mutual(my_pubkey, &remote_pubkey).await,
@@ -312,6 +345,14 @@ async fn authorize_requester(
             short_id(&remote_pubkey)
         );
         return Err(reject("not authorized"));
+    }
+    if let Some(a) = presented
+        && let Err(e) = storage.cache_peer_announcement(a, Some(remote_str)).await
+    {
+        log::warn!(
+            "[sync-server] failed to store the device list of {}: {e}",
+            short_id(&remote_pubkey)
+        );
     }
     Ok(())
 }
@@ -397,14 +438,108 @@ mod tests {
             .unwrap();
 
         assert!(
-            authorize_requester(&storage, &me, &node_id(3))
+            authorize_requester(&storage, &me, &node_id(3), None)
                 .await
                 .is_ok()
         );
         // The local device row and an unknown NodeId are not other devices.
         for remote in [node_id(2), node_id(4)] {
-            assert!(authorize_requester(&storage, &me, &remote).await.is_err());
+            assert!(
+                authorize_requester(&storage, &me, &remote, None)
+                    .await
+                    .is_err()
+            );
         }
+    }
+
+    /// The device list `node_ids` of the identity with master seed `master`, signed.
+    fn device_list(master: u8, node_ids: &[String]) -> LinkedDevicesAnnouncement {
+        let key = SecretKey::from_bytes(&[master; 32]);
+        let mut announcement = LinkedDevicesAnnouncement {
+            master_pubkey: key.public().to_string(),
+            devices: node_ids
+                .iter()
+                .map(|node_id| proscenium_types::DeviceEntry {
+                    node_id: node_id.clone(),
+                    device_name: "Linux".to_string(),
+                    added_at: 1,
+                })
+                .collect(),
+            version: 1,
+            signature: String::new(),
+        };
+        proscenium_types::sign_linked_devices_announcement(&mut announcement, &key);
+        announcement
+    }
+
+    #[tokio::test]
+    async fn requester_of_a_private_profile_is_identified_by_its_presented_list() {
+        let storage = Storage::open_in_memory().await.unwrap();
+        let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let me = SecretKey::from_bytes(&[1u8; 32]).public().to_string();
+        let mutual = SecretKey::from_bytes(&[20u8; 32]).public().to_string();
+        let profile = Profile {
+            display_name: "me".to_string(),
+            bio: String::new(),
+            avatar_hash: None,
+            avatar_ticket: None,
+            visibility: Visibility::Private,
+            updated_at: 1,
+            signature: String::new(),
+        };
+        storage.save_profile(&me, &profile).await.unwrap();
+        storage
+            .merge_follows_lww(
+                &me,
+                &[proscenium_types::FollowEntry {
+                    pubkey: mutual.clone(),
+                    followed_at: 1,
+                    state: "active".to_string(),
+                    last_changed_at: 1,
+                }],
+            )
+            .await
+            .unwrap();
+        storage
+            .approve_follower_directly(&me, &mutual, 1, 1, u64::MAX)
+            .await
+            .unwrap();
+        assert!(storage.is_mutual(&me, &mutual).await.unwrap());
+
+        // A device of the mutual that presents the mutual's list is allowed and mapped.
+        let list = device_list(20, &[node_id(21), node_id(22)]);
+        assert!(
+            authorize_requester(&storage, &me, &node_id(22), Some(&list))
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            storage
+                .get_master_pubkey_for_transport(&node_id(22))
+                .await
+                .as_deref(),
+            Some(mutual.as_str())
+        );
+
+        // A list that does not name the requesting NodeId, and a stranger's list.
+        assert!(
+            authorize_requester(&storage, &me, &node_id(23), Some(&list))
+                .await
+                .is_err()
+        );
+        let stranger = device_list(30, &[node_id(31)]);
+        assert!(
+            authorize_requester(&storage, &me, &node_id(31), Some(&stranger))
+                .await
+                .is_err()
+        );
+        assert!(
+            storage
+                .get_peer_transport_node_ids(&stranger.master_pubkey)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn rows(posts: &[(&str, u64)]) -> Vec<(String, u64)> {
@@ -425,6 +560,8 @@ mod tests {
             newest_interaction_timestamp: 0,
             post_ids_digest: post_ids_digest(&mut ids),
             tombstone_count,
+            since: 0,
+            announcement: None,
         }
     }
 

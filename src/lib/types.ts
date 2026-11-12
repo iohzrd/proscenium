@@ -102,10 +102,12 @@ export interface FollowRequestEntry {
   status: "pending" | "approved" | "denied";
   created_at: number;
   expires_at: number;
+  /** When the request was approved or denied (Unix ms); 0 while pending. */
+  decided_at: number;
 }
 
-/** Result of `send_follow_request_to_peer`. */
-export type FollowRequestOutcome = "approved" | "denied" | "pending";
+/** Result of `follow_user`. */
+export type FollowOutcome = "followed" | "pending" | "denied";
 
 export interface SyncResult {
   posts: Post[];

@@ -23,8 +23,11 @@ pub const SYNC_MAX_INTERACTIONS_PER_RUN: usize = 100_000;
 pub const SYNC_RETURNED_POSTS_MAX: usize = 200;
 /// Tombstones per `Tombstones` frame sent by a responder.
 pub const SYNC_TOMBSTONE_BATCH: usize = 1_000;
-/// Sync requests served at the same time.
-pub const SYNC_SERVER_CONCURRENCY: usize = 2;
+/// Sync requests served at the same time, in total. One NodeId is served one at a time.
+pub const SYNC_SERVER_CONCURRENCY: usize = 4;
+/// Time limit for serving one sync request. A requester stops after `SYNC_PEER_TIMEOUT`
+/// too.
+pub const SYNC_SERVE_TIMEOUT: Duration = SYNC_PEER_TIMEOUT;
 
 // Peer protocol (accept side)
 /// Connections on the peer ALPN handled at the same time, in total and per remote NodeId.
@@ -40,6 +43,9 @@ pub const PEER_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 pub const PEER_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// Request body limits per request type.
 pub const PEER_MAX_SMALL_REQUEST_BYTES: usize = 2 * 1024;
+/// A sync request carries the requester's device list.
+pub const PEER_MAX_SYNC_REQUEST_BYTES: usize =
+    proscenium_types::MAX_ANNOUNCEMENT_JSON_LEN + PEER_MAX_SMALL_REQUEST_BYTES;
 pub const PEER_MAX_FOLLOW_REQUEST_BYTES: usize = 64 * 1024;
 pub const PEER_MAX_LINK_REQUEST_BYTES: usize = 1024;
 pub const PEER_MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
@@ -81,6 +87,10 @@ pub const DRIP_ACTIVE_INTERVAL: Duration = Duration::from_secs(60); // 1 min aft
 // Device sync task
 pub const DEVICE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(15);
 pub const DEVICE_SYNC_INTERVAL: Duration = Duration::from_secs(300); // 5 min
+pub const SERVER_PROFILE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(60);
+pub const SERVER_PROFILE_SYNC_INTERVAL: Duration = Duration::from_secs(600);
+/// Cached device lists of unrelated users older than this are deleted at startup.
+pub const PEER_ANNOUNCEMENT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 
 // DM outbox
 pub const OUTBOX_FLUSH_INTERVAL: Duration = Duration::from_secs(60);

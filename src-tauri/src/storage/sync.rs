@@ -54,25 +54,52 @@ impl Storage {
                 .await?;
             if removed.rows_affected() > 0 {
                 outcome.posts_removed += removed.rows_affected();
-                sqlx::query("DELETE FROM notifications WHERE post_id=?1 OR target_post_id=?1")
-                    .bind(&tombstone.id)
-                    .execute(&mut *tx)
-                    .await?;
+                Self::delete_post_dependents(&mut tx, &tombstone.id).await?;
             }
         }
         if outcome.tombstones_added > 0 {
-            sqlx::query(
-                "DELETE FROM post_tombstones WHERE author=?1 AND id NOT IN
-                    (SELECT id FROM post_tombstones WHERE author=?1
-                     ORDER BY deleted_at DESC, id ASC LIMIT ?2)",
-            )
-            .bind(author)
-            .bind(MAX_SYNC_TOMBSTONES as i64)
-            .execute(&mut *tx)
-            .await?;
+            Self::trim_post_tombstones(&mut tx, author).await?;
         }
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// Store the signed deletion of the own post `(author, id)` in `tx`, keeping at most
+    /// `MAX_SYNC_TOMBSTONES` deletions of `author`.
+    pub(super) async fn insert_post_tombstone(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        author: &str,
+        id: &str,
+        signature: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO post_tombstones (author, id, signature, deleted_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(author)
+        .bind(id)
+        .bind(signature)
+        .bind(proscenium_types::now_millis() as i64)
+        .execute(&mut **tx)
+        .await?;
+        Self::trim_post_tombstones(tx, author).await
+    }
+
+    /// Keep the newest `MAX_SYNC_TOMBSTONES` deletions of `author`.
+    async fn trim_post_tombstones(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        author: &str,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "DELETE FROM post_tombstones WHERE author=?1 AND id NOT IN
+                (SELECT id FROM post_tombstones WHERE author=?1
+                 ORDER BY deleted_at DESC, id ASC LIMIT ?2)",
+        )
+        .bind(author)
+        .bind(MAX_SYNC_TOMBSTONES as i64)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     pub async fn is_post_tombstoned(&self, author: &str, id: &str) -> Result<bool, AppError> {

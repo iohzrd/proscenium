@@ -100,7 +100,9 @@ pub async fn unrepost(state: State<'_, Arc<AppState>>, target_post_id: String) -
     };
     let ids = state
         .storage
-        .delete_repost_by_target(&my_id, &target_post_id)
+        .delete_repost_by_target(&my_id, &target_post_id, |id| {
+            sign_delete_post(id, &my_id, &master_key)
+        })
         .await?;
     // Every deleted id is broadcast even if an earlier broadcast failed.
     let mut result = Ok(());
@@ -127,11 +129,11 @@ pub async fn delete_post(state: State<'_, Arc<AppState>>, id: String) -> CmdResu
         let ident = state.identity.read().await;
         (ident.master_pubkey.clone(), ident.master_key.clone())
     };
-    if !state.storage.delete_post(&my_id, &id).await? {
+    let signature = sign_delete_post(&id, &my_id, &master_key);
+    if !state.storage.delete_post(&my_id, &id, &signature).await? {
         return Err(format!("no post {id} by the local user").into());
     }
     log::info!("[post] deleted post {id}");
-    let signature = sign_delete_post(&id, &my_id, &master_key);
     state
         .gossip()
         .broadcast_delete(&id, &my_id, &signature)

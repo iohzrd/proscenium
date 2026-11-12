@@ -16,8 +16,6 @@ pub enum FollowRequestOutcome {
     Approved,
     /// The local user denied this requester and the denial has not expired.
     Denied,
-    /// No row was stored because `MAX_PENDING_FOLLOW_REQUESTS` pending rows exist.
-    Full,
 }
 
 /// Result of `approve_follower_directly`.
@@ -37,7 +35,10 @@ impl Storage {
     ///
     /// Runs in one write transaction. Pending and denied rows whose `expires_at` is not
     /// after `now` are deleted first. An approved or denied row is never changed, so a
-    /// denied requester stays denied until the denial expires.
+    /// denied requester stays denied until the denial expires. With
+    /// `MAX_PENDING_FOLLOW_REQUESTS` pending rows, the oldest pending row is deleted before
+    /// the new one is inserted, so requests from generated identities cannot block new
+    /// requests.
     pub async fn record_follow_request(
         &self,
         pubkey: &str,
@@ -68,20 +69,26 @@ impl Storage {
                 .fetch_one(&mut *tx)
                 .await?;
                 if pending as u64 >= MAX_PENDING_FOLLOW_REQUESTS {
-                    FollowRequestOutcome::Full
-                } else {
                     sqlx::query(
-                        "INSERT INTO follow_requests (pubkey, timestamp, status, created_at, expires_at)
-                         VALUES (?1, ?2, 'pending', ?3, ?4)",
+                        "DELETE FROM follow_requests WHERE pubkey = (
+                             SELECT pubkey FROM follow_requests WHERE status='pending'
+                             ORDER BY created_at ASC, pubkey ASC LIMIT 1
+                         )",
                     )
-                    .bind(pubkey)
-                    .bind(timestamp as i64)
-                    .bind(now as i64)
-                    .bind(expires_at as i64)
                     .execute(&mut *tx)
                     .await?;
-                    FollowRequestOutcome::NewPending
                 }
+                sqlx::query(
+                    "INSERT INTO follow_requests (pubkey, timestamp, status, created_at, expires_at)
+                     VALUES (?1, ?2, 'pending', ?3, ?4)",
+                )
+                .bind(pubkey)
+                .bind(timestamp as i64)
+                .bind(now as i64)
+                .bind(expires_at as i64)
+                .execute(&mut *tx)
+                .await?;
+                FollowRequestOutcome::NewPending
             }
         };
 
@@ -99,7 +106,7 @@ impl Storage {
     ) -> Result<bool, AppError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query(
-            "UPDATE follow_requests SET status='approved'
+            "UPDATE follow_requests SET status='approved', decided_at=?2
              WHERE pubkey=?1 AND status='pending' AND expires_at > ?2",
         )
         .bind(pubkey)
@@ -141,9 +148,11 @@ impl Storage {
             _ => DirectApproval::New,
         };
         sqlx::query(
-            "INSERT INTO follow_requests (pubkey, timestamp, status, created_at, expires_at)
-             VALUES (?1, ?2, 'approved', ?3, ?4)
-             ON CONFLICT(pubkey) DO UPDATE SET status='approved', timestamp=?2",
+            "INSERT INTO follow_requests
+                (pubkey, timestamp, status, created_at, expires_at, decided_at)
+             VALUES (?1, ?2, 'approved', ?3, ?4, ?3)
+             ON CONFLICT(pubkey) DO UPDATE SET status='approved', timestamp=?2,
+                decided_at=MAX(decided_at, ?3)",
         )
         .bind(pubkey)
         .bind(timestamp as i64)
@@ -159,7 +168,7 @@ impl Storage {
     /// Deny the pending, unexpired request of `pubkey`.
     pub async fn deny_follow_request(&self, pubkey: &str, now: u64) -> Result<bool, AppError> {
         let result = sqlx::query(
-            "UPDATE follow_requests SET status='denied'
+            "UPDATE follow_requests SET status='denied', decided_at=?2
              WHERE pubkey=?1 AND status='pending' AND expires_at > ?2",
         )
         .bind(pubkey)
@@ -172,7 +181,7 @@ impl Storage {
     /// All approved requests plus the pending and denied requests that have not expired.
     pub async fn get_follow_requests(&self, now: u64) -> Result<Vec<FollowRequestEntry>, AppError> {
         let rows = sqlx::query(
-            "SELECT pubkey, timestamp, status, created_at, expires_at
+            "SELECT pubkey, timestamp, status, created_at, expires_at, decided_at
              FROM follow_requests
              WHERE status='approved' OR expires_at > ?1
              ORDER BY created_at DESC, pubkey ASC",
@@ -188,6 +197,7 @@ impl Storage {
                 status: row.get(2),
                 created_at: row.get::<i64, _>(3) as u64,
                 expires_at: row.get::<i64, _>(4) as u64,
+                decided_at: row.get::<i64, _>(5) as u64,
             });
         }
         Ok(entries)
@@ -202,6 +212,67 @@ impl Storage {
         .fetch_one(&self.pool)
         .await?;
         Ok(count as u64)
+    }
+
+    /// Merge follow requests received from another device of the local user `me`.
+    ///
+    /// A received decision (approved or denied) replaces the local row only if its
+    /// `decided_at` is greater; a pending row is inserted only if no row exists. A merged
+    /// approval also records `pubkey` as a follower of `me`. Entries with an invalid
+    /// pubkey or status, and expired pending or denied entries, are skipped. Returns the
+    /// number of rows written.
+    pub async fn merge_follow_requests(
+        &self,
+        me: &str,
+        entries: &[FollowRequestEntry],
+    ) -> Result<u32, AppError> {
+        let now = proscenium_types::now_millis();
+        let clamp = |t: u64| i64::try_from(t.min(now)).unwrap_or(i64::MAX);
+        let mut merged = 0u32;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        for entry in entries {
+            let decided = matches!(entry.status.as_str(), "approved" | "denied");
+            if entry.pubkey == me
+                || !proscenium_types::is_valid_pubkey(&entry.pubkey)
+                || !(decided || entry.status == "pending")
+                || (entry.status != "approved" && entry.expires_at <= now)
+            {
+                continue;
+            }
+            let decided_at = if decided {
+                clamp(entry.decided_at).max(1)
+            } else {
+                0
+            };
+            let result = sqlx::query(
+                "INSERT INTO follow_requests
+                    (pubkey, timestamp, status, created_at, expires_at, decided_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(pubkey) DO UPDATE SET
+                    timestamp = excluded.timestamp,
+                    status = excluded.status,
+                    expires_at = excluded.expires_at,
+                    decided_at = excluded.decided_at
+                 WHERE excluded.decided_at > follow_requests.decided_at",
+            )
+            .bind(&entry.pubkey)
+            .bind(clamp(entry.timestamp))
+            .bind(&entry.status)
+            .bind(clamp(entry.created_at))
+            .bind(i64::try_from(entry.expires_at).unwrap_or(i64::MAX))
+            .bind(decided_at)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() == 0 {
+                continue;
+            }
+            merged += 1;
+            if entry.status == "approved" {
+                Self::upsert_follower_tx(&mut tx, me, &entry.pubkey, now).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(merged)
     }
 
     pub async fn is_approved_follower(&self, pubkey: &str) -> Result<bool, AppError> {

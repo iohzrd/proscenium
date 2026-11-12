@@ -84,8 +84,22 @@
     checkSendTimeouts();
 
     await markRead();
-    requestAnimationFrame(() => scrollToBottom());
+    requestAnimationFrame(() => {
+      scrollToBottom();
+      loadOlderUntilScrollable();
+    });
   });
+
+  /**
+   * Load older pages while the message list does not overflow its container:
+   * without a scrollbar no scroll event reaches `handleScroll`.
+   */
+  function loadOlderUntilScrollable() {
+    if (!messagesContainer || !hasMore || loadingMore) return;
+    if (messagesContainer.scrollHeight <= messagesContainer.clientHeight) {
+      loadOlder();
+    }
+  }
 
   /** Union of both lists by id (entries of `preferred` win), ascending by `(timestamp, id)`. */
   function mergeMessages(
@@ -172,6 +186,7 @@
             const newHeight = messagesContainer.scrollHeight;
             messagesContainer.scrollTop = newHeight - prevHeight;
           }
+          loadOlderUntilScrollable();
         });
       }
     } catch (e) {

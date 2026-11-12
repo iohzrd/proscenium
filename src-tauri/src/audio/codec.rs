@@ -79,14 +79,6 @@ impl OpusDecoder {
         output.truncate(decoded);
         Ok(output)
     }
-
-    /// Generate comfort noise / silence for a lost packet (PLC).
-    pub fn decode_loss(&mut self) -> Result<Vec<f32>, opus::Error> {
-        let mut output = vec![0.0f32; FRAME_SIZE];
-        let decoded = self.decoder.decode_float(&[], &mut output, false)?;
-        output.truncate(decoded);
-        Ok(output)
-    }
 }
 
 #[cfg(test)]
@@ -121,13 +113,6 @@ mod tests {
 
         let packets = enc.push_samples(&half);
         assert_eq!(packets.len(), 1);
-    }
-
-    #[test]
-    fn decode_loss_produces_samples() {
-        let mut dec = OpusDecoder::new().unwrap();
-        let samples = dec.decode_loss().unwrap();
-        assert_eq!(samples.len(), FRAME_SIZE);
     }
 
     #[test]

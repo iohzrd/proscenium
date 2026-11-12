@@ -1,6 +1,6 @@
 use super::control::VerifiedControl;
-use super::state::{ActiveStage, Moderation, Participant};
-use super::{CLOSE_BANNED, Outcome};
+use super::state::{ActiveStage, HostState, MixedStreamServer, Moderation, Participant, RoomRoles};
+use super::{CLOSE_BANNED, CLOSE_NORMAL, Outcome};
 use proscenium_types::{
     MAX_STAGE_PARTICIPANTS, StageControl, StageEvent, StageRole, now_millis, short_id,
 };
@@ -21,8 +21,12 @@ impl ActiveStage {
 
         let actor = match (&signed.control, presence) {
             (StageControl::Presence { .. }, Some(presence)) => {
-                if self.roles.is_banned(&presence.master_pubkey)
-                    || !self.senders.admit(&presence.master_pubkey)
+                let (my_pubkey, roles) = (&self.my_pubkey, &self.roles);
+                let (serving, host) = (self.serving.as_ref(), self.host.as_ref());
+                let protected =
+                    |pubkey: &str| is_protected(pubkey, my_pubkey, roles, serving, host);
+                if roles.is_banned(&presence.master_pubkey)
+                    || !self.senders.admit(&presence.master_pubkey, protected)
                 {
                     return Outcome::Continue;
                 }
@@ -153,8 +157,9 @@ impl ActiveStage {
         Outcome::Continue
     }
 
-    /// Record a verified `Presence` of `actor`. Adds the participant if it is new and
-    /// the participant limit is not reached.
+    /// Record a verified `Presence` of `actor`. Adds the participant if it is new. At the
+    /// participant limit the least recently seen participant that `is_protected` rejects
+    /// is removed first; if every participant is protected, `actor` is not added.
     async fn handle_presence(&mut self, actor: String) {
         let now = now_millis();
         if let Some(p) = self.participants.get_mut(&actor) {
@@ -162,7 +167,18 @@ impl ActiveStage {
             return;
         }
         if self.participants.len() >= MAX_STAGE_PARTICIPANTS {
-            return;
+            let (my_pubkey, roles) = (&self.my_pubkey, &self.roles);
+            let (serving, host) = (self.serving.as_ref(), self.host.as_ref());
+            let evicted = self
+                .participants
+                .values()
+                .filter(|p| !is_protected(&p.pubkey, my_pubkey, roles, serving, host))
+                .min_by_key(|p| p.last_seen_ms)
+                .map(|p| p.pubkey.clone());
+            let Some(evicted) = evicted else {
+                return;
+            };
+            self.remove_participant(&evicted, CLOSE_NORMAL).await;
         }
         self.participants
             .insert(actor.clone(), Participant::new(actor.clone(), now));
@@ -227,12 +243,9 @@ impl ActiveStage {
             return Outcome::Continue;
         }
 
-        let banned: Vec<String> = self
-            .participants
-            .keys()
-            .filter(|pk| self.roles.is_banned(pk))
-            .cloned()
-            .collect();
+        // Every banned identity, including one with a connection to this node that is not
+        // in the participant table.
+        let banned: Vec<String> = self.roles.banned.iter().cloned().collect();
         for pubkey in banned {
             self.close_connections_of(&pubkey, CLOSE_BANNED, b"banned");
             self.participants.remove(&pubkey);
@@ -268,4 +281,19 @@ impl ActiveStage {
         );
         self.start_listener(source_node_id);
     }
+}
+
+/// True if `pubkey` keeps its participant and sender entries when the tables are full:
+/// the local user, holders of a role other than Listener (the host included), and
+/// identities with an audio connection to this node.
+fn is_protected(
+    pubkey: &str,
+    my_pubkey: &str,
+    roles: &RoomRoles,
+    serving: Option<&MixedStreamServer>,
+    host: Option<&HostState>,
+) -> bool {
+    pubkey == my_pubkey
+        || roles.role_of(pubkey) != StageRole::Listener
+        || super::serving::has_audio_connection(serving, host, pubkey)
 }

@@ -272,7 +272,7 @@ impl Harness {
     async fn stored_post_ids(&self) -> Vec<String> {
         let mut ids = self
             .storage
-            .get_sync_cursor(self.pubkey())
+            .get_sync_cursor(self.pubkey(), 0, u32::MAX)
             .await
             .unwrap()
             .post_ids;
@@ -331,7 +331,11 @@ async fn sync_follows_the_protocol_against_a_peer() {
     })
     .await;
     wait_for("interaction and profile of first sync", || async {
-        let cursor = harness.storage.get_sync_cursor(&pk).await.unwrap();
+        let cursor = harness
+            .storage
+            .get_sync_cursor(&pk, 0, u32::MAX)
+            .await
+            .unwrap();
         let user_info = harness.storage.get_user_info(&pk).await.unwrap().unwrap();
         cursor.interaction_count == 1 && user_info.display_name.as_deref() == Some("Alice")
     })
@@ -376,7 +380,7 @@ async fn sync_follows_the_protocol_against_a_peer() {
     assert_eq!(
         harness
             .storage
-            .get_sync_cursor(&pk)
+            .get_sync_cursor(&pk, 0, u32::MAX)
             .await
             .unwrap()
             .tombstone_count,
@@ -412,7 +416,11 @@ async fn sync_follows_the_protocol_against_a_peer() {
     harness
         .sync_until_posts("valid post after invalid content", &[&p1, &p3, &p4, &p5])
         .await;
-    let cursor = harness.storage.get_sync_cursor(&pk).await.unwrap();
+    let cursor = harness
+        .storage
+        .get_sync_cursor(&pk, 0, u32::MAX)
+        .await
+        .unwrap();
     assert_eq!(cursor.interaction_count, 1);
     assert_eq!(cursor.tombstone_count, 1);
     assert_eq!(harness.storage.total_post_count().await.unwrap(), 4);
@@ -579,7 +587,7 @@ async fn gossip_messages_are_verified_and_applied() {
     assert_eq!(
         harness
             .storage
-            .get_sync_cursor(&pk)
+            .get_sync_cursor(&pk, 0, u32::MAX)
             .await
             .unwrap()
             .tombstone_count,

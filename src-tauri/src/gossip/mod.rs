@@ -216,35 +216,13 @@ impl GossipService {
         });
     }
 
-    /// Handle a visibility transition. Must be called BEFORE saving the new
-    /// visibility to the database so that `broadcast_profile` can still reach
-    /// gossip subscribers when downgrading from Public.
-    pub async fn handle_visibility_change(
-        &self,
-        old: Visibility,
-        new: Visibility,
-        profile: &Profile,
-    ) -> Result<(), AppError> {
-        if old == new {
-            return Ok(());
-        }
-
-        log::info!("[visibility] transitioning {old} -> {new}");
-
-        match (old, new) {
-            (Visibility::Public, _) => {
-                self.broadcast_profile(profile).await?;
-                self.stop_own_feed().await;
-            }
-            (_, Visibility::Public) => {
-                self.start_own_feed_unconditional().await?;
-                self.broadcast_profile(profile).await?;
-            }
-            _ => {
-                // Listed <-> Private: both use push
-            }
-        }
-
+    /// Broadcast `profile`, whose visibility is not Public, on the own feed topic, then
+    /// close the topic. Must be called before `profile` is saved: `broadcast_msg` sends on
+    /// the topic only while the stored visibility is Public.
+    pub async fn leave_public(&self, profile: &Profile) -> Result<(), AppError> {
+        log::info!("[visibility] leaving Public for {}", profile.visibility);
+        self.broadcast_profile(profile).await?;
+        self.stop_own_feed().await;
         Ok(())
     }
 }

@@ -22,24 +22,24 @@ pub async fn get_dht_discovery(storage: &Storage) -> bool {
         .unwrap_or(false)
 }
 
-/// True unless the stored value is "0": the follow list is shared by default.
-pub async fn get_share_follows(storage: &Storage) -> bool {
-    storage
-        .get_preference(SHARE_FOLLOWS)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v != "0")
-        .unwrap_or(true)
+/// True unless the stored value is "0" or the preference cannot be read: a list is
+/// shared by default, and not shared when its setting is unknown.
+async fn get_share_preference(storage: &Storage, key: &str) -> bool {
+    match storage.get_preference(key).await {
+        Ok(value) => value.is_none_or(|v| v != "0"),
+        Err(e) => {
+            log::error!("[preferences] failed to read {key}: {e}");
+            false
+        }
+    }
 }
 
-/// True unless the stored value is "0": the followers list is shared by default.
+/// See `get_share_preference`.
+pub async fn get_share_follows(storage: &Storage) -> bool {
+    get_share_preference(storage, SHARE_FOLLOWS).await
+}
+
+/// See `get_share_preference`.
 pub async fn get_share_followers(storage: &Storage) -> bool {
-    storage
-        .get_preference(SHARE_FOLLOWERS)
-        .await
-        .ok()
-        .flatten()
-        .map(|v| v != "0")
-        .unwrap_or(true)
+    get_share_preference(storage, SHARE_FOLLOWERS).await
 }

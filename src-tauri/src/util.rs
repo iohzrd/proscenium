@@ -1,3 +1,7 @@
+use iroh::EndpointId;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 pub fn generate_id() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("failed to generate random bytes");
@@ -23,6 +27,46 @@ pub fn message_preview(content: &str) -> String {
         )
     } else {
         content.to_string()
+    }
+}
+
+/// One counted item (a connection or a served sync) of a remote NodeId; decrements the
+/// count when dropped.
+pub(crate) struct NodeSlot {
+    counts: Arc<Mutex<HashMap<EndpointId, usize>>>,
+    node: EndpointId,
+}
+
+impl NodeSlot {
+    /// Count one more item of `node` in `counts`. Returns `None` if `node` already has
+    /// `limit` items.
+    pub(crate) fn acquire(
+        counts: &Arc<Mutex<HashMap<EndpointId, usize>>>,
+        node: EndpointId,
+        limit: usize,
+    ) -> Option<Self> {
+        let mut map = counts.lock().unwrap_or_else(|e| e.into_inner());
+        let count = map.entry(node).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            counts: counts.clone(),
+            node,
+        })
+    }
+}
+
+impl Drop for NodeSlot {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = map.get_mut(&self.node) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.node);
+            }
+        }
     }
 }
 

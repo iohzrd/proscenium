@@ -230,13 +230,26 @@ impl SenderTable {
     /// Largest number of senders tracked.
     const MAX_ENTRIES: usize = 2 * MAX_STAGE_PARTICIPANTS;
 
-    /// Admit `sender`. Returns false if the table is full and `sender` is not in it.
-    pub(super) fn admit(&mut self, sender: &str) -> bool {
+    /// Admit `sender`. If the table is full, the entry with the lowest last timestamp
+    /// that `protected` rejects is removed first, so keys generated to fill the table
+    /// cannot lock out a new participant. Returns false if every entry is protected.
+    pub(super) fn admit(&mut self, sender: &str, protected: impl Fn(&str) -> bool) -> bool {
         if self.last_timestamps.contains_key(sender) {
             return true;
         }
         if self.last_timestamps.len() >= Self::MAX_ENTRIES {
-            return false;
+            let evicted = self
+                .last_timestamps
+                .iter()
+                .filter(|(key, _)| !protected(key))
+                .min_by_key(|(_, last)| **last)
+                .map(|(key, _)| key.clone());
+            match evicted {
+                Some(key) => {
+                    self.last_timestamps.remove(&key);
+                }
+                None => return false,
+            }
         }
         self.last_timestamps.insert(sender.to_string(), 0);
         true
@@ -350,6 +363,9 @@ pub(super) struct MixedStreamServer {
     pub(super) fanout: Arc<Fanout>,
     /// Maximum number of entries in `conns`.
     pub(super) capacity: usize,
+    /// Entries of `capacity` that only identities with a speaking role (relay
+    /// candidates) may use. 0 on a relay.
+    pub(super) reserved_for_roles: usize,
     /// Transport NodeId -> connection. One connection per NodeId.
     pub(super) conns: HashMap<String, ListenerConn>,
     /// Relay only: stops the task that reads the mixed stream from the host.
@@ -357,10 +373,11 @@ pub(super) struct MixedStreamServer {
 }
 
 impl MixedStreamServer {
-    pub(super) fn new(fanout: Arc<Fanout>, capacity: usize) -> Self {
+    pub(super) fn new(fanout: Arc<Fanout>, capacity: usize, reserved_for_roles: usize) -> Self {
         Self {
             fanout,
             capacity,
+            reserved_for_roles: reserved_for_roles.min(capacity),
             conns: HashMap::new(),
             upstream_cancel: None,
         }
@@ -635,9 +652,9 @@ mod tests {
         assert!(!table.accept_timestamp("master-a", 100));
         assert!(!table.contains("master-a"));
 
-        assert!(table.admit("master-a"));
+        assert!(table.admit("master-a", |_| false));
         assert!(table.contains("master-a"));
-        assert!(table.admit("master-a"));
+        assert!(table.admit("master-a", |_| false));
 
         assert!(table.accept_timestamp("master-a", 100));
         // Same message again.
@@ -646,17 +663,17 @@ mod tests {
         assert!(!table.accept_timestamp("master-a", 99));
         assert!(table.accept_timestamp("master-a", 101));
         // Admitting again keeps the last timestamp.
-        assert!(table.admit("master-a"));
+        assert!(table.admit("master-a", |_| false));
         assert!(!table.accept_timestamp("master-a", 101));
     }
 
     #[test]
     fn sender_table_is_bounded_and_prunes_departed_senders() {
         let mut table = SenderTable::default();
+        let nobody = |_: &str| false;
         for i in 0..SenderTable::MAX_ENTRIES {
-            assert!(table.admit(&format!("master-{i}")));
+            assert!(table.admit(&format!("master-{i}"), nobody));
         }
-        assert!(!table.admit("master-x"));
 
         let now = 10 * MAX_TIMESTAMP_DRIFT_MS;
         assert!(table.accept_timestamp("master-0", now));
@@ -664,7 +681,26 @@ mod tests {
         assert!(table.contains("master-0"));
         assert!(table.contains("master-1"));
         assert!(!table.contains("master-2"));
-        assert!(table.admit("master-x"));
+        assert!(table.admit("master-x", nobody));
+    }
+
+    #[test]
+    fn full_sender_table_evicts_the_least_recent_unprotected_sender() {
+        let mut table = SenderTable::default();
+        let nobody = |_: &str| false;
+        for i in 0..SenderTable::MAX_ENTRIES {
+            let sender = format!("master-{i}");
+            assert!(table.admit(&sender, nobody));
+            assert!(table.accept_timestamp(&sender, 1_000 + i as u64));
+        }
+        // master-0 has the lowest timestamp but is protected; master-1 is evicted.
+        assert!(table.admit("master-x", |s| s == "master-0"));
+        assert!(table.contains("master-x"));
+        assert!(table.contains("master-0"));
+        assert!(!table.contains("master-1"));
+        // Every entry protected: the newcomer is refused.
+        assert!(!table.admit("master-y", |_| true));
+        assert!(!table.contains("master-y"));
     }
 
     #[test]

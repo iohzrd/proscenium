@@ -4,8 +4,8 @@ use crate::signing::{
 };
 use crate::stage::StageTicket;
 use crate::types::{
-    BookmarkEntry, DeviceEntry, DeviceSyncVector, FollowEntry, Interaction, ModerationEntry, Post,
-    Profile, SocialGraphEntry,
+    BookmarkEntry, DeviceEntry, DeviceSyncVector, FollowEntry, FollowRequestEntry, Interaction,
+    ModerationEntry, Post, Profile, SocialGraphEntry,
 };
 use crate::validation::is_recent_timestamp;
 use iroh::SecretKey;
@@ -119,6 +119,8 @@ pub enum PeerRequest {
     LinkRequest {
         /// `LinkQrPayload::secret` (URL-safe base64 without padding).
         secret: String,
+        /// NodeId of the transport key that the new device generated for the identity.
+        node_id: String,
         /// Name under which the existing device stores the new device.
         device_name: String,
     },
@@ -236,6 +238,14 @@ pub struct SyncRequest {
     pub post_ids_digest: String,
     /// Number of deletion records the client stores for this author.
     pub tombstone_count: u64,
+    /// Earliest timestamp of the posts and interactions the requester stores. The
+    /// responder counts and sends only posts and interactions with a timestamp at or
+    /// after it, and the counts and digest above cover only those. 0 for all.
+    pub since: u64,
+    /// The requester's signed device list. A responder whose visibility requires a known
+    /// requester uses it to map the requesting NodeId to its master. `None` from the
+    /// discovery server.
+    pub announcement: Option<LinkedDevicesAnnouncement>,
 }
 
 /// Maximum number of post ids a requester may send in the id-diff phase.
@@ -303,7 +313,13 @@ pub fn sign_stage_announcement(
     signature_to_hex(&master_key.sign(&bytes))
 }
 
-/// Verify that a stage announcement `signature` was made by the key `host_pubkey`.
+/// Oldest stage start time accepted in an announcement, relative to the local clock.
+pub const MAX_STAGE_ANNOUNCEMENT_AGE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Verify a stage announcement: the ticket passes `StageTicket::verify` and names the same
+/// stage, host and title as the announcement, `started_at` is at most
+/// `MAX_TIMESTAMP_DRIFT_MS` in the future and at most `MAX_STAGE_ANNOUNCEMENT_AGE_MS` in
+/// the past, and `signature` was made by the key `host_pubkey`.
 pub fn verify_stage_announcement(
     stage_id: &str,
     title: &str,
@@ -312,6 +328,16 @@ pub fn verify_stage_announcement(
     started_at: u64,
     signature: &str,
 ) -> Result<(), String> {
+    ticket.verify()?;
+    if ticket.stage_id != stage_id || ticket.host_pubkey != host_pubkey || ticket.title != title {
+        return Err("stage ticket differs from the announcement".to_string());
+    }
+    let now = crate::validation::now_millis();
+    if started_at > now.saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS)
+        || started_at < now.saturating_sub(MAX_STAGE_ANNOUNCEMENT_AGE_MS)
+    {
+        return Err("stage start time is outside the accepted range".to_string());
+    }
     verify_signed_by(
         host_pubkey,
         &stage_announcement_signing_bytes(stage_id, title, ticket, host_pubkey, started_at),
@@ -392,8 +418,12 @@ pub enum DeviceSyncFrame {
     /// The sender's state summary. First frame in each direction.
     Vector(DeviceSyncVector),
     Follows(Vec<FollowEntry>),
+    /// Signed device lists of the users the sender follows. Sent with the follow rows.
+    PeerAnnouncements(Vec<LinkedDevicesAnnouncement>),
     Moderation(Vec<ModerationEntry>),
     Bookmarks(Vec<BookmarkEntry>),
+    /// Follow requests of other users with their state.
+    FollowRequests(Vec<FollowRequestEntry>),
     /// Direct messages the receiver's vector does not list.
     DirectMessages(Vec<StoredMessage>),
     /// Ids of deleted own interactions the receiver's vector does not list.

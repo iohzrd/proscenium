@@ -28,6 +28,9 @@ const TRANSPORT_KEY_FILE: &str = "transport_key.key";
 pub(crate) const BLOBS_DIR: &str = "blobs";
 /// Marker file. While it exists, `get_seed_phrase` asks for native confirmation.
 pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
+/// Marker file written when the stored data of an existing identity is deleted and the
+/// keys are kept. While it exists, `get_seed_phrase` asks for native confirmation.
+pub(crate) const SEED_CONFIRM_FILE: &str = ".seed_confirm";
 /// Suffix of the temporary files created by `write_secret_file`.
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 
@@ -112,9 +115,14 @@ fn remove_stale_temp_files(data_dir: &Path) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_temp = name.ends_with(TEMP_FILE_SUFFIX)
-            && [MASTER_KEY_FILE, TRANSPORT_KEY_FILE, SEED_BACKED_UP_FILE]
-                .iter()
-                .any(|prefix| name.starts_with(&format!("{prefix}.")));
+            && [
+                MASTER_KEY_FILE,
+                TRANSPORT_KEY_FILE,
+                SEED_BACKED_UP_FILE,
+                SEED_CONFIRM_FILE,
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(&format!("{prefix}.")));
         if is_temp && let Err(e) = std::fs::remove_file(entry.path()) {
             log::warn!("[setup] failed to delete temporary file {name}: {e}");
         }
@@ -469,6 +477,16 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         .await
     {
         log::error!("[setup] failed to register own device: {e}");
+    }
+    let cutoff = now_millis().saturating_sub(crate::constants::PEER_ANNOUNCEMENT_RETENTION_MS);
+    match state
+        .storage
+        .prune_peer_announcements(&master_pubkey, cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => log::info!("[setup] deleted {n} stale device lists of unrelated users"),
+        Err(e) => log::error!("[setup] failed to delete stale device lists: {e}"),
     }
 
     // Signs the stored profile again if its signature does not verify under the master

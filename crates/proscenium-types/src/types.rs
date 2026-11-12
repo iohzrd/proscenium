@@ -133,8 +133,7 @@ impl std::fmt::Debug for LinkQrPayload {
     }
 }
 
-/// Data sent from the existing device to the new device during linking. The new device
-/// keeps its own transport key.
+/// Data sent from the existing device to the new device during linking.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LinkBundleData {
     /// The master secret key (32 bytes, standard base64).
@@ -149,6 +148,8 @@ pub struct LinkBundleData {
     pub moderation: Vec<ModerationEntry>,
     /// Bookmark rows, including removed ones.
     pub bookmarks: Vec<BookmarkEntry>,
+    /// Follow requests of other users with their state.
+    pub follow_requests: Vec<FollowRequestEntry>,
     /// Signed device announcements of followed users. Each carries the user's transport
     /// NodeIds, which sync, gossip subscription and DMs require.
     pub peer_announcements: Vec<crate::protocol::LinkedDevicesAnnouncement>,
@@ -225,6 +226,8 @@ pub struct FollowRequestEntry {
     pub status: String,
     pub created_at: u64,
     pub expires_at: u64,
+    /// When the request was approved or denied (Unix ms); 0 while pending.
+    pub decided_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

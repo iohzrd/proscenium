@@ -6,7 +6,13 @@ on:
       - 'v*'
 
 jobs:
+  ci:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: ci
     permissions:
       contents: write
     strategy:

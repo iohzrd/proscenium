@@ -1,4 +1,4 @@
-use crate::audio::AudioPlayback;
+use crate::audio::{AudioPlayback, PLAYBACK_CAPACITY_FRAMES};
 use proscenium_types::MAX_STAGE_SPEAKERS;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -55,13 +55,14 @@ pub(super) fn spawn_speaker_mixer(cancel: CancellationToken) -> SpeakerMixerHand
 }
 
 async fn run_speaker_mixer(mut cmd_rx: mpsc::Receiver<SpeakerMixerCmd>, cancel: CancellationToken) {
-    let (mut prod, _playback) = match AudioPlayback::start_blocking(None).await {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("[stage-speaker-mixer] failed to start playback: {e}");
-            return;
-        }
-    };
+    let (mut prod, _playback) =
+        match AudioPlayback::start_blocking(None, PLAYBACK_CAPACITY_FRAMES).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[stage-speaker-mixer] failed to start playback: {e}");
+                return;
+            }
+        };
 
     let mut buffers: HashMap<u32, Vec<f32>> = HashMap::new();
     let mut streams: Vec<(u32, mpsc::Receiver<Vec<f32>>)> = Vec::new();

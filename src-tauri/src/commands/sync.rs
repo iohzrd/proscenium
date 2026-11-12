@@ -11,13 +11,12 @@ pub async fn sync_posts(
     state: State<'_, Arc<AppState>>,
     pubkey: String,
 ) -> CmdResult<FrontendSyncResult> {
-    let my_id = state.identity.read().await.master_pubkey.clone();
     let ep = state.endpoint();
     let result = crate::sync::sync_one_peer(
         &ep,
         &state.storage,
+        &state.identity,
         &pubkey,
-        &my_id,
         &state.app_handle,
         "sync",
     )

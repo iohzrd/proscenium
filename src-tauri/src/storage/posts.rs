@@ -107,7 +107,7 @@ impl Storage {
     /// Remove the rows that refer to post `id`: interactions that target it and its
     /// notifications are deleted; its bookmark is set to `state='removed'`, because device
     /// sync merges bookmark rows by `last_changed_at` and needs the row to carry the removal.
-    async fn delete_post_dependents(
+    pub(super) async fn delete_post_dependents(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         id: &str,
     ) -> Result<(), AppError> {
@@ -131,12 +131,18 @@ impl Storage {
     }
 
     /// Delete the post `(author, id)` together with the interactions that target it, its
-    /// bookmark and its notifications, in one transaction.
+    /// bookmark and its notifications, and store the signed deletion `signature`, in one
+    /// transaction.
     ///
-    /// Returns `false` and deletes nothing if `author` has no post with this id, so a
+    /// Returns `false` and changes nothing if `author` has no post with this id, so a
     /// delete issued by one author cannot remove rows that refer to another author's post.
-    pub async fn delete_post(&self, author: &str, id: &str) -> Result<bool, AppError> {
-        let mut tx = self.pool.begin().await?;
+    pub async fn delete_post(
+        &self,
+        author: &str,
+        id: &str,
+        signature: &str,
+    ) -> Result<bool, AppError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query("DELETE FROM posts WHERE author=?1 AND id=?2")
             .bind(author)
             .bind(id)
@@ -146,6 +152,7 @@ impl Storage {
             return Ok(false);
         }
         Self::delete_post_dependents(&mut tx, id).await?;
+        Self::insert_post_tombstone(&mut tx, author, id, signature).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -185,14 +192,15 @@ impl Storage {
     }
 
     /// Delete every repost (no text, no media) of `target_post_id` by `author`, with the
-    /// rows that refer to each deleted post, in one transaction. Quotes are kept.
-    /// Returns the ids of the deleted posts.
+    /// rows that refer to each deleted post, and store the deletion of each signed by
+    /// `sign`, in one transaction. Quotes are kept. Returns the ids of the deleted posts.
     pub async fn delete_repost_by_target(
         &self,
         author: &str,
         target_post_id: &str,
+        sign: impl Fn(&str) -> String,
     ) -> Result<Vec<String>, AppError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let sql = format!(
             "DELETE FROM posts WHERE author=?1 AND quote_of=?2 AND {IS_PURE_REPOST} RETURNING id"
         );
@@ -203,6 +211,7 @@ impl Storage {
             .await?;
         for id in &ids {
             Self::delete_post_dependents(&mut tx, id).await?;
+            Self::insert_post_tombstone(&mut tx, author, id, &sign(id)).await?;
         }
         tx.commit().await?;
         Ok(ids)

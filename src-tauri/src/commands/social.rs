@@ -2,7 +2,9 @@ use crate::constants::MAX_NODE_IDS_TRIED;
 use crate::error::CmdResult;
 use crate::state::{AppState, SyncCommand};
 use crate::storage::RemoteListKind;
-use proscenium_types::{SocialGraphEntry, is_valid_pubkey, now_millis, short_id};
+use proscenium_types::{
+    FollowResponse, SocialGraphEntry, Visibility, is_valid_pubkey, now_millis, short_id,
+};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
@@ -24,16 +26,32 @@ pub struct RemoteFollowersResult {
     pub cached: bool,
 }
 
+/// Result of `follow_user`.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FollowOutcome {
+    /// The follow is stored.
+    Followed,
+    /// The user's profile is not Public and the follow request awaits approval. Nothing
+    /// is stored; following again after approval stores the follow.
+    Pending,
+    /// The user denied the follow request.
+    Denied,
+}
+
 /// Follow the user whose device has transport NodeId `node_id`.
 ///
 /// The node's identity is verified before anything is stored. If `expected_pubkey` is
-/// given, the command fails unless the node's master pubkey equals it.
+/// given, the command fails unless the node's master pubkey equals it. Unless the node
+/// returned a Public profile (a node returns a Listed or Private profile only to approved
+/// followers), a follow request is sent to the node first and the follow is stored only
+/// if the request is approved; a Public node approves at once.
 #[tauri::command]
 pub async fn follow_user(
     state: State<'_, Arc<AppState>>,
     node_id: String,
     expected_pubkey: Option<String>,
-) -> CmdResult<String> {
+) -> CmdResult<FollowOutcome> {
     let (my_id, my_transport) = {
         let id = state.identity.read().await;
         (id.master_pubkey.clone(), id.transport_node_id.clone())
@@ -75,6 +93,27 @@ pub async fn follow_user(
     );
     let node_ids = identity.transport_node_ids();
 
+    if identity
+        .profile
+        .as_ref()
+        .is_none_or(|p| p.visibility != Visibility::Public)
+    {
+        log::info!("[follow] sending a follow request to {}", short_id(&pubkey));
+        let response = crate::peer::send_follow_request(
+            &state.endpoint(),
+            &state.storage,
+            &state.identity,
+            target,
+            &pubkey,
+        )
+        .await?;
+        match response {
+            FollowResponse::Approved(_) => {}
+            FollowResponse::Pending => return Ok(FollowOutcome::Pending),
+            FollowResponse::Denied => return Ok(FollowOutcome::Denied),
+        }
+    }
+
     log::info!("[follow] following {}...", short_id(&pubkey));
 
     let entry = SocialGraphEntry {
@@ -98,7 +137,7 @@ pub async fn follow_user(
         log::debug!("[follow] sync queue full, {} not queued", short_id(&pubkey));
     }
 
-    Ok(pubkey)
+    Ok(FollowOutcome::Followed)
 }
 
 /// Unfollow `pubkey`: mark the follow as removed, close the gossip subscription, and

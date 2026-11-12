@@ -71,8 +71,9 @@ impl DmHandler {
     /// Handle an envelope received from the device `remote` and return the answer.
     ///
     /// The envelope is applied only if `envelope_refusal` finds nothing, the sender is
-    /// not blocked, the ciphertext decrypts and the payload is valid. The device list is
-    /// cached under the version rule of `Storage::cache_peer_announcement`.
+    /// not blocked, the ciphertext decrypts and the payload is valid. Then the device list
+    /// is cached, delivered by `remote`, under the rule of
+    /// `Storage::cache_peer_announcement`.
     ///
     /// `Ok(DmAck::Rejected)` means the envelope was refused. `Err` means a local failure
     /// (storage); no answer is sent, so the sender keeps the message queued.
@@ -103,17 +104,6 @@ impl DmHandler {
             );
             return Ok(DmAck::Rejected);
         }
-        if let Err(e) = self
-            .storage
-            .cache_peer_announcement(&envelope.sender_devices)
-            .await
-        {
-            log::warn!(
-                "[dm] failed to store the device list of {}: {e}",
-                short_id(&sender)
-            );
-        }
-
         let payload = match envelope::open(&keys.device_key, &envelope).and_then(|plaintext| {
             let payload = serde_json::from_slice::<DmPayload>(&plaintext)?;
             validate_payload(&payload).map_err(AppError::Other)?;
@@ -125,6 +115,17 @@ impl DmHandler {
                 return Ok(DmAck::Rejected);
             }
         };
+
+        if let Err(e) = self
+            .storage
+            .cache_peer_announcement(&envelope.sender_devices, Some(&remote.to_string()))
+            .await
+        {
+            log::warn!(
+                "[dm] failed to store the device list of {}: {e}",
+                short_id(&sender)
+            );
+        }
 
         let conv_id = Storage::conversation_id(&keys.master_pubkey, &sender);
         match payload {

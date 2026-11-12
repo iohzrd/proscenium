@@ -5,8 +5,9 @@ use super::fanout::Fanout;
 use super::speaker_mixer::SpeakerMixerHandle;
 use super::{CLOSE_BANNED, CLOSE_NORMAL, CONN_TYPE_LISTENER, CONN_TYPE_SPEAKER, StageCommand};
 use crate::audio::{
-    AudioPlayback, MicConfig, OpusDecoder, OpusEncoder, PCM_CHANNEL_CAPACITY, SAMPLES_PER_FRAME,
-    TAG_CHECKPOINT, TAG_NORMAL, WireFrame, read_audio_frame, spawn_mic_thread, write_audio_frame,
+    AudioPlayback, MicConfig, OpusDecoder, OpusEncoder, PCM_CHANNEL_CAPACITY,
+    PLAYBACK_CAPACITY_FRAMES, SAMPLES_PER_FRAME, TAG_CHECKPOINT, TAG_NORMAL, WireFrame,
+    read_audio_frame, spawn_mic_thread, write_audio_frame,
 };
 use iroh::endpoint::{Connection, ConnectionError, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, PublicKey};
@@ -272,13 +273,14 @@ pub(super) async fn run_host_playback(
     far_end_tx: mpsc::Sender<Vec<f32>>,
     cancel: CancellationToken,
 ) {
-    let (mut prod, _playback) = match AudioPlayback::start_blocking(None).await {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("[stage-host] failed to start playback: {e}");
-            return;
-        }
-    };
+    let (mut prod, _playback) =
+        match AudioPlayback::start_blocking(None, PLAYBACK_CAPACITY_FRAMES).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::error!("[stage-host] failed to start playback: {e}");
+                return;
+            }
+        };
 
     let mut frames: u32 = 0;
     loop {
@@ -340,9 +342,10 @@ fn closed_with_code(conn: &Connection, code: u32) -> bool {
 /// Reconnects with exponential backoff; the delay returns to `BACKOFF_INITIAL` after a
 /// session that delivered verified audio.
 ///
-/// A relay that fails authentication, or fails `RELAY_MAX_FAILURES` sessions in a row,
-/// is reported to the actor with `UpstreamFailed` and is not dialed again: the pipeline
-/// continues with the host.
+/// A relay that fails authentication, closes with the ban code, or fails
+/// `RELAY_MAX_FAILURES` sessions in a row, is reported to the actor with `UpstreamFailed`
+/// and is not dialed again: the pipeline continues with the host. A ban from the host
+/// stops the pipeline.
 pub(super) async fn start_listener_pipeline(config: ListenerConfig) {
     let mut upstream = config.upstream_node_id.clone();
     let mut backoff = BACKOFF_INITIAL;
@@ -356,8 +359,11 @@ pub(super) async fn start_listener_pipeline(config: ListenerConfig) {
 
         let on_relay = upstream != config.host_node_id;
         let abandon_relay = match outcome {
+            // Only the host decides a ban. A relay that answers with the ban code is left,
+            // and the host answers the next connection.
+            SessionEnd::Banned if on_relay => true,
             SessionEnd::Banned => {
-                log::info!("[stage-listener] rejected as banned, stopping");
+                log::info!("[stage-listener] rejected as banned by the host, stopping");
                 break;
             }
             SessionEnd::EndedAfterAudio => {
@@ -447,31 +453,36 @@ async fn run_listener_once(config: &ListenerConfig, upstream_node_id: &str) -> S
 
     // Adaptive jitter buffer.
     //
-    // The output callback writes silence until `target_frames` decoded frames are
-    // buffered, at the start of the stream and again after each underrun
-    // (`PlaybackProducer::set_prefill_frames`).
+    // A checkpoint releases the frames it covers, so decoded frames arrive in bursts of
+    // `BURST`. The output callback writes silence until `BURST + margin` decoded frames
+    // are buffered, at the start of the stream and again after each underrun, so `margin`
+    // frames remain when the next burst arrives.
     //
-    // Adaptation rules (applied once per decoded frame):
-    //   - Underrun detected  -> target += 1 (up to JB_MAX_FRAMES)
-    //   - DRIFT_INTERVAL consecutive frames with no underrun -> target -= 1 (down to JB_MIN_FRAMES)
-    const JB_MIN_FRAMES: usize = 3; // 60 ms -- LAN / low-latency WAN
-    const JB_INIT_FRAMES: usize = 4; // 80 ms -- conservative start
-    const JB_MAX_FRAMES: usize = 10; // 200 ms -- ceiling for bad WAN
+    // Adaptation rules (applied once per released burst):
+    //   - Underrun detected  -> margin += 1 (up to JB_MAX_MARGIN)
+    //   - DRIFT_INTERVAL frames with no underrun -> margin -= 1 (down to JB_MIN_MARGIN)
+    const BURST: usize = auth::CHECKPOINT_INTERVAL as usize;
+    const JB_MIN_MARGIN: usize = 2; // 40 ms
+    const JB_INIT_MARGIN: usize = 3; // 60 ms
+    const JB_MAX_MARGIN: usize = 10; // 200 ms
     const DRIFT_INTERVAL: usize = 250; // ~5 s at 20 ms/frame before drifting down
+    // A burst on top of the deepest prefill, with room for one late burst.
+    const RING_FRAMES: usize = 2 * BURST + JB_MAX_MARGIN + 2;
 
-    let (mut prod, playback) = match AudioPlayback::start_blocking(None).await {
+    let (mut prod, playback) = match AudioPlayback::start_blocking(None, RING_FRAMES).await {
         Ok(p) => p,
         Err(e) => {
             log::error!("[stage-listener] failed to start playback: {e}");
             return SessionEnd::Failed;
         }
     };
-    let mut target_frames: usize = JB_INIT_FRAMES;
-    prod.set_prefill_frames(target_frames);
+    let mut margin: usize = JB_INIT_MARGIN;
+    prod.set_prefill_frames(BURST + margin);
     let mut frames_since_adapt: usize = 0;
 
-    // Sequence tracking for packet loss concealment.
-    let mut last_seq: Option<u32> = None;
+    // Opus frames waiting for the checkpoint that covers them. `ListenerAuthState` fails
+    // the stream after `MAX_FRAMES_WITHOUT_CHECKPOINT` frames without a checkpoint.
+    let mut held: Vec<Vec<u8>> = Vec::with_capacity(auth::MAX_FRAMES_WITHOUT_CHECKPOINT as usize);
     let mut frames: u32 = 0;
     let mut verified_audio = false;
     let mut auth_failed = false;
@@ -514,8 +525,20 @@ async fn run_listener_once(config: &ListenerConfig, upstream_node_id: &str) -> S
             (None, payload.as_slice())
         };
 
-        // Verify the hash chain. A failure is final for this stream: stop playing it.
-        match auth.verify_frame(seq, timestamp, tag, opus, checkpoint.as_ref()) {
+        // Verify the hash chain. Only frames that a verified checkpoint covers are played;
+        // a failure is final for this stream.
+        let result = auth.verify_frame(
+            seq,
+            timestamp,
+            tag,
+            opus,
+            checkpoint.as_ref(),
+            proscenium_types::now_millis(),
+        );
+        config
+            .checkpoint_floor
+            .fetch_max(auth.checkpoint_floor(), Ordering::Relaxed);
+        match result {
             AuthResult::Failed(failure) => {
                 log::warn!(
                     "[stage-listener] stream from {} failed authentication: {}",
@@ -532,60 +555,49 @@ async fn run_listener_once(config: &ListenerConfig, upstream_node_id: &str) -> S
                 auth_failed = true;
                 break;
             }
-            AuthResult::Verified => {
+            AuthResult::Discard => {
+                held.clear();
+                continue;
+            }
+            AuthResult::Hold => {
+                held.push(opus.to_vec());
+                continue;
+            }
+            AuthResult::Release => {
+                held.push(opus.to_vec());
                 verified_audio = true;
-                config
-                    .checkpoint_floor
-                    .fetch_max(auth.checkpoint_floor(), Ordering::Relaxed);
             }
-            AuthResult::Ok | AuthResult::Unverified => {}
         }
 
-        // Fill a detected gap with PLC frames before decoding this frame.
-        if let Some(prev) = last_seq {
-            let lost = seq.wrapping_sub(prev.wrapping_add(1));
-            if lost > 0 && lost < 64 {
+        // Decode the released frames into the jitter buffer.
+        for opus in held.drain(..) {
+            if let Ok(samples) = decoder.decode(&opus) {
+                prod.push(&samples);
+                frames = frames.wrapping_add(1);
+            }
+        }
+
+        let underruns = prod.drain_underruns();
+        if underruns > 0 {
+            if margin < JB_MAX_MARGIN {
+                margin += 1;
+                prod.set_prefill_frames(BURST + margin);
                 log::debug!(
-                    "[stage-listener] {lost} lost frame(s) before seq {seq}, inserting PLC"
+                    "[stage-listener] underrun x{underruns}, margin -> {margin}f ({}ms)",
+                    margin * 20
                 );
-                for _ in 0..lost {
-                    if let Ok(plc) = decoder.decode_loss() {
-                        prod.push(&plc);
-                    }
-                }
             }
-        }
-        last_seq = Some(seq);
-
-        // Decode and push into the jitter buffer.
-        if let Ok(samples) = decoder.decode(opus) {
-            prod.push(&samples);
-            frames = frames.wrapping_add(1);
-
-            let underruns = prod.drain_underruns();
-            if underruns > 0 {
-                if target_frames < JB_MAX_FRAMES {
-                    target_frames += 1;
-                    prod.set_prefill_frames(target_frames);
-                    log::debug!(
-                        "[stage-listener] underrun x{underruns}, target -> {}f ({}ms)",
-                        target_frames,
-                        target_frames * 20
-                    );
-                }
+            frames_since_adapt = 0;
+        } else {
+            frames_since_adapt += BURST;
+            if frames_since_adapt >= DRIFT_INTERVAL && margin > JB_MIN_MARGIN {
+                margin -= 1;
+                prod.set_prefill_frames(BURST + margin);
                 frames_since_adapt = 0;
-            } else {
-                frames_since_adapt += 1;
-                if frames_since_adapt >= DRIFT_INTERVAL && target_frames > JB_MIN_FRAMES {
-                    target_frames -= 1;
-                    prod.set_prefill_frames(target_frames);
-                    frames_since_adapt = 0;
-                    log::debug!(
-                        "[stage-listener] drifting down, target -> {}f ({}ms)",
-                        target_frames,
-                        target_frames * 20
-                    );
-                }
+                log::debug!(
+                    "[stage-listener] drifting down, margin -> {margin}f ({}ms)",
+                    margin * 20
+                );
             }
         }
     }

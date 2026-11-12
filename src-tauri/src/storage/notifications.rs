@@ -93,10 +93,15 @@ impl Storage {
         }
     }
 
+    /// Unread notifications, without those of muted or blocked actors, which
+    /// `get_notifications` does not return either.
     pub async fn get_unread_notification_count(&self) -> Result<u32, AppError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM notifications WHERE read=0")
-            .fetch_one(&self.pool)
-            .await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notifications
+             WHERE read=0 AND actor NOT IN (SELECT pubkey FROM moderation WHERE state='active')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count as u32)
     }
 

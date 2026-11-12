@@ -1,7 +1,8 @@
 use crate::device_sync::LwwState;
 use crate::error::AppError;
 use proscenium_types::{
-    BookmarkEntry, FollowEntry, ModerationEntry, is_valid_id, is_valid_pubkey, now_millis,
+    BookmarkEntry, FollowEntry, FollowRequestEntry, ModerationEntry, is_valid_id, is_valid_pubkey,
+    now_millis,
 };
 
 use super::Storage;
@@ -94,24 +95,51 @@ impl Storage {
             .filter(is_valid_bookmark_entry)
             .collect();
 
+        // Approved requests and the pending and denied ones that have not expired.
+        let request_rows: Vec<(String, i64, String, i64, i64, i64)> = sqlx::query_as(
+            "SELECT pubkey, timestamp, status, created_at, expires_at, decided_at
+             FROM follow_requests WHERE status = 'approved' OR expires_at > ?1
+             ORDER BY pubkey",
+        )
+        .bind(now_millis() as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        let follow_requests = request_rows
+            .into_iter()
+            .map(
+                |(pubkey, timestamp, status, created_at, expires_at, decided_at)| {
+                    FollowRequestEntry {
+                        pubkey,
+                        timestamp: timestamp as u64,
+                        status,
+                        created_at: created_at as u64,
+                        expires_at: expires_at as u64,
+                        decided_at: decided_at as u64,
+                    }
+                },
+            )
+            .filter(|entry| entry.pubkey != me && is_valid_pubkey(&entry.pubkey))
+            .collect();
+
         Ok(LwwState {
             follows,
             moderation,
             bookmarks,
+            follow_requests,
         })
     }
 
     /// Merge follow rows received from another device of the local user `me`.
     ///
     /// A received row replaces the local row only if its `last_changed_at` is greater.
-    /// Invalid entries are skipped. Returns the number of rows written.
+    /// Invalid entries are skipped. Returns the entries that were written.
     pub async fn merge_follows_lww(
         &self,
         me: &str,
         entries: &[FollowEntry],
-    ) -> Result<u32, AppError> {
+    ) -> Result<Vec<FollowEntry>, AppError> {
         let now = now_millis();
-        let mut merged = 0u32;
+        let mut merged = Vec::new();
         for entry in entries {
             if !is_valid_follow_entry(me, entry) {
                 continue;
@@ -133,7 +161,7 @@ impl Storage {
             .execute(&self.pool)
             .await?;
             if result.rows_affected() > 0 {
-                merged += 1;
+                merged.push(entry.clone());
             }
         }
         Ok(merged)

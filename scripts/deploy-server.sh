@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build the discovery server as a static musl binary, install it on a host over ssh,
-# restart its systemd unit and check that it answers. If the check fails, the previous
-# binary is put back and the unit is restarted.
+# restart its systemd unit and check that it answers. The unit is stopped while the
+# database files are copied, so a new binary that migrates the database can be rolled
+# back. If the unit does not start or the check fails, the previous binary and the copied
+# database are put back and the unit is started again.
 #
 # Required environment:
 #   DEPLOY_HOST        ssh destination, for example deploy@server.example
@@ -10,14 +12,16 @@
 # Optional environment:
 #   DEPLOY_SSH_KEY     ssh private key file (default: ssh's own key selection)
 #   DEPLOY_DIR         install directory on the host (default: /opt/proscenium)
+#   DEPLOY_DATA_DIR    server data directory on the host (default: $DEPLOY_DIR/data)
 #   DEPLOY_SERVICE     systemd unit name (default: proscenium)
 #
-# The ssh user needs sudo for cp, install, mv, test and systemctl on the host.
+# The ssh user needs sudo for cp, install, mv, rm, test and systemctl on the host.
 set -euo pipefail
 
 : "${DEPLOY_HOST:?set DEPLOY_HOST to the ssh destination (user@host)}"
 : "${DEPLOY_HEALTH_URL:?set DEPLOY_HEALTH_URL to the URL of /api/v1/info on the deployed server}"
 DEPLOY_DIR="${DEPLOY_DIR:-/opt/proscenium}"
+DEPLOY_DATA_DIR="${DEPLOY_DATA_DIR:-$DEPLOY_DIR/data}"
 DEPLOY_SERVICE="${DEPLOY_SERVICE:-proscenium}"
 
 HEALTH_ATTEMPTS=15
@@ -68,25 +72,35 @@ trap cleanup EXIT
 scp ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} "$BINARY" "$DEPLOY_HOST:$REMOTE_TMP/proscenium-server"
 
 echo "Installing and restarting $DEPLOY_SERVICE..."
-remote "bash -s -- $(quote "$REMOTE_TMP" "$DEPLOY_DIR" "$DEPLOY_SERVICE" "$CHECKSUM")" <<'REMOTE'
+remote "bash -s -- $(quote "$REMOTE_TMP" "$DEPLOY_DIR" "$DEPLOY_DATA_DIR" "$DEPLOY_SERVICE" "$CHECKSUM")" <<'REMOTE'
 set -euo pipefail
 tmp=$1
 dir=$2
-service=$3
-checksum=$4
+data=$3
+service=$4
+checksum=$5
 
 echo "$checksum  $tmp/proscenium-server" | sha256sum --check --status -
 
-# Keep the installed binary so a failed health check can restore it.
+# Keep the installed binary and, with the unit stopped, the database files, so a failed
+# start or health check can restore both.
 if sudo test -f "$dir/proscenium-server"; then
     sudo cp -p -- "$dir/proscenium-server" "$dir/proscenium-server.previous"
 else
     sudo rm -f -- "$dir/proscenium-server.previous"
 fi
+sudo systemctl stop "$service"
+for file in server.db server.db-wal server.db-shm; do
+    sudo rm -f -- "$data/$file.previous"
+    if sudo test -f "$data/$file"; then
+        sudo cp -p -- "$data/$file" "$data/$file.previous"
+    fi
+done
 # Write next to the target, then rename: the target path never holds a partial file.
 sudo install -o root -g root -m 0755 -- "$tmp/proscenium-server" "$dir/proscenium-server.new"
 sudo mv -f -- "$dir/proscenium-server.new" "$dir/proscenium-server"
-sudo systemctl restart "$service"
+# A failed start is detected by the health check, which then restores the copies.
+sudo systemctl start "$service" || echo "systemctl start $service failed" >&2
 REMOTE
 
 echo "Checking $DEPLOY_HEALTH_URL..."
@@ -103,17 +117,27 @@ done
 
 if [[ "$healthy" -ne 1 ]]; then
     echo "Health check failed after $((HEALTH_ATTEMPTS * HEALTH_INTERVAL_SECONDS)) seconds." >&2
-    remote "bash -s -- $(quote "$DEPLOY_DIR" "$DEPLOY_SERVICE")" <<'REMOTE'
+    remote "bash -s -- $(quote "$DEPLOY_DIR" "$DEPLOY_DATA_DIR" "$DEPLOY_SERVICE")" <<'REMOTE'
 set -euo pipefail
 dir=$1
-service=$2
-if sudo test -f "$dir/proscenium-server.previous"; then
-    sudo mv -f -- "$dir/proscenium-server.previous" "$dir/proscenium-server"
-    sudo systemctl restart "$service"
-    echo "Restored the previous binary and restarted $service." >&2
-else
+data=$2
+service=$3
+if ! sudo test -f "$dir/proscenium-server.previous"; then
     echo "No previous binary to restore; the new binary stays installed." >&2
+    exit 0
 fi
+sudo systemctl stop "$service" || true
+# The copies were taken with the unit stopped. A file without a copy did not exist then.
+for file in server.db server.db-wal server.db-shm; do
+    if sudo test -f "$data/$file.previous"; then
+        sudo mv -f -- "$data/$file.previous" "$data/$file"
+    else
+        sudo rm -f -- "$data/$file"
+    fi
+done
+sudo mv -f -- "$dir/proscenium-server.previous" "$dir/proscenium-server"
+sudo systemctl start "$service"
+echo "Restored the previous binary and database and started $service." >&2
 REMOTE
     exit 1
 fi

@@ -300,7 +300,7 @@ impl super::GossipService {
             );
             return;
         }
-        match storage.cache_peer_announcement(&announcement).await {
+        match storage.cache_peer_announcement(&announcement, None).await {
             Ok(crate::storage::AnnouncementOutcome::Stored) => {
                 log::info!(
                     "[gossip-rx] device announcement from {} v{} ({} devices)",

@@ -7,8 +7,22 @@ use tauri::State;
 
 /// Start a device-link session on this device. The returned payload is shown as a QR
 /// code; it is accepted until `expires_at`. Linking always transfers the master key.
+///
+/// Asks for confirmation in a native dialog first, which script in the webview cannot
+/// answer, and returns the error `"cancelled"` if it is declined.
 #[tauri::command]
 pub async fn start_device_link(state: State<'_, Arc<AppState>>) -> CmdResult<LinkQrPayload> {
+    let confirmed = crate::confirm::confirm_native(
+        &state.app_handle,
+        "Link a device",
+        "Show a link code? The device that scans it within 60 seconds receives the master \
+         key of this identity and can post, message and link further devices as you.",
+        "Show link code",
+    )
+    .await;
+    if !confirmed {
+        return Err("cancelled".into());
+    }
     let relay_url = state
         .endpoint()
         .addr()
@@ -29,9 +43,9 @@ pub async fn cancel_device_link(state: State<'_, Arc<AppState>>) -> CmdResult<()
 ///
 /// Asks for confirmation in a native dialog and returns the error `"cancelled"` if it is
 /// declined. Nothing is changed locally until the link bundle was received and
-/// validated. Then all local rows and media are deleted, the master key file is replaced
-/// (the transport key is kept), the link bundle is imported and the network stack is
-/// rebuilt. The caller reloads the
+/// validated. Then all local rows and media are deleted, the key files are replaced with
+/// the master key and a new transport key, the link bundle is imported and the network
+/// stack is rebuilt. The caller reloads the
 /// webview after `Ok`.
 #[tauri::command]
 pub async fn link_with_device(

@@ -1,7 +1,6 @@
-use crate::constants::MAX_NODE_IDS_TRIED;
-use crate::error::{AppError, CmdResult};
+use crate::error::CmdResult;
 use crate::state::AppState;
-use proscenium_types::{FollowRequestEntry, FollowResponse, is_valid_pubkey, now_millis, short_id};
+use proscenium_types::{FollowRequestEntry, now_millis, short_id};
 use std::sync::Arc;
 use tauri::State;
 
@@ -45,62 +44,4 @@ pub async fn deny_follow_request(
         .storage
         .deny_follow_request(&pubkey, now_millis())
         .await
-}
-
-/// Send a follow request to the user `pubkey` and return the answer:
-/// `"approved"`, `"denied"` or `"pending"`.
-///
-/// The request is sent to at most `MAX_NODE_IDS_TRIED` cached NodeIds of the user, in
-/// order, until one answers. Fails if no NodeId is cached or none answers.
-#[tauri::command]
-pub async fn send_follow_request_to_peer(
-    state: State<'_, Arc<AppState>>,
-    pubkey: String,
-) -> CmdResult<String> {
-    if !is_valid_pubkey(&pubkey) {
-        return Err("invalid pubkey".into());
-    }
-    if pubkey == state.identity.read().await.master_pubkey {
-        return Err("cannot send a follow request to yourself".into());
-    }
-    log::info!(
-        "[follow-req] sending follow request to {}",
-        short_id(&pubkey)
-    );
-    let node_ids = state.storage.get_peer_transport_node_ids(&pubkey).await?;
-    if node_ids.is_empty() {
-        return Err(format!("no transport NodeIds cached for {}", short_id(&pubkey)).into());
-    }
-
-    let ep = state.endpoint();
-    let mut last_err = AppError::Other("no usable transport NodeId".into());
-    for node_id in node_ids.iter().take(MAX_NODE_IDS_TRIED) {
-        let Ok(target) = node_id.parse::<iroh::EndpointId>() else {
-            continue;
-        };
-        match crate::peer::send_follow_request(
-            &ep,
-            &state.storage,
-            &state.identity,
-            target,
-            &pubkey,
-        )
-        .await
-        {
-            Ok(response) => {
-                let result = match response {
-                    FollowResponse::Approved(_) => "approved",
-                    FollowResponse::Denied => "denied",
-                    FollowResponse::Pending => "pending",
-                };
-                log::info!("[follow-req] response from {}: {result}", short_id(&pubkey));
-                return Ok(result.to_string());
-            }
-            Err(e) => {
-                log::debug!("[follow-req] failed via {}: {e}", short_id(node_id));
-                last_err = e;
-            }
-        }
-    }
-    Err(last_err)
 }

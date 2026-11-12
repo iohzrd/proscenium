@@ -89,6 +89,22 @@
     }
   }
 
+  /**
+   * A Ctrl, Shift or Meta click, or a middle click, on a link to a page of the
+   * app would open the app URL in the system browser. It navigates inside the
+   * app instead. Links to other origins are left to their own handlers.
+   */
+  function handleModifiedLinkClick(e: MouseEvent) {
+    const modified = e.ctrlKey || e.metaKey || e.shiftKey || e.button === 1;
+    if (!modified || !(e.target instanceof Element)) return;
+    const anchor = e.target.closest("a[href]");
+    if (!(anchor instanceof HTMLAnchorElement)) return;
+    const url = new URL(anchor.href, location.href);
+    if (url.origin !== location.origin) return;
+    e.preventDefault();
+    goto(url.pathname + url.search + url.hash);
+  }
+
   function handleDeepLink(url: string) {
     try {
       const parsed = new URL(url);
@@ -218,6 +234,8 @@
     }
 
     window.addEventListener("keydown", handleZoomKeys);
+    document.addEventListener("click", handleModifiedLinkClick, true);
+    document.addEventListener("auxclick", handleModifiedLinkClick, true);
 
     // Listeners are registered before any await, so no event emitted during
     // the permission request or the identity load is missed.
@@ -253,6 +271,8 @@
 
     return () => {
       window.removeEventListener("keydown", handleZoomKeys);
+      document.removeEventListener("click", handleModifiedLinkClick, true);
+      document.removeEventListener("auxclick", handleModifiedLinkClick, true);
       clearInterval(statusInterval);
       clearInterval(unreadInterval);
       clearInterval(notificationInterval);

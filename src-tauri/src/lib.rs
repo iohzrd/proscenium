@@ -193,7 +193,6 @@ pub fn run() {
             get_pending_follow_request_count,
             approve_follow_request,
             deny_follow_request,
-            send_follow_request_to_peer,
             add_server,
             remove_server,
             list_servers,

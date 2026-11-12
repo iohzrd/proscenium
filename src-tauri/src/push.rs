@@ -118,7 +118,10 @@ pub async fn handle_push(
         }
         match verify_linked_devices_announcement(announcement) {
             Ok(()) => {
-                if let Err(e) = storage.cache_peer_announcement(announcement).await {
+                if let Err(e) = storage
+                    .cache_peer_announcement(announcement, Some(remote_str))
+                    .await
+                {
                     log::warn!(
                         "[push-rx] rejected device announcement of {}: {e}",
                         short_id(author)

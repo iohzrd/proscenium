@@ -50,8 +50,8 @@ fn make_profile(name: &str) -> Profile {
     }
 }
 
-/// A `VerifiedIdentity` with the given device NodeIds and version.
-/// Storage does not check signatures, so the signature fields are placeholders.
+/// A `VerifiedIdentity` with the given device NodeIds and version, sent by the first
+/// NodeId. Storage does not check signatures, so the signature fields are placeholders.
 fn make_identity(master: &str, nodes: &[&str], version: u64) -> VerifiedIdentity {
     VerifiedIdentity {
         master_pubkey: master.to_string(),
@@ -69,6 +69,7 @@ fn make_identity(master: &str, nodes: &[&str], version: u64) -> VerifiedIdentity
             signature: "sig".to_string(),
         },
         profile: None,
+        node_id: nodes.first().map(|n| n.to_string()).unwrap_or_default(),
     }
 }
 
@@ -177,9 +178,33 @@ async fn post_insert_duplicate_is_ignored() {
 async fn post_delete() {
     let s = test_storage().await;
     s.insert_post(&make_post("p1", "a", 1000)).await.unwrap();
-    assert!(s.delete_post("a", "p1").await.unwrap());
+    assert!(s.delete_post("a", "p1", "sig").await.unwrap());
     assert!(s.get_post_by_id("p1").await.unwrap().is_none());
-    assert!(!s.delete_post("a", "p1").await.unwrap()); // already deleted
+    // The signed deletion is stored in the same transaction.
+    assert!(s.is_post_tombstoned("a", "p1").await.unwrap());
+    assert!(!s.delete_post("a", "p1", "sig").await.unwrap()); // already deleted
+}
+
+#[tokio::test]
+async fn received_tombstone_removes_the_rows_that_refer_to_the_post() {
+    let s = test_storage().await;
+    s.insert_post(&make_post("p1", "a", 1000)).await.unwrap();
+    s.save_interaction(&make_interaction("i1", "liker", "p1", "a", 2000))
+        .await
+        .unwrap();
+    s.toggle_bookmark("p1").await.unwrap();
+    let tombstone = PostTombstone {
+        id: "p1".to_string(),
+        author: "a".to_string(),
+        signature: "sig".to_string(),
+    };
+    let outcome = s
+        .apply_post_tombstones("a", &[tombstone], 3000)
+        .await
+        .unwrap();
+    assert_eq!(outcome.posts_removed, 1);
+    assert_eq!(s.get_post_counts("me", "p1").await.unwrap().likes, 0);
+    assert!(!s.is_bookmarked("p1").await.unwrap());
 }
 
 #[tokio::test]
@@ -317,7 +342,10 @@ async fn post_delete_repost_by_target() {
     repost.quote_of_author = Some("b".to_string());
     s.insert_post(&repost).await.unwrap();
 
-    let deleted = s.delete_repost_by_target("a", "target_post").await.unwrap();
+    let deleted = s
+        .delete_repost_by_target("a", "target_post", |_| "sig".to_string())
+        .await
+        .unwrap();
     assert_eq!(deleted, vec!["rp1"]);
     assert!(s.get_post_by_id("rp1").await.unwrap().is_none());
 }
@@ -490,12 +518,12 @@ async fn post_delete_removes_rows_that_refer_to_the_post() {
     }
 
     // Another author cannot delete the post or the rows that refer to it.
-    assert!(!s.delete_post("b", "p1").await.unwrap());
+    assert!(!s.delete_post("b", "p1", "sig").await.unwrap());
     assert!(s.get_post_by_id("p1").await.unwrap().is_some());
     assert_eq!(s.get_post_counts("me", "p1").await.unwrap().likes, 1);
     assert!(s.is_bookmarked("p1").await.unwrap());
 
-    assert!(s.delete_post("a", "p1").await.unwrap());
+    assert!(s.delete_post("a", "p1", "sig").await.unwrap());
     assert!(s.get_post_by_id("p1").await.unwrap().is_none());
     assert_eq!(s.get_post_counts("me", "p1").await.unwrap().likes, 0);
     assert!(!s.is_bookmarked("p1").await.unwrap());
@@ -529,7 +557,7 @@ async fn post_repost_is_distinct_from_quote() {
     assert_eq!(counts.reposts, 1);
     assert!(!counts.reposted_by_me);
     assert!(
-        s.delete_repost_by_target("me", "target")
+        s.delete_repost_by_target("me", "target", |_| "sig".to_string())
             .await
             .unwrap()
             .is_empty()
@@ -566,7 +594,10 @@ async fn post_repost_is_distinct_from_quote() {
             .reposted_by_me
     );
 
-    let mut deleted = s.delete_repost_by_target("me", "target").await.unwrap();
+    let mut deleted = s
+        .delete_repost_by_target("me", "target", |_| "sig".to_string())
+        .await
+        .unwrap();
     deleted.sort();
     assert_eq!(deleted, vec!["repost1", "repost2"]);
     assert!(!s.has_repost("me", "target").await.unwrap());
@@ -588,7 +619,7 @@ async fn post_get_by_id_is_deterministic_when_authors_share_an_id() {
     assert_eq!(post.author, "a");
 
     // A delete by one author keeps the other author's row.
-    assert!(s.delete_post("a", "shared").await.unwrap());
+    assert!(s.delete_post("a", "shared", "sig").await.unwrap());
     let post = s.get_post_by_id("shared").await.unwrap().unwrap();
     assert_eq!(post.author, "b");
 }
@@ -1955,7 +1986,9 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
     let s = test_storage().await;
     let v10 = make_identity("master_pk", &["transport_1"], 10);
     assert_eq!(
-        s.cache_peer_announcement(&v10.announcement).await.unwrap(),
+        s.cache_peer_announcement(&v10.announcement, None)
+            .await
+            .unwrap(),
         AnnouncementOutcome::Stored
     );
 
@@ -1963,7 +1996,9 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
     for version in [10, 5] {
         let old = make_identity("master_pk", &["old_device"], version);
         assert_eq!(
-            s.cache_peer_announcement(&old.announcement).await.unwrap(),
+            s.cache_peer_announcement(&old.announcement, None)
+                .await
+                .unwrap(),
             AnnouncementOutcome::NotNewer
         );
     }
@@ -1974,7 +2009,9 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
 
     let v11 = make_identity("master_pk", &["transport_2"], 11);
     assert_eq!(
-        s.cache_peer_announcement(&v11.announcement).await.unwrap(),
+        s.cache_peer_announcement(&v11.announcement, None)
+            .await
+            .unwrap(),
         AnnouncementOutcome::Stored
     );
     assert_eq!(
@@ -2039,59 +2076,70 @@ async fn peer_identity_empty_returns() {
 }
 
 #[tokio::test]
-async fn peer_transport_lookup_follows_the_latest_device_list() {
+async fn peer_transport_lookup_maps_only_the_delivering_device() {
     let s = test_storage().await;
+    let lookup = |node: &'static str| {
+        let s = &s;
+        async move { s.get_master_pubkey_for_transport(node).await }
+    };
+    // node_1 delivers a list of node_1 and node_2: only node_1 is mapped.
     let v1 = make_identity("master_a", &["node_1", "node_2"], 1);
     s.cache_peer_identity(&v1).await.unwrap();
-    assert_eq!(
-        s.get_master_pubkey_for_transport("node_1").await.as_deref(),
-        Some("master_a")
-    );
-    assert_eq!(
-        s.try_get_master_pubkey_for_transport("node_2")
-            .await
-            .unwrap()
-            .as_deref(),
-        Some("master_a")
-    );
+    assert_eq!(lookup("node_1").await.as_deref(), Some("master_a"));
+    assert!(lookup("node_2").await.is_none());
 
-    // A newer device list without node_1 removes its mapping.
-    let v2 = make_identity("master_a", &["node_2", "node_3"], 2);
+    // node_2 delivers the cached version: mapped.
+    let mut from_node_2 = v1.clone();
+    from_node_2.node_id = "node_2".to_string();
+    s.cache_peer_identity(&from_node_2).await.unwrap();
+    assert_eq!(lookup("node_2").await.as_deref(), Some("master_a"));
+
+    // A newer list without node_1 removes its mapping and keeps node_2.
+    let mut v2 = make_identity("master_a", &["node_2", "node_3"], 2);
+    v2.node_id = "node_3".to_string();
     s.cache_peer_identity(&v2).await.unwrap();
-    assert!(s.get_master_pubkey_for_transport("node_1").await.is_none());
-    assert_eq!(
-        s.get_master_pubkey_for_transport("node_3").await.as_deref(),
-        Some("master_a")
-    );
+    assert!(lookup("node_1").await.is_none());
+    assert_eq!(lookup("node_2").await.as_deref(), Some("master_a"));
+    assert_eq!(lookup("node_3").await.as_deref(), Some("master_a"));
 
-    // An older device list changes nothing.
-    s.cache_peer_announcement(&v1.announcement).await.unwrap();
-    assert!(s.get_master_pubkey_for_transport("node_1").await.is_none());
+    // node_1 delivers the older list again; the cached list does not contain it.
+    s.cache_peer_identity(&v1).await.unwrap();
+    assert!(lookup("node_1").await.is_none());
 }
 
 #[tokio::test]
-async fn peer_transport_lookup_returns_one_master_per_node() {
+async fn device_list_of_another_master_does_not_take_over_a_node() {
     let s = test_storage().await;
     let a = make_identity("master_a", &["node_1"], 1);
-    let b = make_identity("master_b", &["node_1", "node_9"], 1);
     s.cache_peer_identity(&a).await.unwrap();
-    s.cache_peer_identity(&b).await.unwrap();
-    // The most recently stored announcement that lists the NodeId determines the result.
-    assert_eq!(
-        s.get_master_pubkey_for_transport("node_1").await.as_deref(),
-        Some("master_b")
-    );
 
-    let a2 = make_identity("master_a", &["node_1"], 2);
-    s.cache_peer_identity(&a2).await.unwrap();
+    // master_b names node_1 in a newer list, delivered by its own device or by gossip.
+    let b = make_identity("master_b", &["node_9", "node_1"], 5);
+    s.cache_peer_identity(&b).await.unwrap();
+    s.cache_peer_announcement(&b.announcement, None)
+        .await
+        .unwrap();
     assert_eq!(
         s.get_master_pubkey_for_transport("node_1").await.as_deref(),
         Some("master_a")
     );
-    // The forward list of the other master is unchanged.
+    assert_eq!(
+        s.get_master_pubkey_for_transport("node_9").await.as_deref(),
+        Some("master_b")
+    );
+    // The forward list of master_b still names both NodeIds.
     assert_eq!(
         s.get_peer_transport_node_ids("master_b").await.unwrap(),
-        vec!["node_1", "node_9"]
+        vec!["node_9", "node_1"]
+    );
+
+    // node_1 delivers the list of master_b itself: the device moved to master_b.
+    let mut from_node_1 = b;
+    from_node_1.node_id = "node_1".to_string();
+    s.cache_peer_identity(&from_node_1).await.unwrap();
+    assert_eq!(
+        s.get_master_pubkey_for_transport("node_1").await.as_deref(),
+        Some("master_b")
     );
 }
 
@@ -2236,26 +2284,35 @@ async fn follow_request_expired_pending_is_not_listed_or_approvable() {
 }
 
 #[tokio::test]
-async fn follow_request_pending_rows_are_capped() {
+async fn follow_request_pending_rows_are_capped_by_removing_the_oldest() {
     let s = test_storage().await;
-    for i in 0..crate::constants::MAX_PENDING_FOLLOW_REQUESTS {
+    let max = crate::constants::MAX_PENDING_FOLLOW_REQUESTS;
+    for i in 0..max {
         let outcome = s
-            .record_follow_request(&format!("requester_{i}"), 1, 1000, 9000)
+            .record_follow_request(&format!("requester_{i}"), 1, 1000 + i, 90_000)
             .await
             .unwrap();
         assert_eq!(outcome, FollowRequestOutcome::NewPending);
     }
     let outcome = s
-        .record_follow_request("one_more", 1, 1000, 9000)
+        .record_follow_request("one_more", 1, 1000 + max, 90_000)
         .await
         .unwrap();
-    assert_eq!(outcome, FollowRequestOutcome::Full);
-    // An existing requester is still answered from its row.
+    assert_eq!(outcome, FollowRequestOutcome::NewPending);
+    assert_eq!(
+        s.get_pending_follow_request_count(1000 + max)
+            .await
+            .unwrap(),
+        max
+    );
+    // The oldest request was removed; the others are answered from their rows.
     let outcome = s
-        .record_follow_request("requester_0", 1, 1000, 9000)
+        .record_follow_request("requester_1", 1, 1000 + max, 90_000)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::StillPending);
+    let requests = s.get_follow_requests(1000 + max).await.unwrap();
+    assert!(!requests.iter().any(|r| r.pubkey == "requester_0"));
 }
 
 #[tokio::test]
@@ -2321,6 +2378,45 @@ async fn server_add_get_and_remove() {
     assert!(s.remove_server("https://a.test").await.unwrap());
     assert!(!s.remove_server("https://a.test").await.unwrap());
     assert_eq!(s.get_servers().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn servers_without_the_current_profile_are_listed_until_they_accept_it() {
+    let s = test_storage().await;
+    for url in ["https://a.test", "https://b.test", "https://c.test"] {
+        s.add_server(url, "", "", "").await.unwrap();
+    }
+    s.mark_server_registered("https://a.test", "public")
+        .await
+        .unwrap();
+    s.mark_server_registered("https://b.test", "public")
+        .await
+        .unwrap();
+    // c.test is not registered and is never listed.
+    assert_eq!(
+        s.get_servers_without_profile(10).await.unwrap(),
+        vec!["https://a.test", "https://b.test"]
+    );
+    s.mark_server_profile_synced("https://a.test", 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_servers_without_profile(10).await.unwrap(),
+        vec!["https://b.test"]
+    );
+    // An older accepted version does not lower the stored one; a newer profile lists
+    // the server again.
+    s.mark_server_profile_synced("https://a.test", 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.get_servers_without_profile(10).await.unwrap(),
+        vec!["https://b.test"]
+    );
+    assert_eq!(
+        s.get_servers_without_profile(11).await.unwrap(),
+        vec!["https://a.test", "https://b.test"]
+    );
 }
 
 #[tokio::test]
@@ -2531,6 +2627,61 @@ async fn migrations_upgrade_a_database_created_before_015() {
     .await
     .unwrap();
     assert_eq!(in_seconds, 0);
+}
+
+#[tokio::test]
+async fn newest_dm_ids_query_uses_an_index() {
+    let s = test_storage().await;
+    let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+        "EXPLAIN QUERY PLAN SELECT id FROM dm_messages ORDER BY timestamp DESC, id DESC LIMIT 10",
+    )
+    .fetch_all(&s.pool)
+    .await
+    .unwrap();
+    let details: Vec<&str> = rows.iter().map(|r| r.3.as_str()).collect();
+    assert!(
+        details.iter().any(|d| d.contains("idx_dm_messages_time")),
+        "{details:?}"
+    );
+    assert!(
+        !details.iter().any(|d| d.contains("TEMP B-TREE")),
+        "{details:?}"
+    );
+}
+
+#[tokio::test]
+async fn wipe_all_data_leaves_no_message_text_in_the_database_files() {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).unwrap();
+    let dir = std::env::temp_dir().join(format!("proscenium-wipe-{}", hex::encode(random)));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("social.db");
+    let marker = "wipe-marker-5f0c1d9e";
+    {
+        let s = Storage::open(&db).await.unwrap();
+        let conv_id = Storage::conversation_id("me", "bob");
+        for i in 0..50 {
+            let id = format!("m{i}");
+            s.insert_outgoing_dm(
+                &make_stored_message(&id, &conv_id, "me", "bob", marker, 1000 + i),
+                marker,
+                "{}",
+                0,
+            )
+            .await
+            .unwrap();
+        }
+        s.wipe_all_data().await.unwrap();
+        s.pool.close().await;
+    }
+    for name in ["social.db", "social.db-wal"] {
+        let bytes = std::fs::read(dir.join(name)).unwrap_or_default();
+        assert!(
+            !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "{name} still holds the message text"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test]
@@ -2788,6 +2939,78 @@ async fn device_sync_does_not_undo_a_bookmark_removal() {
     );
 }
 
+fn request_entry(pubkey: &str, status: &str, decided_at: u64) -> FollowRequestEntry {
+    FollowRequestEntry {
+        pubkey: pubkey.to_string(),
+        timestamp: 1,
+        status: status.to_string(),
+        created_at: 1,
+        expires_at: u64::MAX,
+        decided_at,
+    }
+}
+
+async fn request_status(s: &Storage, requester: &str) -> Option<String> {
+    s.get_follow_requests(now_millis())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.pubkey == requester)
+        .map(|r| r.status)
+}
+
+#[tokio::test]
+async fn merged_follow_request_keeps_the_later_decision() {
+    let s = test_storage().await;
+    let (me, requester) = (pubkey(1), pubkey(2));
+
+    // A pending request is copied; an approval replaces it and records the follower.
+    let merged = s
+        .merge_follow_requests(&me, &[request_entry(&requester, "pending", 0)])
+        .await
+        .unwrap();
+    assert_eq!(merged, 1);
+    assert_eq!(
+        request_status(&s, &requester).await.as_deref(),
+        Some("pending")
+    );
+    s.merge_follow_requests(&me, &[request_entry(&requester, "approved", 100)])
+        .await
+        .unwrap();
+    assert!(s.is_approved_follower(&requester).await.unwrap());
+    assert!(s.is_follower(&me, &requester).await.unwrap());
+
+    // An earlier decision and a pending copy do not replace it; a later one does.
+    for entry in [
+        request_entry(&requester, "denied", 50),
+        request_entry(&requester, "pending", 0),
+    ] {
+        assert_eq!(s.merge_follow_requests(&me, &[entry]).await.unwrap(), 0);
+    }
+    assert_eq!(
+        request_status(&s, &requester).await.as_deref(),
+        Some("approved")
+    );
+    s.merge_follow_requests(&me, &[request_entry(&requester, "denied", 200)])
+        .await
+        .unwrap();
+    assert_eq!(
+        request_status(&s, &requester).await.as_deref(),
+        Some("denied")
+    );
+
+    // Invalid, own and expired entries are skipped.
+    let mut expired = request_entry(&pubkey(3), "pending", 0);
+    expired.expires_at = 1;
+    let skipped = [
+        request_entry("not-a-pubkey", "approved", 1),
+        request_entry(&me, "approved", 1),
+        request_entry(&pubkey(4), "unknown", 1),
+        expired,
+    ];
+    assert_eq!(s.merge_follow_requests(&me, &skipped).await.unwrap(), 0);
+}
+
 #[tokio::test]
 async fn merge_follows_lww_newer_row_wins() {
     let s = test_storage().await;
@@ -2796,7 +3019,8 @@ async fn merge_follows_lww_newer_row_wins() {
     assert_eq!(
         s.merge_follows_lww(&me, &[follow_entry(&followee, "active", 100)])
             .await
-            .unwrap(),
+            .unwrap()
+            .len(),
         1
     );
     assert!(s.is_following(&me, &followee).await.unwrap());
@@ -2806,7 +3030,8 @@ async fn merge_follows_lww_newer_row_wins() {
         assert_eq!(
             s.merge_follows_lww(&me, &[follow_entry(&followee, "removed", changed)])
                 .await
-                .unwrap(),
+                .unwrap()
+                .len(),
             0
         );
     }
@@ -2815,7 +3040,8 @@ async fn merge_follows_lww_newer_row_wins() {
     assert_eq!(
         s.merge_follows_lww(&me, &[follow_entry(&followee, "removed", 200)])
             .await
-            .unwrap(),
+            .unwrap()
+            .len(),
         1
     );
     assert!(!s.is_following(&me, &followee).await.unwrap());
@@ -2841,7 +3067,7 @@ async fn merge_follows_lww_skips_invalid_entries_and_limits_timestamps() {
         )
         .await
         .unwrap();
-    assert_eq!(merged, 0);
+    assert!(merged.is_empty());
     assert!(s.load_lww_state(&me).await.unwrap().follows.is_empty());
 
     // A timestamp later than the local clock is stored as the local time, so a local
@@ -2911,6 +3137,56 @@ async fn lww_state_leaves_out_rows_that_a_merge_would_skip() {
 }
 
 #[tokio::test]
+async fn stale_device_lists_of_unrelated_users_are_pruned() {
+    let s = test_storage().await;
+    let me = pubkey(1);
+    let followed = signed_announcement(20, 21, 5);
+    let messaged = signed_announcement(30, 31, 5);
+    let stranger = signed_announcement(40, 41, 5);
+    for announcement in [&followed, &messaged, &stranger] {
+        s.cache_peer_announcement(announcement, Some(&announcement.devices[0].node_id))
+            .await
+            .unwrap();
+    }
+    s.merge_follows_lww(&me, &[follow_entry(&followed.master_pubkey, "active", 100)])
+        .await
+        .unwrap();
+    let conv_id = Storage::conversation_id(&me, &messaged.master_pubkey);
+    s.insert_outgoing_dm(
+        &make_stored_message("m1", &conv_id, &me, &messaged.master_pubkey, "hi", 1000),
+        "hi",
+        "{}",
+        0,
+    )
+    .await
+    .unwrap();
+
+    // Lists cached after the cutoff are kept.
+    assert_eq!(s.prune_peer_announcements(&me, 0).await.unwrap(), 0);
+    assert_eq!(s.prune_peer_announcements(&me, u64::MAX).await.unwrap(), 1);
+    assert!(
+        s.get_peer_transport_node_ids(&stranger.master_pubkey)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.get_master_pubkey_for_transport(&pubkey(41))
+            .await
+            .is_none()
+    );
+    for kept in [&followed, &messaged] {
+        assert_eq!(
+            s.get_peer_transport_node_ids(&kept.master_pubkey)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
 async fn followed_peer_announcements_are_exported_for_active_follows() {
     let s = test_storage().await;
     let me = pubkey(1);
@@ -2918,7 +3194,7 @@ async fn followed_peer_announcements_are_exported_for_active_follows() {
     let unfollowed = signed_announcement(30, 31, 5);
     let stranger = signed_announcement(40, 41, 5);
     for announcement in [&followed, &unfollowed, &stranger] {
-        s.cache_peer_announcement(announcement).await.unwrap();
+        s.cache_peer_announcement(announcement, None).await.unwrap();
     }
     s.merge_follows_lww(
         &me,
@@ -2966,6 +3242,7 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
             bookmark_entry(&bookmarked, "active", 100),
             bookmark_entry(&unbookmarked, "removed", 100),
         ],
+        follow_requests: vec![],
         peer_announcements: vec![followed.clone(), not_followed.clone(), forged.clone()],
     };
     let own_device = device_entry(&own_node, "Android");

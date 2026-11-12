@@ -10,7 +10,7 @@ mod notifications;
 mod posts;
 mod preferences;
 mod profile;
-mod servers;
+pub(crate) mod servers;
 mod social;
 mod stage;
 pub(crate) mod sync;

@@ -35,7 +35,14 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     if !confirmed {
         return Err("cancelled".into());
     }
-    let blobs_dir = app.path().app_data_dir()?.join(crate::setup::BLOBS_DIR);
+    let data_dir = app.path().app_data_dir()?;
+    let blobs_dir = data_dir.join(crate::setup::BLOBS_DIR);
+    // The keys are kept, so the identity is not new: `get_seed_phrase` keeps asking for
+    // confirmation although no profile remains.
+    let marker = data_dir.join(crate::setup::SEED_CONFIRM_FILE);
+    tokio::task::spawn_blocking(move || crate::setup::write_secret_file(&marker, b"1"))
+        .await
+        .map_err(|e| format!("marker write task failed: {e}"))??;
 
     if tokio::time::timeout(WIPE_SHUTDOWN_TIMEOUT, crate::setup::stop_network(&state))
         .await

@@ -4,7 +4,7 @@ use super::fanout::Fanout;
 use super::pipeline::{self, ConnKind, IncomingAudio};
 use super::relay::{RelayConfig, run_relay_upstream};
 use super::state::{
-    ActiveStage, LISTENER_CAPACITY, ListenerConn, MAX_FAILED_UPSTREAMS,
+    ActiveStage, HostState, LISTENER_CAPACITY, ListenerConn, MAX_FAILED_UPSTREAMS,
     MAX_LISTENER_CONNS_PER_IDENTITY, MixedStreamServer, SpeakerConn,
 };
 use super::{CLOSE_BANNED, CLOSE_FULL, CLOSE_NORMAL, CLOSE_REJECTED, CLOSE_REPLACED, StageCommand};
@@ -21,6 +21,23 @@ use tokio::sync::mpsc;
 
 /// The host broadcasts a `RoomState` at least this often.
 const ROOM_STATE_INTERVAL_MS: u64 = 10_000;
+
+/// True if `master_pubkey` has a listener connection to `serving` or a speaker
+/// connection to `host`.
+pub(super) fn has_audio_connection(
+    serving: Option<&MixedStreamServer>,
+    host: Option<&HostState>,
+    master_pubkey: &str,
+) -> bool {
+    let listening =
+        serving.is_some_and(|s| s.conns.values().any(|c| c.master_pubkey == master_pubkey));
+    let speaking = host.is_some_and(|h| {
+        h.speaker_conns
+            .values()
+            .any(|c| c.master_pubkey == master_pubkey)
+    });
+    listening || speaking
+}
 
 impl ActiveStage {
     /// Broadcast a control message signed by this node. A send failure is logged.
@@ -51,6 +68,8 @@ impl ActiveStage {
     /// Serve the mixed stream to a listener connection.
     /// One connection per NodeId (a new one replaces the old one), at most
     /// `MAX_LISTENER_CONNS_PER_IDENTITY` per master pubkey, at most `capacity` in total.
+    /// An identity without a speaking role may not use the last `reserved_for_roles`
+    /// entries, which are kept for the upstream connections of relays.
     fn admit_listener(&mut self, incoming: IncomingAudio, conn_id: u64) {
         let IncomingAudio {
             conn,
@@ -73,8 +92,12 @@ impl ActiveStage {
             .values()
             .filter(|c| c.master_pubkey == master_pubkey)
             .count();
-        if same_identity >= MAX_LISTENER_CONNS_PER_IDENTITY || server.conns.len() >= server.capacity
-        {
+        let limit = if self.roles.role_of(&master_pubkey) == StageRole::Listener {
+            server.capacity - server.reserved_for_roles
+        } else {
+            server.capacity
+        };
+        if same_identity >= MAX_LISTENER_CONNS_PER_IDENTITY || server.conns.len() >= limit {
             log::info!(
                 "[stage] rejected listener {}: no free slot",
                 short_id(&node_id)
@@ -269,16 +292,7 @@ impl ActiveStage {
 
     /// True if `master_pubkey` has an audio connection to this node.
     pub(super) fn has_connection(&self, master_pubkey: &str) -> bool {
-        let listening = self
-            .serving
-            .as_ref()
-            .is_some_and(|s| s.conns.values().any(|c| c.master_pubkey == master_pubkey));
-        let speaking = self.host.as_ref().is_some_and(|h| {
-            h.speaker_conns
-                .values()
-                .any(|c| c.master_pubkey == master_pubkey)
-        });
-        listening || speaking
+        has_audio_connection(self.serving.as_ref(), self.host.as_ref(), master_pubkey)
     }
 
     // ---- Listener upstream ------------------------------------------------
@@ -326,7 +340,7 @@ impl ActiveStage {
                     fanout: fanout.clone(),
                     cancel: cancel.clone(),
                 }));
-                let mut server = MixedStreamServer::new(fanout, capacity);
+                let mut server = MixedStreamServer::new(fanout, capacity, 0);
                 server.upstream_cancel = Some(cancel);
                 self.serving = Some(server);
             }

@@ -450,3 +450,12 @@ export function detectImageMime(data: Uint8Array): string {
     return "image/webp";
   return "image/png";
 }
+
+/** Toast text and type for a `follow_user` result that stored no follow. */
+export function followRequestNotice(
+  outcome: "pending" | "denied",
+): [string, "success" | "error"] {
+  return outcome === "pending"
+    ? ["Follow request sent. Waiting for approval.", "success"]
+    : ["Follow request denied", "error"];
+}

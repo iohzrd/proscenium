@@ -477,8 +477,9 @@ pub async fn sync_profile_to_server(state: State<'_, Arc<AppState>>, url: String
 }
 
 /// Send the stored own profile to a server the user is listed on, as a signed
-/// `ProfileUpdateRequest`. Called from `save_my_profile`, `register_with_server` and the
-/// `sync_profile_to_server` command.
+/// `ProfileUpdateRequest`, and record its `updated_at` as accepted by that server. Called
+/// from `save_my_profile`, `register_with_server`, the `sync_profile_to_server` command and
+/// the task that retries servers without the current profile.
 pub(crate) async fn sync_profile_to_server_inner(
     http_client: &reqwest::Client,
     storage: &Storage,
@@ -497,6 +498,7 @@ pub(crate) async fn sync_profile_to_server_inner(
         (id.master_pubkey.clone(), id.master_key.clone())
     };
     let timestamp = now_millis();
+    let updated_at = profile.updated_at;
     let signature = sign_profile_update(&master_pubkey, &url, timestamp, &profile, &master_key);
     let request = ProfileUpdateRequest {
         master_pubkey,
@@ -514,7 +516,7 @@ pub(crate) async fn sync_profile_to_server_inner(
     if !resp.status().is_success() {
         return Err(format!("profile sync failed: {}", describe_failure(resp).await).into());
     }
-    Ok(())
+    storage.mark_server_profile_synced(&url, updated_at).await
 }
 
 #[cfg(test)]
