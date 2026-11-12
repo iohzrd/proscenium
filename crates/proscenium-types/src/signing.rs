@@ -246,13 +246,10 @@ pub fn sign_linked_devices_announcement(
 /// Verify a LinkedDevicesAnnouncement: the list holds 1 to `MAX_LINKED_DEVICES` devices
 /// and at most `MAX_REMOVED_DEVICES` removed NodeIds, every NodeId is a canonical public
 /// key, no removed NodeId is listed as a device, every device name is at most
-/// `MAX_DEVICE_NAME_LEN` bytes, the version (a creation time) is at most
-/// `MAX_TIMESTAMP_DRIFT_MS` after the local clock, so a device with a fast clock cannot
-/// publish a list that outranks every later one, and the signature was made by
-/// `master_pubkey`.
+/// `MAX_DEVICE_NAME_LEN` bytes, and the signature was made by `master_pubkey`.
 ///
-/// Does not compare the version with previously stored values; the caller does that when
-/// it stores the announcement.
+/// Does not check the version: a list signed by a device with a fast clock still
+/// authenticates its devices. A cache ranks a list by `announcement_cache_version`.
 pub fn verify_linked_devices_announcement(
     announcement: &LinkedDevicesAnnouncement,
 ) -> Result<(), String> {
@@ -261,11 +258,6 @@ pub fn verify_linked_devices_announcement(
             "announcement lists {} devices (allowed 1..={MAX_LINKED_DEVICES})",
             announcement.devices.len()
         ));
-    }
-    if announcement.version
-        > crate::validation::now_millis().saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS)
-    {
-        return Err("announcement version is later than the local clock".to_string());
     }
     if announcement.removed.len() > MAX_REMOVED_DEVICES {
         return Err(format!(
@@ -294,6 +286,16 @@ pub fn verify_linked_devices_announcement(
         &linked_devices_signing_bytes(announcement),
         &announcement.signature,
         "linked devices announcement",
+    )
+}
+
+/// The version under which a cache ranks `announcement`: its version (a creation time),
+/// at most `MAX_TIMESTAMP_DRIFT_MS` after the local clock. A list with a later version,
+/// from a device with a fast clock or signed with a version far in the future, then
+/// outranks later lists for at most `MAX_TIMESTAMP_DRIFT_MS`.
+pub fn announcement_cache_version(announcement: &LinkedDevicesAnnouncement) -> u64 {
+    announcement.version.min(
+        crate::validation::now_millis().saturating_add(crate::validation::MAX_TIMESTAMP_DRIFT_MS),
     )
 }
 
@@ -482,15 +484,21 @@ mod tests {
     }
 
     #[test]
-    fn announcement_version_after_the_local_clock_is_rejected() {
+    fn announcement_ahead_of_the_clock_verifies_and_ranks_at_the_drift_limit() {
         let a = identity(1);
         let mut list = announcement(&a, &[node_id(50)]);
-        list.version = crate::validation::now_millis();
+        let now = crate::validation::now_millis();
+        list.version = now;
         sign_linked_devices_announcement(&mut list, &a.key);
         assert!(verify_linked_devices_announcement(&list).is_ok());
-        list.version += crate::validation::MAX_TIMESTAMP_DRIFT_MS + 60_000;
+        assert_eq!(announcement_cache_version(&list), now);
+
+        list.version = u64::MAX;
         sign_linked_devices_announcement(&mut list, &a.key);
-        assert!(verify_linked_devices_announcement(&list).is_err());
+        assert!(verify_linked_devices_announcement(&list).is_ok());
+        let ranked = announcement_cache_version(&list);
+        let limit = crate::validation::now_millis() + crate::validation::MAX_TIMESTAMP_DRIFT_MS;
+        assert!(ranked <= limit && ranked >= now + crate::validation::MAX_TIMESTAMP_DRIFT_MS);
     }
 
     #[test]

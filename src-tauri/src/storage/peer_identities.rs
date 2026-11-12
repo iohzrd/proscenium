@@ -1,6 +1,8 @@
 use crate::error::AppError;
 use crate::storage::Storage;
-use proscenium_types::{LinkedDevicesAnnouncement, VerifiedIdentity, now_millis};
+use proscenium_types::{
+    LinkedDevicesAnnouncement, VerifiedIdentity, announcement_cache_version, now_millis,
+};
 
 /// Result of offering a peer's device announcement to the cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,7 +17,9 @@ impl Storage {
     /// Store a device announcement that passed `verify_linked_devices_announcement`.
     ///
     /// The announcement replaces the cached one of its master pubkey only if its
-    /// `version` is greater; otherwise `AnnouncementOutcome::NotNewer` is returned.
+    /// `announcement_cache_version` (the version, at most `MAX_TIMESTAMP_DRIFT_MS` after
+    /// the local clock) is greater than the stored one; otherwise
+    /// `AnnouncementOutcome::NotNewer` is returned.
     ///
     /// `peer_transports` maps a NodeId to a master pubkey only if the NodeId delivered,
     /// over a connection that QUIC authenticates, a device list of that master that the
@@ -46,7 +50,7 @@ impl Storage {
         )
         .bind(master)
         .bind(&json)
-        .bind(i64::try_from(announcement.version).unwrap_or(i64::MAX))
+        .bind(i64::try_from(announcement_cache_version(announcement)).unwrap_or(i64::MAX))
         .bind(now_millis() as i64)
         .execute(&mut *tx)
         .await?

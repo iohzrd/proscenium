@@ -2022,6 +2022,42 @@ async fn peer_announcement_keeps_device_list_unless_version_increases() {
 }
 
 #[tokio::test]
+async fn peer_announcement_ahead_of_the_clock_is_stored_at_the_drift_limit() {
+    let s = test_storage().await;
+    // A list from a device whose clock is far ahead is stored, so its devices can be
+    // dialed, and ranked at most MAX_TIMESTAMP_DRIFT_MS after the local clock.
+    let future = make_identity("master_pk", &["fast_device"], u64::MAX / 2);
+    assert_eq!(
+        s.cache_peer_announcement(&future.announcement, None)
+            .await
+            .unwrap(),
+        AnnouncementOutcome::Stored
+    );
+    assert_eq!(
+        s.get_peer_transport_node_ids("master_pk").await.unwrap(),
+        vec!["fast_device"]
+    );
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT version FROM peer_device_announcements WHERE master_pubkey = 'master_pk'",
+    )
+    .fetch_one(&s.pool)
+    .await
+    .unwrap();
+    assert!(stored as u64 <= now_millis() + MAX_TIMESTAMP_DRIFT_MS);
+
+    // A list with a later version than the stored rank replaces it. Its rank is capped
+    // at the clock of its store, which must be later.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let later = make_identity("master_pk", &["other_device"], stored as u64 + 1);
+    assert_eq!(
+        s.cache_peer_announcement(&later.announcement, None)
+            .await
+            .unwrap(),
+        AnnouncementOutcome::Stored
+    );
+}
+
+#[tokio::test]
 async fn profile_is_replaced_only_by_equal_or_newer_version() {
     let s = test_storage().await;
     let mut newer = make_profile("newer");

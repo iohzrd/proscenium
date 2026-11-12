@@ -1,7 +1,7 @@
 use futures_lite::Stream;
 use proscenium_types::{
     Interaction, InteractionKind, LinkedDevicesAnnouncement, MAX_SYNC_TOMBSTONES, Post, Profile,
-    ProfileUpdateRequest, RegistrationRequest, Visibility, now_millis,
+    ProfileUpdateRequest, RegistrationRequest, Visibility, announcement_cache_version, now_millis,
 };
 use serde::Serialize;
 use sqlx::sqlite::{
@@ -658,8 +658,9 @@ impl Storage {
     /// Store the device NodeIds of an announcement that passed
     /// `verify_linked_devices_announcement`, for an active registration.
     ///
-    /// The stored list is replaced only if `announcement.version` is greater than the
-    /// stored version. If the announcement removes the registering device, its NodeId is
+    /// The stored list is replaced only if its `announcement_cache_version` (the version,
+    /// at most `MAX_TIMESTAMP_DRIFT_MS` after the local clock) is greater than the stored
+    /// version. If the announcement removes the registering device, its NodeId is
     /// cleared, so only the devices of the list are dialed.
     pub async fn cache_announcement(
         &self,
@@ -667,7 +668,7 @@ impl Storage {
     ) -> Result<AnnouncementOutcome, ChangeError> {
         let mut tx = self.begin_write().await?;
         let row = Self::load_active_row(&mut tx, &announcement.master_pubkey).await?;
-        let version = to_i64(announcement.version);
+        let version = to_i64(announcement_cache_version(announcement));
         if version <= row.announcement_version {
             return Ok(AnnouncementOutcome::NotNewer);
         }

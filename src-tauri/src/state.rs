@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use zeroize::Zeroize;
 
 /// Commands sent to the peer sync task to trigger on-demand syncs.
 pub enum SyncCommand {
@@ -24,9 +23,9 @@ pub enum SyncCommand {
 /// Wrapped in `SharedIdentity` (Arc<RwLock<Identity>>) so `setup::replace_identity` can
 /// replace it in place.
 pub struct Identity {
-    /// Master key secret bytes. Every device of the user holds the master key.
-    pub master_secret_key_bytes: [u8; 32],
     /// The master key. It is the user's identity and signs all of the user's content.
+    /// Every device of the user holds it. `SecretKey` zeroizes its bytes when dropped;
+    /// `to_bytes` returns a copy for the recovery phrase and the link bundle.
     pub master_key: SecretKey,
     /// Master public key string (the user ID).
     pub master_pubkey: String,
@@ -37,22 +36,13 @@ pub struct Identity {
 }
 
 impl Identity {
-    pub fn new(master_secret_key_bytes: [u8; 32], transport_key: SecretKey) -> Self {
-        let master_key = SecretKey::from_bytes(&master_secret_key_bytes);
+    pub fn new(master_key: SecretKey, transport_key: SecretKey) -> Self {
         Self {
-            master_secret_key_bytes,
             master_pubkey: master_key.public().to_string(),
             master_key,
             transport_node_id: transport_key.public().to_string(),
             transport_key,
         }
-    }
-}
-
-/// Overwrites the master key bytes with zeros. `SecretKey` zeroizes its own bytes.
-impl Drop for Identity {
-    fn drop(&mut self) {
-        self.master_secret_key_bytes.zeroize();
     }
 }
 

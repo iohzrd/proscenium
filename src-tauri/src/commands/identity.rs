@@ -1,6 +1,7 @@
 use crate::error::CmdResult;
 use crate::setup::{IdentityKeys, SEED_BACKED_UP_FILE, SEED_CONFIRM_FILE};
 use crate::state::AppState;
+use iroh::SecretKey;
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub async fn get_seed_phrase(state: State<'_, Arc<AppState>>) -> CmdResult<Strin
             return Err("cancelled".into());
         }
     }
-    let mut master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
+    let mut master_secret_key_bytes = state.identity.read().await.master_key.to_bytes();
     let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes);
     master_secret_key_bytes.zeroize();
     Ok(mnemonic?.to_string())
@@ -83,7 +84,7 @@ pub async fn verify_seed_phrase_words(
     if FAILED_VERIFICATIONS.load(Ordering::Relaxed) >= MAX_FAILED_VERIFICATIONS {
         return Err("Too many failed attempts. Restart the app to verify the phrase again.".into());
     }
-    let mut master_secret_key_bytes = state.identity.read().await.master_secret_key_bytes;
+    let mut master_secret_key_bytes = state.identity.read().await.master_key.to_bytes();
     let mnemonic = bip39::Mnemonic::from_entropy(&master_secret_key_bytes);
     master_secret_key_bytes.zeroize();
     let mnemonic = mnemonic?;
@@ -128,7 +129,9 @@ pub async fn recover_from_seed_phrase(
     let master_secret_key =
         master.map_err(|_| "Recovery phrase did not produce 32 bytes of entropy")?;
 
-    if state.identity.read().await.master_secret_key_bytes == master_secret_key {
+    if SecretKey::from_bytes(&master_secret_key).public()
+        == state.identity.read().await.master_key.public()
+    {
         return Err("This device already uses the identity of that recovery phrase.".into());
     }
 

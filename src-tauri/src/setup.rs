@@ -245,11 +245,13 @@ fn load_identity(data_dir: &Path) -> Result<Identity, AppError> {
         read_key_file(&path)?
             .ok_or_else(|| AppError::Other(format!("{} is missing", path.display())))
     };
-    let master_secret_key_bytes = read(MASTER_KEY_FILE)?;
+    let mut master_secret_key = read(MASTER_KEY_FILE)?;
+    let master_key = SecretKey::from_bytes(&master_secret_key);
+    master_secret_key.zeroize();
     let mut transport_secret_key = read(TRANSPORT_KEY_FILE)?;
     let transport_key = SecretKey::from_bytes(&transport_secret_key);
     transport_secret_key.zeroize();
-    Ok(Identity::new(master_secret_key_bytes, transport_key))
+    Ok(Identity::new(master_key, transport_key))
 }
 
 /// Write the transport key file, then the master key file.
@@ -943,7 +945,7 @@ mod tests {
         )
         .unwrap();
         let identity = load_identity(&dir.0).unwrap();
-        assert_eq!(identity.master_secret_key_bytes, master);
+        assert_eq!(identity.master_key.to_bytes(), master);
         assert_eq!(
             identity.transport_node_id,
             SecretKey::from_bytes(&transport).public().to_string()
@@ -1009,12 +1011,15 @@ mod tests {
     #[test]
     fn identity_debug_output_holds_no_secret_bytes() {
         let master = [0xABu8; 32];
-        let identity = Identity::new(master, SecretKey::from_bytes(&[0xCDu8; 32]));
+        let identity = Identity::new(
+            SecretKey::from_bytes(&master),
+            SecretKey::from_bytes(&[0xCDu8; 32]),
+        );
         let debug = format!("{identity:?}");
         assert!(debug.contains(&identity.master_pubkey));
         assert!(debug.contains(&identity.transport_node_id));
         for secret in [
-            identity.master_secret_key_bytes,
+            identity.master_key.to_bytes(),
             identity.transport_key.to_bytes(),
         ] {
             assert!(!debug.contains(&hex::encode(secret)));

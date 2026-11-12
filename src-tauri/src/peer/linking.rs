@@ -463,7 +463,7 @@ impl PeerHandler {
             .get_followed_peer_announcements(&master_pubkey)
             .await?;
         // The copy of the master key exists only while it is encoded.
-        let mut master_secret_key_bytes = self.identity.read().await.master_secret_key_bytes;
+        let mut master_secret_key_bytes = self.identity.read().await.master_key.to_bytes();
         let master_secret_key =
             base64::engine::general_purpose::STANDARD.encode(master_secret_key_bytes);
         master_secret_key_bytes.zeroize();

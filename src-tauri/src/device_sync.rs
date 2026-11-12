@@ -836,7 +836,7 @@ mod tests {
 
     fn shared_identity(master: [u8; 32], transport_seed: u8) -> SharedIdentity {
         Arc::new(tokio::sync::RwLock::new(Identity::new(
-            master,
+            SecretKey::from_bytes(&master),
             SecretKey::from_bytes(&[transport_seed; 32]),
         )))
     }
