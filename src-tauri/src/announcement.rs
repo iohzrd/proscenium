@@ -37,16 +37,19 @@ pub fn verify_lists_device(
     Ok(())
 }
 
-/// Build and sign the local user's device announcement from the `linked_devices` table.
+/// Build and sign the local user's device announcement from the `linked_devices` and
+/// `removed_devices` tables.
 ///
 /// The local device is listed first, whether or not the table holds a row for it, then
-/// the other rows, at most `MAX_LINKED_DEVICES` in total. `version` is the creation time
-/// in milliseconds, so receivers replace an earlier announcement with a later one.
+/// the other rows, at most `MAX_LINKED_DEVICES` in total. `removed` holds the recorded
+/// removed NodeIds that are not listed as devices, newest first. `version` is the creation
+/// time in milliseconds, so receivers replace an earlier announcement with a later one.
 pub async fn build_own_announcement(
     storage: &Storage,
     identity: &SharedIdentity,
 ) -> Result<LinkedDevicesAnnouncement, AppError> {
     let stored = storage.get_linked_devices().await?;
+    let mut removed = storage.get_removed_device_ids().await?;
     let id = identity.read().await;
     let now = now_millis();
 
@@ -74,9 +77,12 @@ pub async fn build_own_announcement(
         }
     }
 
+    removed.retain(|node_id| !devices.iter().any(|d| d.node_id == *node_id));
+
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: id.master_pubkey.clone(),
         devices,
+        removed,
         version: now,
         signature: String::new(),
     };

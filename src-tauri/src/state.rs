@@ -31,7 +31,6 @@ pub struct Identity {
     /// Master public key string (the user ID).
     pub master_pubkey: String,
     /// Secret key of this device's iroh endpoint, generated at random for each device.
-    /// Its X25519 form decrypts the DMs sent to this device.
     pub transport_key: SecretKey,
     /// Transport NodeId string (the public key of `transport_key`).
     pub transport_node_id: String,

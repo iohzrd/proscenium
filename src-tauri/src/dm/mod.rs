@@ -1,11 +1,11 @@
 //! Direct messages over the DM ALPN.
 //!
-//! Every payload is encrypted to one device of the recipient (`envelope`) and sent to that
-//! device on its own QUIC connection. A message, receipt or typing signal goes to every
-//! device of the recipient; a call signal goes to one device. There is no session state.
+//! Every payload is sent in a `DmEnvelope` to one device of the recipient on its own QUIC
+//! connection, which encrypts it and authenticates both devices. A message, receipt or
+//! typing signal goes to every device of the recipient; a call signal goes to one device.
+//! There is no session state.
 
 mod delivery;
-mod envelope;
 mod incoming;
 
 use crate::error::AppError;
@@ -13,7 +13,7 @@ use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use crate::util::NodeSlot;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
+    Endpoint, EndpointAddr, EndpointId,
     endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler},
 };
@@ -36,14 +36,10 @@ pub(crate) const MAX_DM_CONTENT_LEN: usize = 10_000;
 /// 40 KiB when no character needs a JSON escape sequence.
 pub(crate) const MAX_DM_PAYLOAD_LEN: usize = 64 * 1024;
 
-/// Maximum ciphertext length in an envelope: the payload plus the 16-byte
-/// ChaCha20-Poly1305 tag.
-const MAX_DM_CIPHERTEXT_LEN: usize = MAX_DM_PAYLOAD_LEN + 16;
-
-/// Maximum byte length of the envelope the acceptor reads: a ciphertext of
-/// `MAX_DM_CIPHERTEXT_LEN` bytes in hex, and a device list of at most
-/// `MAX_ANNOUNCEMENT_JSON_LEN` bytes. The other fields take under 1 KiB.
-const MAX_DM_FRAME_LEN: usize = 2 * MAX_DM_CIPHERTEXT_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
+/// Maximum byte length of the envelope the acceptor reads: a payload of
+/// `MAX_DM_PAYLOAD_LEN` bytes and a device list of at most `MAX_ANNOUNCEMENT_JSON_LEN`
+/// bytes. The other fields take under 1 KiB.
+const MAX_DM_FRAME_LEN: usize = MAX_DM_PAYLOAD_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
 
 /// Incoming DM connections handled at the same time, in total and per remote NodeId.
 const DM_MAX_CONNECTIONS: usize = 64;
@@ -68,15 +64,6 @@ pub struct CallSignal {
     pub peer_pubkey: String,
     pub peer_device: EndpointId,
     pub payload: proscenium_types::DmPayload,
-}
-
-/// Copy of the local identity values one DM operation needs. Taken once so the identity
-/// lock is not held across storage or network calls.
-struct DmKeys {
-    master_pubkey: String,
-    /// Transport key of this device. Its X25519 form decrypts the envelopes sent to it
-    /// and authenticates the envelopes it sends.
-    device_key: SecretKey,
 }
 
 #[derive(Clone)]
@@ -127,14 +114,6 @@ impl DmHandler {
     /// to wire call signals into the CallHandler.
     pub fn set_call_signal_tx(&mut self, tx: mpsc::UnboundedSender<CallSignal>) {
         self.call_signal_tx = tx;
-    }
-
-    async fn dm_keys(&self) -> DmKeys {
-        let id = self.identity.read().await;
-        DmKeys {
-            master_pubkey: id.master_pubkey.clone(),
-            device_key: id.transport_key.clone(),
-        }
     }
 
     /// NodeIds of the cached device list of `peer_master_pubkey`, in list order.
@@ -288,9 +267,10 @@ impl ProtocolHandler for DmHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::SecretKey;
     use proscenium_types::{
         DeviceEntry, DmPayload, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
-        MediaAttachment,
+        MAX_REMOVED_DEVICES, MediaAttachment,
     };
 
     fn message() -> DirectMessage {
@@ -333,35 +313,9 @@ mod tests {
         assert!(validate_direct_message(&repeated_hash).is_err());
     }
 
-    #[test]
-    fn largest_envelope_fits_in_the_frame_limit() {
-        let key = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
-        let envelope = DmEnvelope {
-            sender: key(1),
-            sender_device: key(2),
-            recipient: key(3),
-            recipient_device: key(4),
-            sender_devices: LinkedDevicesAnnouncement {
-                master_pubkey: key(1),
-                devices: (0..MAX_LINKED_DEVICES as u8)
-                    .map(|i| DeviceEntry {
-                        node_id: key(i + 10),
-                        device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
-                        added_at: u64::MAX,
-                    })
-                    .collect(),
-                version: u64::MAX,
-                signature: "f".repeat(128),
-            },
-            encapped_key: vec![0xff; 32],
-            ciphertext: vec![0xff; MAX_DM_CIPHERTEXT_LEN],
-        };
-        let frame = serde_json::to_vec(&envelope).unwrap();
-        assert!(frame.len() <= MAX_DM_FRAME_LEN);
-    }
-
-    #[test]
-    fn unescaped_maximum_message_fits_in_the_payload_limit() {
+    /// A message whose JSON has `MAX_DM_CONTENT_LEN` content bytes and ten attachments
+    /// with the largest fields, none of which needs a JSON escape sequence.
+    fn maximum_message() -> DmPayload {
         let media = (0..10)
             .map(|i| MediaAttachment {
                 hash: format!("{i:064}"),
@@ -371,13 +325,43 @@ mod tests {
                 ticket: "t".repeat(2_048),
             })
             .collect();
-        let payload = DmPayload::Message(DirectMessage {
+        DmPayload::Message(DirectMessage {
             id: "f".repeat(32),
             content: "c".repeat(MAX_DM_CONTENT_LEN),
             timestamp: u64::MAX,
             media,
             reply_to: Some("f".repeat(32)),
-        });
-        assert!(serde_json::to_vec(&payload).unwrap().len() <= MAX_DM_PAYLOAD_LEN);
+        })
+    }
+
+    #[test]
+    fn largest_envelope_fits_in_the_frame_limit() {
+        let key = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let envelope = DmEnvelope {
+            recipient: key(3),
+            sender_devices: LinkedDevicesAnnouncement {
+                master_pubkey: key(1),
+                devices: (0..MAX_LINKED_DEVICES as u8)
+                    .map(|i| DeviceEntry {
+                        node_id: key(i + 10),
+                        device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
+                        added_at: u64::MAX,
+                    })
+                    .collect(),
+                removed: (0..MAX_REMOVED_DEVICES as u8)
+                    .map(|i| key(i + 100))
+                    .collect(),
+                version: u64::MAX,
+                signature: "f".repeat(128),
+            },
+            payload: maximum_message(),
+        };
+        let frame = serde_json::to_vec(&envelope).unwrap();
+        assert!(frame.len() <= MAX_DM_FRAME_LEN);
+    }
+
+    #[test]
+    fn unescaped_maximum_message_fits_in_the_payload_limit() {
+        assert!(serde_json::to_vec(&maximum_message()).unwrap().len() <= MAX_DM_PAYLOAD_LEN);
     }
 }

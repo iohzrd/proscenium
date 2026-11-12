@@ -23,17 +23,17 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 Each user has one master key, and each device its own transport key:
 
 - **Master key** (Ed25519) -- The identity. The master public key is what others follow. The master key signs all of the user's content: posts, interactions, profiles, deletions, device lists, follow requests, server registrations and Stage messages. Stored in `master_key.key` (mode 0600) on every device of the user. A 24-word BIP39 recovery phrase encodes it.
-- **Transport key** (Ed25519) -- Generated at random on each device and stored in `transport_key.key` (mode 0600). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content. Recovery from the phrase and linking generate a new one.
+- **Transport key** (Ed25519) -- Generated at random on each device and stored in `transport_key.key` (mode 0600). It is the iroh NodeId of that device. Never signs content. Recovery from the phrase and linking generate a new one.
 
 Content is verified against the public key in its `author` field, so it verifies without other cached data. There is no key rotation: a leaked master key can only be replaced by a new identity.
 
-A user's devices are listed in a `LinkedDevicesAnnouncement` signed by the master key. The signature proves only that the master named those NodeIds, not that the devices agreed, so a NodeId is mapped to a master (for blocking, push, sync authorization and calls) only when that NodeId itself delivered a list of that master that lists it, over a connection QUIC authenticates. Lists from gossip or a link bundle are used to dial a user's devices, never to identify an incoming connection.
+A user's devices, and the NodeIds of removed devices, are listed in a `LinkedDevicesAnnouncement` signed by the master key. The signature proves only that the master named those NodeIds, not that the devices agreed, so a NodeId is mapped to a master (for blocking, push, sync authorization and calls) only when that NodeId itself delivered a list of that master that lists it, over a connection QUIC authenticates. Lists from gossip or a link bundle are used to dial a user's devices, never to identify an incoming connection.
 
 Every signed byte string is a JSON array that starts with a type tag (`proscenium/<type>/2`), so a signature made for one message type does not verify as another. Post ids are a SHA-256 hash over the post's other fields, including the author. Profiles carry a signed `updated_at`; an older profile does not replace a newer one.
 
 ### Protocols
 
-All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
+The ALPNs are `proscenium/peer/2`, `proscenium/dm/3`, `proscenium/call/2` and `proscenium/stage/2`.
 
 - **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and Stage announcements. A message is stored only if the topic owner is its author and signed it.
 - **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to the user's other devices and to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends its signed device list, counts and a digest of the post ids it holds, and the earliest timestamp it stores (`since`); the responder considers only content at or after `since`. One sync per NodeId is served at a time, for at most 5 minutes. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
@@ -239,16 +239,14 @@ Signed requests are rejected if the timestamp is more than 5 minutes from the se
 
 ## Direct Messaging
 
-End-to-end encrypted direct messages over a QUIC protocol (`proscenium/dm/2`). Only the two participants' devices can read them.
+Direct messages over a QUIC protocol (`proscenium/dm/3`), sent from one device to another. Only the two participants' devices can read them.
 
-### Encryption Scheme
+### Transport and Checks
 
-Every payload (message, receipt, typing signal, call signal) is encrypted separately to each device it is sent to. There is no session state.
+Every payload (message, receipt, typing signal, call signal) is sent on its own QUIC connection to each device it is for. There is no session state and no encryption layer of its own: the QUIC connection (TLS 1.3 with the NodeIds of both devices, ephemeral key exchange) encrypts the payload and authenticates both devices, and no server or other device stores or forwards it.
 
-- **Keys**: the sending and receiving keys are the X25519 forms of the two devices' transport keys: the scalar of the Ed25519 seed, and the Montgomery form of the NodeId.
-- **Encryption**: HPKE (RFC 9180) in Auth mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and ChaCha20-Poly1305. Each envelope has its own ephemeral key. The associated data covers the sender, the sending device, the recipient and the receiving device.
-- **Envelope**: the ciphertext, the encapsulated key, the four sender and recipient fields, and the sender's signed device list.
-- **Checks**: the receiving device accepts an envelope only if the QUIC connection comes from the sending device, the recipient fields name the local user and this device, the device list verifies, belongs to the sender and lists the sending device, the sender is not blocked, and the ciphertext decrypts. The device list is then cached.
+- **Envelope**: the recipient's master pubkey, the sender's signed device list and the payload.
+- **Checks**: the receiving device accepts an envelope only if the recipient is the local user, the device list verifies, is not the local user's, and lists the NodeId of the connection, the sender (the master of that list) is not blocked, and the payload is valid. The device list is then cached.
 
 **At rest.** Message text is stored unencrypted in the local database. Key files are created with mode 0600 in a 0700 directory; there is no passphrase.
 
@@ -256,7 +254,7 @@ Every payload (message, receipt, typing signal, call signal) is encrypted separa
 
 Messages, receipts and typing signals go to every device in the recipient's cached device list at once. Each device answers with an acknowledgement; the sender marks a message delivered when one device acknowledges it. Call signals go to one device: the offer to the first device that answers, every later signal to the device of the call.
 
-Undelivered messages are queued as plaintext payloads and encrypted at send time. Retries back off from 30 seconds to 15 minutes; entries older than 7 days are dropped. The message view can request an immediate retry.
+Undelivered messages are queued with their payload. Retries back off from 30 seconds to 15 minutes; entries older than 7 days are dropped. The message view can request an immediate retry.
 
 Device sync copies messages between the devices of one user, so a device that was offline when a message arrived, or that did not send it, receives it from a sibling device.
 
@@ -296,10 +294,12 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 
 Several devices can share one identity.
 
-- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device generates a new transport key, dials that NodeId, so QUIC authenticates the existing device, and sends the secret, the NodeId of the new key and its device name. The existing device compares the secret in constant time, sends the link bundle, and registers that NodeId as the new device after the new device reported that it stored the bundle.
-- **Bundle**: the master key, the signed device list, profile, follows, moderation entries, bookmarks and the device lists of followed users. Linking replaces the identity, the transport key and all local data of the new device, after confirmation in a native dialog.
-- **Keys**: every device holds the master key and its own random transport key. A device cannot be removed from the identity.
-- **Device sync**: each side sends its device list signed by the master key, and the other side continues only if the list is signed by its own master key and contains the NodeId of the connection. Both sides store the devices of the other's list. Devices exchange follows with the device lists of the followed users, moderation entries, bookmarks and follow requests (last writer wins; for a follow request, the later approval or denial), direct messages (by id, among the newest 50,000) and deletions of own interactions. After that, each side fetches the other's own posts, interactions and post deletions with the sync protocol; a device serves that sync to its other devices whatever its visibility.
+- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device generates a new transport key, dials that NodeId, so QUIC authenticates the existing device, and sends the secret, the NodeId of the new key and its device name. The existing device compares the secret in constant time.
+- **Link code**: both devices then show a 6-digit code computed from the existing NodeId and the new NodeId (SHA-256). The existing device sends the link bundle only after the user confirmed in a native dialog that the codes match, and registers the new NodeId after the new device reported that it stored the bundle. The new NodeId is generated after the QR code was read and travels only inside the QUIC connection, so a device that also read the QR code cannot produce the same code.
+- **Bundle**: the master key, the signed device list (with the removed NodeIds), profile, follows, moderation entries, bookmarks and the device lists of followed users. Linking replaces the identity, the transport key and all local data of the new device, after confirmation in a native dialog.
+- **Keys**: every device holds the master key and its own random transport key.
+- **Removal**: removing a device records its NodeId as removed; the device list carries the 16 newest removed NodeIds, and a removed NodeId is never stored as a device again. Followers stop dialing it when they receive the newer list. The removed device deletes its data, key files included, and restarts with a new identity when a device sync shows it a list that removes it. A device that is not connected keeps the identity until then, and a device that someone else controls can ignore the removal: only a new identity protects against a stolen device.
+- **Device sync**: each side sends its device list signed by the master key, and the other side continues only if the list is signed by its own master key, contains the NodeId of the connection, and that NodeId was not removed. Both sides store the removed NodeIds and the devices of the other's list. The responder sends its list before it checks the requester, so a removed requester receives the list that removes it. Devices exchange follows with the device lists of the followed users, moderation entries, bookmarks and follow requests (last writer wins; for a follow request, the later approval or denial), direct messages (by id, among the newest 50,000) and deletions of own interactions. After that, each side fetches the other's own posts, interactions and post deletions with the sync protocol; a device serves that sync to its other devices whatever its visibility.
 - **Not replicated**: read state of direct messages.
 
 ## Recommended IDE Setup

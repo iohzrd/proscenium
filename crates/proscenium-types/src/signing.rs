@@ -1,5 +1,6 @@
 use crate::protocol::{
     IdentityResponse, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
+    MAX_REMOVED_DEVICES,
 };
 use crate::types::{Interaction, Post, Profile};
 use crate::validation::{ID_HEX_LEN, is_valid_pubkey, parse_pubkey, validate_profile};
@@ -226,6 +227,7 @@ fn linked_devices_signing_bytes(announcement: &LinkedDevicesAnnouncement) -> Vec
         LINKED_DEVICES_TAG,
         &announcement.master_pubkey,
         &announcement.devices,
+        &announcement.removed,
         announcement.version,
     ))
 }
@@ -241,8 +243,9 @@ pub fn sign_linked_devices_announcement(
     announcement.signature = signature_to_hex(&sig);
 }
 
-/// Verify a LinkedDevicesAnnouncement: the list holds 1 to `MAX_LINKED_DEVICES` devices,
-/// every NodeId is a canonical public key, every device name is at most
+/// Verify a LinkedDevicesAnnouncement: the list holds 1 to `MAX_LINKED_DEVICES` devices
+/// and at most `MAX_REMOVED_DEVICES` removed NodeIds, every NodeId is a canonical public
+/// key, no removed NodeId is listed as a device, every device name is at most
 /// `MAX_DEVICE_NAME_LEN` bytes, the version (a creation time) is at most
 /// `MAX_TIMESTAMP_DRIFT_MS` after the local clock, so a device with a fast clock cannot
 /// publish a list that outranks every later one, and the signature was made by
@@ -264,12 +267,26 @@ pub fn verify_linked_devices_announcement(
     {
         return Err("announcement version is later than the local clock".to_string());
     }
+    if announcement.removed.len() > MAX_REMOVED_DEVICES {
+        return Err(format!(
+            "announcement lists {} removed devices (allowed {MAX_REMOVED_DEVICES})",
+            announcement.removed.len()
+        ));
+    }
     for device in &announcement.devices {
         if !is_valid_pubkey(&device.node_id) {
             return Err("announcement contains an invalid device NodeId".to_string());
         }
         if device.device_name.len() > MAX_DEVICE_NAME_LEN {
             return Err("announcement contains a device name that is too long".to_string());
+        }
+    }
+    for node_id in &announcement.removed {
+        if !is_valid_pubkey(node_id) {
+            return Err("announcement contains an invalid removed NodeId".to_string());
+        }
+        if announcement.devices.iter().any(|d| d.node_id == *node_id) {
+            return Err("announcement lists a removed NodeId as a device".to_string());
         }
     }
     verify_signed_by(
@@ -370,6 +387,7 @@ mod tests {
                     added_at: 1,
                 })
                 .collect(),
+            removed: vec![],
             version: 1,
             signature: String::new(),
         };
@@ -473,6 +491,41 @@ mod tests {
         list.version += crate::validation::MAX_TIMESTAMP_DRIFT_MS + 60_000;
         sign_linked_devices_announcement(&mut list, &a.key);
         assert!(verify_linked_devices_announcement(&list).is_err());
+    }
+
+    #[test]
+    fn removed_devices_are_signed_bounded_and_not_listed() {
+        let a = identity(1);
+        let mut list = announcement(&a, &[node_id(50)]);
+        list.removed = vec![node_id(51)];
+        sign_linked_devices_announcement(&mut list, &a.key);
+        assert!(verify_linked_devices_announcement(&list).is_ok());
+
+        // The removed list is covered by the signature.
+        let mut changed = list.clone();
+        changed.removed.clear();
+        assert!(verify_linked_devices_announcement(&changed).is_err());
+
+        // A NodeId cannot be listed and removed at once.
+        let mut both = list.clone();
+        both.removed = vec![node_id(50)];
+        sign_linked_devices_announcement(&mut both, &a.key);
+        assert!(verify_linked_devices_announcement(&both).is_err());
+
+        let mut invalid = list.clone();
+        invalid.removed = vec!["zz".to_string()];
+        sign_linked_devices_announcement(&mut invalid, &a.key);
+        assert!(verify_linked_devices_announcement(&invalid).is_err());
+
+        let mut too_many = list;
+        too_many.removed = (0..=MAX_REMOVED_DEVICES as u8)
+            .map(|i| node_id(100 + i))
+            .collect();
+        sign_linked_devices_announcement(&mut too_many, &a.key);
+        assert!(verify_linked_devices_announcement(&too_many).is_err());
+        too_many.removed.pop();
+        sign_linked_devices_announcement(&mut too_many, &a.key);
+        assert!(verify_linked_devices_announcement(&too_many).is_ok());
     }
 
     #[test]

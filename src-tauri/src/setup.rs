@@ -31,6 +31,9 @@ pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
 /// Marker file written when the stored data of an existing identity is deleted and the
 /// keys are kept. While it exists, `get_seed_phrase` asks for native confirmation.
 pub(crate) const SEED_CONFIRM_FILE: &str = ".seed_confirm";
+/// Marker file written after another device removed this device and its data was
+/// deleted. `take_device_removed_notice` reads and deletes it.
+pub(crate) const DEVICE_REMOVED_FILE: &str = ".device_removed";
 /// Suffix of the temporary files created by `write_secret_file`.
 const TEMP_FILE_SUFFIX: &str = ".tmp";
 
@@ -120,6 +123,7 @@ fn remove_stale_temp_files(data_dir: &Path) {
                 TRANSPORT_KEY_FILE,
                 SEED_BACKED_UP_FILE,
                 SEED_CONFIRM_FILE,
+                DEVICE_REMOVED_FILE,
             ]
             .iter()
             .any(|prefix| name.starts_with(&format!("{prefix}.")));
@@ -685,6 +689,68 @@ pub async fn replace_identity(
 
     log::info!("[identity] identity replaced, network stack rebuilt");
     Ok(())
+}
+
+/// Delete the data of this device after another device of the identity removed it, then
+/// restart the app. At startup `ensure_key_files` generates a new identity.
+///
+/// Stops the network stack, deletes all rows, then the blob store, the master key file,
+/// the transport key file and the seed phrase markers, and writes `DEVICE_REMOVED_FILE`.
+/// If the rows were not deleted, the files are kept, so the next start loads the same
+/// identity and the next device sync starts this again. Returns without changes while an
+/// identity replacement is in progress.
+pub(crate) async fn reset_removed_device(state: Arc<AppState>) {
+    let Some(_replacement) = ReplacementInProgress::begin(&state) else {
+        log::warn!("[identity] an identity replacement is in progress; the removal is not applied");
+        return;
+    };
+    log::warn!("[identity] this device was removed from the identity; deleting its data");
+    if tokio::time::timeout(REPLACE_SHUTDOWN_LIMIT, stop_network(&state))
+        .await
+        .is_err()
+    {
+        log::error!(
+            "[identity] network stack did not stop within {}s; deleting the data anyway",
+            REPLACE_SHUTDOWN_LIMIT.as_secs()
+        );
+    }
+    let app = state.app_handle.clone();
+    let data_dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::error!("[identity] no data directory: {e}");
+            app.request_restart();
+            return;
+        }
+    };
+    if let Err(e) = state.storage.wipe_all_data().await {
+        log::error!("[identity] failed to delete database rows: {e}");
+        app.request_restart();
+        return;
+    }
+    match tokio::fs::remove_dir_all(data_dir.join(BLOBS_DIR)).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::error!("[identity] failed to remove the blob store: {e}"),
+    }
+    for name in [
+        MASTER_KEY_FILE,
+        TRANSPORT_KEY_FILE,
+        SEED_BACKED_UP_FILE,
+        SEED_CONFIRM_FILE,
+    ] {
+        match tokio::fs::remove_file(data_dir.join(name)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::error!("[identity] failed to delete {name}: {e}"),
+        }
+    }
+    let marker = data_dir.join(DEVICE_REMOVED_FILE);
+    if let Err(e) = run_blocking_io(move || write_secret_file(&marker, b"1")).await {
+        log::error!("[identity] failed to write the removal notice: {e}");
+    }
+    log::info!("[identity] data of the removed device deleted; restarting");
+    app.request_restart();
 }
 
 /// Stop the network stack, which closes the blob store, before the process exits, waiting

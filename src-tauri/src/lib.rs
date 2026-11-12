@@ -214,6 +214,8 @@ pub fn run() {
             cancel_device_link,
             link_with_device,
             get_linked_devices,
+            remove_linked_device,
+            take_device_removed_notice,
             force_device_sync,
             start_call,
             accept_call,

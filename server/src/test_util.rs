@@ -173,6 +173,7 @@ impl TestUser {
                     added_at: 1,
                 })
                 .collect(),
+            removed: vec![],
             version,
             signature: String::new(),
         };

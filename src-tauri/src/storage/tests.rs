@@ -65,6 +65,7 @@ fn make_identity(master: &str, nodes: &[&str], version: u64) -> VerifiedIdentity
                     added_at: 1,
                 })
                 .collect(),
+            removed: vec![],
             version,
             signature: "sig".to_string(),
         },
@@ -2808,6 +2809,7 @@ fn signed_announcement(master_seed: u8, node_seed: u8, version: u64) -> LinkedDe
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: master.public().to_string(),
         devices: vec![device_entry(&pubkey(node_seed), "device")],
+        removed: vec![],
         version,
         signature: String::new(),
     };
@@ -2858,6 +2860,99 @@ async fn linked_devices_insert_missing_keeps_existing_rows() {
     for (node_id, is_other) in [(&own, false), (&other, true), (&pubkey(4), false)] {
         assert_eq!(s.is_other_device(node_id).await.unwrap(), is_other);
     }
+}
+
+#[tokio::test]
+async fn removed_device_is_not_stored_again() {
+    let s = test_storage().await;
+    let (own, other) = (pubkey(1), pubkey(2));
+    s.upsert_linked_device(&own, "Linux", true, 1)
+        .await
+        .unwrap();
+    s.insert_missing_linked_devices(&[device_entry(&other, "Android")])
+        .await
+        .unwrap();
+
+    // Only another stored device can be removed.
+    assert!(!s.remove_linked_device(&own, 5).await.unwrap());
+    assert!(!s.remove_linked_device(&pubkey(3), 5).await.unwrap());
+    assert!(s.get_removed_device_ids().await.unwrap().is_empty());
+
+    assert!(s.remove_linked_device(&other, 5).await.unwrap());
+    assert!(!s.is_other_device(&other).await.unwrap());
+    assert!(s.is_removed_device(&other).await.unwrap());
+    assert_eq!(
+        s.get_removed_device_ids().await.unwrap(),
+        vec![other.clone()]
+    );
+
+    // A device list that still lists the removed device does not store it again.
+    let inserted = s
+        .insert_missing_linked_devices(&[device_entry(&other, "Android")])
+        .await
+        .unwrap();
+    assert_eq!(inserted, 0);
+    assert_eq!(s.get_linked_devices().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn merged_removals_delete_rows_and_detect_the_local_device() {
+    let s = test_storage().await;
+    let (own, other, third) = (pubkey(1), pubkey(2), pubkey(3));
+    s.upsert_linked_device(&own, "Linux", true, 1)
+        .await
+        .unwrap();
+    s.insert_missing_linked_devices(&[device_entry(&other, "Android")])
+        .await
+        .unwrap();
+
+    let merged = s
+        .merge_removed_devices(&[other.clone(), third.clone()], &own)
+        .await
+        .unwrap();
+    assert_eq!(merged.devices_removed, 1);
+    assert!(!merged.local_removed);
+    assert!(s.is_removed_device(&third).await.unwrap());
+    assert!(!s.is_other_device(&other).await.unwrap());
+
+    // A list that removes the local device stores nothing.
+    let fourth = pubkey(4);
+    let merged = s
+        .merge_removed_devices(&[fourth.clone(), own.clone()], &own)
+        .await
+        .unwrap();
+    assert!(merged.local_removed);
+    assert!(!s.is_removed_device(&fourth).await.unwrap());
+    assert!(!s.is_removed_device(&own).await.unwrap());
+}
+
+#[tokio::test]
+async fn removed_devices_keep_the_newest_records() {
+    let s = test_storage().await;
+    let own = pubkey(1);
+    s.upsert_linked_device(&own, "Linux", true, 1)
+        .await
+        .unwrap();
+    let count = MAX_REMOVED_DEVICES as u8 + 3;
+    for i in 0..count {
+        let node_id = pubkey(10 + i);
+        s.insert_missing_linked_devices(&[device_entry(&node_id, "d")])
+            .await
+            .unwrap();
+        assert!(
+            s.remove_linked_device(&node_id, 100 + u64::from(i))
+                .await
+                .unwrap()
+        );
+    }
+    let ids = s.get_removed_device_ids().await.unwrap();
+    let expected: Vec<String> = (0..count)
+        .rev()
+        .take(MAX_REMOVED_DEVICES)
+        .map(|i| pubkey(10 + i))
+        .collect();
+    assert_eq!(ids, expected);
+    assert!(!s.is_removed_device(&pubkey(10)).await.unwrap());
 }
 
 #[tokio::test]

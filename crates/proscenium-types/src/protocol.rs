@@ -15,14 +15,16 @@ use sha2::{Digest, Sha256};
 
 /// Maximum number of devices in one `LinkedDevicesAnnouncement`.
 pub const MAX_LINKED_DEVICES: usize = 16;
+/// Maximum number of removed NodeIds in one `LinkedDevicesAnnouncement`.
+pub const MAX_REMOVED_DEVICES: usize = 16;
 /// Maximum byte length of a device name in a `LinkedDevicesAnnouncement`.
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
 /// Maximum byte length of the JSON of a `LinkedDevicesAnnouncement` that passes
 /// `verify_linked_devices_announcement`: `MAX_LINKED_DEVICES` entries whose names of
-/// `MAX_DEVICE_NAME_LEN` bytes are escaped as `\u00XX` (6 bytes per byte), and under
-/// 1 KiB of other fields.
+/// `MAX_DEVICE_NAME_LEN` bytes are escaped as `\u00XX` (6 bytes per byte),
+/// `MAX_REMOVED_DEVICES` NodeIds, and under 1 KiB of other fields.
 pub const MAX_ANNOUNCEMENT_JSON_LEN: usize =
-    MAX_LINKED_DEVICES * (6 * MAX_DEVICE_NAME_LEN + 256) + 1024;
+    MAX_LINKED_DEVICES * (6 * MAX_DEVICE_NAME_LEN + 256) + MAX_REMOVED_DEVICES * 128 + 1024;
 
 /// Signed announcement listing all of a user's linked devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,9 @@ pub struct LinkedDevicesAnnouncement {
     pub master_pubkey: String,
     /// All currently active devices.
     pub devices: Vec<DeviceEntry>,
+    /// NodeIds of devices removed from the identity, newest first. None is in `devices`.
+    /// A device that finds its own NodeId here deletes its data.
+    pub removed: Vec<String>,
     /// Creation time (Unix timestamp ms). Receivers keep the announcement with the
     /// highest version.
     pub version: u64,
@@ -114,8 +119,9 @@ pub enum PeerRequest {
     FollowsListRequest,
     /// Request a peer's public followers list.
     FollowersListRequest,
-    /// Device linking: the new device sends the one-time secret of the link code. The
-    /// existing device answers with the `LinkBundleData` JSON on the same stream.
+    /// Device linking: the new device sends the one-time secret of the link code. After
+    /// the user confirmed the link code on it, the existing device answers with the
+    /// `LinkBundleData` JSON on the same stream.
     LinkRequest {
         /// `LinkQrPayload::secret` (URL-safe base64 without padding).
         secret: String,

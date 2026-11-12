@@ -20,8 +20,17 @@
   let seedPhrase = $state("");
   let error = $state("");
   let loadingPhrase = false;
+  // True after another device removed this device and its data was deleted.
+  let removedNotice = $state(false);
 
   const node = useNodeInit(async () => {
+    try {
+      if (await invoke<boolean>("take_device_removed_notice")) {
+        removedNotice = true;
+      }
+    } catch (e) {
+      console.error("Failed to read the device removal notice:", e);
+    }
     const profile = await invoke("get_my_profile");
     if (profile) {
       goto("/");
@@ -86,6 +95,13 @@
       <button class="btn-elevated" onclick={node.init}>Retry</button>
     </div>
   {:else}
+    {#if removedNotice}
+      <p class="welcome-notice" role="status">
+        Another device of your identity removed this device, so its data and its
+        copy of the identity were deleted. Create a new identity, recover one,
+        or link this device again.
+      </p>
+    {/if}
     {#if error}
       <p class="welcome-error" role="alert">{error}</p>
     {/if}
@@ -125,6 +141,14 @@
     justify-content: center;
     min-height: 70vh;
     padding: 2rem 1rem;
+  }
+
+  .welcome-notice {
+    max-width: 32rem;
+    color: var(--text-secondary);
+    font-size: var(--text-base);
+    margin: 0 0 1rem;
+    text-align: center;
   }
 
   .welcome-error {

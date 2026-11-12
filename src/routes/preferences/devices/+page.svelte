@@ -10,6 +10,9 @@
   import ConfirmDialog from "../../ConfirmDialog.svelte";
 
   let devices = $state<DeviceEntry[]>([]);
+  // NodeId of this device; it has no remove button.
+  let ownNodeId = $state("");
+  let removing = $state<string | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let linkStatus = $state<string | null>(null);
@@ -28,7 +31,10 @@
 
   async function loadDevices() {
     try {
-      devices = await invoke<DeviceEntry[]>("get_linked_devices");
+      [devices, ownNodeId] = await Promise.all([
+        invoke<DeviceEntry[]>("get_linked_devices"),
+        invoke<string>("get_node_id"),
+      ]);
     } catch (e) {
       error = `Failed to load devices: ${e}`;
       console.error("Failed to load devices:", e);
@@ -44,6 +50,22 @@
     } catch (e) {
       // "cancelled": the native confirmation was declined.
       if (String(e) !== "cancelled") error = `Failed to start link: ${e}`;
+    }
+  }
+
+  async function removeDevice(device: DeviceEntry) {
+    if (removing) return;
+    removing = device.node_id;
+    error = null;
+    try {
+      await invoke("remove_linked_device", { nodeId: device.node_id });
+      linkStatus = `${device.device_name} was removed. It deletes its data the next time it connects to one of your devices.`;
+      await loadDevices();
+    } catch (e) {
+      // "cancelled": the native confirmation was declined.
+      if (String(e) !== "cancelled") error = `Failed to remove device: ${e}`;
+    } finally {
+      removing = null;
     }
   }
 
@@ -103,12 +125,31 @@
     loadDevices();
 
     const unlisten = useEventListeners({
+      // Existing device: progress of a link request.
       "device-link-progress": (payload) => {
-        if (payload === "bundle_sent") {
+        if (payload === "confirming") {
           showLinkQr = false;
           linkPayload = null;
+          error = null;
+          linkStatus =
+            "A device presented the link code. Compare the code in the dialog with the code on the new device.";
+        } else if (payload === "declined") {
+          linkStatus = null;
+          error =
+            "The link was declined. Generate a new code to link a device.";
+        } else if (payload === "failed") {
+          // Emitted only for a failure after the code dialog was shown.
+          linkStatus = null;
+          error = "The link failed. Generate a new code to try again.";
+        } else if (payload === "bundle_sent") {
           linkStatus = "Link bundle sent to new device.";
           loadDevices();
+        }
+      },
+      // New device: the code to compare with the existing device.
+      "device-link-code": (payload) => {
+        if (linking && typeof payload === "string") {
+          linkStatus = `Confirm on your other device that it shows the code ${payload}.`;
         }
       },
     });
@@ -157,7 +198,12 @@
             </svg>
           </div>
           <div class="device-info">
-            <span class="device-name">{device.device_name}</span>
+            <span class="device-name">
+              {device.device_name}
+              {#if device.node_id === ownNodeId}
+                <span class="device-self">This device</span>
+              {/if}
+            </span>
             <span class="device-meta">
               <code class="device-node-id"
                 >{device.node_id.slice(0, 12)}...</code
@@ -166,6 +212,16 @@
               Added <Timeago timestamp={device.added_at} />
             </span>
           </div>
+          {#if ownNodeId && device.node_id !== ownNodeId}
+            <button
+              class="btn-elevated device-remove"
+              onclick={() => removeDevice(device)}
+              disabled={removing !== null}
+              aria-label={`Remove ${device.device_name}`}
+            >
+              {removing === device.node_id ? "Removing..." : "Remove"}
+            </button>
+          {/if}
         </div>
       {/each}
     </div>
@@ -183,10 +239,10 @@
     <div class="link-card">
       <h4>Enroll a new device</h4>
       <p class="link-card-desc">
-        Generate a QR code on this device, then scan it on the new device. The
-        new device receives the master key of this identity and can post,
-        interact, message, and enroll further devices as you. Show the code only
-        to a device you control.
+        Generate a QR code on this device, then scan it on the new device. Both
+        devices then show a 6-digit code; confirm on this device only if the
+        codes match. The new device receives the master key of this identity and
+        can post, interact, message, and enroll further devices as you.
       </p>
       <button class="btn-accent" onclick={startLink} disabled={linking}>
         Generate link code
@@ -360,6 +416,16 @@
 
   .device-sep {
     color: var(--text-muted);
+  }
+
+  .device-self {
+    font-size: var(--text-xs);
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+
+  .device-remove {
+    flex-shrink: 0;
   }
 
   .section-desc {

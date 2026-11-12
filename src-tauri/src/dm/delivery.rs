@@ -5,15 +5,18 @@ use crate::constants::{
 use crate::error::AppError;
 use crate::storage::Storage;
 use iroh::EndpointId;
-use proscenium_types::{DirectMessage, DmAck, DmPayload, StoredMessage, now_millis, short_id};
+use proscenium_types::{
+    DirectMessage, DmAck, DmEnvelope, DmPayload, StoredMessage, now_millis, short_id,
+};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tauri::Emitter;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{ACK_TIMEOUT, DmHandler, MAX_DM_PAYLOAD_LEN, envelope};
+use super::{ACK_TIMEOUT, DmHandler, MAX_DM_PAYLOAD_LEN};
 
 /// Answer of a peer that ends the delivery of a payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,8 @@ enum QueuedOutcome {
     Failed,
     /// The entry no longer exists (delivered or deleted in the meantime).
     Gone,
+    /// The stored payload did not parse; the entry was removed.
+    Invalid,
 }
 
 /// Delay before the next delivery attempt after `attempts` failed attempts:
@@ -207,8 +212,7 @@ impl DmHandler {
         target: Target,
         payload: &DmPayload,
     ) -> Result<(), AppError> {
-        let plaintext = serde_json::to_vec(payload)?;
-        match self.deliver(peer_pubkey, target, &plaintext).await? {
+        match self.deliver(peer_pubkey, target, payload).await? {
             Delivery::Acknowledged => Ok(()),
             Delivery::Rejected => Err(AppError::Other(format!(
                 "{} rejected the signal",
@@ -239,8 +243,25 @@ impl DmHandler {
             }
         };
 
+        let payload = match serde_json::from_str::<DmPayload>(&payload_json) {
+            Ok(payload) => payload,
+            Err(e) => {
+                log::error!(
+                    "[dm] outbox entry {} does not parse, removing it: {e}",
+                    short_id(message_id)
+                );
+                if let Err(e) = self.storage.remove_outbox_message(message_id).await {
+                    log::error!(
+                        "[dm] failed to remove outbox entry {}: {e}",
+                        short_id(message_id)
+                    );
+                }
+                return QueuedOutcome::Invalid;
+            }
+        };
+
         match self
-            .deliver(peer_pubkey, Target::AllDevices, payload_json.as_bytes())
+            .deliver(peer_pubkey, Target::AllDevices, &payload)
             .await
         {
             Ok(Delivery::Acknowledged) => {
@@ -331,9 +352,8 @@ impl DmHandler {
         }
     }
 
-    /// Encrypt `plaintext` (a serialized `DmPayload`) for each device `target` names and
-    /// send it, within `DM_SEND_TIMEOUT` in total. Every envelope carries the local signed
-    /// device list.
+    /// Send `payload` in a `DmEnvelope` to each device `target` names, within
+    /// `DM_SEND_TIMEOUT` in total. The envelope carries the local signed device list.
     ///
     /// Returns `Acknowledged` as soon as a device answers `DmAck::Ok`; the sends to the
     /// other devices continue in the background. `Target::FirstDevice` tries the devices
@@ -343,28 +363,24 @@ impl DmHandler {
         &self,
         peer_master_pubkey: &str,
         target: Target,
-        plaintext: &[u8],
+        payload: &DmPayload,
     ) -> Result<Delivery, AppError> {
         tokio::time::timeout(DM_SEND_TIMEOUT, async {
-            let keys = self.dm_keys().await;
-            let own_devices =
-                crate::announcement::build_own_announcement(&self.storage, &self.identity).await?;
+            let envelope = DmEnvelope {
+                recipient: peer_master_pubkey.to_string(),
+                sender_devices: crate::announcement::build_own_announcement(
+                    &self.storage,
+                    &self.identity,
+                )
+                .await?,
+                payload: payload.clone(),
+            };
+            let frame: Arc<[u8]> = serde_json::to_vec(&envelope)?.into();
             let devices = match target {
                 Target::Device(device) => vec![device],
                 Target::AllDevices | Target::FirstDevice => {
                     self.peer_devices(peer_master_pubkey).await?
                 }
-            };
-            let seal = |device: &EndpointId| -> Result<Vec<u8>, AppError> {
-                let envelope = envelope::seal(
-                    &keys.device_key,
-                    &keys.master_pubkey,
-                    &own_devices,
-                    peer_master_pubkey,
-                    device,
-                    plaintext,
-                )?;
-                Ok(serde_json::to_vec(&envelope)?)
             };
 
             let mut rejected = false;
@@ -372,7 +388,7 @@ impl DmHandler {
             match target {
                 Target::FirstDevice => {
                     for device in &devices {
-                        match self.send_frame(*device, &seal(device)?).await {
+                        match self.send_frame(*device, &frame).await {
                             Ok(DmAck::Ok) => return Ok(Delivery::Acknowledged),
                             Ok(DmAck::Rejected) => rejected = true,
                             Err(e) => last_error = Some(e),
@@ -383,7 +399,7 @@ impl DmHandler {
                     let mut sends = JoinSet::new();
                     for device in &devices {
                         let handler = self.clone();
-                        let (device, frame) = (*device, seal(device)?);
+                        let (device, frame) = (*device, frame.clone());
                         sends.spawn(async move { handler.send_frame(device, &frame).await });
                     }
                     while let Some(sent) = sends.join_next().await {

@@ -7,10 +7,10 @@ use proscenium_types::{
 };
 use tauri::Emitter;
 
-use super::{CallSignal, DmHandler, MAX_DM_CIPHERTEXT_LEN, envelope, validate_direct_message};
+use super::{CallSignal, DmHandler, validate_direct_message};
 
-/// Check a decrypted payload: the message limits of `validate_direct_message`, and the
-/// id format of every message id and call id.
+/// Check a payload: the message limits of `validate_direct_message`, and the id format of
+/// every message id and call id.
 fn validate_payload(payload: &DmPayload) -> Result<(), String> {
     match payload {
         DmPayload::Message(message) => validate_direct_message(message),
@@ -35,33 +35,22 @@ fn validate_payload(payload: &DmPayload) -> Result<(), String> {
     }
 }
 
-/// Reason to refuse `envelope` received from the device `remote` by the device
-/// `my_device` of `me`, or `None` if its fields pass: `remote` is `sender_device`, the
-/// recipient fields name `me` and `my_device`, the sender is another user, the ciphertext
-/// fits, and `sender_devices` verifies, belongs to `sender` and lists `sender_device`.
-fn envelope_refusal(
-    envelope: &DmEnvelope,
-    remote: &str,
-    me: &str,
-    my_device: &str,
-) -> Option<&'static str> {
-    if envelope.sender_device != remote {
-        Some("the envelope was not sent by its sender device")
-    } else if envelope.recipient != me || envelope.recipient_device != my_device {
-        Some("the envelope is for another device")
-    } else if envelope.sender == me {
+/// Reason to refuse `envelope` received from the device `remote` by `me`, or `None` if
+/// it passes: the recipient is `me`, the sender is another user, and `sender_devices`
+/// verifies and lists `remote`.
+fn envelope_refusal(envelope: &DmEnvelope, remote: &str, me: &str) -> Option<&'static str> {
+    if envelope.recipient != me {
+        Some("the envelope is for another user")
+    } else if envelope.sender_devices.master_pubkey == me {
         Some("the envelope is from the local identity")
-    } else if envelope.ciphertext.len() > MAX_DM_CIPHERTEXT_LEN {
-        Some("the ciphertext is too long")
-    } else if envelope.sender_devices.master_pubkey != envelope.sender
-        || verify_linked_devices_announcement(&envelope.sender_devices).is_err()
+    } else if verify_linked_devices_announcement(&envelope.sender_devices).is_err()
         || !envelope
             .sender_devices
             .devices
             .iter()
-            .any(|device| device.node_id == envelope.sender_device)
+            .any(|device| device.node_id == remote)
     {
-        Some("the device list does not list the sender device")
+        Some("the device list does not list the sending device")
     } else {
         None
     }
@@ -71,9 +60,8 @@ impl DmHandler {
     /// Handle an envelope received from the device `remote` and return the answer.
     ///
     /// The envelope is applied only if `envelope_refusal` finds nothing, the sender is
-    /// not blocked, the ciphertext decrypts and the payload is valid. Then the device list
-    /// is cached, delivered by `remote`, under the rule of
-    /// `Storage::cache_peer_announcement`.
+    /// not blocked and the payload is valid. Then the device list is cached, delivered by
+    /// `remote`, under the rule of `Storage::cache_peer_announcement`.
     ///
     /// `Ok(DmAck::Rejected)` means the envelope was refused. `Err` means a local failure
     /// (storage); no answer is sent, so the sender keeps the message queued.
@@ -82,15 +70,9 @@ impl DmHandler {
         remote: EndpointId,
         envelope: DmEnvelope,
     ) -> Result<DmAck, AppError> {
-        let keys = self.dm_keys().await;
-        let sender = envelope.sender.clone();
-        let my_device = keys.device_key.public().to_string();
-        if let Some(reason) = envelope_refusal(
-            &envelope,
-            &remote.to_string(),
-            &keys.master_pubkey,
-            &my_device,
-        ) {
+        let me = self.identity.read().await.master_pubkey.clone();
+        let sender = envelope.sender_devices.master_pubkey.clone();
+        if let Some(reason) = envelope_refusal(&envelope, &remote.to_string(), &me) {
             log::warn!(
                 "[dm] rejecting envelope from node {}: {reason}",
                 short_id(&remote.to_string())
@@ -104,17 +86,13 @@ impl DmHandler {
             );
             return Ok(DmAck::Rejected);
         }
-        let payload = match envelope::open(&keys.device_key, &envelope).and_then(|plaintext| {
-            let payload = serde_json::from_slice::<DmPayload>(&plaintext)?;
-            validate_payload(&payload).map_err(AppError::Other)?;
-            Ok(payload)
-        }) {
-            Ok(payload) => payload,
-            Err(e) => {
-                log::warn!("[dm] rejecting envelope from {}: {e}", short_id(&sender));
-                return Ok(DmAck::Rejected);
-            }
-        };
+        if let Err(reason) = validate_payload(&envelope.payload) {
+            log::warn!(
+                "[dm] rejecting envelope from {}: {reason}",
+                short_id(&sender)
+            );
+            return Ok(DmAck::Rejected);
+        }
 
         if let Err(e) = self
             .storage
@@ -127,15 +105,15 @@ impl DmHandler {
             );
         }
 
-        let conv_id = Storage::conversation_id(&keys.master_pubkey, &sender);
-        match payload {
+        let conv_id = Storage::conversation_id(&me, &sender);
+        match envelope.payload {
             DmPayload::Message(msg) => {
                 let now = now_millis();
                 let stored_msg = StoredMessage {
                     id: msg.id.clone(),
                     conversation_id: conv_id.clone(),
                     from_pubkey: sender.clone(),
-                    to_pubkey: keys.master_pubkey.clone(),
+                    to_pubkey: me.clone(),
                     content: msg.content.clone(),
                     // A timestamp after the local clock would keep the conversation at
                     // the top of the list.
@@ -171,7 +149,7 @@ impl DmHandler {
                 // Only a message the local user sent in this conversation is updated.
                 if self
                     .storage
-                    .mark_dm_delivered(&conv_id, &keys.master_pubkey, &message_id)
+                    .mark_dm_delivered(&conv_id, &me, &message_id)
                     .await?
                 {
                     let _ = self.app_handle.emit(
@@ -183,7 +161,7 @@ impl DmHandler {
             DmPayload::Read { message_id } => {
                 if self
                     .storage
-                    .mark_dm_read_by_id(&conv_id, &keys.master_pubkey, &message_id)
+                    .mark_dm_read_by_id(&conv_id, &me, &message_id)
                     .await?
                 {
                     let _ = self
@@ -253,6 +231,7 @@ mod tests {
                     device_name: "d".to_string(),
                     added_at: 1,
                 }],
+                removed: vec![],
                 version: 1,
                 signature: String::new(),
             };
@@ -260,56 +239,42 @@ mod tests {
             announcement
         }
 
-        fn seal_to(&self, to: &Party, plaintext: &[u8]) -> DmEnvelope {
-            envelope::seal(
-                &self.device,
-                &self.pubkey(),
-                &self.devices(),
-                &to.pubkey(),
-                &to.device.public(),
-                plaintext,
-            )
-            .unwrap()
+        fn envelope_to(&self, to: &Party) -> DmEnvelope {
+            DmEnvelope {
+                recipient: to.pubkey(),
+                sender_devices: self.devices(),
+                payload: DmPayload::Typing,
+            }
         }
     }
 
     #[test]
-    fn envelope_fields_are_checked_before_decryption() {
+    fn envelope_fields_are_checked() {
         let (alice, bob) = (Party::new(1), Party::new(2));
-        let valid = alice.seal_to(&bob, b"{}");
-        let check = |envelope: &DmEnvelope, remote: &str| {
-            envelope_refusal(envelope, remote, &bob.pubkey(), &bob.node_id())
-        };
+        let valid = alice.envelope_to(&bob);
+        let check =
+            |envelope: &DmEnvelope, remote: &str| envelope_refusal(envelope, remote, &bob.pubkey());
         assert_eq!(check(&valid, &alice.node_id()), None);
-        assert_eq!(
-            envelope::open(&bob.device, &valid).unwrap().as_slice(),
-            b"{}"
-        );
 
-        // Delivered by another node than the sender device.
+        // Sent by a device the sender's list does not list.
         assert!(check(&valid, &bob.node_id()).is_some());
 
-        // Addressed to another device of the recipient.
-        let other_device = Party::new(3).node_id();
-        assert!(envelope_refusal(&valid, &alice.node_id(), &bob.pubkey(), &other_device).is_some());
-
-        // A device list of another identity, or one that does not list the sender device.
+        // Addressed to another user.
         let carol = Party::new(4);
+        assert!(envelope_refusal(&valid, &alice.node_id(), &carol.pubkey()).is_some());
+
+        // A list of another identity that does not list the sending device, and a changed
+        // list.
         let mut foreign_list = valid.clone();
         foreign_list.sender_devices = carol.devices();
         assert!(check(&foreign_list, &alice.node_id()).is_some());
         let mut tampered_list = valid.clone();
         tampered_list.sender_devices.devices[0].node_id = carol.node_id();
-        assert!(check(&tampered_list, &alice.node_id()).is_some());
+        assert!(check(&tampered_list, &carol.node_id()).is_some());
 
         // From the local identity.
-        let own = bob.seal_to(&bob, b"{}");
-        assert!(envelope_refusal(&own, &bob.node_id(), &bob.pubkey(), &bob.node_id()).is_some());
-
-        // Oversized ciphertext.
-        let mut long = valid;
-        long.ciphertext = vec![0; MAX_DM_CIPHERTEXT_LEN + 1];
-        assert!(check(&long, &alice.node_id()).is_some());
+        let own = bob.envelope_to(&bob);
+        assert!(envelope_refusal(&own, &bob.node_id(), &bob.pubkey()).is_some());
     }
 
     const ID: &str = "0123456789abcdef0123456789abcdef";

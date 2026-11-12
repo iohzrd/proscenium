@@ -6,11 +6,18 @@
 //! identity, so a key that a device list of a previous identity names is not reused, and
 //! sends its NodeId; the existing device stores that NodeId as the new device.
 //!
+//! Both devices show `link_code` of the existing NodeId and the new NodeId, and the
+//! existing device sends the master key only after the user confirmed in a native dialog
+//! that the codes match. The new NodeId is generated after the QR code was read and sent
+//! only inside the QUIC connection, so a device that also read the QR code cannot choose a
+//! NodeId with the same code.
+//!
 //! One bi-stream, opened by the new device:
 //! - new device: JSON `PeerRequest::LinkRequest { secret, node_id, device_name }`, then
 //!   finish.
-//! - existing device: compares the secret in constant time and removes the session, then
-//!   writes the `LinkBundleData` JSON and finishes.
+//! - existing device: compares the secret in constant time and removes the session, asks
+//!   for confirmation, then writes the `LinkBundleData` JSON and finishes, or closes the
+//!   connection with `LINK_CLOSE_DECLINED`.
 //!
 //! The new device validates the bundle and closes the connection with `LINK_CLOSE_DONE`.
 //! The existing device stores the new device only after it received that close code.
@@ -28,6 +35,7 @@ use proscenium_types::{
     LinkBundleData, LinkQrPayload, MAX_LINKED_DEVICES, PEER_ALPN, PeerRequest, now_millis,
     parse_pubkey, short_id,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +79,11 @@ const MAX_LINK_REMOTES: usize = 32;
 const LINK_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time limit for writing or reading the link bundle.
 const LINK_BUNDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Time the existing device waits for the user to confirm the link code.
+const LINK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Domain tag of the `link_code` hash.
+const LINK_CODE_TAG: &[u8] = b"proscenium/link-code/1";
 
 /// Largest accepted `LinkBundleData` JSON.
 const MAX_BUNDLE_LEN: usize = 16 * 1024 * 1024;
@@ -80,6 +93,30 @@ const MAX_BUNDLE_LEN: usize = 16 * 1024 * 1024;
 const LINK_CLOSE_DONE: u32 = 1;
 /// QUIC close code sent by either device when the exchange failed.
 const LINK_CLOSE_FAILED: u32 = 2;
+/// QUIC close code sent by the existing device when the user declined the link code.
+const LINK_CLOSE_DECLINED: u32 = 3;
+
+/// Six-digit code that both devices show before the master key is sent: SHA-256 over
+/// `LINK_CODE_TAG`, the existing device's NodeId and the NodeId in the link request; the
+/// first 4 bytes as a big-endian integer modulo 10^6, as two groups of 3 digits.
+fn link_code(existing: &EndpointId, requested: &EndpointId) -> String {
+    let digest = Sha256::new()
+        .chain_update(LINK_CODE_TAG)
+        .chain_update(existing.as_bytes())
+        .chain_update(requested.as_bytes())
+        .finalize();
+    let number = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{:03} {:03}", number / 1_000, number % 1_000)
+}
+
+/// End of a served link request on the existing device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkServed {
+    /// The bundle was sent and the new device reported completion.
+    Linked,
+    /// The user declined the link code. Nothing was sent.
+    Declined,
+}
 
 /// Count one link attempt of `remote` against the session in `slot` and return its
 /// secret. Removes the session if it expired. Refuses a remote that made
@@ -229,6 +266,15 @@ async fn check_link_secret(
     Ok(())
 }
 
+/// True if the other device closed `conn` with `LINK_CLOSE_DECLINED`.
+fn was_declined(conn: &Connection) -> bool {
+    matches!(
+        conn.close_reason(),
+        Some(ConnectionError::ApplicationClosed(close))
+            if close.error_code == VarInt::from_u32(LINK_CLOSE_DECLINED)
+    )
+}
+
 /// Existing-device side: write `bundle_json` and finish the stream.
 async fn send_link_bundle(send: &mut SendStream, bundle_json: &[u8]) -> Result<(), AppError> {
     link_step(
@@ -318,7 +364,14 @@ impl PeerHandler {
             .await;
         secret.zeroize();
         match served {
-            Ok(()) => Ok(()),
+            Ok(LinkServed::Linked) => Ok(()),
+            Ok(LinkServed::Declined) => {
+                log::info!("[link] link code declined");
+                conn.close(VarInt::from_u32(LINK_CLOSE_DECLINED), b"link declined");
+                Err(AcceptError::from_err(std::io::Error::other(
+                    "link code declined",
+                )))
+            }
             Err(e) => {
                 log::warn!(
                     "[link] link request from {} failed: {e}",
@@ -330,24 +383,30 @@ impl PeerHandler {
         }
     }
 
-    /// Serve one link request: check the secret and remove the session, send the
-    /// bundle, and store `new_node_id` as the device `device_name` and announce it after
-    /// the new device closed the connection with `LINK_CLOSE_DONE`.
+    /// Serve one link request: check the secret and remove the session, then run
+    /// `confirm_and_send`.
+    ///
+    /// Emits `device-link-progress`: `confirming` before the code dialog, then `declined`
+    /// or `failed` if the link did not complete. A request refused before the dialog emits
+    /// nothing, so it does not end a link whose dialog is shown.
     async fn serve_link_request(
         &self,
-        mut send: SendStream,
+        send: SendStream,
         secret: &str,
         new_node_id: &str,
         device_name: &str,
         conn: &Connection,
-    ) -> Result<(), AppError> {
+    ) -> Result<LinkServed, AppError> {
         check_link_secret(&self.pending_link, conn.remote_id(), secret).await?;
 
-        let new_node_id = parse_pubkey(new_node_id)
-            .map_err(AppError::Other)?
-            .to_string();
-        if new_node_id == self.identity.read().await.transport_node_id {
+        let new_node = parse_pubkey(new_node_id).map_err(AppError::Other)?;
+        let new_node_id = new_node.to_string();
+        let local_node = self.identity.read().await.transport_key.public();
+        if new_node == local_node {
             return Err("link request names the local NodeId".into());
+        }
+        if self.storage.is_removed_device(&new_node_id).await? {
+            return Err("link request names a removed NodeId".into());
         }
         let devices = self.storage.get_linked_devices().await?;
         if devices.len() >= MAX_LINKED_DEVICES && !devices.iter().any(|d| d.node_id == new_node_id)
@@ -355,6 +414,44 @@ impl PeerHandler {
             return Err(AppError::Other(format!(
                 "device limit of {MAX_LINKED_DEVICES} reached"
             )));
+        }
+
+        // The QR code is no longer accepted; the devices page closes it on this event.
+        let _ = self.app_handle.emit("device-link-progress", "confirming");
+        let served = self
+            .confirm_and_send(
+                send,
+                conn,
+                &link_code(&local_node, &new_node),
+                &new_node_id,
+                device_name,
+            )
+            .await;
+        match &served {
+            Ok(LinkServed::Linked) => {}
+            Ok(LinkServed::Declined) => {
+                let _ = self.app_handle.emit("device-link-progress", "declined");
+            }
+            Err(_) => {
+                let _ = self.app_handle.emit("device-link-progress", "failed");
+            }
+        }
+        served
+    }
+
+    /// Ask the user to compare `code` (`confirm_link`), send the bundle, and store
+    /// `new_node_id` as the device `device_name` and announce it after the new device
+    /// closed the connection with `LINK_CLOSE_DONE`.
+    async fn confirm_and_send(
+        &self,
+        mut send: SendStream,
+        conn: &Connection,
+        code: &str,
+        new_node_id: &str,
+        device_name: &str,
+    ) -> Result<LinkServed, AppError> {
+        if !self.confirm_link(conn, code, device_name).await? {
+            return Ok(LinkServed::Declined);
         }
 
         let master_pubkey = self.identity.read().await.master_pubkey.clone();
@@ -392,9 +489,9 @@ impl PeerHandler {
         wait_for_completion(conn).await?;
 
         self.storage
-            .upsert_linked_device(&new_node_id, device_name, false, now_millis())
+            .upsert_linked_device(new_node_id, device_name, false, now_millis())
             .await?;
-        log::info!("[link] registered new device {}", short_id(&new_node_id));
+        log::info!("[link] registered new device {}", short_id(new_node_id));
         // The devices page closes the QR code and reloads the device list on this event.
         let _ = self.app_handle.emit("device-link-progress", "bundle_sent");
 
@@ -409,14 +506,46 @@ impl PeerHandler {
             Err(e) => log::error!("[link] failed to build device announcement: {e}"),
         }
 
-        Ok(())
+        Ok(LinkServed::Linked)
+    }
+
+    /// Ask in a native dialog whether the new device shows `code`. Returns `false` if the
+    /// user declined, and an error if the connection closed or `LINK_CONFIRM_TIMEOUT`
+    /// passed first; the dialog then stays open and its answer is not used.
+    async fn confirm_link(
+        &self,
+        conn: &Connection,
+        code: &str,
+        device_name: &str,
+    ) -> Result<bool, AppError> {
+        let message = format!(
+            "A device ({}) requests the master key of this identity.\n\n\
+             Link it only if it shows the code {code}. If it shows another code, choose \
+             Cancel: another device read the link code.",
+            crate::confirm::dialog_device_name(device_name)
+        );
+        tokio::select! {
+            confirmed = crate::confirm::confirm_native(
+                &self.app_handle,
+                "Link a device",
+                &message,
+                "Link device",
+            ) => Ok(confirmed),
+            closed = conn.closed() => Err(AppError::Other(format!(
+                "new device closed the connection before the link was confirmed: {closed}"
+            ))),
+            () = tokio::time::sleep(LINK_CONFIRM_TIMEOUT) => {
+                Err("the link code was not confirmed in time".into())
+            }
+        }
     }
 
     /// New-device side of device linking.
     ///
     /// Generates the transport key of the new identity, connects to the device named in
-    /// `payload`, sends the secret and the NodeId of that key, and receives and validates
-    /// the link bundle. Returns the keys of the identity to install and the bundle (with
+    /// `payload`, sends the secret and the NodeId of that key, emits `device-link-code`
+    /// with the `link_code` to compare, and receives and validates the link bundle.
+    /// Returns the keys of the identity to install and the bundle (with
     /// `master_secret_key` cleared). Writes nothing to disk.
     pub async fn request_link(
         &self,
@@ -440,11 +569,15 @@ impl PeerHandler {
         .await;
         let result = match connected {
             Ok(Ok(conn)) => {
+                let app_handle = self.app_handle.clone();
                 let result = exchange_link(
                     &conn,
                     &target.secret,
-                    &responder_node_id,
+                    target.node_id,
                     transport_secret_key,
+                    move |code| {
+                        let _ = app_handle.emit("device-link-code", code);
+                    },
                 )
                 .await;
                 match &result {
@@ -462,23 +595,23 @@ impl PeerHandler {
     }
 }
 
-/// Run the new-device side of the link exchange on an established connection: send
-/// `secret`, the NodeId of `transport_secret_key` and the local device name, then read
-/// and validate the bundle.
+/// Run the new-device side of the link exchange on an established connection to
+/// `responder`: send `secret`, the NodeId of `transport_secret_key` and the local device
+/// name, pass the `link_code` to `show_code`, then read and validate the bundle.
 async fn exchange_link(
     conn: &Connection,
     secret: &[u8; 32],
-    responder_node_id: &str,
+    responder: EndpointId,
     transport_secret_key: [u8; 32],
+    show_code: impl FnOnce(String),
 ) -> Result<(IdentityKeys, LinkBundleData), AppError> {
     let (mut send, mut recv) =
         link_step("open stream", LINK_STEP_TIMEOUT, conn.open_bi()).await??;
+    let new_node = SecretKey::from_bytes(&transport_secret_key).public();
     let mut encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
     let request = serde_json::to_vec(&PeerRequest::LinkRequest {
         secret: encoded.clone(),
-        node_id: SecretKey::from_bytes(&transport_secret_key)
-            .public()
-            .to_string(),
+        node_id: new_node.to_string(),
         device_name: local_device_name(),
     });
     encoded.zeroize();
@@ -487,17 +620,25 @@ async fn exchange_link(
     request.zeroize();
     written??;
     send.finish()?;
+    show_code(link_code(&responder, &new_node));
 
-    let mut bundle_json = link_step(
+    let read = link_step(
         "read bundle",
-        LINK_BUNDLE_TIMEOUT,
+        LINK_CONFIRM_TIMEOUT + LINK_BUNDLE_TIMEOUT,
         recv.read_to_end(MAX_BUNDLE_LEN),
     )
-    .await??;
+    .await?;
+    let mut bundle_json = match read {
+        Ok(bundle_json) => bundle_json,
+        Err(_) if was_declined(conn) => {
+            return Err("The other device declined the link.".into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     let parsed: Result<LinkBundleData, _> = serde_json::from_slice(&bundle_json);
     bundle_json.zeroize();
     let mut bundle = parsed?;
-    let keys = validate_link_bundle(&mut bundle, responder_node_id, transport_secret_key)?;
+    let keys = validate_link_bundle(&mut bundle, &responder.to_string(), transport_secret_key)?;
     log::info!("[link] received link bundle");
     Ok((keys, bundle))
 }
@@ -527,6 +668,7 @@ mod tests {
                     added_at: 1,
                 })
                 .collect(),
+            removed: vec![],
             version: 1,
             signature: String::new(),
         };
@@ -554,12 +696,14 @@ mod tests {
 
     /// Existing-device side of one link exchange on `endpoint` with a session holding
     /// `secret`: the request read of `PeerHandler::accept`, then the steps of
-    /// `serve_link_request` without storage.
+    /// `serve_link_request` without storage and dialog. `confirm` is the answer of the
+    /// user. Returns the link code the dialog shows.
     async fn serve_one_link(
         endpoint: Endpoint,
         secret: [u8; 32],
         bundle_json: Vec<u8>,
-    ) -> Result<(), AppError> {
+        confirm: bool,
+    ) -> Result<String, AppError> {
         let pending: PendingLinkState = Arc::new(tokio::sync::Mutex::new(Some(PendingLink::new(
             secret,
             now_millis() + LINK_SESSION_TTL_MS,
@@ -568,7 +712,10 @@ mod tests {
         let conn = incoming.await.map_err(|e| AppError::Other(e.to_string()))?;
         let (mut send, mut recv) = conn.accept_bi().await?;
         let request = recv.read_to_end(10_000).await?;
-        let PeerRequest::LinkRequest { secret, .. } = serde_json::from_slice(&request)? else {
+        let PeerRequest::LinkRequest {
+            secret, node_id, ..
+        } = serde_json::from_slice(&request)?
+        else {
             return Err("unexpected request".into());
         };
         let checked = check_link_secret(&pending, conn.remote_id(), &secret).await;
@@ -577,8 +724,14 @@ mod tests {
         }
         checked?;
         assert!(pending.lock().await.is_none());
+        let code = link_code(&endpoint.id(), &parse_pubkey(&node_id)?);
+        if !confirm {
+            conn.close(VarInt::from_u32(LINK_CLOSE_DECLINED), b"link declined");
+            return Ok(code);
+        }
         send_link_bundle(&mut send, &bundle_json).await?;
-        wait_for_completion(&conn).await
+        wait_for_completion(&conn).await?;
+        Ok(code)
     }
 
     /// Two loopback endpoints: the existing device (master `EXISTING_MASTER`, serving one
@@ -587,8 +740,7 @@ mod tests {
         existing: Endpoint,
         new: Endpoint,
         conn: Connection,
-        responder_node_id: String,
-        server: tokio::task::JoinHandle<Result<(), AppError>>,
+        server: tokio::task::JoinHandle<Result<String, AppError>>,
     }
 
     const EXISTING_MASTER: [u8; 32] = [7u8; 32];
@@ -601,9 +753,9 @@ mod tests {
         bundle(&EXISTING_MASTER, &[node_id(&EXISTING_TRANSPORT)])
     }
 
-    /// Start the existing device with a session holding `secret` and connect the new
-    /// device.
-    async fn link_pair(secret: [u8; 32], bundle: &LinkBundleData) -> LinkPair {
+    /// Start the existing device with a session holding `secret`, whose user answers the
+    /// link code with `confirm`, and connect the new device.
+    async fn link_pair(secret: [u8; 32], bundle: &LinkBundleData, confirm: bool) -> LinkPair {
         let existing =
             loopback_endpoint(SecretKey::from_bytes(&EXISTING_TRANSPORT), PEER_ALPN).await;
         let new = loopback_endpoint(SecretKey::from_bytes(&NEW_TRANSPORT), PEER_ALPN).await;
@@ -611,13 +763,13 @@ mod tests {
             existing.clone(),
             secret,
             serde_json::to_vec(bundle).unwrap(),
+            confirm,
         ));
         let conn = tokio::time::timeout(TEST_TIMEOUT, new.connect(existing.addr(), PEER_ALPN))
             .await
             .expect("connect timed out")
             .expect("connect");
         LinkPair {
-            responder_node_id: existing.id().to_string(),
             existing,
             new,
             conn,
@@ -626,22 +778,34 @@ mod tests {
     }
 
     impl LinkPair {
-        /// Run the new-device side of the exchange with `secret`.
+        /// Run the new-device side of the exchange with `secret`. Returns its result and
+        /// the link code it showed.
         async fn exchange(
             &self,
             secret: &[u8; 32],
-        ) -> Result<(IdentityKeys, LinkBundleData), AppError> {
-            tokio::time::timeout(
+        ) -> (
+            Result<(IdentityKeys, LinkBundleData), AppError>,
+            Option<String>,
+        ) {
+            let mut shown = None;
+            let result = tokio::time::timeout(
                 TEST_TIMEOUT,
-                exchange_link(&self.conn, secret, &self.responder_node_id, NEW_TRANSPORT),
+                exchange_link(
+                    &self.conn,
+                    secret,
+                    self.existing.id(),
+                    NEW_TRANSPORT,
+                    |code| shown = Some(code),
+                ),
             )
             .await
-            .expect("exchange timed out")
+            .expect("exchange timed out");
+            (result, shown)
         }
 
         /// Close the connection with `code`, return the result of the existing-device
         /// task, and close both endpoints.
-        async fn close(self, code: u32) -> Result<(), AppError> {
+        async fn close(self, code: u32) -> Result<String, AppError> {
             self.conn.close(VarInt::from_u32(code), b"");
             let served = tokio::time::timeout(TEST_TIMEOUT, self.server)
                 .await
@@ -666,8 +830,9 @@ mod tests {
             })
             .collect();
 
-        let pair = link_pair(secret, &sent).await;
-        let Ok((keys, received)) = pair.exchange(&secret).await else {
+        let pair = link_pair(secret, &sent, true).await;
+        let (exchanged, shown) = pair.exchange(&secret).await;
+        let Ok((keys, received)) = exchanged else {
             panic!("exchange failed");
         };
         assert_eq!(keys.master_secret_key, EXISTING_MASTER);
@@ -676,26 +841,58 @@ mod tests {
         assert_eq!(received.announcement.devices.len(), 1);
         assert!(received.master_secret_key.is_empty());
 
-        // The existing device saw the completion close.
-        pair.close(LINK_CLOSE_DONE)
+        // The existing device saw the completion close, and both devices showed the
+        // same code.
+        let code = pair
+            .close(LINK_CLOSE_DONE)
             .await
             .expect("existing device side");
+        assert_eq!(shown.as_deref(), Some(code.as_str()));
+    }
+
+    #[tokio::test]
+    async fn declined_link_code_sends_no_bundle() {
+        let secret = [9u8; 32];
+        let pair = link_pair(secret, &existing_bundle(), false).await;
+        let (exchanged, shown) = pair.exchange(&secret).await;
+        let Err(e) = exchanged else {
+            panic!("a declined link must fail");
+        };
+        assert!(e.to_string().contains("declined"), "{e}");
+        let code = pair.close(LINK_CLOSE_FAILED).await.unwrap();
+        assert_eq!(shown.as_deref(), Some(code.as_str()));
     }
 
     #[tokio::test]
     async fn link_exchange_with_wrong_secret_fails_on_both_devices() {
-        let pair = link_pair([1u8; 32], &existing_bundle()).await;
-        assert!(pair.exchange(&[2u8; 32]).await.is_err());
+        let pair = link_pair([1u8; 32], &existing_bundle(), true).await;
+        assert!(pair.exchange(&[2u8; 32]).await.0.is_err());
         assert!(pair.close(LINK_CLOSE_FAILED).await.is_err());
     }
 
     #[tokio::test]
     async fn existing_device_requires_the_completion_close_code() {
         let secret = [9u8; 32];
-        let pair = link_pair(secret, &existing_bundle()).await;
-        assert!(pair.exchange(&secret).await.is_ok());
+        let pair = link_pair(secret, &existing_bundle(), true).await;
+        assert!(pair.exchange(&secret).await.0.is_ok());
         // Code 0 is what a dropped connection sends.
         assert!(pair.close(0).await.is_err());
+    }
+
+    #[test]
+    fn link_code_depends_on_both_node_ids() {
+        let (existing, new, other) = (remote(1), remote(2), remote(3));
+        let code = link_code(&existing, &new);
+        assert_eq!(code, link_code(&existing, &new));
+        assert_eq!(code.len(), 7);
+        assert!(code.chars().enumerate().all(|(i, c)| if i == 3 {
+            c == ' '
+        } else {
+            c.is_ascii_digit()
+        }));
+        assert_ne!(code, link_code(&existing, &other));
+        assert_ne!(code, link_code(&other, &new));
+        assert_ne!(code, link_code(&new, &existing));
     }
 
     fn remote(seed: u8) -> EndpointId {

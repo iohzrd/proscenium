@@ -659,7 +659,8 @@ impl Storage {
     /// `verify_linked_devices_announcement`, for an active registration.
     ///
     /// The stored list is replaced only if `announcement.version` is greater than the
-    /// stored version.
+    /// stored version. If the announcement removes the registering device, its NodeId is
+    /// cleared, so only the devices of the list are dialed.
     pub async fn cache_announcement(
         &self,
         announcement: &LinkedDevicesAnnouncement,
@@ -684,6 +685,16 @@ impl Storage {
         .bind(version)
         .execute(&mut *tx)
         .await?;
+        if !announcement.removed.is_empty() {
+            sqlx::query(
+                "UPDATE registrations SET transport_node_id = NULL
+                 WHERE pubkey = ?1 AND transport_node_id IN (SELECT value FROM json_each(?2))",
+            )
+            .bind(&announcement.master_pubkey)
+            .bind(serde_json::to_string(&announcement.removed)?)
+            .execute(&mut *tx)
+            .await?;
+        }
         tx.commit().await?;
         Ok(AnnouncementOutcome::Stored)
     }

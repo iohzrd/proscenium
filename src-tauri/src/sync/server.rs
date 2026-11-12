@@ -465,6 +465,7 @@ mod tests {
                     added_at: 1,
                 })
                 .collect(),
+            removed: vec![],
             version: 1,
             signature: String::new(),
         };

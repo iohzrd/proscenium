@@ -142,6 +142,10 @@ impl Storage {
             "021_dm_messages_time_index",
             include_str!("../../migrations/021_dm_messages_time_index.sql"),
         ),
+        (
+            "022_removed_devices",
+            include_str!("../../migrations/022_removed_devices.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {

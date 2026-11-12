@@ -421,6 +421,7 @@ mod tests {
                     added_at: u64::MAX,
                 })
                 .collect(),
+            removed: vec![],
             version: u64::MAX,
             signature: "c".repeat(128),
         }

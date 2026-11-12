@@ -582,7 +582,19 @@ async fn announcement_device_list_is_replaced_only_by_higher_version() {
     );
     assert_eq!(
         storage.get_device_node_ids(pk).await.unwrap(),
-        Some(vec![transport, node_id(51)])
+        Some(vec![transport.clone(), node_id(51)])
+    );
+
+    // A list that removes the registering device clears it.
+    let mut v7 = user.announcement(7, &[node_id(51)]);
+    v7.removed = vec![transport];
+    assert_eq!(
+        storage.cache_announcement(&v7).await.unwrap(),
+        AnnouncementOutcome::Stored
+    );
+    assert_eq!(
+        storage.get_device_node_ids(pk).await.unwrap(),
+        Some(vec![node_id(51)])
     );
 }
 
