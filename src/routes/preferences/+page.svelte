@@ -9,11 +9,14 @@
   import SecuritySection from "#lib/preferences/SecuritySection.svelte";
   import DangerZoneSection from "#lib/preferences/DangerZoneSection.svelte";
   import AccentPicker from "#lib/preferences/AccentPicker.svelte";
+  import type { LegalDocumentId } from "#lib/legal/documents.ts";
+  import LegalDocumentModal from "#lib/legal/LegalDocumentModal.svelte";
 
   const node = useNodeInit(async () => {});
   // Closing the window keeps the app running; on desktop it is quit here or from
   // the tray.
   const isDesktop = platform() !== "android" && platform() !== "ios";
+  let shownDocument = $state<LegalDocumentId | null>(null);
 
   onMount(() => {
     node.init();
@@ -80,8 +83,27 @@
     </section>
   {/if}
 
+  <section class="settings-section">
+    <h3>Terms and Privacy</h3>
+    <div class="legal-links">
+      <button class="btn-elevated" onclick={() => (shownDocument = "terms")}>
+        Terms of Use
+      </button>
+      <button class="btn-elevated" onclick={() => (shownDocument = "privacy")}>
+        Privacy Policy
+      </button>
+    </div>
+  </section>
+
   <DangerZoneSection />
 </div>
+
+{#if shownDocument}
+  <LegalDocumentModal
+    docId={shownDocument}
+    onclose={() => (shownDocument = null)}
+  />
+{/if}
 
 <style>
   h2 {
@@ -157,5 +179,11 @@
 
   .quit-btn {
     margin-top: 0.75rem;
+  }
+
+  .legal-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
   }
 </style>

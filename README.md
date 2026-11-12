@@ -135,7 +135,7 @@ Produces a native desktop application in `src-tauri/target/release/`.
 ### Prerequisites
 
 1. Install [Android Studio](https://developer.android.com/studio)
-2. Install the Android SDK (API level 33+) and NDK via Android Studio's SDK Manager
+2. Install the Android SDK (API level 36) and NDK via Android Studio's SDK Manager
 3. Install the Android Rust targets:
    ```bash
    rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
@@ -144,6 +144,9 @@ Produces a native desktop application in `src-tauri/target/release/`.
    ```bash
    export ANDROID_HOME="$HOME/Android/Sdk"
    export NDK_HOME="$ANDROID_HOME/ndk/<version>"
+   export ANDROID_NDK_HOME="$NDK_HOME"  # read by the opusic-sys build script
+   # Gradle 9.6 runs on JDK 17 to 25; Android Studio bundles one.
+   export JAVA_HOME=/opt/android-studio/jbr
    ```
 
 ### Development
@@ -169,10 +172,27 @@ adb logcat | grep -i proscenium
 ### Building
 
 ```bash
-npm run tauri android build
+npm run tauri android build -- --aab
 ```
 
-The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
+The bundle is written to `src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab`.
+
+Release builds are signed with the upload key named in `src-tauri/gen/android/keystore.properties` (gitignored). Without that file, release builds are unsigned. To create the key:
+
+```bash
+keytool -genkeypair -v -keystore ~/.android/proscenium-upload.jks -storetype PKCS12 \
+  -keyalg RSA -keysize 4096 -validity 10000 -alias upload -dname "CN=Proscenium"
+```
+
+and write `keystore.properties`:
+
+```properties
+keyAlias=upload
+password=<keystore password>
+storeFile=/home/<user>/.android/proscenium-upload.jks
+```
+
+Google Play re-signs the app with its app signing key; the upload key only authenticates uploads, and Play can replace a lost upload key.
 
 ### Notes
 
@@ -181,6 +201,11 @@ The APK/AAB is output to `src-tauri/gen/android/app/build/outputs/`.
 - QR code scanning uses `tauri-plugin-barcode-scanner` which requires the CAMERA permission (declared in the manifest)
 - Deep links use the `proscenium://` scheme
 - App data, which holds the master and transport keys, is excluded from cloud backup and device-to-device transfer (`android:allowBackup="false"` and `res/xml/data_extraction_rules.xml`)
+- The application ID is `com.proscenium.app`
+
+## Terms of Use and Privacy Policy
+
+[docs/terms-of-use.md](docs/terms-of-use.md) and [docs/privacy-policy.md](docs/privacy-policy.md) are bundled into the app and shown from the welcome screen and from Preferences. The welcome screen requires accepting the terms before an identity is created, recovered or linked. The app renders a Markdown subset (`#` and `##` headings, paragraphs, `- ` lists, no inline formatting); keep both files to that subset.
 
 ## Discovery Server
 
