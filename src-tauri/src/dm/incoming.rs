@@ -250,11 +250,9 @@ mod tests {
                 devices: vec![DeviceEntry {
                     node_id: self.node_id(),
                     device_name: "d".to_string(),
-                    is_primary: true,
                     added_at: 1,
                 }],
                 version: 1,
-                timestamp: 1,
                 signature: String::new(),
             };
             sign_linked_devices_announcement(&mut announcement, &self.master);

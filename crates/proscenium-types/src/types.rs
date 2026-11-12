@@ -95,8 +95,6 @@ pub struct DeviceEntry {
     pub node_id: String,
     /// Human-readable device name.
     pub device_name: String,
-    /// Whether this is the device with transport key derivation index 0.
-    pub is_primary: bool,
     /// When this device was added (Unix timestamp ms).
     pub added_at: u64,
 }
@@ -136,16 +134,13 @@ impl std::fmt::Debug for LinkQrPayload {
 }
 
 /// Data sent from the existing device to the new device during linking. The new device
-/// derives its transport key from the master key and `device_index`.
+/// keeps its own transport key.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LinkBundleData {
     /// The master secret key (32 bytes, standard base64).
     pub master_secret_key: String,
-    /// Transport key derivation index assigned to the new device
-    /// (`1..MAX_LINKED_DEVICES`).
-    pub device_index: u32,
-    /// The existing device's device list. Does not contain the new device.
-    pub devices: Vec<DeviceEntry>,
+    /// The existing device's signed device list. Does not contain the new device.
+    pub announcement: crate::protocol::LinkedDevicesAnnouncement,
     /// The user's signed profile.
     pub profile: Option<Profile>,
     /// Follow rows, including removed ones.
@@ -162,8 +157,7 @@ pub struct LinkBundleData {
 impl std::fmt::Debug for LinkBundleData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinkBundleData")
-            .field("device_index", &self.device_index)
-            .field("devices", &self.devices.len())
+            .field("devices", &self.announcement.devices.len())
             .field("follows", &self.follows.len())
             .field("moderation", &self.moderation.len())
             .field("bookmarks", &self.bookmarks.len())
@@ -373,19 +367,11 @@ pub struct PostSearchResponse {
 /// Summary of one device's state, exchanged at the start of a device sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceSyncVector {
-    pub post_count: u64,
-    pub newest_post_ts: u64,
-    pub interaction_count: u64,
-    pub newest_interaction_ts: u64,
     /// Hex SHA-256 over the sender's follow, moderation and bookmark rows
     /// (key, state, `last_changed_at`). Equal digests mean equal rows.
     pub lww_digest: String,
-    /// The sender's device list.
-    pub devices: Vec<DeviceEntry>,
     /// Ids of the sender's newest direct messages, at most `MAX_DEVICE_SYNC_DM_IDS`.
     pub dm_ids: Vec<String>,
-    /// Ids of the sender's newest deletions of own posts, at most `MAX_SYNC_TOMBSTONES`.
-    pub post_tombstone_ids: Vec<String>,
     /// Ids of the sender's newest deletions of own interactions, at most
     /// `MAX_SYNC_TOMBSTONES`.
     pub interaction_tombstone_ids: Vec<String>,

@@ -87,3 +87,27 @@ pub async fn sync_one_peer(
         short_id(pubkey),
     )))
 }
+
+/// Fetch the own posts, interactions and post deletions of the local user `my_id` from
+/// the other device `target`, within `SYNC_PEER_TIMEOUT`. See `sync_from_peer` for what
+/// differs from the sync of another user.
+pub async fn sync_from_own_device(
+    endpoint: &Endpoint,
+    storage: &Storage,
+    target: EndpointId,
+    my_id: &str,
+    app_handle: &AppHandle,
+) -> Result<SyncOneResult, AppError> {
+    let deadline = Instant::now() + SYNC_PEER_TIMEOUT;
+    sync_from_peer(
+        endpoint,
+        storage,
+        target,
+        my_id,
+        my_id,
+        app_handle,
+        "device-sync",
+        deadline,
+    )
+    .await
+}

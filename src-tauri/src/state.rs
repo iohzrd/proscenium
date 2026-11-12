@@ -6,7 +6,6 @@ use crate::stage::StageHandler;
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
-use proscenium_types::{DeviceEntry, MAX_LINKED_DEVICES, derive_transport_key};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
@@ -30,45 +29,23 @@ pub struct Identity {
     pub master_key: SecretKey,
     /// Master public key string (the user ID).
     pub master_pubkey: String,
-    /// Transport key derivation index of this device (0 for the primary device).
-    pub device_index: u32,
-    /// Transport NodeId string (iroh's own key, for QUIC networking).
+    /// Secret key of this device's iroh endpoint, generated at random for each device.
+    /// Its X25519 form decrypts the DMs sent to this device.
+    pub transport_key: SecretKey,
+    /// Transport NodeId string (the public key of `transport_key`).
     pub transport_node_id: String,
 }
 
 impl Identity {
-    /// Derive the identity of the device with transport key derivation index
-    /// `device_index` from the master key.
-    pub fn derive(master_secret_key_bytes: [u8; 32], device_index: u32) -> Self {
+    pub fn new(master_secret_key_bytes: [u8; 32], transport_key: SecretKey) -> Self {
         let master_key = SecretKey::from_bytes(&master_secret_key_bytes);
         Self {
             master_secret_key_bytes,
             master_pubkey: master_key.public().to_string(),
             master_key,
-            device_index,
-            transport_node_id: device_node_id(&master_secret_key_bytes, device_index),
+            transport_node_id: transport_key.public().to_string(),
+            transport_key,
         }
-    }
-
-    /// Secret key of this device's iroh endpoint. Its X25519 form decrypts the DMs sent
-    /// to this device.
-    pub fn transport_secret_key(&self) -> SecretKey {
-        SecretKey::from_bytes(&derive_transport_key(
-            &self.master_secret_key_bytes,
-            self.device_index,
-        ))
-    }
-
-    /// Transport key derivation index of `node_id`, or `None` if `node_id` is not the
-    /// NodeId of a device of this identity.
-    pub fn device_index_of(&self, node_id: &str) -> Option<u32> {
-        device_index_of(&self.master_secret_key_bytes, node_id)
-    }
-
-    /// Keep the entries whose NodeId is a device of this identity, and set `is_primary`
-    /// from the derivation index (index 0 is the primary device).
-    pub fn own_devices(&self, devices: &[DeviceEntry]) -> Vec<DeviceEntry> {
-        own_devices(&self.master_secret_key_bytes, devices)
     }
 }
 
@@ -77,47 +54,9 @@ impl std::fmt::Debug for Identity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
             .field("master_pubkey", &self.master_pubkey)
-            .field("device_index", &self.device_index)
             .field("transport_node_id", &self.transport_node_id)
             .finish_non_exhaustive()
     }
-}
-
-/// Transport NodeId of the device with derivation index `device_index`.
-pub fn device_node_id(master_secret_key_bytes: &[u8; 32], device_index: u32) -> String {
-    SecretKey::from_bytes(&derive_transport_key(master_secret_key_bytes, device_index))
-        .public()
-        .to_string()
-}
-
-/// Transport key derivation index (`0..MAX_LINKED_DEVICES`) whose NodeId equals `node_id`.
-///
-/// A device of an identity holds the master key and derives its transport key from it,
-/// so a QUIC peer with such a NodeId is a device of that identity.
-pub fn device_index_of(master_secret_key_bytes: &[u8; 32], node_id: &str) -> Option<u32> {
-    (0..MAX_LINKED_DEVICES as u32)
-        .find(|index| device_node_id(master_secret_key_bytes, *index) == node_id)
-}
-
-/// Keep the entries whose NodeId derives from the master key, and set `is_primary`
-/// from the derivation index (index 0 is the primary device).
-pub fn own_devices(
-    master_secret_key_bytes: &[u8; 32],
-    devices: &[DeviceEntry],
-) -> Vec<DeviceEntry> {
-    let node_ids: Vec<String> = (0..MAX_LINKED_DEVICES as u32)
-        .map(|index| device_node_id(master_secret_key_bytes, index))
-        .collect();
-    devices
-        .iter()
-        .filter_map(|device| {
-            let index = node_ids.iter().position(|id| *id == device.node_id)?;
-            Some(DeviceEntry {
-                is_primary: index == 0,
-                ..device.clone()
-            })
-        })
-        .collect()
 }
 
 /// Shared, mutable identity -- the canonical source for all key material.
@@ -256,64 +195,5 @@ pub(crate) mod test_support {
             .bind()
             .await
             .expect("bind loopback endpoint")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_index_is_found_only_for_derived_node_ids() {
-        let master = [1u8; 32];
-        let identity = Identity::derive(master, 3);
-        assert_eq!(identity.transport_node_id, device_node_id(&master, 3));
-        assert_eq!(
-            identity.device_index_of(&identity.transport_node_id),
-            Some(3)
-        );
-        assert_eq!(
-            identity.device_index_of(&device_node_id(&master, 0)),
-            Some(0)
-        );
-        let last = MAX_LINKED_DEVICES as u32 - 1;
-        assert_eq!(
-            identity.device_index_of(&device_node_id(&master, last)),
-            Some(last)
-        );
-        // An index outside the range, another master key, the master pubkey itself, and
-        // a string that is not a key.
-        for node_id in [
-            device_node_id(&master, MAX_LINKED_DEVICES as u32),
-            device_node_id(&[2u8; 32], 0),
-            identity.master_pubkey.clone(),
-            "aaaaaaa\u{20ac}".to_string(),
-        ] {
-            assert_eq!(identity.device_index_of(&node_id), None);
-        }
-    }
-
-    #[test]
-    fn own_devices_drops_foreign_entries_and_sets_primary_from_index() {
-        let master = [1u8; 32];
-        let entry = |node_id: String, is_primary: bool| DeviceEntry {
-            node_id,
-            device_name: "d".to_string(),
-            is_primary,
-            added_at: 1,
-        };
-        let filtered = own_devices(
-            &master,
-            &[
-                entry(device_node_id(&master, 0), false),
-                entry(device_node_id(&[2u8; 32], 0), true),
-                entry(device_node_id(&master, 2), true),
-            ],
-        );
-        assert_eq!(filtered.len(), 2);
-        assert_eq!(filtered[0].node_id, device_node_id(&master, 0));
-        assert!(filtered[0].is_primary);
-        assert_eq!(filtered[1].node_id, device_node_id(&master, 2));
-        assert!(!filtered[1].is_primary);
     }
 }

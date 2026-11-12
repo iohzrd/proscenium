@@ -43,7 +43,8 @@ pub const PEER_MAX_SMALL_REQUEST_BYTES: usize = 2 * 1024;
 pub const PEER_MAX_FOLLOW_REQUEST_BYTES: usize = 64 * 1024;
 pub const PEER_MAX_LINK_REQUEST_BYTES: usize = 1024;
 pub const PEER_MAX_PUSH_BYTES: usize = 4 * 1024 * 1024;
-pub const PEER_MAX_DEVICE_SYNC_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const PEER_MAX_DEVICE_SYNC_REQUEST_BYTES: usize =
+    proscenium_types::MAX_ANNOUNCEMENT_JSON_LEN + 64;
 
 // Peer protocol (connect side)
 /// Time allowed for one identity, follow-request or list exchange (connect, request, response).

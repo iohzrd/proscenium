@@ -17,8 +17,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use proscenium_types::{
-    DM_ALPN, DirectMessage, DmEnvelope, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES, is_valid_id,
-    short_id, validate_media_list,
+    DM_ALPN, DirectMessage, DmEnvelope, MAX_ANNOUNCEMENT_JSON_LEN, is_valid_id, short_id,
+    validate_media_list,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -39,11 +39,9 @@ pub(crate) const MAX_DM_PAYLOAD_LEN: usize = 64 * 1024;
 const MAX_DM_CIPHERTEXT_LEN: usize = MAX_DM_PAYLOAD_LEN + 16;
 
 /// Maximum byte length of the envelope the acceptor reads: a ciphertext of
-/// `MAX_DM_CIPHERTEXT_LEN` bytes in hex, and a device list of `MAX_LINKED_DEVICES` entries
-/// whose names of `MAX_DEVICE_NAME_LEN` bytes are escaped as `\u00XX` (6 bytes per byte).
-/// The other fields take under 1 KiB.
-const MAX_DM_FRAME_LEN: usize =
-    2 * MAX_DM_CIPHERTEXT_LEN + MAX_LINKED_DEVICES * (6 * MAX_DEVICE_NAME_LEN + 256) + 1024;
+/// `MAX_DM_CIPHERTEXT_LEN` bytes in hex, and a device list of at most
+/// `MAX_ANNOUNCEMENT_JSON_LEN` bytes. The other fields take under 1 KiB.
+const MAX_DM_FRAME_LEN: usize = 2 * MAX_DM_CIPHERTEXT_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
 
 /// Maximum byte length of the answer the sender reads (a `DmAck`).
 const MAX_DM_ANSWER_LEN: usize = 64;
@@ -123,7 +121,7 @@ impl DmHandler {
         let id = self.identity.read().await;
         DmKeys {
             master_pubkey: id.master_pubkey.clone(),
-            device_key: id.transport_secret_key(),
+            device_key: id.transport_key.clone(),
         }
     }
 
@@ -260,7 +258,10 @@ impl ProtocolHandler for DmHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proscenium_types::{DeviceEntry, DmPayload, LinkedDevicesAnnouncement, MediaAttachment};
+    use proscenium_types::{
+        DeviceEntry, DmPayload, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
+        MediaAttachment,
+    };
 
     fn message() -> DirectMessage {
         DirectMessage {
@@ -316,12 +317,10 @@ mod tests {
                     .map(|i| DeviceEntry {
                         node_id: key(i + 10),
                         device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
-                        is_primary: false,
                         added_at: u64::MAX,
                     })
                     .collect(),
                 version: u64::MAX,
-                timestamp: u64::MAX,
                 signature: "f".repeat(128),
             },
             encapped_key: vec![0xff; 32],

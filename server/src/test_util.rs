@@ -170,12 +170,10 @@ impl TestUser {
                 .map(|node_id| DeviceEntry {
                     node_id: node_id.clone(),
                     device_name: "device".to_string(),
-                    is_primary: false,
                     added_at: 1,
                 })
                 .collect(),
             version,
-            timestamp: version,
             signature: String::new(),
         };
         sign_linked_devices_announcement(&mut announcement, &self.key);

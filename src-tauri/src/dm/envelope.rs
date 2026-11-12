@@ -134,7 +134,6 @@ mod tests {
             master_pubkey: master.to_string(),
             devices: vec![],
             version: 1,
-            timestamp: 1,
             signature: String::new(),
         }
     }

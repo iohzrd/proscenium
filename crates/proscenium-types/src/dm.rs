@@ -175,7 +175,6 @@ mod tests {
                 master_pubkey: "aa".repeat(32),
                 devices: vec![],
                 version: 1,
-                timestamp: 1,
                 signature: String::new(),
             },
             encapped_key: vec![1; 32],

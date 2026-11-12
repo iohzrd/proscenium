@@ -151,12 +151,7 @@
             </svg>
           </div>
           <div class="device-info">
-            <span class="device-name">
-              {device.device_name}
-              {#if device.is_primary}
-                <span class="device-badge">Primary</span>
-              {/if}
-            </span>
+            <span class="device-name">{device.device_name}</span>
             <span class="device-meta">
               <code class="device-node-id"
                 >{device.node_id.slice(0, 12)}...</code
@@ -342,15 +337,6 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-  }
-
-  .device-badge {
-    font-size: var(--text-xs);
-    font-weight: 600;
-    color: var(--accent-light);
-    background: var(--bg-deep);
-    padding: 0.1rem 0.4rem;
-    border-radius: var(--radius-sm);
   }
 
   .device-meta {

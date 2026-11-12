@@ -23,6 +23,11 @@ use tokio::time::Instant;
 /// continues from there. An error is returned only if no summary was received or the
 /// summary could not be used.
 ///
+/// If `author` is `my_id`, `target` is another device of the local user: the device list
+/// and stage announcement of the summary are ignored (device sync exchanges device
+/// lists), and local interactions that `target` lacks are kept, because neither device
+/// holds the complete set.
+///
 /// Emits `feed-updated` once at the end if a post row was inserted or deleted or a new
 /// tombstone was stored. Rows that already existed produce no event.
 #[allow(clippy::too_many_arguments)]
@@ -78,9 +83,10 @@ pub(super) async fn sync_from_peer(
     let summary_bytes =
         read_to_end_timeout(&mut recv, SYNC_MAX_SUMMARY_BYTES, SYNC_STEP_TIMEOUT).await?;
     let summary: SyncSummary = serde_json::from_slice(&summary_bytes)?;
+    let own_device = author == my_id;
 
-    // The responder's signed device list: current NodeIds and DM pubkey of the author.
-    if let Some(announcement) = &summary.announcement {
+    // The responder's signed device list: the current NodeIds of the author.
+    if !own_device && let Some(announcement) = &summary.announcement {
         if announcement.master_pubkey != author {
             log::warn!("[{label}] sync summary carries a device list of another user");
         } else if let Err(reason) = verify_linked_devices_announcement(announcement) {
@@ -100,7 +106,7 @@ pub(super) async fn sync_from_peer(
         }
     }
 
-    if let Some(stage) = &summary.active_stage {
+    if !own_device && let Some(stage) = &summary.active_stage {
         emit_verified_stage(stage, author, app_handle, label);
     }
 
@@ -154,6 +160,7 @@ pub(super) async fn sync_from_peer(
     // interaction set: local interactions of the author that the responder no longer
     // has were deleted by the author and are removed.
     if complete
+        && !own_device
         && let Some(received_ids) = ingest.take_interaction_ids()
         && received_ids.len() as u64 == summary.server_interaction_count
     {

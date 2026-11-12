@@ -206,7 +206,6 @@ export interface PostSearchResponse {
 export interface DeviceEntry {
   node_id: string;
   device_name: string;
-  is_primary: boolean;
   added_at: number;
 }
 

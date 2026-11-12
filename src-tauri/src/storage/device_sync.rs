@@ -1,8 +1,7 @@
 use crate::device_sync::LwwState;
 use crate::error::AppError;
 use proscenium_types::{
-    BookmarkEntry, DeviceSyncVector, FollowEntry, MAX_DEVICE_SYNC_DM_IDS, MAX_SYNC_TOMBSTONES,
-    ModerationEntry, is_valid_id, is_valid_pubkey, now_millis,
+    BookmarkEntry, FollowEntry, ModerationEntry, is_valid_id, is_valid_pubkey, now_millis,
 };
 
 use super::Storage;
@@ -99,45 +98,6 @@ impl Storage {
             follows,
             moderation,
             bookmarks,
-        })
-    }
-
-    /// Build the summary a device sends at the start of a device sync.
-    pub async fn build_device_sync_vector(
-        &self,
-        master_pubkey: &str,
-        lww: &LwwState,
-    ) -> Result<DeviceSyncVector, AppError> {
-        let (post_count, newest_post_ts): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM posts WHERE author = ?1",
-        )
-        .bind(master_pubkey)
-        .fetch_one(&self.pool)
-        .await?;
-        let (interaction_count, newest_interaction_ts): (i64, i64) = sqlx::query_as(
-            "SELECT COUNT(*), COALESCE(MAX(timestamp), 0) FROM interactions WHERE author = ?1",
-        )
-        .bind(master_pubkey)
-        .fetch_one(&self.pool)
-        .await?;
-
-        Ok(DeviceSyncVector {
-            post_count: post_count as u64,
-            newest_post_ts: newest_post_ts as u64,
-            interaction_count: interaction_count as u64,
-            newest_interaction_ts: newest_interaction_ts as u64,
-            lww_digest: lww.digest(),
-            devices: self.get_linked_devices().await?,
-            dm_ids: self.get_newest_dm_ids(MAX_DEVICE_SYNC_DM_IDS).await?,
-            post_tombstone_ids: self
-                .get_post_tombstones(master_pubkey, MAX_SYNC_TOMBSTONES)
-                .await?
-                .into_iter()
-                .map(|tombstone| tombstone.id)
-                .collect(),
-            interaction_tombstone_ids: self
-                .get_interaction_tombstone_ids(master_pubkey, MAX_SYNC_TOMBSTONES)
-                .await?,
         })
     }
 

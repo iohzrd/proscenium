@@ -29,8 +29,9 @@ pub async fn cancel_device_link(state: State<'_, Arc<AppState>>) -> CmdResult<()
 ///
 /// Asks for confirmation in a native dialog and returns the error `"cancelled"` if it is
 /// declined. Nothing is changed locally until the link bundle was received and
-/// validated. Then all local rows and media are deleted, the key files are replaced, the
-/// link bundle is imported and the network stack is rebuilt. The caller reloads the
+/// validated. Then all local rows and media are deleted, the master key file is replaced
+/// (the transport key is kept), the link bundle is imported and the network stack is
+/// rebuilt. The caller reloads the
 /// webview after `Ok`.
 #[tauri::command]
 pub async fn link_with_device(
@@ -59,12 +60,11 @@ pub async fn link_with_device(
         .peer()
         .request_link(&state.endpoint(), &qr_payload)
         .await?;
-    let device_index = keys.device_index;
 
     let state_arc: Arc<AppState> = Arc::clone(&state);
     crate::setup::replace_identity(&state_arc, keys, Some(&bundle)).await?;
 
-    log::info!("[link] device linked (device_index={device_index})");
+    log::info!("[link] device linked");
     Ok(())
 }
 

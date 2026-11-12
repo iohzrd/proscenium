@@ -17,6 +17,12 @@ use sha2::{Digest, Sha256};
 pub const MAX_LINKED_DEVICES: usize = 16;
 /// Maximum byte length of a device name in a `LinkedDevicesAnnouncement`.
 pub const MAX_DEVICE_NAME_LEN: usize = 64;
+/// Maximum byte length of the JSON of a `LinkedDevicesAnnouncement` that passes
+/// `verify_linked_devices_announcement`: `MAX_LINKED_DEVICES` entries whose names of
+/// `MAX_DEVICE_NAME_LEN` bytes are escaped as `\u00XX` (6 bytes per byte), and under
+/// 1 KiB of other fields.
+pub const MAX_ANNOUNCEMENT_JSON_LEN: usize =
+    MAX_LINKED_DEVICES * (6 * MAX_DEVICE_NAME_LEN + 256) + 1024;
 
 /// Signed announcement listing all of a user's linked devices.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,10 +31,9 @@ pub struct LinkedDevicesAnnouncement {
     pub master_pubkey: String,
     /// All currently active devices.
     pub devices: Vec<DeviceEntry>,
-    /// Monotonically increasing version number.
+    /// Creation time (Unix timestamp ms). Receivers keep the announcement with the
+    /// highest version.
     pub version: u64,
-    /// When this announcement was created (Unix timestamp ms).
-    pub timestamp: u64,
     /// Ed25519 signature by the master key over the canonical bytes.
     pub signature: String,
 }
@@ -114,11 +119,17 @@ pub enum PeerRequest {
     LinkRequest {
         /// `LinkQrPayload::secret` (URL-safe base64 without padding).
         secret: String,
+        /// Name under which the existing device stores the new device.
+        device_name: String,
     },
-    /// Sync between two devices of one user. The responder serves it only to a NodeId
-    /// derived from its own master key. `DeviceSyncFrame`s follow on a second
-    /// bi-stream opened by the requester.
-    DeviceSyncRequest,
+    /// Sync between two devices of one user. The responder serves it only if
+    /// `announcement` is signed by its own master key and lists the requester's NodeId,
+    /// and answers with its own announcement on the same stream. `DeviceSyncFrame`s
+    /// follow on a second bi-stream opened by the requester.
+    DeviceSyncRequest {
+        /// The requester's signed device list.
+        announcement: LinkedDevicesAnnouncement,
+    },
 }
 
 /// Response sent back depending on the request type.
@@ -380,15 +391,11 @@ pub enum SyncFrame {
 pub enum DeviceSyncFrame {
     /// The sender's state summary. First frame in each direction.
     Vector(DeviceSyncVector),
-    Posts(Vec<Post>),
-    Interactions(Vec<Interaction>),
     Follows(Vec<FollowEntry>),
     Moderation(Vec<ModerationEntry>),
     Bookmarks(Vec<BookmarkEntry>),
     /// Direct messages the receiver's vector does not list.
     DirectMessages(Vec<StoredMessage>),
-    /// Signed deletions of own posts the receiver's vector does not list.
-    PostTombstones(Vec<PostTombstone>),
     /// Ids of deleted own interactions the receiver's vector does not list.
     InteractionTombstones(Vec<String>),
 }

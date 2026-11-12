@@ -3,7 +3,7 @@ mod orchestration;
 mod processing;
 mod server;
 
-pub use orchestration::sync_one_peer;
+pub use orchestration::{sync_from_own_device, sync_one_peer};
 pub use server::handle_sync;
 
 /// Interaction rule of the sync protocol, for a request whose interaction count differs

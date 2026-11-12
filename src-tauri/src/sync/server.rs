@@ -266,15 +266,23 @@ fn select_mode(
     }
 }
 
-/// Return an error unless the local visibility allows the NodeId `remote_str` to sync.
+/// Return an error unless the NodeId `remote_str` is another device of the local user or
+/// the local visibility allows it to sync.
 ///
 /// Public: anyone. Listed: approved followers. Private: approved followers that the local
-/// user follows. A failed visibility or follower lookup rejects the request.
+/// user follows. A failed device, visibility or follower lookup rejects the request.
 async fn authorize_requester(
     storage: &Storage,
     my_pubkey: &str,
     remote_str: &str,
 ) -> Result<(), AcceptError> {
+    if storage
+        .is_other_device(remote_str)
+        .await
+        .map_err(AcceptError::from_err)?
+    {
+        return Ok(());
+    }
     let visibility = storage
         .get_visibility(my_pubkey)
         .await
@@ -362,6 +370,42 @@ async fn write_post_frames(send: &mut SendStream, posts: Vec<Post>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proscenium_types::Profile;
+
+    #[tokio::test]
+    async fn other_devices_may_sync_a_private_profile() {
+        let storage = Storage::open_in_memory().await.unwrap();
+        let node_id = |seed: u8| SecretKey::from_bytes(&[seed; 32]).public().to_string();
+        let me = node_id(1);
+        let profile = Profile {
+            display_name: "me".to_string(),
+            bio: String::new(),
+            avatar_hash: None,
+            avatar_ticket: None,
+            visibility: Visibility::Private,
+            updated_at: 1,
+            signature: String::new(),
+        };
+        storage.save_profile(&me, &profile).await.unwrap();
+        storage
+            .upsert_linked_device(&node_id(2), "Linux", true, 1)
+            .await
+            .unwrap();
+        storage
+            .upsert_linked_device(&node_id(3), "Android", false, 2)
+            .await
+            .unwrap();
+
+        assert!(
+            authorize_requester(&storage, &me, &node_id(3))
+                .await
+                .is_ok()
+        );
+        // The local device row and an unknown NodeId are not other devices.
+        for remote in [node_id(2), node_id(4)] {
+            assert!(authorize_requester(&storage, &me, &remote).await.is_err());
+        }
+    }
 
     fn rows(posts: &[(&str, u64)]) -> Vec<(String, u64)> {
         posts

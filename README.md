@@ -20,10 +20,10 @@ Every user runs their own node. Posts, profiles, and follows are stored locally.
 
 ### Identity and Key Architecture
 
-Each user has one master key, and each device a transport key derived from it:
+Each user has one master key, and each device its own transport key:
 
 - **Master key** (Ed25519) -- The identity. The master public key is what others follow. The master key signs all of the user's content: posts, interactions, profiles, deletions, device lists, follow requests, server registrations and Stage messages. Stored in `master_key.key` (mode 0600) on every device of the user. A 24-word BIP39 recovery phrase encodes it.
-- **Transport key** (Ed25519) -- Derived from the master key with a per-device index (`device_index` file, 0 on the first device). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content.
+- **Transport key** (Ed25519) -- Generated at random on each device and stored in `transport_key.key` (mode 0600). It is the iroh NodeId of that device, and its X25519 form decrypts the DMs sent to that device. Never signs content. Recovery from the phrase generates a new one.
 
 Content is verified against the public key in its `author` field, so it verifies without other cached data. There is no key rotation: a leaked master key can only be replaced by a new identity.
 
@@ -36,7 +36,7 @@ Every signed byte string is a JSON array that starts with a type tag (`prosceniu
 All ALPNs are version 2 (`proscenium/{peer,dm,call,stage}/2`).
 
 - **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and Stage announcements. A message is stored only if the topic owner is its author and signed it.
-- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
+- **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to the user's other devices and to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends counts and a digest of the post ids it holds. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so a deleted post stays deleted and deletions reach followers that were offline. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
 - **Push** -- Listed and Private users deliver new content directly to their followers. A node accepts a push only from a user it follows.
 - **Blobs** -- Content-addressed media (iroh-blobs). The size of a remote blob is checked before download; blobs over 50 MiB are rejected. Media over 10 MiB is fetched only after a click.
 - **DM** -- End-to-end encrypted direct messages. See "Direct Messaging".
@@ -294,10 +294,10 @@ Multi-participant audio rooms over a QUIC protocol (`proscenium/stage/2`) with r
 
 Several devices can share one identity.
 
-- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device dials that NodeId, so QUIC authenticates the existing device, and sends the secret. The existing device compares it in constant time, sends the link bundle, and registers the new device after the new device reported that it stored the bundle.
-- **Bundle**: the master key, the new device's index, the device list, profile, follows, moderation entries and bookmarks. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog.
-- **Keys**: every device holds the master key and derives its own transport key from its device index. A device cannot be removed from the identity.
-- **Device sync**: devices exchange own posts and interactions, their deletions, follows, moderation entries and bookmarks (last writer wins), and direct messages (by id, among the newest 50,000). A device serves device sync only to a NodeId that derives from its own master key.
+- **Pairing**: the existing device shows a QR code (or its text form for a device without a camera) that holds its NodeId and a one-time secret valid for 60 seconds. The new device dials that NodeId, so QUIC authenticates the existing device, and sends the secret and its device name. The existing device compares the secret in constant time, sends the link bundle, and registers the NodeId of the connection as the new device after the new device reported that it stored the bundle.
+- **Bundle**: the master key, the signed device list, profile, follows, moderation entries, bookmarks and the device lists of followed users. Linking replaces the identity and all local data of the new device, after confirmation in a native dialog. The new device keeps its transport key.
+- **Keys**: every device holds the master key and its own random transport key. A device cannot be removed from the identity.
+- **Device sync**: each side sends its device list signed by the master key, and the other side continues only if the list is signed by its own master key and contains the NodeId of the connection. Both sides store the devices of the other's list. Devices exchange follows, moderation entries and bookmarks (last writer wins), direct messages (by id, among the newest 50,000) and deletions of own interactions. After that, each side fetches the other's own posts, interactions and post deletions with the sync protocol; a device serves that sync to its other devices whatever its visibility.
 - **Not replicated**: read state of direct messages.
 
 ## Recommended IDE Setup

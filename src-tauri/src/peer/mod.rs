@@ -290,7 +290,7 @@ impl ProtocolHandler for PeerHandler {
                 PeerRequest::FollowsListRequest => "follows-list",
                 PeerRequest::FollowersListRequest => "followers-list",
                 PeerRequest::LinkRequest { .. } => "link-request",
-                PeerRequest::DeviceSyncRequest => "device-sync",
+                PeerRequest::DeviceSyncRequest { .. } => "device-sync",
             },
             short_id(&remote_str)
         );
@@ -351,18 +351,22 @@ impl ProtocolHandler for PeerHandler {
                 )
                 .await
             }
-            PeerRequest::LinkRequest { secret } => {
-                self.handle_link_request(send, secret, &conn).await
+            PeerRequest::LinkRequest {
+                secret,
+                device_name,
+            } => {
+                self.handle_link_request(send, secret, &device_name, &conn)
+                    .await
             }
-            PeerRequest::DeviceSyncRequest => {
-                // The exchange runs on a second stream that the requester opens.
-                drop(send);
+            PeerRequest::DeviceSyncRequest { announcement } => {
                 crate::device_sync::handle_device_sync(
                     &self.storage,
                     &self.identity,
                     &self.gossip,
                     &self.app_handle,
                     &conn,
+                    send,
+                    &announcement,
                 )
                 .await
             }
@@ -419,7 +423,35 @@ mod tests {
             Some(PEER_MAX_LINK_REQUEST_BYTES)
         );
         assert_eq!(
-            request_size_limit(br#"{"DeviceSyncRequest":{"challenge""#),
+            request_size_limit(br#"{"DeviceSyncRequest":{"announcement""#),
+            Some(PEER_MAX_DEVICE_SYNC_REQUEST_BYTES)
+        );
+    }
+
+    #[test]
+    fn largest_device_sync_request_fits_its_limit() {
+        use proscenium_types::{
+            DeviceEntry, LinkedDevicesAnnouncement, MAX_DEVICE_NAME_LEN, MAX_LINKED_DEVICES,
+        };
+        // Names of control characters, which JSON escapes as `\u00XX`.
+        let request = PeerRequest::DeviceSyncRequest {
+            announcement: LinkedDevicesAnnouncement {
+                master_pubkey: "a".repeat(64),
+                devices: (0..MAX_LINKED_DEVICES)
+                    .map(|_| DeviceEntry {
+                        node_id: "b".repeat(64),
+                        device_name: "\u{1}".repeat(MAX_DEVICE_NAME_LEN),
+                        added_at: u64::MAX,
+                    })
+                    .collect(),
+                version: u64::MAX,
+                signature: "c".repeat(128),
+            },
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert!(bytes.len() <= PEER_MAX_DEVICE_SYNC_REQUEST_BYTES);
+        assert_eq!(
+            request_size_limit(&bytes),
             Some(PEER_MAX_DEVICE_SYNC_REQUEST_BYTES)
         );
     }

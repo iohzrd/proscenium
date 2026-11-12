@@ -23,22 +23,19 @@ impl Storage {
         &self,
         node_id: &str,
         device_name: &str,
-        is_primary: bool,
         is_self: bool,
         added_at: u64,
     ) -> Result<(), AppError> {
         sqlx::query(
-            "INSERT INTO linked_devices (node_id, device_name, is_primary, is_self, added_at, last_seen_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO linked_devices (node_id, device_name, is_self, added_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(node_id) DO UPDATE SET
                 device_name = ?2,
-                is_primary = ?3,
-                is_self = ?4,
-                last_seen_at = ?6",
+                is_self = ?3,
+                last_seen_at = ?5",
         )
         .bind(node_id)
         .bind(bounded_device_name(device_name))
-        .bind(is_primary as i32)
         .bind(is_self as i32)
         .bind(added_at as i64)
         .bind(now_millis() as i64)
@@ -50,7 +47,7 @@ impl Storage {
     /// Insert the given devices with `is_self = 0`. A NodeId that is already stored keeps
     /// its row. Returns the number of rows inserted.
     ///
-    /// The caller passes only entries whose NodeId derives from the local master key.
+    /// The caller passes only entries of a device list signed by the local master key.
     pub async fn insert_missing_linked_devices(
         &self,
         devices: &[DeviceEntry],
@@ -58,13 +55,12 @@ impl Storage {
         let mut inserted = 0u32;
         for device in devices {
             let result = sqlx::query(
-                "INSERT INTO linked_devices (node_id, device_name, is_primary, is_self, added_at, last_seen_at)
-                 VALUES (?1, ?2, ?3, 0, ?4, 0)
+                "INSERT INTO linked_devices (node_id, device_name, is_self, added_at, last_seen_at)
+                 VALUES (?1, ?2, 0, ?3, 0)
                  ON CONFLICT(node_id) DO NOTHING",
             )
             .bind(&device.node_id)
             .bind(bounded_device_name(&device.device_name))
-            .bind(device.is_primary as i32)
             .bind(i64::try_from(device.added_at).unwrap_or(i64::MAX))
             .execute(&self.pool)
             .await?;
@@ -77,7 +73,7 @@ impl Storage {
 
     pub async fn get_linked_devices(&self) -> Result<Vec<DeviceEntry>, AppError> {
         let rows = sqlx::query(
-            "SELECT node_id, device_name, is_primary, added_at FROM linked_devices ORDER BY added_at ASC",
+            "SELECT node_id, device_name, added_at FROM linked_devices ORDER BY added_at ASC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -86,11 +82,21 @@ impl Storage {
             devices.push(DeviceEntry {
                 node_id: row.get(0),
                 device_name: row.get(1),
-                is_primary: row.get::<i32, _>(2) != 0,
-                added_at: row.get::<i64, _>(3) as u64,
+                added_at: row.get::<i64, _>(2) as u64,
             });
         }
         Ok(devices)
+    }
+
+    /// True if `node_id` is stored as another device of the local user.
+    pub async fn is_other_device(&self, node_id: &str) -> Result<bool, AppError> {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM linked_devices WHERE node_id = ?1 AND is_self = 0)",
+        )
+        .bind(node_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
     }
 
     pub async fn get_other_device_node_ids(&self) -> Result<Vec<String>, AppError> {
@@ -136,10 +142,10 @@ impl Storage {
 
     /// Store the content of a link bundle for the identity `master_pubkey`.
     ///
-    /// `own_device` is the row of the local device. The caller has checked that every
-    /// NodeId in `bundle.devices` derives from the bundle's master key. The profile is
-    /// stored only if it passes `validate_profile`; a peer announcement is stored only
-    /// if it verifies and belongs to an actively followed user.
+    /// `own_device` is the row of the local device. The caller has checked that
+    /// `bundle.announcement` is signed by the bundle's master key. The profile is stored
+    /// only if it passes `validate_profile`; a peer announcement is stored only if it
+    /// verifies and belongs to an actively followed user.
     pub async fn import_link_bundle(
         &self,
         master_pubkey: &str,
@@ -155,11 +161,11 @@ impl Storage {
             }
         }
 
-        self.insert_missing_linked_devices(&bundle.devices).await?;
+        self.insert_missing_linked_devices(&bundle.announcement.devices)
+            .await?;
         self.upsert_linked_device(
             &own_device.node_id,
             &own_device.device_name,
-            own_device.is_primary,
             true,
             own_device.added_at,
         )

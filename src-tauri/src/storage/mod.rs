@@ -126,6 +126,10 @@ impl Storage {
             "017_master_key_signing",
             include_str!("../../migrations/017_master_key_signing.sql"),
         ),
+        (
+            "018_random_transport_keys",
+            include_str!("../../migrations/018_random_transport_keys.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {

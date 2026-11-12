@@ -62,12 +62,10 @@ fn make_identity(master: &str, nodes: &[&str], version: u64) -> VerifiedIdentity
                 .map(|n| DeviceEntry {
                     node_id: n.to_string(),
                     device_name: "device".to_string(),
-                    is_primary: false,
                     added_at: 1,
                 })
                 .collect(),
             version,
-            timestamp: version,
             signature: "sig".to_string(),
         },
         profile: None,
@@ -219,24 +217,6 @@ async fn post_count_after() {
     assert_eq!(s.count_posts_after("a", 1500).await.unwrap(), 2);
     assert_eq!(s.count_posts_after("a", 3000).await.unwrap(), 0);
     assert_eq!(s.count_posts_after("a", 0).await.unwrap(), 3);
-}
-
-#[tokio::test]
-async fn post_get_after_with_pagination() {
-    let s = test_storage().await;
-    for i in 1..=10 {
-        s.insert_post(&make_post(&format!("p{i}"), "a", i * 100))
-            .await
-            .unwrap();
-    }
-
-    let batch1 = s.get_posts_after("a", 0, 3, 0).await.unwrap();
-    assert_eq!(batch1.len(), 3);
-    assert_eq!(batch1[0].id, "p1"); // ASC order
-
-    let batch2 = s.get_posts_after("a", 0, 3, 3).await.unwrap();
-    assert_eq!(batch2.len(), 3);
-    assert_eq!(batch2[0].id, "p4");
 }
 
 #[tokio::test]
@@ -627,20 +607,14 @@ async fn post_page_size_is_capped() {
         .await
         .unwrap();
     assert_eq!(page.len(), MAX_PAGE_SIZE);
-    let batch = s.get_posts_after("a", 0, usize::MAX, 0).await.unwrap();
-    assert_eq!(batch.len(), MAX_PAGE_SIZE);
 }
 
 #[tokio::test]
-async fn post_get_after_orders_equal_timestamps_by_id() {
+async fn post_ids_by_author_order_equal_timestamps_by_id() {
     let s = test_storage().await;
     for id in ["c", "a", "d", "b"] {
         s.insert_post(&make_post(id, "author", 1000)).await.unwrap();
     }
-    let first = s.get_posts_after("author", 0, 2, 0).await.unwrap();
-    let second = s.get_posts_after("author", 0, 2, 2).await.unwrap();
-    assert_eq!(ids(&first), vec!["a", "b"]);
-    assert_eq!(ids(&second), vec!["c", "d"]);
     assert_eq!(
         s.get_post_ids_by_author("author").await.unwrap(),
         vec!["a", "b", "c", "d"]
@@ -2033,61 +2007,6 @@ async fn profile_is_replaced_only_by_equal_or_newer_version() {
 }
 
 #[tokio::test]
-async fn announcement_row_of_an_earlier_format_keeps_its_node_ids() {
-    let s = test_storage().await;
-    let master = pubkey(20);
-    // A row as stored before migration 017: the JSON carries a delegation.
-    let old_json = serde_json::json!({
-        "master_pubkey": master,
-        "delegation": {},
-        "devices": [{ "node_id": "node_1" }, { "node_id": "node_2" }],
-        "version": 3,
-    });
-    sqlx::query(
-        "INSERT INTO peer_device_announcements (master_pubkey, announcement_json, version, cached_at)
-         VALUES (?1, ?2, 3, 0)",
-    )
-    .bind(&master)
-    .bind(old_json.to_string())
-    .execute(&s.pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        s.get_peer_transport_node_ids(&master).await.unwrap(),
-        vec!["node_1", "node_2"]
-    );
-
-    // The row does not parse as a current announcement, so it is not exported.
-    let me = pubkey(1);
-    s.merge_follows_lww(&me, &[follow_entry(&master, "active", 1)])
-        .await
-        .unwrap();
-    assert!(s.is_following(&me, &master).await.unwrap());
-    assert!(
-        s.get_followed_peer_announcements(&me)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-
-    let newer = make_identity(&master, &["node_3"], 4);
-    assert_eq!(
-        s.cache_peer_announcement(&newer.announcement)
-            .await
-            .unwrap(),
-        AnnouncementOutcome::Stored
-    );
-    assert_eq!(
-        s.get_peer_transport_node_ids(&master).await.unwrap(),
-        vec!["node_3"]
-    );
-    assert_eq!(
-        s.get_followed_peer_announcements(&me).await.unwrap().len(),
-        1
-    );
-}
-
-#[tokio::test]
 async fn peer_identity_reverse_lookups() {
     let s = test_storage().await;
     let response = make_identity("master_pk", &["transport_node_1"], 1);
@@ -2723,11 +2642,10 @@ fn bookmark_entry(post_id: &str, state: &str, last_changed_at: u64) -> BookmarkE
     }
 }
 
-fn device_entry(node_id: &str, name: &str, is_primary: bool) -> DeviceEntry {
+fn device_entry(node_id: &str, name: &str) -> DeviceEntry {
     DeviceEntry {
         node_id: node_id.to_string(),
         device_name: name.to_string(),
-        is_primary,
         added_at: 1,
     }
 }
@@ -2738,9 +2656,8 @@ fn signed_announcement(master_seed: u8, node_seed: u8, version: u64) -> LinkedDe
     let master = iroh::SecretKey::from_bytes(&[master_seed; 32]);
     let mut announcement = LinkedDevicesAnnouncement {
         master_pubkey: master.public().to_string(),
-        devices: vec![device_entry(&pubkey(node_seed), "device", true)],
+        devices: vec![device_entry(&pubkey(node_seed), "device")],
         version,
-        timestamp: version,
         signature: String::new(),
     };
     sign_linked_devices_announcement(&mut announcement, &master);
@@ -2751,14 +2668,14 @@ fn signed_announcement(master_seed: u8, node_seed: u8, version: u64) -> LinkedDe
 async fn linked_devices_insert_missing_keeps_existing_rows() {
     let s = test_storage().await;
     let (own, other, third) = (pubkey(1), pubkey(2), pubkey(3));
-    s.upsert_linked_device(&own, "Primary Device", true, true, 10)
+    s.upsert_linked_device(&own, "Linux", true, 10)
         .await
         .unwrap();
 
     let inserted = s
         .insert_missing_linked_devices(&[
-            device_entry(&own, "renamed", false),
-            device_entry(&other, "Device 1", false),
+            device_entry(&own, "renamed"),
+            device_entry(&other, "Android"),
         ])
         .await
         .unwrap();
@@ -2766,8 +2683,8 @@ async fn linked_devices_insert_missing_keeps_existing_rows() {
     // A second call with one known and one new NodeId inserts only the new one.
     let inserted = s
         .insert_missing_linked_devices(&[
-            device_entry(&other, "Device 1", false),
-            device_entry(&third, &"n".repeat(200), false),
+            device_entry(&other, "Android"),
+            device_entry(&third, &"n".repeat(200)),
         ])
         .await
         .unwrap();
@@ -2776,8 +2693,7 @@ async fn linked_devices_insert_missing_keeps_existing_rows() {
     let devices = s.get_linked_devices().await.unwrap();
     assert_eq!(devices.len(), 3);
     let own_row = devices.iter().find(|d| d.node_id == own).unwrap();
-    assert_eq!(own_row.device_name, "Primary Device");
-    assert!(own_row.is_primary);
+    assert_eq!(own_row.device_name, "Linux");
     // A device name is stored with at most MAX_DEVICE_NAME_LEN bytes.
     let third_row = devices.iter().find(|d| d.node_id == third).unwrap();
     assert!(third_row.device_name.len() <= MAX_DEVICE_NAME_LEN);
@@ -2785,9 +2701,12 @@ async fn linked_devices_insert_missing_keeps_existing_rows() {
     // Only rows of other devices are returned for device sync.
     let mut others = s.get_other_device_node_ids().await.unwrap();
     others.sort();
-    let mut expected = vec![other, third];
+    let mut expected = vec![other.clone(), third];
     expected.sort();
     assert_eq!(others, expected);
+    for (node_id, is_other) in [(&own, false), (&other, true), (&pubkey(4), false)] {
+        assert_eq!(s.is_other_device(node_id).await.unwrap(), is_other);
+    }
 }
 
 #[tokio::test]
@@ -2796,11 +2715,11 @@ async fn has_identity_data_detects_own_device_row_or_profile() {
     assert!(!s.has_identity_data().await.unwrap());
 
     // A row of another device alone does not count.
-    s.upsert_linked_device(&pubkey(2), "Device 1", false, false, 1)
+    s.upsert_linked_device(&pubkey(2), "Android", false, 1)
         .await
         .unwrap();
     assert!(!s.has_identity_data().await.unwrap());
-    s.upsert_linked_device(&pubkey(1), "Primary Device", true, true, 1)
+    s.upsert_linked_device(&pubkey(1), "Linux", true, 1)
         .await
         .unwrap();
     assert!(s.has_identity_data().await.unwrap());
@@ -2992,46 +2911,6 @@ async fn lww_state_leaves_out_rows_that_a_merge_would_skip() {
 }
 
 #[tokio::test]
-async fn device_sync_vector_summarizes_own_rows() {
-    let s = test_storage().await;
-    let me = pubkey(1);
-    s.insert_post(&make_post("p1", &me, 1000)).await.unwrap();
-    s.insert_post(&make_post("p2", &me, 3000)).await.unwrap();
-    s.insert_post(&make_post("p3", &pubkey(2), 9000))
-        .await
-        .unwrap();
-    s.save_interaction(&make_interaction("i1", &me, "p3", &pubkey(2), 2000))
-        .await
-        .unwrap();
-    s.upsert_linked_device(&pubkey(10), "Primary Device", true, true, 1)
-        .await
-        .unwrap();
-    s.merge_follows_lww(&me, &[follow_entry(&pubkey(2), "active", 100)])
-        .await
-        .unwrap();
-
-    let lww = s.load_lww_state(&me).await.unwrap();
-    let vector = s.build_device_sync_vector(&me, &lww).await.unwrap();
-    assert_eq!(vector.post_count, 2);
-    assert_eq!(vector.newest_post_ts, 3000);
-    assert_eq!(vector.interaction_count, 1);
-    assert_eq!(vector.newest_interaction_ts, 2000);
-    assert_eq!(vector.devices.len(), 1);
-    assert_eq!(vector.lww_digest, lww.digest());
-
-    // An empty database yields zero counts and the digest of no rows.
-    let empty = test_storage().await;
-    let lww = empty.load_lww_state(&me).await.unwrap();
-    let vector = empty.build_device_sync_vector(&me, &lww).await.unwrap();
-    assert_eq!(vector.post_count, 0);
-    assert_eq!(vector.newest_post_ts, 0);
-    assert_ne!(
-        vector.lww_digest,
-        s.load_lww_state(&me).await.unwrap().digest()
-    );
-}
-
-#[tokio::test]
 async fn followed_peer_announcements_are_exported_for_active_follows() {
     let s = test_storage().await;
     let me = pubkey(1);
@@ -3061,7 +2940,7 @@ async fn followed_peer_announcements_are_exported_for_active_follows() {
 async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
     let s = test_storage().await;
     let me = pubkey(1);
-    let (primary_node, own_node) = (pubkey(10), pubkey(11));
+    let (existing_node, own_node) = (pubkey(10), pubkey(11));
     let followed = signed_announcement(20, 21, 5);
     let not_followed = signed_announcement(30, 31, 5);
     let mut forged = signed_announcement(40, 41, 5);
@@ -3071,8 +2950,7 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
 
     let bundle = LinkBundleData {
         master_secret_key: String::new(),
-        device_index: 1,
-        devices: vec![device_entry(&primary_node, "Primary Device", true)],
+        announcement: signed_announcement(1, 10, 5),
         profile: Some(make_profile("me")),
         follows: vec![
             follow_entry(&followed.master_pubkey, "active", 100),
@@ -3090,7 +2968,7 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
         ],
         peer_announcements: vec![followed.clone(), not_followed.clone(), forged.clone()],
     };
-    let own_device = device_entry(&own_node, "Device 1", false);
+    let own_device = device_entry(&own_node, "Android");
 
     // Importing twice gives the same rows: bookmarks are inserted, not toggled.
     for _ in 0..2 {
@@ -3108,7 +2986,7 @@ async fn link_bundle_import_stores_rows_under_the_bundle_identity() {
     assert_eq!(devices.len(), 2);
     assert_eq!(
         s.get_other_device_node_ids().await.unwrap(),
-        vec![primary_node]
+        vec![existing_node]
     );
     assert!(s.has_identity_data().await.unwrap());
 

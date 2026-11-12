@@ -2,7 +2,7 @@ use crate::error::AppError;
 use proscenium_types::{MediaAttachment, Post};
 use sqlx::Row;
 
-use super::{Cursor, Storage, page_limit, page_offset, sql_timestamp};
+use super::{Cursor, Storage, page_limit, sql_timestamp};
 
 /// Column list matching the indexes read by `row_to_post`.
 const POST_COLUMNS: &str = "id, author, content, timestamp, media_json, reply_to, reply_to_author, quote_of, quote_of_author, signature";
@@ -278,29 +278,6 @@ impl Storage {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(count as u64)
-    }
-
-    /// Posts of `author` with `timestamp > after_ts`, ordered by `(timestamp, id)` ascending.
-    /// At most `MAX_PAGE_SIZE` rows are returned per call.
-    pub async fn get_posts_after(
-        &self,
-        author: &str,
-        after_ts: u64,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Post>, AppError> {
-        let sql = format!(
-            "SELECT {POST_COLUMNS} FROM posts WHERE author=?1 AND timestamp > ?2
-             ORDER BY timestamp ASC, id ASC LIMIT ?3 OFFSET ?4"
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(author)
-            .bind(sql_timestamp(after_ts))
-            .bind(page_limit(limit))
-            .bind(page_offset(offset))
-            .fetch_all(&self.pool)
-            .await?;
-        Self::rows_to_posts(&rows)
     }
 
     /// Replies to `parent_post_id` without muted and blocked authors, ordered by

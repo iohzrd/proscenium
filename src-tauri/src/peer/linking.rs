@@ -2,29 +2,29 @@
 //!
 //! The existing device shows a QR code with its NodeId and a one-time secret. The new
 //! device dials that NodeId, so QUIC authenticates the existing device; the secret
-//! authenticates the new device.
+//! authenticates the new device. The new device keeps its transport key, so the existing
+//! device stores the NodeId of the connection as the new device.
 //!
 //! One bi-stream, opened by the new device:
-//! - new device: JSON `PeerRequest::LinkRequest { secret }`, then finish.
+//! - new device: JSON `PeerRequest::LinkRequest { secret, device_name }`, then finish.
 //! - existing device: compares the secret in constant time and removes the session, then
 //!   writes the `LinkBundleData` JSON and finishes.
 //!
 //! The new device validates the bundle and closes the connection with `LINK_CLOSE_DONE`.
 //! The existing device stores the new device only after it received that close code.
 
+use crate::announcement::{build_own_announcement, local_device_name, verify_lists_device};
 use crate::error::AppError;
 use crate::setup::IdentityKeys;
-use crate::state::{device_index_of, device_node_id, own_devices};
 use base64::Engine;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayUrl,
+    Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey,
     endpoint::{Connection, ConnectionError, SendStream, VarInt},
     protocol::AcceptError,
 };
 use proscenium_types::{
     LinkBundleData, LinkQrPayload, MAX_LINKED_DEVICES, PEER_ALPN, PeerRequest, now_millis, short_id,
 };
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -95,16 +95,6 @@ fn consume_link_session(slot: &mut Option<PendingLink>, secret: &[u8; 32]) -> bo
     matches
 }
 
-/// Lowest transport key derivation index in `1..MAX_LINKED_DEVICES` whose NodeId is not
-/// in `used_node_ids`. `None` if every index is in use.
-fn lowest_unused_device_index(
-    master_secret_key_bytes: &[u8; 32],
-    used_node_ids: &HashSet<String>,
-) -> Option<u32> {
-    (1..MAX_LINKED_DEVICES as u32)
-        .find(|index| !used_node_ids.contains(&device_node_id(master_secret_key_bytes, *index)))
-}
-
 /// Decode a link secret (URL-safe base64 without padding, 32 bytes).
 fn decode_secret(encoded: &str) -> Result<[u8; 32], AppError> {
     let mut decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -148,17 +138,16 @@ fn parse_link_payload(payload: &LinkQrPayload, now: u64) -> Result<LinkTarget, A
     })
 }
 
-/// Check a link bundle received from the device `responder_node_id` and return
-/// the keys of the identity it defines.
+/// Check a link bundle received from the device `responder_node_id` and return the keys
+/// of the identity it defines, with the transport key `transport_secret_key` of this
+/// device.
 ///
-/// Fails unless: the master key is 32 bytes, `device_index` is in
-/// `1..MAX_LINKED_DEVICES`, the responder's NodeId derives from the master key at another
-/// index, and the device list does not already hold the assigned NodeId.
-/// `bundle.devices` is reduced to the entries whose NodeId derives from the master key,
-/// and `bundle.master_secret_key` is cleared.
+/// Fails unless the master key is 32 bytes and `bundle.announcement` is signed by it and
+/// lists the responder. `bundle.master_secret_key` is cleared.
 fn validate_link_bundle(
     bundle: &mut LinkBundleData,
     responder_node_id: &str,
+    transport_secret_key: [u8; 32],
 ) -> Result<IdentityKeys, AppError> {
     let decoded =
         base64::engine::general_purpose::STANDARD.decode(bundle.master_secret_key.as_bytes());
@@ -167,37 +156,17 @@ fn validate_link_bundle(
         decoded.map_err(|_| AppError::Other("link bundle master key is not base64".into()))?;
     let master: Result<[u8; 32], _> = decoded.as_slice().try_into();
     decoded.zeroize();
-    let master =
-        master.map_err(|_| AppError::Other("link bundle master key is not 32 bytes".into()))?;
-
-    if bundle.device_index == 0 || bundle.device_index as usize >= MAX_LINKED_DEVICES {
-        return Err(AppError::Other(format!(
-            "link bundle device index {} is out of range (1..{MAX_LINKED_DEVICES})",
-            bundle.device_index
-        )));
-    }
-    match device_index_of(&master, responder_node_id) {
-        None => {
-            return Err(
-                "the linking device is not a device of the identity in the link bundle".into(),
-            );
-        }
-        Some(index) if index == bundle.device_index => {
-            return Err("link bundle assigns the index of the linking device".into());
-        }
-        Some(_) => {}
-    }
-
-    bundle.devices = own_devices(&master, &bundle.devices);
-    let assigned_node_id = device_node_id(&master, bundle.device_index);
-    if bundle.devices.iter().any(|d| d.node_id == assigned_node_id) {
-        return Err("link bundle assigns a device index that is in use".into());
-    }
-
-    Ok(IdentityKeys {
-        master_secret_key: master,
-        device_index: bundle.device_index,
-    })
+    let keys = IdentityKeys {
+        master_secret_key: master
+            .map_err(|_| AppError::Other("link bundle master key is not 32 bytes".into()))?,
+        transport_secret_key,
+    };
+    let master_pubkey = SecretKey::from_bytes(&keys.master_secret_key)
+        .public()
+        .to_string();
+    verify_lists_device(&bundle.announcement, &master_pubkey, responder_node_id)
+        .map_err(|e| AppError::Other(format!("link bundle device list rejected: {e}")))?;
+    Ok(keys)
 }
 
 /// Await `step` for at most `limit`. `what` names the step in the error.
@@ -314,10 +283,13 @@ impl PeerHandler {
         &self,
         send: SendStream,
         secret: String,
+        device_name: &str,
         conn: &Connection,
     ) -> Result<(), AcceptError> {
         let mut secret = secret;
-        let served = self.serve_link_request(send, &secret, conn).await;
+        let served = self
+            .serve_link_request(send, &secret, device_name, conn)
+            .await;
         secret.zeroize();
         match served {
             Ok(()) => Ok(()),
@@ -333,44 +305,38 @@ impl PeerHandler {
     }
 
     /// Serve one link request: check the secret and remove the session, send the
-    /// bundle, and store and announce the new device after the new device closed the
-    /// connection with `LINK_CLOSE_DONE`.
+    /// bundle, and store the NodeId of `conn` as the device `device_name` and announce it
+    /// after the new device closed the connection with `LINK_CLOSE_DONE`.
     async fn serve_link_request(
         &self,
         mut send: SendStream,
         secret: &str,
+        device_name: &str,
         conn: &Connection,
     ) -> Result<(), AppError> {
         check_link_secret(&self.pending_link, secret).await?;
 
-        let (master_secret_key_bytes, master_pubkey, device_index) = {
+        let new_node_id = conn.remote_id().to_string();
+        if new_node_id == self.identity.read().await.transport_node_id {
+            return Err("link request from a device with the local NodeId".into());
+        }
+        let devices = self.storage.get_linked_devices().await?;
+        if devices.len() >= MAX_LINKED_DEVICES && !devices.iter().any(|d| d.node_id == new_node_id)
+        {
+            return Err(AppError::Other(format!(
+                "device limit of {MAX_LINKED_DEVICES} reached"
+            )));
+        }
+
+        let (master_secret_key_bytes, master_pubkey) = {
             let id = self.identity.read().await;
-            (
-                id.master_secret_key_bytes,
-                id.master_pubkey.clone(),
-                id.device_index,
-            )
+            (id.master_secret_key_bytes, id.master_pubkey.clone())
         };
-
-        let devices = own_devices(
-            &master_secret_key_bytes,
-            &self.storage.get_linked_devices().await?,
-        );
-        let mut used_node_ids: HashSet<String> =
-            devices.iter().map(|d| d.node_id.clone()).collect();
-        used_node_ids.insert(device_node_id(&master_secret_key_bytes, device_index));
-        let new_device_index = lowest_unused_device_index(&master_secret_key_bytes, &used_node_ids)
-            .ok_or_else(|| {
-                AppError::Other(format!("device limit of {MAX_LINKED_DEVICES} reached"))
-            })?;
-        let new_node_id = device_node_id(&master_secret_key_bytes, new_device_index);
-
         let lww = self.storage.load_lww_state(&master_pubkey).await?;
         let mut bundle = LinkBundleData {
             master_secret_key: base64::engine::general_purpose::STANDARD
                 .encode(master_secret_key_bytes),
-            device_index: new_device_index,
-            devices,
+            announcement: build_own_announcement(&self.storage, &self.identity).await?,
             profile: self.storage.get_profile(&master_pubkey).await?,
             follows: lww.follows,
             moderation: lww.moderation,
@@ -392,22 +358,13 @@ impl PeerHandler {
         wait_for_completion(conn).await?;
 
         self.storage
-            .upsert_linked_device(
-                &new_node_id,
-                &crate::announcement::default_device_name(new_device_index),
-                false,
-                false,
-                now_millis(),
-            )
+            .upsert_linked_device(&new_node_id, device_name, false, now_millis())
             .await?;
-        log::info!(
-            "[link] registered new device {} (index={new_device_index})",
-            short_id(&new_node_id)
-        );
+        log::info!("[link] registered new device {}", short_id(&new_node_id));
         // The devices page closes the QR code and reloads the device list on this event.
         let _ = self.app_handle.emit("device-link-progress", "bundle_sent");
 
-        match crate::announcement::build_own_announcement(&self.storage, &self.identity).await {
+        match build_own_announcement(&self.storage, &self.identity).await {
             Ok(announcement) => {
                 if let Err(e) = self.gossip.broadcast_linked_devices(&announcement).await {
                     log::error!("[link] failed to broadcast device announcement: {e}");
@@ -433,16 +390,11 @@ impl PeerHandler {
     ) -> Result<(IdentityKeys, LinkBundleData), AppError> {
         let mut target = parse_link_payload(payload, now_millis())?;
         let responder_node_id = target.node_id.to_string();
-        if self
-            .identity
-            .read()
-            .await
-            .device_index_of(&responder_node_id)
-            .is_some()
-        {
+        if self.storage.is_other_device(&responder_node_id).await? {
             target.secret.zeroize();
             return Err("this device already belongs to the identity of that device".into());
         }
+        let mut transport_secret_key = self.identity.read().await.transport_key.to_bytes();
 
         // QUIC authenticates the NodeId of the link code.
         let connected = link_step(
@@ -453,7 +405,13 @@ impl PeerHandler {
         .await;
         let result = match connected {
             Ok(Ok(conn)) => {
-                let result = exchange_link(&conn, &target.secret, &responder_node_id).await;
+                let result = exchange_link(
+                    &conn,
+                    &target.secret,
+                    &responder_node_id,
+                    transport_secret_key,
+                )
+                .await;
                 match &result {
                     Ok(_) => conn.close(VarInt::from_u32(LINK_CLOSE_DONE), b"done"),
                     Err(_) => conn.close(VarInt::from_u32(LINK_CLOSE_FAILED), b"link failed"),
@@ -464,22 +422,25 @@ impl PeerHandler {
             Err(e) => Err(e),
         };
         target.secret.zeroize();
+        transport_secret_key.zeroize();
         result
     }
 }
 
 /// Run the new-device side of the link exchange on an established connection: send
-/// `secret`, then read and validate the bundle.
+/// `secret` and the local device name, then read and validate the bundle.
 async fn exchange_link(
     conn: &Connection,
     secret: &[u8; 32],
     responder_node_id: &str,
+    transport_secret_key: [u8; 32],
 ) -> Result<(IdentityKeys, LinkBundleData), AppError> {
     let (mut send, mut recv) =
         link_step("open stream", LINK_STEP_TIMEOUT, conn.open_bi()).await??;
     let mut encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
     let request = serde_json::to_vec(&PeerRequest::LinkRequest {
         secret: encoded.clone(),
+        device_name: local_device_name(),
     });
     encoded.zeroize();
     let mut request = request?;
@@ -497,11 +458,8 @@ async fn exchange_link(
     let parsed: Result<LinkBundleData, _> = serde_json::from_slice(&bundle_json);
     bundle_json.zeroize();
     let mut bundle = parsed?;
-    let keys = validate_link_bundle(&mut bundle, responder_node_id)?;
-    log::info!(
-        "[link] received link bundle (device index {})",
-        keys.device_index
-    );
+    let keys = validate_link_bundle(&mut bundle, responder_node_id, transport_secret_key)?;
+    log::info!("[link] received link bundle");
     Ok((keys, bundle))
 }
 
@@ -509,22 +467,39 @@ async fn exchange_link(
 mod tests {
     use super::*;
     use crate::state::test_support::loopback_endpoint;
-    use proscenium_types::{DeviceEntry, derive_transport_key};
+    use proscenium_types::{
+        DeviceEntry, LinkedDevicesAnnouncement, sign_linked_devices_announcement,
+    };
 
-    fn device(master: &[u8; 32], index: u32) -> DeviceEntry {
-        DeviceEntry {
-            node_id: device_node_id(master, index),
-            device_name: format!("Device {index}"),
-            is_primary: false,
-            added_at: 1,
-        }
+    fn node_id(key: &[u8; 32]) -> String {
+        SecretKey::from_bytes(key).public().to_string()
     }
 
-    fn bundle(master: &[u8; 32], device_index: u32, devices: Vec<DeviceEntry>) -> LinkBundleData {
+    /// The device list `node_ids` of the identity `signer`, signed by `signer`.
+    fn announcement(signer: &[u8; 32], node_ids: &[String]) -> LinkedDevicesAnnouncement {
+        let key = SecretKey::from_bytes(signer);
+        let mut announcement = LinkedDevicesAnnouncement {
+            master_pubkey: key.public().to_string(),
+            devices: node_ids
+                .iter()
+                .map(|node_id| DeviceEntry {
+                    node_id: node_id.clone(),
+                    device_name: "Linux".to_string(),
+                    added_at: 1,
+                })
+                .collect(),
+            version: 1,
+            signature: String::new(),
+        };
+        sign_linked_devices_announcement(&mut announcement, &key);
+        announcement
+    }
+
+    /// A bundle with the master key `master` and the device list `node_ids` signed by it.
+    fn bundle(master: &[u8; 32], node_ids: &[String]) -> LinkBundleData {
         LinkBundleData {
             master_secret_key: base64::engine::general_purpose::STANDARD.encode(master),
-            device_index,
-            devices,
+            announcement: announcement(master, node_ids),
             profile: None,
             follows: vec![],
             moderation: vec![],
@@ -554,7 +529,7 @@ mod tests {
         let conn = incoming.await.map_err(|e| AppError::Other(e.to_string()))?;
         let (mut send, mut recv) = conn.accept_bi().await?;
         let request = recv.read_to_end(10_000).await?;
-        let PeerRequest::LinkRequest { secret } = serde_json::from_slice(&request)? else {
+        let PeerRequest::LinkRequest { secret, .. } = serde_json::from_slice(&request)? else {
             return Err("unexpected request".into());
         };
         let checked = check_link_secret(&pending, &secret).await;
@@ -578,21 +553,21 @@ mod tests {
     }
 
     const EXISTING_MASTER: [u8; 32] = [7u8; 32];
+    const EXISTING_TRANSPORT: [u8; 32] = [17u8; 32];
+    const NEW_TRANSPORT: [u8; 32] = [18u8; 32];
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// A bundle of `EXISTING_MASTER` that lists the existing device.
+    fn existing_bundle() -> LinkBundleData {
+        bundle(&EXISTING_MASTER, &[node_id(&EXISTING_TRANSPORT)])
+    }
 
     /// Start the existing device with a session holding `secret` and connect the new
     /// device.
     async fn link_pair(secret: [u8; 32], bundle: &LinkBundleData) -> LinkPair {
-        let existing = loopback_endpoint(
-            iroh::SecretKey::from_bytes(&derive_transport_key(&EXISTING_MASTER, 0)),
-            PEER_ALPN,
-        )
-        .await;
-        let new = loopback_endpoint(
-            iroh::SecretKey::from_bytes(&derive_transport_key(&[8u8; 32], 0)),
-            PEER_ALPN,
-        )
-        .await;
+        let existing =
+            loopback_endpoint(SecretKey::from_bytes(&EXISTING_TRANSPORT), PEER_ALPN).await;
+        let new = loopback_endpoint(SecretKey::from_bytes(&NEW_TRANSPORT), PEER_ALPN).await;
         let server = tokio::spawn(serve_one_link(
             existing.clone(),
             secret,
@@ -619,7 +594,7 @@ mod tests {
         ) -> Result<(IdentityKeys, LinkBundleData), AppError> {
             tokio::time::timeout(
                 TEST_TIMEOUT,
-                exchange_link(&self.conn, secret, &self.responder_node_id),
+                exchange_link(&self.conn, secret, &self.responder_node_id, NEW_TRANSPORT),
             )
             .await
             .expect("exchange timed out")
@@ -642,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn link_exchange_over_loopback_transfers_the_bundle() {
         let secret = [9u8; 32];
-        let mut sent = bundle(&EXISTING_MASTER, 1, vec![device(&EXISTING_MASTER, 0)]);
+        let mut sent = existing_bundle();
         sent.follows = (0..2_000u32)
             .map(|i| proscenium_types::FollowEntry {
                 pubkey: format!("{i:064}"),
@@ -657,9 +632,9 @@ mod tests {
             panic!("exchange failed");
         };
         assert_eq!(keys.master_secret_key, EXISTING_MASTER);
-        assert_eq!(keys.device_index, 1);
+        assert_eq!(keys.transport_secret_key, NEW_TRANSPORT);
         assert_eq!(received.follows.len(), 2_000);
-        assert_eq!(received.devices.len(), 1);
+        assert_eq!(received.announcement.devices.len(), 1);
         assert!(received.master_secret_key.is_empty());
 
         // The existing device saw the completion close.
@@ -670,8 +645,7 @@ mod tests {
 
     #[tokio::test]
     async fn link_exchange_with_wrong_secret_fails_on_both_devices() {
-        let sent = bundle(&EXISTING_MASTER, 1, vec![device(&EXISTING_MASTER, 0)]);
-        let pair = link_pair([1u8; 32], &sent).await;
+        let pair = link_pair([1u8; 32], &existing_bundle()).await;
         assert!(pair.exchange(&[2u8; 32]).await.is_err());
         assert!(pair.close(LINK_CLOSE_FAILED).await.is_err());
     }
@@ -679,8 +653,7 @@ mod tests {
     #[tokio::test]
     async fn existing_device_requires_the_completion_close_code() {
         let secret = [9u8; 32];
-        let sent = bundle(&EXISTING_MASTER, 1, vec![device(&EXISTING_MASTER, 0)]);
-        let pair = link_pair(secret, &sent).await;
+        let pair = link_pair(secret, &existing_bundle()).await;
         assert!(pair.exchange(&secret).await.is_ok());
         // Code 0 is what a dropped connection sends.
         assert!(pair.close(0).await.is_err());
@@ -752,33 +725,9 @@ mod tests {
     }
 
     #[test]
-    fn device_index_is_lowest_unused() {
-        let master = [1u8; 32];
-        let used = |indexes: &[u32]| -> HashSet<String> {
-            indexes
-                .iter()
-                .map(|i| device_node_id(&master, *i))
-                .collect()
-        };
-        assert_eq!(lowest_unused_device_index(&master, &used(&[0])), Some(1));
-        assert_eq!(
-            lowest_unused_device_index(&master, &used(&[0, 1, 2])),
-            Some(3)
-        );
-        // Index 1 is free again although three devices are stored.
-        assert_eq!(
-            lowest_unused_device_index(&master, &used(&[0, 2, 3])),
-            Some(1)
-        );
-        let all: Vec<u32> = (0..MAX_LINKED_DEVICES as u32).collect();
-        assert_eq!(lowest_unused_device_index(&master, &used(&all)), None);
-    }
-
-    #[test]
     fn link_payload_is_validated() {
-        let master = [2u8; 32];
         let good = LinkQrPayload {
-            node_id: device_node_id(&master, 0),
+            node_id: node_id(&[2u8; 32]),
             secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 32]),
             relay_url: Some("not a url".to_string()),
             expires_at: 2_000,
@@ -810,33 +759,26 @@ mod tests {
     #[test]
     fn link_bundle_is_validated() {
         let master = [3u8; 32];
-        let responder = device_node_id(&master, 0);
-        let foreign = device(&[4u8; 32], 0);
+        let responder = node_id(&[30u8; 32]);
+        let transport = [31u8; 32];
 
-        let mut ok = bundle(&master, 2, vec![device(&master, 0), foreign]);
-        let keys = validate_link_bundle(&mut ok, &responder).unwrap();
+        let mut ok = bundle(&master, &[responder.clone(), node_id(&[32u8; 32])]);
+        let keys = validate_link_bundle(&mut ok, &responder, transport).unwrap();
         assert_eq!(keys.master_secret_key, master);
-        assert_eq!(keys.device_index, 2);
+        assert_eq!(keys.transport_secret_key, transport);
         assert!(ok.master_secret_key.is_empty());
-        // The foreign entry is dropped and index 0 is marked as primary.
-        assert_eq!(ok.devices.len(), 1);
-        assert!(ok.devices[0].is_primary);
+        assert_eq!(ok.announcement.devices.len(), 2);
 
-        // Index 0 and indexes outside the range are rejected.
-        for index in [0, MAX_LINKED_DEVICES as u32, u32::MAX] {
-            assert!(validate_link_bundle(&mut bundle(&master, index, vec![]), &responder).is_err());
-        }
         // A master key of the wrong length.
-        let mut short = bundle(&master, 1, vec![]);
+        let mut short = bundle(&master, std::slice::from_ref(&responder));
         short.master_secret_key = base64::engine::general_purpose::STANDARD.encode([3u8; 31]);
-        assert!(validate_link_bundle(&mut short, &responder).is_err());
-        // The responder is not a device of the bundle's identity.
-        let other = device_node_id(&[4u8; 32], 0);
-        assert!(validate_link_bundle(&mut bundle(&master, 1, vec![]), &other).is_err());
-        // The assigned index is the responder's own, or already listed.
-        let responder_1 = device_node_id(&master, 1);
-        assert!(validate_link_bundle(&mut bundle(&master, 1, vec![]), &responder_1).is_err());
-        let mut in_use = bundle(&master, 2, vec![device(&master, 2)]);
-        assert!(validate_link_bundle(&mut in_use, &responder).is_err());
+        assert!(validate_link_bundle(&mut short, &responder, transport).is_err());
+        // The device list does not list the responder.
+        let mut unlisted = bundle(&master, &[node_id(&[32u8; 32])]);
+        assert!(validate_link_bundle(&mut unlisted, &responder, transport).is_err());
+        // The device list is signed by another identity.
+        let mut foreign = bundle(&master, std::slice::from_ref(&responder));
+        foreign.announcement = announcement(&[4u8; 32], std::slice::from_ref(&responder));
+        assert!(validate_link_bundle(&mut foreign, &responder, transport).is_err());
     }
 }

@@ -4,14 +4,13 @@ use crate::error::AppError;
 use crate::gossip::GossipService;
 use crate::peer::PeerHandler;
 use crate::stage::StageHandler;
-use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand, device_node_id};
+use crate::state::{AppState, Identity, NetworkStack, SharedIdentity, SyncCommand};
 use crate::storage::Storage;
 use iroh::{Endpoint, SecretKey, protocol::Router};
 use iroh_blobs::{BlobsProtocol, store::fs::FsStore};
 use iroh_gossip::Gossip;
 use proscenium_types::{
-    CALL_ALPN, DM_ALPN, DeviceEntry, LinkBundleData, MAX_LINKED_DEVICES, PEER_ALPN, STAGE_ALPN,
-    now_millis,
+    CALL_ALPN, DM_ALPN, DeviceEntry, LinkBundleData, PEER_ALPN, STAGE_ALPN, now_millis,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -23,9 +22,10 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
 
 const MASTER_KEY_FILE: &str = "master_key.key";
+/// Secret key of this device's iroh endpoint.
+const TRANSPORT_KEY_FILE: &str = "transport_key.key";
 /// Directory of the blob store inside the data directory.
 pub(crate) const BLOBS_DIR: &str = "blobs";
-const DEVICE_INDEX_FILE: &str = "device_index";
 /// Marker file. While it exists, `get_seed_phrase` asks for native confirmation.
 pub(crate) const SEED_BACKED_UP_FILE: &str = ".seed_backed_up";
 /// Suffix of the temporary files created by `write_secret_file`.
@@ -36,17 +36,25 @@ const EXIT_SHUTDOWN_LIMIT: Duration = Duration::from_secs(3);
 /// Time limit for the network shutdown before the local identity is replaced.
 const REPLACE_SHUTDOWN_LIMIT: Duration = Duration::from_secs(10);
 
-/// The master key and transport key derivation index that define the identity of a
-/// device. The master key bytes are overwritten with zeros when the value is dropped.
+/// The master key and transport key that define the identity of a device. Both are
+/// overwritten with zeros when the value is dropped.
 pub struct IdentityKeys {
     pub master_secret_key: [u8; 32],
-    pub device_index: u32,
+    pub transport_secret_key: [u8; 32],
 }
 
 impl Drop for IdentityKeys {
     fn drop(&mut self) {
         self.master_secret_key.zeroize();
+        self.transport_secret_key.zeroize();
     }
+}
+
+/// 32 random bytes for a new master or transport key.
+pub(crate) fn random_key() -> Result<[u8; 32], AppError> {
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key)?;
+    Ok(key)
 }
 
 /// Write `bytes` to `path` so that `path` holds either its previous content or all of
@@ -104,7 +112,7 @@ fn remove_stale_temp_files(data_dir: &Path) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         let is_temp = name.ends_with(TEMP_FILE_SUFFIX)
-            && [MASTER_KEY_FILE, DEVICE_INDEX_FILE, SEED_BACKED_UP_FILE]
+            && [MASTER_KEY_FILE, TRANSPORT_KEY_FILE, SEED_BACKED_UP_FILE]
                 .iter()
                 .any(|prefix| name.starts_with(&format!("{prefix}.")));
         if is_temp && let Err(e) = std::fs::remove_file(entry.path()) {
@@ -147,9 +155,9 @@ fn create_data_dir(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Read the master key file. Returns `Ok(None)` if the file does not exist, and an error
-/// if it cannot be read or does not hold exactly 32 bytes.
-fn read_master_key(path: &Path) -> Result<Option<[u8; 32]>, AppError> {
+/// Read a key file. Returns `Ok(None)` if the file does not exist, and an error if it
+/// cannot be read or does not hold exactly 32 bytes.
+fn read_key_file(path: &Path) -> Result<Option<[u8; 32]>, AppError> {
     let mut bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -180,14 +188,30 @@ fn read_master_key(path: &Path) -> Result<Option<[u8; 32]>, AppError> {
     Ok(Some(key))
 }
 
-/// Make sure the master key file exists.
+/// Write a new random key to `path`.
+fn write_random_key_file(path: &Path) -> Result<(), AppError> {
+    let mut key = random_key()?;
+    let written = write_secret_file(path, &key);
+    key.zeroize();
+    written.map_err(|e| AppError::Other(format!("failed to write {}: {e}", path.display())))
+}
+
+/// Make sure the master key file and the transport key file exist.
 ///
-/// A new random key is generated only if the file is missing and the database holds no
-/// rows of an existing identity. A missing key file next to such a database is an error:
-/// generating a key would start a different identity on top of the stored data.
-async fn ensure_master_key(data_dir: &Path, storage: &Storage) -> Result<(), AppError> {
+/// A missing transport key file gets a new random key; the device then has a new NodeId.
+/// A new random master key is generated only if the file is missing and the database
+/// holds no rows of an existing identity. A missing master key file next to such a
+/// database is an error: generating a key would start a different identity on top of the
+/// stored data.
+async fn ensure_key_files(data_dir: &Path, storage: &Storage) -> Result<(), AppError> {
+    let transport_path = data_dir.join(TRANSPORT_KEY_FILE);
+    if read_key_file(&transport_path)?.is_none() {
+        write_random_key_file(&transport_path)?;
+        log::info!("[setup] generated a new transport key");
+    }
+
     let path = data_dir.join(MASTER_KEY_FILE);
-    if read_master_key(&path)?.is_some() {
+    if read_key_file(&path)?.is_some() {
         return Ok(());
     }
     if storage.has_identity_data().await? {
@@ -197,57 +221,33 @@ async fn ensure_master_key(data_dir: &Path, storage: &Storage) -> Result<(), App
             path.display()
         )));
     }
-
-    let mut key = [0u8; 32];
-    getrandom::fill(&mut key)?;
-    let written = write_secret_file(&path, &key);
-    key.zeroize();
-    written.map_err(|e| AppError::Other(format!("failed to write {}: {e}", path.display())))?;
+    write_random_key_file(&path)?;
     log::info!("[setup] generated a new master key");
     Ok(())
 }
 
-/// Read the device index file. A missing file means index 0.
-/// Returns an error if the file exists and does not hold a decimal `u32`.
-fn read_index_file(data_dir: &Path, name: &str) -> Result<u32, AppError> {
-    let path = data_dir.join(name);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => content.trim().parse().map_err(|_| {
-            AppError::Other(format!(
-                "{} does not hold a derivation index",
-                path.display()
-            ))
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(AppError::Other(format!(
-            "failed to read {}: {e}",
-            path.display()
-        ))),
-    }
-}
-
-/// Read the master key and device index files in `data_dir` and derive the identity.
+/// Read the master key and transport key files in `data_dir`.
 fn load_identity(data_dir: &Path) -> Result<Identity, AppError> {
-    let path = data_dir.join(MASTER_KEY_FILE);
-    let master_secret_key_bytes = read_master_key(&path)?
-        .ok_or_else(|| AppError::Other(format!("{} is missing", path.display())))?;
-    let device_index = read_index_file(data_dir, DEVICE_INDEX_FILE)?;
-    if device_index as usize >= MAX_LINKED_DEVICES {
-        return Err(AppError::Other(format!(
-            "device index {device_index} is out of range (0..{MAX_LINKED_DEVICES})"
-        )));
-    }
-    Ok(Identity::derive(master_secret_key_bytes, device_index))
+    let read = |name: &str| {
+        let path = data_dir.join(name);
+        read_key_file(&path)?
+            .ok_or_else(|| AppError::Other(format!("{} is missing", path.display())))
+    };
+    let master_secret_key_bytes = read(MASTER_KEY_FILE)?;
+    let mut transport_secret_key = read(TRANSPORT_KEY_FILE)?;
+    let transport_key = SecretKey::from_bytes(&transport_secret_key);
+    transport_secret_key.zeroize();
+    Ok(Identity::new(master_secret_key_bytes, transport_key))
 }
 
-/// Write the device index file, then the master key file.
+/// Write the transport key file, then the master key file.
 ///
 /// The master key is written last: if a step fails, the previous master key is still on
-/// disk and the new key is never combined with the previous device index.
+/// disk, used with either transport key.
 fn write_identity_files(data_dir: &Path, keys: &IdentityKeys) -> std::io::Result<()> {
     write_secret_file(
-        &data_dir.join(DEVICE_INDEX_FILE),
-        keys.device_index.to_string().as_bytes(),
+        &data_dir.join(TRANSPORT_KEY_FILE),
+        &keys.transport_secret_key,
     )?;
     write_secret_file(&data_dir.join(MASTER_KEY_FILE), &keys.master_secret_key)
 }
@@ -293,7 +293,7 @@ async fn build_network_stack(
         if dht_enabled { "enabled" } else { "disabled" },
     );
 
-    let transport_secret_key = identity.read().await.transport_secret_key();
+    let transport_secret_key = identity.read().await.transport_key.clone();
     log::info!("[setup] binding iroh endpoint...");
     let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(transport_secret_key)
@@ -453,22 +453,16 @@ async fn broadcast_initial_state(state: &Arc<AppState>) {
         log::info!("[setup] own gossip feed started");
     }
 
-    let (transport_node_id, master_pubkey, device_index) = {
+    let (transport_node_id, master_pubkey) = {
         let id = state.identity.read().await;
-        (
-            id.transport_node_id.clone(),
-            id.master_pubkey.clone(),
-            id.device_index,
-        )
+        (id.transport_node_id.clone(), id.master_pubkey.clone())
     };
 
-    // Only the device with derivation index 0 is stored as the primary device.
     if let Err(e) = state
         .storage
         .upsert_linked_device(
             &transport_node_id,
-            &crate::announcement::default_device_name(device_index),
-            device_index == 0,
+            &crate::announcement::local_device_name(),
             true,
             now_millis(),
         )
@@ -539,15 +533,14 @@ pub(crate) async fn stop_network(state: &AppState) {
     log::info!("[net] network stack stopped");
 }
 
-/// Derive the identity from the files in `data_dir`, build a network stack for it, store
+/// Load the identity from the files in `data_dir`, build a network stack for it, store
 /// both in `state`, start the background services and broadcast the initial state.
 async fn start_network(state: &Arc<AppState>, data_dir: &Path) -> Result<(), AppError> {
     let identity = load_identity(data_dir)?;
     log::info!("[identity] master pubkey: {}", identity.master_pubkey);
     log::info!(
-        "[identity] transport NodeId: {} (device index {})",
-        identity.transport_node_id,
-        identity.device_index
+        "[identity] transport NodeId: {}",
+        identity.transport_node_id
     );
     *state.identity.write().await = identity;
 
@@ -577,9 +570,10 @@ async fn install_identity(
         .public()
         .to_string();
     let own_device = DeviceEntry {
-        node_id: device_node_id(&keys.master_secret_key, keys.device_index),
-        device_name: crate::announcement::default_device_name(keys.device_index),
-        is_primary: keys.device_index == 0,
+        node_id: SecretKey::from_bytes(&keys.transport_secret_key)
+            .public()
+            .to_string(),
+        device_name: crate::announcement::local_device_name(),
         added_at: now_millis(),
     };
 
@@ -635,9 +629,9 @@ impl Drop for ReplacementInProgress<'_> {
 /// stack in place. Used by seed phrase recovery (`bundle` is `None`) and device linking.
 ///
 /// Order: stop the network stack (which closes the blob store), delete all rows and the
-/// blob store, write the index files and then the master key file, import `bundle`,
-/// derive the identity from disk, build and start a new network stack. Returns an error,
-/// and changes nothing, if the network stack does not stop within
+/// blob store, write the transport key file and then the master key file, import
+/// `bundle`, load the identity from disk, build and start a new network stack. Returns an
+/// error, and changes nothing, if the network stack does not stop within
 /// `REPLACE_SHUTDOWN_LIMIT`. The returned error of any later step states that a restart
 /// is required. Returns an error at once if another call is in progress.
 pub async fn replace_identity(
@@ -726,7 +720,7 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     log::info!("[setup] data dir: {}", data_dir.display());
     remove_stale_temp_files(&data_dir);
 
-    // The database is opened before the key is loaded: `ensure_master_key` reads it to
+    // The database is opened before the key is loaded: `ensure_key_files` reads it to
     // tell a first start from a missing key file, and the endpoint builder reads
     // preferences from it.
     let storage = Arc::new(
@@ -736,14 +730,13 @@ async fn setup(handle: tauri::AppHandle) -> Result<(), Box<dyn std::error::Error
     );
     log::info!("[setup] database opened");
 
-    ensure_master_key(&data_dir, &storage).await?;
+    ensure_key_files(&data_dir, &storage).await?;
     let identity_data = load_identity(&data_dir)?;
 
     log::info!("[setup] master pubkey: {}", identity_data.master_pubkey);
     log::info!(
-        "[setup] Transport NodeId: {} (device index {})",
-        identity_data.transport_node_id,
-        identity_data.device_index
+        "[setup] transport NodeId: {}",
+        identity_data.transport_node_id
     );
 
     // The handlers of the network stack hold the shared identity, so it is created first.
@@ -837,7 +830,7 @@ mod tests {
 
         // An existing file with wider permissions is narrowed when it is read.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        read_master_key(&path).unwrap();
+        read_key_file(&path).unwrap();
         let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600);
     }
@@ -846,50 +839,35 @@ mod tests {
     fn master_key_with_wrong_length_is_an_error() {
         let dir = TempDir::new();
         let path = dir.0.join(MASTER_KEY_FILE);
-        assert!(read_master_key(&path).unwrap().is_none());
+        assert!(read_key_file(&path).unwrap().is_none());
         std::fs::write(&path, [7u8; 31]).unwrap();
-        let err = read_master_key(&path).unwrap_err().to_string();
+        let err = read_key_file(&path).unwrap_err().to_string();
         assert!(err.contains("31 bytes"), "{err}");
         assert!(load_identity(&dir.0).is_err());
     }
 
     #[test]
-    fn index_files_default_to_zero_and_reject_other_content() {
+    fn identity_files_hold_the_master_and_transport_keys() {
         let dir = TempDir::new();
-        assert_eq!(read_index_file(&dir.0, DEVICE_INDEX_FILE).unwrap(), 0);
-        std::fs::write(dir.0.join(DEVICE_INDEX_FILE), "3\n").unwrap();
-        assert_eq!(read_index_file(&dir.0, DEVICE_INDEX_FILE).unwrap(), 3);
-        std::fs::write(dir.0.join(DEVICE_INDEX_FILE), "three").unwrap();
-        assert!(read_index_file(&dir.0, DEVICE_INDEX_FILE).is_err());
-    }
-
-    #[test]
-    fn identity_files_select_the_transport_key() {
-        let dir = TempDir::new();
-        let master = [9u8; 32];
+        let (master, transport) = ([9u8; 32], [10u8; 32]);
         write_identity_files(
             &dir.0,
             &IdentityKeys {
                 master_secret_key: master,
-                device_index: 2,
+                transport_secret_key: transport,
             },
         )
         .unwrap();
         let identity = load_identity(&dir.0).unwrap();
-        assert_eq!(identity.device_index, 2);
-        assert_eq!(identity.transport_node_id, device_node_id(&master, 2));
-        assert_ne!(identity.transport_node_id, device_node_id(&master, 0));
+        assert_eq!(identity.master_secret_key_bytes, master);
         assert_eq!(
-            identity.transport_secret_key().public().to_string(),
-            identity.transport_node_id
+            identity.transport_node_id,
+            SecretKey::from_bytes(&transport).public().to_string()
         );
+        assert_eq!(identity.transport_key.to_bytes(), transport);
 
-        // An index outside 0..MAX_LINKED_DEVICES is rejected.
-        std::fs::write(
-            dir.0.join(DEVICE_INDEX_FILE),
-            MAX_LINKED_DEVICES.to_string(),
-        )
-        .unwrap();
+        // A missing transport key file is an error.
+        std::fs::remove_file(dir.0.join(TRANSPORT_KEY_FILE)).unwrap();
         assert!(load_identity(&dir.0).is_err());
     }
 
@@ -908,42 +886,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_key_with_identity_rows_is_an_error() {
+    async fn missing_master_key_with_identity_rows_is_an_error() {
         let dir = TempDir::new();
         let storage = Storage::open_in_memory().await.unwrap();
+        let read = |name: &str| read_key_file(&dir.0.join(name)).unwrap().unwrap();
 
-        // Empty database: a key is generated.
-        ensure_master_key(&dir.0, &storage).await.unwrap();
-        let first = read_master_key(&dir.0.join(MASTER_KEY_FILE))
-            .unwrap()
-            .unwrap();
+        // Empty database: both keys are generated.
+        ensure_key_files(&dir.0, &storage).await.unwrap();
+        let (master, transport) = (read(MASTER_KEY_FILE), read(TRANSPORT_KEY_FILE));
+        assert_ne!(master, transport);
 
-        // Existing key: kept.
-        ensure_master_key(&dir.0, &storage).await.unwrap();
-        let second = read_master_key(&dir.0.join(MASTER_KEY_FILE))
-            .unwrap()
-            .unwrap();
-        assert_eq!(first, second);
+        // Existing keys: kept.
+        ensure_key_files(&dir.0, &storage).await.unwrap();
+        assert_eq!(read(MASTER_KEY_FILE), master);
+        assert_eq!(read(TRANSPORT_KEY_FILE), transport);
 
-        // Key file removed while the database holds the local device row: error, no new key.
+        // A removed transport key is replaced by a new one.
+        std::fs::remove_file(dir.0.join(TRANSPORT_KEY_FILE)).unwrap();
+        ensure_key_files(&dir.0, &storage).await.unwrap();
+        assert_ne!(read(TRANSPORT_KEY_FILE), transport);
+        assert_eq!(read(MASTER_KEY_FILE), master);
+
+        // Master key file removed while the database holds the local device row: error,
+        // no new key.
         storage
-            .upsert_linked_device(&device_node_id(&first, 0), "Primary Device", true, true, 1)
+            .upsert_linked_device(&node_id_of(&transport), "Linux", true, 1)
             .await
             .unwrap();
         std::fs::remove_file(dir.0.join(MASTER_KEY_FILE)).unwrap();
-        assert!(ensure_master_key(&dir.0, &storage).await.is_err());
+        assert!(ensure_key_files(&dir.0, &storage).await.is_err());
         assert!(!dir.0.join(MASTER_KEY_FILE).exists());
+    }
+
+    fn node_id_of(transport: &[u8; 32]) -> String {
+        SecretKey::from_bytes(transport).public().to_string()
     }
 
     #[test]
     fn identity_debug_output_holds_no_secret_bytes() {
         let master = [0xABu8; 32];
-        let identity = Identity::derive(master, 0);
+        let identity = Identity::new(master, SecretKey::from_bytes(&[0xCDu8; 32]));
         let debug = format!("{identity:?}");
         assert!(debug.contains(&identity.master_pubkey));
+        assert!(debug.contains(&identity.transport_node_id));
         for secret in [
             identity.master_secret_key_bytes,
-            identity.transport_secret_key().to_bytes(),
+            identity.transport_key.to_bytes(),
         ] {
             assert!(!debug.contains(&hex::encode(secret)));
             assert!(!debug.contains(&format!("{secret:?}")));

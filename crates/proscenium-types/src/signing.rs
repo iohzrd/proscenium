@@ -227,7 +227,6 @@ fn linked_devices_signing_bytes(announcement: &LinkedDevicesAnnouncement) -> Vec
         &announcement.master_pubkey,
         &announcement.devices,
         announcement.version,
-        announcement.timestamp,
     ))
 }
 
@@ -357,12 +356,10 @@ mod tests {
                 .map(|n| DeviceEntry {
                     node_id: n.clone(),
                     device_name: "d".to_string(),
-                    is_primary: true,
                     added_at: 1,
                 })
                 .collect(),
             version: 1,
-            timestamp: 1,
             signature: String::new(),
         };
         sign_linked_devices_announcement(&mut a, &id.key);
