@@ -3,7 +3,6 @@ use crate::error::AppError;
 use crate::preferences;
 use iroh::EndpointId;
 use proscenium_types::{CallState, DmPayload, short_id};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -17,9 +16,6 @@ pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(super) const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Total time for delivering one call signal over the DM channel.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Length of the proof each side sends on the audio stream.
-pub(super) const CALL_PROOF_LEN: usize = 32;
 
 /// Phase of the active call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,26 +97,6 @@ impl ActiveCall {
         self.phase_timeout = self.cancel.child_token();
         self.phase_timeout.clone()
     }
-}
-
-/// Proof that the sender holds `call_id`, which only the two peers of the encrypted
-/// offer hold. `role` separates the caller's proof from the callee's.
-pub(super) fn call_proof(call_id: &str, role: &[u8]) -> [u8; CALL_PROOF_LEN] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"proscenium/call-audio/2");
-    hasher.update([0u8]);
-    hasher.update(role);
-    hasher.update([0u8]);
-    hasher.update(call_id.as_bytes());
-    hasher.finalize().into()
-}
-
-pub(super) const ROLE_CALLER: &[u8] = b"caller";
-pub(super) const ROLE_CALLEE: &[u8] = b"callee";
-
-/// Compare two proofs without an early exit on the first differing byte.
-pub(super) fn proofs_equal(a: &[u8; CALL_PROOF_LEN], b: &[u8; CALL_PROOF_LEN]) -> bool {
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 impl super::CallHandler {
@@ -355,19 +331,6 @@ impl super::CallHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn proofs_depend_on_call_id_and_role() {
-        let caller = call_proof("0123456789abcdef0123456789abcdef", ROLE_CALLER);
-        let callee = call_proof("0123456789abcdef0123456789abcdef", ROLE_CALLEE);
-        let other_call = call_proof("1123456789abcdef0123456789abcdef", ROLE_CALLER);
-        assert!(proofs_equal(
-            &caller,
-            &call_proof("0123456789abcdef0123456789abcdef", ROLE_CALLER)
-        ));
-        assert!(!proofs_equal(&caller, &callee));
-        assert!(!proofs_equal(&caller, &other_call));
-    }
 
     #[test]
     fn new_call_phase_follows_direction_and_enter_phase_replaces_timeout() {

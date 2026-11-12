@@ -10,10 +10,7 @@ use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use proscenium_types::{CallEvent, CallState, short_id};
-use state::{
-    ActiveCall, CALL_PROOF_LEN, CONNECT_TIMEOUT, CallPhase, IO_TIMEOUT, ROLE_CALLEE, ROLE_CALLER,
-    call_proof, proofs_equal,
-};
+use state::{ActiveCall, CONNECT_TIMEOUT, CallPhase};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex, Semaphore};
@@ -74,10 +71,10 @@ fn reject(reason: &'static str) -> AcceptError {
 impl ProtocolHandler for CallHandler {
     /// Accept the caller's audio connection for a call the local user answered.
     ///
-    /// The connection is served only if all of these hold:
-    /// - the remote NodeId is the device that sent the offer of the active call,
-    /// - the call is incoming and in phase `Connecting` (`accept_call` was invoked),
-    /// - the first bytes of the stream are the caller's proof of the call id.
+    /// The connection is served only if the remote NodeId, which QUIC authenticates, is
+    /// the device that sent the offer of the active call, and the call is incoming and
+    /// in phase `Connecting` (`accept_call` was invoked). The caller's stream becomes
+    /// visible with its first audio frame, which the session then reads.
     ///
     /// Microphone capture starts after these checks.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
@@ -119,26 +116,13 @@ impl ProtocolHandler for CallHandler {
             }
         };
 
-        // The caller opens a bi-stream and sends its proof first.
-        let Ok(Ok((mut send, mut recv))) =
-            tokio::time::timeout(CONNECT_TIMEOUT, conn.accept_bi()).await
+        let Ok(Ok((send, recv))) = tokio::time::timeout(CONNECT_TIMEOUT, conn.accept_bi()).await
         else {
             conn.close(1u32.into(), b"no stream");
             return Err(reject("audio stream was not opened"));
         };
-        let mut proof = [0u8; CALL_PROOF_LEN];
-        let read = tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut proof)).await;
-        if !matches!(read, Ok(Ok(()))) || !proofs_equal(&proof, &call_proof(&call_id, ROLE_CALLER))
-        {
-            log::warn!(
-                "[call] rejecting audio connection from {}: invalid call proof",
-                short_id(&peer_pubkey)
-            );
-            conn.close(1u32.into(), b"invalid call proof");
-            return Err(reject("invalid call proof"));
-        }
 
-        // The call can end, or another connection can take it, while the proof is read.
+        // The call can end, or another connection can take it, while the stream opens.
         let activated = {
             let mut lock = self.active_call.lock().await;
             match lock.as_mut() {
@@ -152,15 +136,6 @@ impl ProtocolHandler for CallHandler {
         if !activated {
             conn.close(1u32.into(), b"call ended");
             return Err(reject("call ended before the audio stream opened"));
-        }
-
-        let reply = call_proof(&call_id, ROLE_CALLEE);
-        let written = tokio::time::timeout(IO_TIMEOUT, send.write_all(&reply)).await;
-        if !matches!(written, Ok(Ok(()))) {
-            conn.close(1u32.into(), b"handshake failed");
-            self.end_call(&call_id, CallState::Failed, state::PeerNotice::Hangup)
-                .await;
-            return Err(reject("failed to send the call proof"));
         }
 
         log::info!(

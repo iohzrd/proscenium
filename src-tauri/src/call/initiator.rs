@@ -3,10 +3,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{EndpointAddr, EndpointId};
 use proscenium_types::{CALL_ALPN, CallState, DmPayload, is_valid_pubkey, short_id};
 
-use super::state::{
-    ActiveCall, CALL_PROOF_LEN, CONNECT_TIMEOUT, CallPhase, IO_TIMEOUT, PeerNotice, RING_TIMEOUT,
-    ROLE_CALLEE, ROLE_CALLER, call_proof, proofs_equal,
-};
+use super::state::{ActiveCall, CONNECT_TIMEOUT, CallPhase, IO_TIMEOUT, PeerNotice, RING_TIMEOUT};
 
 impl super::CallHandler {
     /// Initiate an outgoing call to a peer: register the call, then send a CallOffer to
@@ -133,8 +130,10 @@ impl super::CallHandler {
         });
     }
 
-    /// Caller side: dial the peer's device `target` on CALL_ALPN, exchange the call
-    /// proofs and move the call to phase `Active`. Every step has a timeout.
+    /// Caller side: dial the peer's device `target` on CALL_ALPN, which QUIC
+    /// authenticates, open the audio stream and move the call to phase `Active`. Every
+    /// step has a timeout. The callee sees the stream with the first audio frame and
+    /// closes the connection if it does not serve it.
     async fn open_audio(
         &self,
         call_id: &str,
@@ -148,29 +147,11 @@ impl super::CallHandler {
         .map_err(|_| "connect timed out".to_string())?
         .map_err(|e| format!("connect failed: {e}"))?;
 
-        let handshake = async {
-            let (mut send, mut recv) = tokio::time::timeout(IO_TIMEOUT, conn.open_bi())
+        let opened = async {
+            let (send, recv) = tokio::time::timeout(IO_TIMEOUT, conn.open_bi())
                 .await
                 .map_err(|_| "opening the stream timed out".to_string())?
                 .map_err(|e| format!("opening the stream failed: {e}"))?;
-
-            tokio::time::timeout(
-                IO_TIMEOUT,
-                send.write_all(&call_proof(call_id, ROLE_CALLER)),
-            )
-            .await
-            .map_err(|_| "sending the call proof timed out".to_string())?
-            .map_err(|e| format!("sending the call proof failed: {e}"))?;
-
-            // The callee proves that it holds the call id before any audio is sent.
-            let mut reply = [0u8; CALL_PROOF_LEN];
-            tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut reply))
-                .await
-                .map_err(|_| "reading the call proof timed out".to_string())?
-                .map_err(|e| format!("reading the call proof failed: {e}"))?;
-            if !proofs_equal(&reply, &call_proof(call_id, ROLE_CALLEE)) {
-                return Err("peer sent an invalid call proof".to_string());
-            }
 
             let mut lock = self.active_call.lock().await;
             match lock.as_mut() {
@@ -178,10 +159,10 @@ impl super::CallHandler {
                     call.enter_phase(CallPhase::Active);
                     Ok((send, recv))
                 }
-                _ => Err("call ended during the handshake".to_string()),
+                _ => Err("call ended while the connection opened".to_string()),
             }
         };
-        match handshake.await {
+        match opened.await {
             Ok((send, recv)) => {
                 log::info!(
                     "[call] audio connection established for {}",
@@ -190,7 +171,7 @@ impl super::CallHandler {
                 Ok((conn, send, recv))
             }
             Err(e) => {
-                conn.close(1u32.into(), b"handshake failed");
+                conn.close(1u32.into(), b"call setup failed");
                 Err(e)
             }
         }

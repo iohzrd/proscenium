@@ -33,7 +33,7 @@ Every signed byte string is a JSON array that starts with a type tag (`prosceniu
 
 ### Protocols
 
-The ALPNs are `proscenium/peer/2`, `proscenium/dm/3`, `proscenium/call/2` and `proscenium/stage/2`.
+The ALPNs are `proscenium/peer/2`, `proscenium/dm/3`, `proscenium/call/3` and `proscenium/stage/2`.
 
 - **Gossip** -- Real-time pub/sub (iroh-gossip, 64 KiB frames). Each user has a topic derived from the master public key. Followers receive posts, deletions, profile updates, device lists and Stage announcements. A message is stored only if the topic owner is its author and signed it.
 - **Sync** -- Historical pull over the peer ALPN. A node serves only its own posts, and only to the user's other devices and to requesters its visibility allows (Public: anyone; Listed: approved followers; Private: mutuals). The requester sends its signed device list, counts and a digest of the post ids it holds, and the earliest timestamp it stores (`since`); the responder considers only content at or after `since`. One sync per NodeId is served at a time, for at most 5 minutes. Connections and syncs from NodeIds that are neither the user's devices nor mapped to an identity have their own limits (32 connections, 4 syncs), so generated NodeIds cannot take the slots of known peers. A blocked user is refused at any visibility, and blocking withdraws its approval as follower. Syncing the profile of a user the local user does not follow keeps that user's newest 2,000 posts and interactions, for at most 50 such users and 7 days. The responder answers up-to-date, sends newer posts, or asks for the id list and sends the missing posts. Signed deletion records (tombstones) are part of the exchange, so deletions reach followers that were offline, and a deleted post is not stored again while its deletion is among the 10,000 newest of its author. The responder's signed device list travels with every sync and push, so a follower learns device list changes it missed.
@@ -277,11 +277,11 @@ Device sync copies messages between the devices of one user, so a device that wa
 
 ## Voice Calls
 
-1:1 voice calls over a QUIC protocol (`proscenium/call/2`).
+1:1 voice calls over a QUIC protocol (`proscenium/call/3`).
 
 - Signaling (offer, answer, reject, hangup) travels as DMs. The offer goes to the first device of the callee that answers; the answer, and every later signal, come from and go to the two devices of the call, and the caller opens the audio connection to the device that answered.
 - Call phases: Ringing (caller), Incoming, Connecting, Active. The audio connection is served only for a call the local user accepted. Microphone capture starts in phase Active.
-- Each side sends a proof derived from the call id as the first bytes of the audio stream; audio starts only after the other side's proof verified.
+- The callee serves the audio connection only from the device that sent the offer, and only for the call it accepted; the caller dials the device that answered. QUIC authenticates both NodeIds, and only one call is active at a time, so the connection belongs to that call without a further check.
 - Timeouts: 30 seconds ringing, 15 seconds for the audio connection after the answer.
 - Opus at 48 kHz mono, 20 ms frames, echo cancellation, mute.
 

@@ -3,7 +3,7 @@ use crate::types::MediaAttachment;
 use serde::{Deserialize, Serialize};
 
 pub const DM_ALPN: &[u8] = b"proscenium/dm/3";
-pub const CALL_ALPN: &[u8] = b"proscenium/call/2";
+pub const CALL_ALPN: &[u8] = b"proscenium/call/3";
 
 // -- Wire types (sent over QUIC) --
 
