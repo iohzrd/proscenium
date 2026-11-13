@@ -3074,7 +3074,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.102.0"
-source = "git+https://github.com/iohzrd/iroh-gossip?rev=fb253e0cd604829fc734a77a95b03c80f968d9cd#fb253e0cd604829fc734a77a95b03c80f968d9cd"
+source = "git+https://github.com/iohzrd/iroh-gossip?rev=ef8fac735fafbf7b98ac49da7dcdb6c44f09e588#ef8fac735fafbf7b98ac49da7dcdb6c44f09e588"
 dependencies = [
  "blake3",
  "bytes",
@@ -5266,7 +5266,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "aec3",
  "base64 0.23.1",
@@ -5319,7 +5319,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.51"
+version = "0.2.52"
 dependencies = [
  "hex",
  "iroh",

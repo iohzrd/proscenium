@@ -336,6 +336,7 @@ async fn build_network_stack(
     let blobs = BlobsProtocol::new(&blob_store, None);
     let gossip = Gossip::builder()
         .max_message_size(crate::constants::GOSSIP_MAX_MESSAGE_SIZE)
+        .max_recv_buffer(crate::constants::GOSSIP_MAX_RECV_BUFFER)
         .spawn(endpoint.clone());
     log::info!("[setup] gossip started");
 
@@ -383,7 +384,14 @@ async fn build_network_stack(
 
     let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
-        .accept(iroh_gossip::ALPN, gossip)
+        .accept(
+            iroh_gossip::ALPN,
+            proscenium_types::ConnectionLimit::new(
+                gossip,
+                crate::constants::GOSSIP_MAX_INCOMING_CONNECTIONS,
+                crate::constants::GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE,
+            ),
+        )
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
         .accept(CALL_ALPN, call_handler.clone())

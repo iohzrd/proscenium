@@ -17,7 +17,8 @@ const WIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 ///    answered and no received message is stored while tables are empty (an absent own
 ///    profile row reads as public visibility).
 /// 2. Every database row is deleted in one transaction, except the rows that list the
-///    devices of the identity (`Storage::wipe_data_keep_devices`).
+///    devices of the identity, the own profile and the sharing settings
+///    (`Storage::wipe_data_keep_devices`).
 /// 3. The blob store is shut down and its directory is removed.
 /// 4. The process restarts. Key files are kept, so the identity is the same afterwards.
 ///
@@ -29,13 +30,14 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     let confirmed = crate::confirm::confirm_native(
         &app,
         "Delete all data",
-        "Delete all posts, messages, follows, media and settings stored on this device? Your identity and the list of your devices are kept, so your other devices copy your follows, messages and posts back at the next device sync. This cannot be undone. The app restarts afterwards.",
+        "Delete all posts, messages, follows, media and settings stored on this device? Your identity, your profile, the settings for sharing your follow lists and the list of your devices are kept, so your other devices copy your follows, messages and posts back at the next device sync. This cannot be undone. The app restarts afterwards.",
         "Delete everything",
     )
     .await;
     if !confirmed {
         return Err("cancelled".into());
     }
+    let master_pubkey = state.identity.read().await.master_pubkey.clone();
     let data_dir = app.path().app_data_dir()?;
     let blobs_dir = data_dir.join(crate::setup::BLOBS_DIR);
     // The keys are kept, so the identity is not new: `get_seed_phrase` keeps asking for
@@ -52,7 +54,7 @@ pub async fn wipe_all_data(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
         log::warn!("[wipe] stopping the network stack timed out");
     }
 
-    if let Err(e) = state.storage.wipe_data_keep_devices().await {
+    if let Err(e) = state.storage.wipe_data_keep_devices(&master_pubkey).await {
         // Nothing was deleted (the deletes are one transaction). The network stack is
         // stopped, so the process restarts in either case.
         log::error!("[wipe] failed to delete database rows: {e}");

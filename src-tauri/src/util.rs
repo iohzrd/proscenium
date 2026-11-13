@@ -1,6 +1,7 @@
 use iroh::EndpointId;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub fn generate_id() -> String {
     let mut bytes = [0u8; 16];
@@ -70,9 +71,57 @@ impl Drop for NodeSlot {
     }
 }
 
+/// Admits at most `max` events per sliding `window`.
+#[derive(Debug)]
+pub(crate) struct RateWindow {
+    max: usize,
+    window: Duration,
+    admitted: VecDeque<Instant>,
+}
+
+impl RateWindow {
+    pub(crate) fn new(max: usize, window: Duration) -> Self {
+        Self {
+            max,
+            window,
+            admitted: VecDeque::with_capacity(max),
+        }
+    }
+
+    /// Remove the events older than `window` at `now`. True if fewer than `max` remain.
+    pub(crate) fn has_room(&mut self, now: Instant) -> bool {
+        self.admitted
+            .retain(|at| now.saturating_duration_since(*at) < self.window);
+        self.admitted.len() < self.max
+    }
+
+    /// Record an event at `now` and return true if `has_room(now)`; else record nothing
+    /// and return false.
+    pub(crate) fn admit(&mut self, now: Instant) -> bool {
+        if !self.has_room(now) {
+            return false;
+        }
+        self.admitted.push_back(now);
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_window_admits_max_events_per_window() {
+        let mut window = RateWindow::new(3, Duration::from_secs(60));
+        let start = Instant::now();
+        for _ in 0..3 {
+            assert!(window.admit(start));
+        }
+        assert!(!window.has_room(start));
+        assert!(!window.admit(start + Duration::from_secs(59)));
+        // After the window the earlier events no longer count.
+        assert!(window.admit(start + Duration::from_secs(60)));
+    }
 
     #[test]
     fn message_preview_truncates_on_char_boundaries() {

@@ -6,8 +6,8 @@ mod list_sharing;
 pub use client::{fetch_remote_list, query_identity, send_follow_request};
 
 use crate::constants::{
-    PEER_ACCEPT_STREAM_TIMEOUT, PEER_CLOSE_WAIT, PEER_MAX_CONNECTIONS,
-    PEER_MAX_CONNECTIONS_PER_NODE, PEER_MAX_DEVICE_SYNC_REQUEST_BYTES,
+    FOLLOW_REQUEST_WINDOW, MAX_NEW_FOLLOW_REQUESTS, PEER_ACCEPT_STREAM_TIMEOUT, PEER_CLOSE_WAIT,
+    PEER_MAX_CONNECTIONS, PEER_MAX_CONNECTIONS_PER_NODE, PEER_MAX_DEVICE_SYNC_REQUEST_BYTES,
     PEER_MAX_FOLLOW_REQUEST_BYTES, PEER_MAX_LINK_REQUEST_BYTES, PEER_MAX_PUSH_BYTES,
     PEER_MAX_SMALL_REQUEST_BYTES, PEER_MAX_SYNC_REQUEST_BYTES, PEER_MAX_UNKNOWN_CONNECTIONS,
     PEER_REQUEST_READ_TIMEOUT, PEER_RESPONSE_WRITE_TIMEOUT, SYNC_SERVE_TIMEOUT,
@@ -19,7 +19,7 @@ use crate::gossip::GossipService;
 use crate::stage::StageActorHandle;
 use crate::state::SharedIdentity;
 use crate::storage::{RemoteListKind, Storage};
-use crate::util::NodeSlot;
+use crate::util::{NodeSlot, RateWindow};
 use iroh::{
     EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
@@ -139,6 +139,8 @@ pub struct PeerHandler {
     unknown_sync_limit: Arc<Semaphore>,
     /// Sync requests currently served per remote NodeId (at most one).
     syncs_per_node: Arc<Mutex<HashMap<EndpointId, usize>>>,
+    /// New pending follow requests stored within `FOLLOW_REQUEST_WINDOW`.
+    follow_request_admissions: Arc<tokio::sync::Mutex<RateWindow>>,
 }
 
 impl PeerHandler {
@@ -162,6 +164,10 @@ impl PeerHandler {
             sync_limit: Arc::new(Semaphore::new(SYNC_SERVER_CONCURRENCY)),
             unknown_sync_limit: Arc::new(Semaphore::new(SYNC_SERVER_UNKNOWN_CONCURRENCY)),
             syncs_per_node: Arc::new(Mutex::new(HashMap::new())),
+            follow_request_admissions: Arc::new(tokio::sync::Mutex::new(RateWindow::new(
+                MAX_NEW_FOLLOW_REQUESTS,
+                FOLLOW_REQUEST_WINDOW,
+            ))),
         }
     }
 

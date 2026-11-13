@@ -21,7 +21,7 @@ The app stores the following in its private storage on your device:
 - content received from other users;
 - settings and diagnostic logs.
 
-This data is excluded from Android cloud backups and device-to-device transfers. Uninstalling the app deletes it from the device. "Delete all data" in Preferences deletes it from the device except your identity (recovery phrase and keys), the list of your devices, and the diagnostic logs; your other devices then copy your follows, messages and posts back at the next device sync. Data already sent to other devices or servers is not deleted from them.
+This data is excluded from Android cloud backups and device-to-device transfers. Uninstalling the app deletes it from the device. "Delete all data" in Preferences deletes it from the device except your identity (recovery phrase and keys), your profile, the settings for sharing your follow lists, the list of your devices, and the diagnostic logs; your other devices then copy your follows, messages and posts back at the next device sync. Data already sent to other devices or servers is not deleted from them.
 
 ## Data you publish
 

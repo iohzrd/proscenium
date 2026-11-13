@@ -29,8 +29,9 @@
   <p class="section-desc">
     Delete all posts, messages, follows, notifications, bookmarks, preferences
     and downloaded media stored on this device, then restart the app. Your
-    identity keys are kept. Copies that other peers or servers already hold are
-    not deleted.
+    identity keys, your profile, the settings for sharing your follow lists and
+    the list of your devices are kept. Copies that other peers or servers
+    already hold are not deleted.
   </p>
   {#if wipeStatus}
     <p class="wipe-status" role="status">{wipeStatus}</p>

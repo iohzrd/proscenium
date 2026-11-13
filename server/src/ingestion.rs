@@ -74,18 +74,19 @@ pub struct IngestionManager {
     pub(crate) syncing: std::sync::Mutex<HashSet<String>>,
 }
 
-/// Writes at most `REJECT_LOGS_PER_WINDOW` warn records per window for one topic and
-/// reports the number of unlogged rejections when the next window starts.
-/// Messages a topic may deliver at once, and on average per second, before further
-/// messages are discarded unread. Each message costs a signature check and a write
-/// transaction, and a re-encoded copy of a signed message passes the deduplication of
-/// iroh-gossip. Content of a discarded message reaches the server at its next sync of
+/// Messages one sender may deliver on a topic at once, and on average per second, before
+/// its further messages are discarded unread. Each message costs a signature check and a
+/// write transaction, and a re-encoded copy of a signed message passes the deduplication
+/// of iroh-gossip. Content of a discarded message reaches the server at its next sync of
 /// the author.
 const TOPIC_MESSAGE_BURST: f64 = 60.0;
 const TOPIC_MESSAGES_PER_SECOND: f64 = 1.0;
 
-/// Token bucket of one topic subscription: `TOPIC_MESSAGE_BURST` tokens, refilled at
-/// `TOPIC_MESSAGES_PER_SECOND`.
+/// Senders other than the author's devices that `SenderBudgets` keeps a budget for at
+/// once, per topic. Messages of further senders share one budget.
+const MAX_BUDGETED_SENDERS: usize = 16;
+
+/// Token bucket: `TOPIC_MESSAGE_BURST` tokens, refilled at `TOPIC_MESSAGES_PER_SECOND`.
 struct MessageBudget {
     tokens: f64,
     refilled_at: Instant,
@@ -99,13 +100,17 @@ impl MessageBudget {
         }
     }
 
-    /// Take one token at `now`; false if none is left.
-    fn take(&mut self, now: Instant) -> bool {
+    fn refill(&mut self, now: Instant) {
         let elapsed = now
             .saturating_duration_since(self.refilled_at)
             .as_secs_f64();
         self.refilled_at = now;
         self.tokens = (self.tokens + elapsed * TOPIC_MESSAGES_PER_SECOND).min(TOPIC_MESSAGE_BURST);
+    }
+
+    /// Take one token at `now`; false if none is left.
+    fn take(&mut self, now: Instant) -> bool {
+        self.refill(now);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -113,8 +118,70 @@ impl MessageBudget {
             false
         }
     }
+
+    /// True if the bucket holds `TOPIC_MESSAGE_BURST` tokens at `now`: it then equals a
+    /// new bucket, so removing it changes no later decision.
+    fn is_full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= TOPIC_MESSAGE_BURST
+    }
 }
 
+/// `MessageBudget`s of one topic, per NodeId that delivered a message
+/// (`Message::delivered_from`), so messages from one sender cannot use up the budget of
+/// the others. The author's devices (`author_nodes`) always have their own budget. Of the
+/// other senders, `MAX_BUDGETED_SENDERS` have one; further senders share `others`.
+struct SenderBudgets {
+    author_nodes: HashSet<EndpointId>,
+    senders: HashMap<EndpointId, MessageBudget>,
+    others: MessageBudget,
+}
+
+impl SenderBudgets {
+    fn new(author_nodes: HashSet<EndpointId>, now: Instant) -> Self {
+        Self {
+            author_nodes,
+            senders: HashMap::new(),
+            others: MessageBudget::new(now),
+        }
+    }
+
+    /// Take one token of `sender`'s budget at `now`; false if none is left.
+    fn take(&mut self, sender: EndpointId, now: Instant) -> bool {
+        if let Some(budget) = self.senders.get_mut(&sender) {
+            return budget.take(now);
+        }
+        if !self.author_nodes.contains(&sender) && self.budgeted_others() >= MAX_BUDGETED_SENDERS {
+            let author_nodes = &self.author_nodes;
+            self.senders
+                .retain(|id, budget| author_nodes.contains(id) || !budget.is_full(now));
+            if self.budgeted_others() >= MAX_BUDGETED_SENDERS {
+                return self.others.take(now);
+            }
+        }
+        self.senders
+            .entry(sender)
+            .or_insert_with(|| MessageBudget::new(now))
+            .take(now)
+    }
+
+    /// Number of senders other than the author's devices with their own budget.
+    fn budgeted_others(&self) -> usize {
+        self.senders
+            .keys()
+            .filter(|id| !self.author_nodes.contains(*id))
+            .count()
+    }
+
+    /// Replace the author's NodeIds. A former author NodeId keeps its budget as an
+    /// ordinary sender.
+    fn set_author_nodes(&mut self, author_nodes: HashSet<EndpointId>) {
+        self.author_nodes = author_nodes;
+    }
+}
+
+/// Writes at most `REJECT_LOGS_PER_WINDOW` warn records per window for one topic and
+/// reports the number of unlogged rejections when the next window starts.
 struct RejectLog {
     window_start: Instant,
     logged: u32,
@@ -327,7 +394,10 @@ impl IngestionManager {
         receiver: &mut GossipReceiver,
     ) {
         let mut reject_log = RejectLog::new();
-        let mut budget = MessageBudget::new(Instant::now());
+        let mut budgets = SenderBudgets::new(
+            self.stored_node_ids(pubkey).await.into_iter().collect(),
+            Instant::now(),
+        );
         let mut rejoin_delay = REJOIN_MIN_DELAY;
         let mut rejoin_at = Instant::now() + rejoin_delay;
         let mut last_sync_request: Option<Instant> = None;
@@ -337,8 +407,8 @@ impl IngestionManager {
             tokio::select! {
                 event = receiver.try_next() => match event {
                     Ok(Some(Event::Received(message))) => {
-                        if !budget.take(Instant::now()) {
-                            reject_log.record(pubkey, "message rate limit of the topic reached");
+                        if !budgets.take(message.delivered_from, Instant::now()) {
+                            reject_log.record(pubkey, "message rate limit of the sender reached");
                         } else if let Err(reason) =
                             self.handle_gossip_message(pubkey, &message.content).await
                         {
@@ -380,6 +450,7 @@ impl IngestionManager {
                 },
                 _ = tokio::time::sleep_until(rejoin_at), if !has_neighbors => {
                     let bootstrap = self.stored_node_ids(pubkey).await;
+                    budgets.set_author_nodes(bootstrap.iter().copied().collect());
                     if !bootstrap.is_empty()
                         && let Err(e) = sender.join_peers(bootstrap).await
                     {
@@ -703,5 +774,41 @@ mod tests {
             assert!(budget.take(much_later));
         }
         assert!(!budget.take(much_later));
+    }
+
+    fn node(seed: u8) -> EndpointId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn one_sender_cannot_use_up_the_budget_of_others() {
+        let now = Instant::now();
+        let author = node(1);
+        let mut budgets = SenderBudgets::new(HashSet::from([author]), now);
+        let attacker = node(2);
+        while budgets.take(attacker, now) {}
+        assert!(budgets.take(author, now));
+        assert!(budgets.take(node(3), now));
+    }
+
+    #[test]
+    fn senders_beyond_the_limit_share_one_budget_and_never_displace_the_author() {
+        let now = Instant::now();
+        let author = node(1);
+        let mut budgets = SenderBudgets::new(HashSet::from([author]), now);
+        // Each budgeted sender takes two tokens: its budget is full again after 2 s.
+        for seed in 10..10 + MAX_BUDGETED_SENDERS as u8 {
+            assert!(budgets.take(node(seed), now));
+            assert!(budgets.take(node(seed), now));
+        }
+        for _ in 0..TOPIC_MESSAGE_BURST as usize {
+            assert!(budgets.take(node(200), now));
+        }
+        assert!(!budgets.take(node(201), now));
+        assert!(budgets.take(author, now));
+        assert!(!budgets.senders.contains_key(&node(201)));
+        // Refilled budgets hold no state; they are removed for a new sender.
+        assert!(budgets.take(node(201), now + Duration::from_secs(2)));
+        assert!(budgets.senders.contains_key(&node(201)));
     }
 }

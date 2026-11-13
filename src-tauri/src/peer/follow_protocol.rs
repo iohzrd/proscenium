@@ -8,6 +8,7 @@ use proscenium_types::{
     FollowRequest, FollowResponse, VerifiedIdentity, Visibility, now_millis, short_id,
     verify_follow_request,
 };
+use std::time::Instant;
 use tauri::Emitter;
 
 use super::{PeerHandler, reject};
@@ -15,11 +16,15 @@ use super::{PeerHandler, reject};
 impl PeerHandler {
     /// Answer a follow request.
     ///
-    /// Public: approved without a stored row. Listed: a pending row is stored for the
-    /// local user to approve or deny; an approved requester is answered `Approved`, a denied one
-    /// `Denied`. Private: approved if the local user follows the requester, else denied.
-    /// After the first approval of a requester a Private user sends a follow request back,
-    /// so two Private users who follow each other become mutuals in either order.
+    /// Public: approved without a stored row. Private, from a requester the local user
+    /// follows: approved; after the first approval the local user sends a follow request
+    /// back, so two Private users who follow each other become mutuals in either order.
+    /// Listed, and Private from any other requester: a pending row is stored for the local
+    /// user to approve or deny (for Private, following the requester approves it); an
+    /// approved requester is answered `Approved`, a denied one `Denied`. A new pending row
+    /// from a requester the local user does not follow counts against
+    /// `MAX_NEW_FOLLOW_REQUESTS` per `FOLLOW_REQUEST_WINDOW`; beyond it nothing is stored
+    /// and the answer is `RateLimited`.
     pub(super) async fn handle_follow_request(
         &self,
         remote_str: &str,
@@ -69,10 +74,7 @@ impl PeerHandler {
         let now = now_millis();
         let expires_at = now.saturating_add(FOLLOW_REQUEST_TTL_MS);
         let mut reciprocate = false;
-        // A Private user approves a request directly only from a user it follows. Any
-        // other request is stored as pending, as for Listed: following the requester
-        // later approves it (`follow_user`), and the user sees it.
-        let follows_requester = visibility == Visibility::Private
+        let follows_requester = visibility != Visibility::Public
             && self
                 .storage
                 .is_following(&my_pubkey, requester)
@@ -96,14 +98,36 @@ impl PeerHandler {
                 approval != DirectApproval::Denied
             }
             Visibility::Listed | Visibility::Private => {
+                // Held until the row is written, so concurrent requests cannot exceed the
+                // limit.
+                let mut admissions = self.follow_request_admissions.lock().await;
+                let at = Instant::now();
+                let counted = !follows_requester;
                 let outcome = self
                     .storage
-                    .record_follow_request(requester, req.timestamp, now, expires_at)
+                    .record_follow_request(
+                        requester,
+                        req.timestamp,
+                        now,
+                        expires_at,
+                        !counted || admissions.has_room(at),
+                    )
                     .await
                     .map_err(AcceptError::from_err)?;
+                if counted && outcome == FollowRequestOutcome::NewPending {
+                    admissions.admit(at);
+                }
+                drop(admissions);
                 match outcome {
                     FollowRequestOutcome::Approved => true,
                     FollowRequestOutcome::Denied => false,
+                    FollowRequestOutcome::Refused => {
+                        log::info!(
+                            "[follow-req] not storing the request of {}: new request limit reached",
+                            short_id(requester)
+                        );
+                        return Self::respond(send, conn, &FollowResponse::RateLimited).await;
+                    }
                     FollowRequestOutcome::NewPending | FollowRequestOutcome::StillPending => {
                         // The identity is stored so the requester can be reached and
                         // verified after approval.

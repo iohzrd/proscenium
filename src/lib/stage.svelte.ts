@@ -270,25 +270,43 @@ export function startStageSync(): () => void {
   };
 }
 
-// The host repeats its announcement every 30 s. An entry that was not
-// repeated within this time is removed.
+// A Public host repeats its announcement every 30 s on gossip; any other host
+// pushes it every 90 s. An entry that was not repeated within this time is
+// removed.
 const ANNOUNCEMENT_TTL_MS = 120_000;
 const ANNOUNCEMENT_SWEEP_MS = 15_000;
 const MAX_LIVE_STAGES = 50;
+// Ended stage ids kept, so an announcement that arrives after the end (a push
+// or a gossip message sent before it) does not show the stage again.
+const MAX_ENDED_STAGES = 200;
 
 /** Announced stages of followed users, keyed by stage id. */
 export const liveStages = new SvelteMap<string, StageAnnouncement>();
 const announcementSeenAt = new Map<string, number>();
+// Insertion order is end order: the first entry is the oldest.
+const endedStages = new Set<string>();
 
 function removeLiveStage(stageId: string) {
   announcementSeenAt.delete(stageId);
   liveStages.delete(stageId);
 }
 
+function recordEnd(stageId: string) {
+  if (typeof stageId !== "string") return;
+  removeLiveStage(stageId);
+  endedStages.delete(stageId);
+  endedStages.add(stageId);
+  if (endedStages.size > MAX_ENDED_STAGES) {
+    const oldest = endedStages.values().next().value;
+    if (oldest !== undefined) endedStages.delete(oldest);
+  }
+}
+
 function recordAnnouncement(ann: StageAnnouncement) {
   if (typeof ann?.stage_id !== "string" || typeof ann.ticket !== "string") {
     return;
   }
+  if (endedStages.has(ann.stage_id)) return;
   announcementSeenAt.set(ann.stage_id, Date.now());
   liveStages.set(ann.stage_id, ann);
   if (liveStages.size > MAX_LIVE_STAGES) {
@@ -320,9 +338,7 @@ export function startLiveStageTracking(): () => void {
     listen<StageAnnouncement>("stage-announced", (event) =>
       recordAnnouncement(event.payload),
     ),
-    listen<string>("stage-ended-remote", (event) =>
-      removeLiveStage(event.payload),
-    ),
+    listen<string>("stage-ended-remote", (event) => recordEnd(event.payload)),
   ];
   const sweep = setInterval(removeExpiredAnnouncements, ANNOUNCEMENT_SWEEP_MS);
   return () => {

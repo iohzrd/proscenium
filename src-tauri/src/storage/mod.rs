@@ -63,6 +63,34 @@ impl std::fmt::Debug for Storage {
 const IDENTITY_DEVICE_TABLES: &[&str] =
     &["linked_devices", "removed_devices", "pending_link_devices"];
 
+/// Preferences that `wipe_data_keep_devices` keeps: the highest version of the own device
+/// lists, and the settings that limit what is shared with other users.
+const KEPT_PREFERENCES: &[&str] = &[
+    linked_devices::OWN_ANNOUNCEMENT_VERSION_KEY,
+    crate::preferences::SHARE_FOLLOWS,
+    crate::preferences::SHARE_FOLLOWERS,
+];
+
+/// What `wipe_tables_except` keeps of one table.
+enum Kept<'a> {
+    /// Every row.
+    Table(&'a str),
+    /// The rows whose `column` holds one of `values`.
+    Rows {
+        table: &'a str,
+        column: &'a str,
+        values: &'a [&'a str],
+    },
+}
+
+impl Kept<'_> {
+    fn table(&self) -> &str {
+        match self {
+            Kept::Table(table) | Kept::Rows { table, .. } => table,
+        }
+    }
+}
+
 impl Storage {
     const MIGRATIONS: &'static [(&'static str, &'static str)] = &[
         (
@@ -209,17 +237,35 @@ impl Storage {
         self.wipe_tables_except(&[]).await
     }
 
-    /// `wipe_all_data` except `IDENTITY_DEVICE_TABLES` and the highest version of the own
-    /// device lists, for "Delete all data", which keeps the keys. Without these rows the
-    /// device would publish a device list that names only itself and refuse device sync
-    /// with the other devices of the identity, which copy follows, messages and posts back.
-    pub async fn wipe_data_keep_devices(&self) -> Result<(), AppError> {
-        let version = self.get_own_announcement_version().await?;
-        self.wipe_tables_except(IDENTITY_DEVICE_TABLES).await?;
-        self.record_own_announcement_version(version).await
+    /// `wipe_all_data` except `IDENTITY_DEVICE_TABLES`, the profile of `own_pubkey` and
+    /// `KEPT_PREFERENCES`, for "Delete all data", which keeps the keys.
+    ///
+    /// Without the device rows the device would publish a device list that names only
+    /// itself and refuse device sync with the other devices of the identity, which copy
+    /// follows, messages and posts back. Without the profile row the app shows the profile
+    /// setup form, whose defaults (Public, registration with the discovery server) would
+    /// replace the profile on every device, and the device reads its visibility as Public
+    /// until a device sync restores the row.
+    pub async fn wipe_data_keep_devices(&self, own_pubkey: &str) -> Result<(), AppError> {
+        let own = [own_pubkey];
+        let mut kept: Vec<Kept<'_>> = IDENTITY_DEVICE_TABLES
+            .iter()
+            .map(|table| Kept::Table(table))
+            .collect();
+        kept.push(Kept::Rows {
+            table: "profiles",
+            column: "pubkey",
+            values: &own,
+        });
+        kept.push(Kept::Rows {
+            table: "preferences",
+            column: "key",
+            values: KEPT_PREFERENCES,
+        });
+        self.wipe_tables_except(&kept).await
     }
 
-    async fn wipe_tables_except(&self, kept: &[&str]) -> Result<(), AppError> {
+    async fn wipe_tables_except(&self, kept: &[Kept<'_>]) -> Result<(), AppError> {
         // Read before the transaction starts: its first statement must be a write, because
         // a transaction that starts with a read fails with SQLITE_BUSY when it needs the
         // write lock after another connection has committed.
@@ -229,20 +275,39 @@ impl Storage {
         )
         .fetch_all(&self.pool)
         .await?;
-        let tables = tables.into_iter().filter(|t| !kept.contains(&t.as_str()));
 
         let mut tx = self.pool.begin().await?;
-        // Foreign keys are checked at commit, when every table is empty, so the order of
-        // the deletes does not matter.
+        // Foreign keys are checked at commit, after every delete, so the order of the
+        // deletes does not matter.
         sqlx::query("PRAGMA defer_foreign_keys = ON")
             .execute(&mut *tx)
             .await?;
         for table in tables {
-            // Table names come from `sqlite_schema`, which only migrations write.
-            let sql = format!("DELETE FROM \"{}\"", table.replace('"', "\"\""));
-            sqlx::query(sqlx::AssertSqlSafe(sql))
-                .execute(&mut *tx)
-                .await?;
+            let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+            // Table names come from `sqlite_schema`, which only migrations write; column
+            // names are constants of this module.
+            match kept.iter().find(|k| k.table() == table) {
+                Some(Kept::Table(_)) => {}
+                Some(Kept::Rows { column, values, .. }) => {
+                    let placeholders = vec!["?"; values.len()].join(", ");
+                    let sql = format!(
+                        "DELETE FROM {} WHERE {} NOT IN ({placeholders})",
+                        quote(&table),
+                        quote(column)
+                    );
+                    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+                    for value in *values {
+                        query = query.bind(*value);
+                    }
+                    query.execute(&mut *tx).await?;
+                }
+                None => {
+                    let sql = format!("DELETE FROM {}", quote(&table));
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
         }
         tx.commit().await?;
 

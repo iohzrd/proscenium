@@ -6,6 +6,7 @@ use proscenium_types::{
     PushMessage, StageAnnouncement, StageEnd, StageTicket, Visibility, now_millis, short_id,
     sign_stage_announcement, sign_stage_ended,
 };
+use tokio::task::JoinHandle;
 
 /// A `PushMessage` of `author` without content.
 fn empty_push(author: String) -> PushMessage {
@@ -199,8 +200,9 @@ impl super::GossipService {
 
     /// Announce a Stage room on the host's own user-feed gossip topic so followers discover
     /// it. Without a broadcast (the host is not Public), the announcement is pushed to the
-    /// push recipients if `push` is set. The announcement is signed with the local master
-    /// key; `host_pubkey` must be the local master pubkey or receivers reject it.
+    /// push recipients if `push` is set; the push delivery task is returned. The
+    /// announcement is signed with the local master key; `host_pubkey` must be the local
+    /// master pubkey or receivers reject it.
     pub async fn broadcast_stage_announcement(
         &self,
         stage_id: String,
@@ -209,7 +211,7 @@ impl super::GossipService {
         host_pubkey: String,
         started_at: u64,
         push: bool,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<JoinHandle<()>>, AppError> {
         let signature = {
             let id = self.identity.read().await;
             sign_stage_announcement(
@@ -238,13 +240,14 @@ impl super::GossipService {
             signature: announcement.signature.clone(),
         };
         if !self.broadcast_msg(&msg, "stage announcement").await? && push {
-            self.attempt_push(PushMessage {
-                stage: Some(announcement),
-                ..empty_push(self.my_master_pubkey().await)
-            })
-            .await;
+            return Ok(self
+                .start_push(PushMessage {
+                    stage: Some(announcement),
+                    ..empty_push(self.my_master_pubkey().await)
+                })
+                .await);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Broadcast that a Stage room has ended on the host's own user-feed gossip topic, or

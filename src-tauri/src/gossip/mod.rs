@@ -183,7 +183,14 @@ impl GossipService {
     /// mirror. At most `PUSH_CONCURRENCY` connections are open at
     /// once over all pending pushes, and at most `MAX_NODE_IDS_TRIED` NodeIds are tried
     /// per recipient. A recipient that does not acknowledge receives the content at its next sync.
-    pub(crate) async fn attempt_push(&self, mut msg: PushMessage) {
+    pub(crate) async fn attempt_push(&self, msg: PushMessage) {
+        let _ = self.start_push(msg).await;
+    }
+
+    /// `attempt_push`, returning the delivery task, or `None` if no task was started (no
+    /// recipient, or the recipients could not be read). Aborting the task ends the
+    /// deliveries not yet acknowledged.
+    pub(crate) async fn start_push(&self, mut msg: PushMessage) -> Option<JoinHandle<()>> {
         let my_id = self.identity.read().await.master_pubkey.clone();
         let recipients = match self.my_visibility().await {
             Ok(visibility) => self.storage.get_push_recipients(&my_id, visibility).await,
@@ -193,11 +200,11 @@ impl GossipService {
             Ok(recipients) => recipients,
             Err(e) => {
                 log::error!("[push] failed to determine recipients: {e}");
-                return;
+                return None;
             }
         };
         if recipients.is_empty() {
-            return;
+            return None;
         }
         if msg.announcement.is_none() || msg.profile.is_none() {
             match crate::announcement::build_own_identity_response(&self.storage, &self.identity)
@@ -217,7 +224,8 @@ impl GossipService {
         let storage = self.storage.clone();
         let limit = self.push_limit.clone();
         let msg = Arc::new(msg);
-        tokio::spawn(async move {
+        // Dropping `deliveries` when the task is aborted aborts its delivery tasks.
+        Some(tokio::spawn(async move {
             let mut deliveries = JoinSet::new();
             for recipient in recipients {
                 // One permit per recipient, taken before the task is spawned.
@@ -234,7 +242,7 @@ impl GossipService {
                 while deliveries.try_join_next().is_some() {}
             }
             while deliveries.join_next().await.is_some() {}
-        });
+        }))
     }
 
     /// Broadcast `profile`, whose visibility is not Public, on the own feed topic, then

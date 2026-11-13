@@ -226,6 +226,8 @@ pub enum FollowResponse {
     Approved(Box<IdentityResponse>),
     Denied,
     Pending,
+    /// The receiver stores no new follow request now (rate limit). Nothing was stored.
+    RateLimited,
 }
 
 /// Response to a FollowsListRequest.

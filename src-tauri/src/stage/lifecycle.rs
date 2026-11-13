@@ -30,7 +30,9 @@ const HOST_TICK_INTERVAL: Duration = Duration::from_secs(1);
 /// Interval at which the host repeats the stage announcement on its feed topic.
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 /// A host that is not Public pushes its announcement on every this many ticks of
-/// `ANNOUNCE_INTERVAL` (90 s): each push opens a connection per push recipient.
+/// `ANNOUNCE_INTERVAL` (90 s): each push opens a connection per push recipient. A push
+/// that is due while the previous push round runs starts at the first tick after that
+/// round ends.
 const ANNOUNCE_PUSH_EVERY: u32 = 3;
 
 /// Send `command()` to the actor every `period` until `cancel` is cancelled or the
@@ -252,13 +254,22 @@ impl StageActor {
                 let mut interval = tokio::time::interval(ANNOUNCE_INTERVAL);
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut tick: u32 = 0;
+                let mut push_due = false;
+                // The running push round. At most one runs; it is aborted at the end of
+                // the stage, so no announcement is delivered after the end.
+                let mut round: Option<tokio::task::JoinHandle<()>> = None;
                 loop {
                     tokio::select! {
                         _ = ann_cancel.cancelled() => break,
                         _ = interval.tick() => {
-                            let push = tick.is_multiple_of(ANNOUNCE_PUSH_EVERY);
+                            push_due |= tick.is_multiple_of(ANNOUNCE_PUSH_EVERY);
                             tick = tick.wrapping_add(1);
-                            if let Err(e) = gs
+                            let push = push_due
+                                && round.as_ref().is_none_or(tokio::task::JoinHandle::is_finished);
+                            if push {
+                                push_due = false;
+                            }
+                            match gs
                                 .broadcast_stage_announcement(
                                     ann_stage_id.clone(),
                                     title.clone(),
@@ -269,10 +280,17 @@ impl StageActor {
                                 )
                                 .await
                             {
-                                log::warn!("[stage] failed to broadcast stage announcement: {e}");
+                                Ok(Some(started)) => round = Some(started),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    log::warn!("[stage] failed to broadcast stage announcement: {e}");
+                                }
                             }
                         }
                     }
+                }
+                if let Some(round) = round {
+                    round.abort();
                 }
             });
         }

@@ -93,6 +93,13 @@ pub const MAX_PUSH_TOMBSTONES: usize = 200;
 pub const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
 /// Pending follow requests stored at the same time.
 pub const MAX_PENDING_FOLLOW_REQUESTS: u64 = 500;
+/// New pending follow requests stored per `FOLLOW_REQUEST_WINDOW`, over all requesters
+/// the local user does not follow. Identities cost nothing to generate; with this limit,
+/// requests from generated identities take 25 hours to evict the oldest of the
+/// `MAX_PENDING_FOLLOW_REQUESTS` rows and produce at most this many notifications per
+/// window.
+pub const MAX_NEW_FOLLOW_REQUESTS: usize = 20;
+pub const FOLLOW_REQUEST_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 // Peer sync task
 pub const RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -141,6 +148,17 @@ pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Bytes of a gossip frame reserved for the iroh-gossip header; a payload larger than
 /// `GOSSIP_MAX_MESSAGE_SIZE - GOSSIP_FRAME_OVERHEAD` is not broadcast.
 pub const GOSSIP_FRAME_OVERHEAD: usize = 1024;
+/// Bytes of frame storage that the streams of one gossip connection hold beyond 1 KiB per
+/// stream (iroh-gossip `Builder::max_recv_buffer` of the `[patch.crates-io]` build): 16
+/// frames of `GOSSIP_MAX_MESSAGE_SIZE`. A stream whose next bytes would exceed it is
+/// stopped, and the sender opens a new one for its next message.
+pub const GOSSIP_MAX_RECV_BUFFER: usize = 1024 * 1024;
+/// Incoming gossip connections held at the same time, in total and per remote NodeId
+/// (`proscenium_types::ConnectionLimit`). Each connection holds up to
+/// `GOSSIP_MAX_RECV_BUFFER` plus 1 KiB per stream of frames, and up to
+/// `CONNECTION_RECEIVE_WINDOW` of unread data.
+pub const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 128;
+pub const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
 /// Interval at which a subscription without neighbors calls `join_peers` again.
 pub const GOSSIP_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 /// First and largest delay before a failed subscription is attempted again.

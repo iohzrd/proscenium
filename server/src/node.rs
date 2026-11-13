@@ -7,8 +7,21 @@ use std::path::Path;
 use std::time::Duration;
 
 /// Maximum size of one gossip frame. Must equal the client's `GOSSIP_MAX_MESSAGE_SIZE`:
-/// a peer closes the gossip connection when it receives a larger frame.
+/// a peer drops the stream on which it receives a larger frame.
 pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
+
+/// Bytes of frame storage that the streams of one gossip connection hold beyond 1 KiB per
+/// stream (iroh-gossip `Builder::max_recv_buffer` of the `[patch.crates-io]` build): 16
+/// frames of `GOSSIP_MAX_MESSAGE_SIZE`. A stream whose next bytes would exceed it is
+/// stopped, and the sender opens a new one for its next message.
+const GOSSIP_MAX_RECV_BUFFER: usize = 1024 * 1024;
+
+/// Incoming gossip connections held at the same time, in total and per remote NodeId
+/// (`proscenium_types::ConnectionLimit`). Each connection holds up to
+/// `GOSSIP_MAX_RECV_BUFFER` plus 1 KiB per stream of frames, and up to
+/// `CONNECTION_RECEIVE_WINDOW` of unread data.
+const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 256;
+const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
 
 /// Time allowed for `Router::shutdown` before the process exits anyway.
 const ROUTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -118,10 +131,18 @@ impl Node {
     pub(crate) fn spawn(endpoint: Endpoint) -> Self {
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
+            .max_recv_buffer(GOSSIP_MAX_RECV_BUFFER)
             .spawn(endpoint.clone());
 
         let router = Router::builder(endpoint.clone())
-            .accept(iroh_gossip::ALPN, gossip.clone())
+            .accept(
+                iroh_gossip::ALPN,
+                proscenium_types::ConnectionLimit::new(
+                    gossip.clone(),
+                    GOSSIP_MAX_INCOMING_CONNECTIONS,
+                    GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE,
+                ),
+            )
             .spawn();
 
         Self {

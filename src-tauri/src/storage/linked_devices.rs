@@ -14,7 +14,7 @@ use super::Storage;
 const PENDING_LINK_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// `preferences` key of the highest version of a device list of the local identity.
-const OWN_ANNOUNCEMENT_VERSION_KEY: &str = "own_announcement_version";
+pub(super) const OWN_ANNOUNCEMENT_VERSION_KEY: &str = "own_announcement_version";
 
 /// Result of `Storage::merge_removed_devices`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
