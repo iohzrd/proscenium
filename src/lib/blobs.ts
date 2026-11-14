@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
-import { writeFile } from "@tauri-apps/plugin-fs";
 import { setContext, getContext } from "svelte";
 import type { MediaAttachment } from "#lib/types.ts";
 import { isAudio, isImage, isVideo, normalizeMime } from "#lib/utils.ts";
@@ -167,15 +166,16 @@ export function createBlobCache(options: BlobCacheOptions = {}) {
     );
   }
 
-  /** Never rejects: a failure is logged and passed to `options.onError`. */
+  /**
+   * Write the attachment to a location the user picks. The backend writes the
+   * file (`save_blob_to_file`), so the bytes do not pass through the webview.
+   * Never rejects: a failure is logged and passed to `options.onError`.
+   */
   async function saveFileAs(att: MediaAttachment): Promise<void> {
     try {
       const path = await save({ defaultPath: sanitizeFilename(att.filename) });
       if (!path) return;
-      const bytes = await invoke<ArrayBuffer>("fetch_blob_bytes", {
-        ticket: att.ticket,
-      });
-      await writeFile(path, new Uint8Array(bytes));
+      await invoke("save_blob_to_file", { ticket: att.ticket, path });
     } catch (e) {
       console.error("Failed to save file:", e);
       options.onError?.("Failed to save file");

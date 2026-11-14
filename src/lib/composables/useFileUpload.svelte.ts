@@ -164,33 +164,24 @@ export function useFileUpload() {
     const startedIn = generation;
     activeUploads += 1;
     try {
-      const result = await invoke<AddedBlob>("add_blob_from_rgba", {
-        data: rgba,
-        width,
-        height,
-      });
-      // Build a preview from the RGBA data
+      // Encoded here, so only the PNG, several times smaller than the pixel
+      // data, passes to the backend (in chunks, by `uploadFiles`).
       const canvas = document.createElement("canvas");
       canvas.width = width;
       canvas.height = height;
-      const ctx = canvas.getContext("2d")!;
-      const imageData = new ImageData(
-        new Uint8ClampedArray(rgba),
-        width,
-        height,
+      canvas
+        .getContext("2d")!
+        .putImageData(
+          new ImageData(new Uint8ClampedArray(rgba), width, height),
+          0,
+          0,
+        );
+      const png = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob(resolve, "image/png"),
       );
-      ctx.putImageData(imageData, 0, 0);
-      const previewUrl = canvas.toDataURL("image/png");
-      accept(startedIn, [
-        {
-          hash: result.hash,
-          ticket: result.ticket,
-          mime_type: result.mime_type,
-          filename: result.filename,
-          size: result.size,
-          previewUrl,
-        },
-      ]);
+      if (!png) throw new Error("PNG encoding failed");
+      const file = new File([png], "clipboard.png", { type: "image/png" });
+      accept(startedIn, await uploadFiles([file]));
     } catch (err) {
       if (startedIn === generation) {
         showError("Failed to upload clipboard image");

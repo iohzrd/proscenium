@@ -9,11 +9,13 @@ use iroh_blobs::get::request::{get_blob, get_verified_size};
 use iroh_blobs::{BlobFormat, Hash, HashAndFormat, store::fs::FsStore, ticket::BlobTicket};
 use proscenium_types::{MAX_BLOB_SIZE, MAX_BLOB_TICKET_LEN};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::Response;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
+use tauri_plugin_fs::{FilePath, FsExt, OpenOptions, SafeFilePath};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 
@@ -35,10 +37,6 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const AUTOMATIC_TRANSFER_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// Number of dropped paths remembered. The oldest entry is removed when the list is full.
 const MAX_DROPPED_PATHS: usize = 256;
-/// Largest RGBA pixel buffer `add_blob_from_rgba` encodes. PNG encoding shrinks typical
-/// screen content several times; the encoded size is checked against `MAX_BLOB_SIZE`
-/// when the blob is added.
-const MAX_RGBA_BYTES: usize = 4 * MAX_BLOB_SIZE;
 
 /// File paths the operating system delivered through drag-and-drop onto a window.
 ///
@@ -89,7 +87,7 @@ fn check_size_limit(size: u64, max_size: u64) -> Result<(), AppError> {
     Ok(())
 }
 
-fn check_blob_size(size: u64) -> Result<(), AppError> {
+pub(super) fn check_blob_size(size: u64) -> Result<(), AppError> {
     check_size_limit(size, MAX_BLOB_SIZE as u64)
 }
 
@@ -159,7 +157,7 @@ fn record_unreachable(provider: EndpointId) {
 /// addresses. Tickets end up in signed posts and avatars that followers and discovery
 /// servers store and serve, and direct addresses would publish the device's LAN and public
 /// IP addresses. A fetcher reaches the device through the relay or iroh address lookup.
-fn ticket_addr(endpoint: &Endpoint) -> EndpointAddr {
+pub(super) fn ticket_addr(endpoint: &Endpoint) -> EndpointAddr {
     let addr = EndpointAddr::new(endpoint.id());
     match endpoint.addr().relay_urls().next() {
         Some(relay_url) => addr.with_relay_url(relay_url.clone()),
@@ -363,56 +361,6 @@ async fn download_to_memory(conn: Connection, hash: Hash, size: u64) -> CmdResul
     Ok(bytes.into())
 }
 
-#[tauri::command]
-pub async fn add_blob_bytes(
-    state: State<'_, Arc<AppState>>,
-    data: Vec<u8>,
-) -> CmdResult<serde_json::Value> {
-    add_blob_data(&state.blob_store(), &state.endpoint(), data).await
-}
-
-/// Add a blob from RGBA pixel data (used by clipboard paste).
-/// Returns `{ hash, ticket, filename, size, mime_type }`.
-#[tauri::command]
-pub async fn add_blob_from_rgba(
-    state: State<'_, Arc<AppState>>,
-    data: Vec<u8>,
-    width: u32,
-    height: u32,
-) -> CmdResult<serde_json::Value> {
-    // 4 bytes per pixel.
-    let expected_len = u64::from(width) * u64::from(height) * 4;
-    if width == 0 || height == 0 || data.len() as u64 != expected_len {
-        return Err("pixel data length does not match width x height x 4".into());
-    }
-    if data.len() > MAX_RGBA_BYTES {
-        return Err(format!(
-            "image too large: {} bytes of pixel data (max {MAX_RGBA_BYTES} bytes)",
-            data.len()
-        )
-        .into());
-    }
-
-    let png_data = tokio::task::spawn_blocking(move || {
-        let mut buf = Vec::new();
-        let mut encoder = png::Encoder::new(std::io::Cursor::new(&mut buf), width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .map_err(|e| AppError::Other(format!("png encode error: {e}")))?;
-        writer
-            .write_image_data(&data)
-            .map_err(|e| AppError::Other(format!("png write error: {e}")))?;
-        drop(writer);
-        Ok::<Vec<u8>, AppError>(buf)
-    })
-    .await
-    .map_err(|e| AppError::Other(format!("task join error: {e}")))??;
-
-    add_named_blob(&state, png_data, "clipboard.png", "image/png").await
-}
-
 /// Add a blob from a file that the user dropped onto the window.
 ///
 /// `path` must equal a path delivered by a native drag-and-drop event (see
@@ -470,10 +418,15 @@ pub async fn fetch_blob_bytes(
     ticket: String,
     max_size: Option<u64>,
 ) -> CmdResult<Response> {
-    let ticket = parse_ticket(&ticket)?;
+    Ok(Response::new(blob_bytes(&state, &ticket, max_size).await?))
+}
+
+/// The bytes of the blob named by `ticket`, as `fetch_blob_bytes` obtains them.
+async fn blob_bytes(state: &AppState, ticket: &str, max_size: Option<u64>) -> CmdResult<Vec<u8>> {
+    let ticket = parse_ticket(ticket)?;
     let hash = ticket.hash();
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
-        return Ok(Response::new(bytes));
+        return Ok(bytes);
     }
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
@@ -491,7 +444,7 @@ pub async fn fetch_blob_bytes(
     // Another request may have downloaded the blob while this one waited.
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
         conn.close(0u32.into(), b"done");
-        return Ok(Response::new(bytes));
+        return Ok(bytes);
     }
     let provider = ticket.addr().id;
     let downloaded = download_to_store(state.blobs().remote(), conn, hash, size, time_limit).await;
@@ -506,7 +459,44 @@ pub async fn fetch_blob_bytes(
         .await?
         .ok_or("blob is incomplete after download")?;
     log::info!("[blob] fetched {hash} from remote ({} bytes)", bytes.len());
-    Ok(Response::new(bytes))
+    Ok(bytes)
+}
+
+/// Write the blob named by `ticket` to `path`, which the save dialog returned: a file path
+/// in the scope of the fs plugin (the dialog adds the chosen path to it) or, on Android, a
+/// `content://` URI. The blob is obtained as `fetch_blob_bytes` does for a load the user
+/// requested. The bytes pass from here to the file without an IPC call.
+#[tauri::command]
+pub async fn save_blob_to_file(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    ticket: String,
+    path: String,
+) -> CmdResult<()> {
+    let target: FilePath = path
+        .parse::<SafeFilePath>()
+        .map_err(|e| AppError::Other(format!("invalid save location: {e}")))?
+        .into();
+    match &target {
+        FilePath::Path(path) if app.fs_scope().is_allowed(path) => {}
+        FilePath::Path(_) => {
+            return Err("the save location was not chosen in the save dialog".into());
+        }
+        FilePath::Url(url) if cfg!(target_os = "android") && url.scheme() == "content" => {}
+        FilePath::Url(_) => return Err("unsupported save location".into()),
+    }
+    let bytes = blob_bytes(&state, &ticket, None).await?;
+    tokio::task::spawn_blocking(move || {
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // No `sync_all`: an Android content provider can hand out a pipe, on which it
+        // fails after the bytes were written.
+        app.fs().open(target, options)?.write_all(&bytes)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("task join error: {e}")))?
+    .map_err(|e| AppError::Other(format!("failed to write the file: {e}")))?;
+    Ok(())
 }
 
 /// Download the blob named by `ticket` from the node in the ticket and return its bytes as

@@ -14,6 +14,7 @@ pub(crate) mod servers;
 mod social;
 mod stage;
 pub(crate) mod sync;
+mod uploads;
 
 pub use blobs::*;
 pub use calls::*;
@@ -31,6 +32,7 @@ pub use servers::*;
 pub use social::*;
 pub use stage::*;
 pub use sync::{get_sync_status, sync_all_peers, sync_posts};
+pub use uploads::*;
 
 use crate::error::CmdResult;
 use proscenium_types::{is_valid_id, is_valid_pubkey};

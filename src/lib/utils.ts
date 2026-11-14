@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { platform } from "@tauri-apps/plugin-os";
 import { SvelteMap } from "svelte/reactivity";
 import type { Profile, PendingAttachment } from "#lib/types.ts";
 
@@ -402,6 +403,51 @@ function revokePreviews(attachments: PendingAttachment[]) {
   }
 }
 
+/** Bytes per `append_blob_upload` call; equals `MAX_UPLOAD_CHUNK` in the backend. */
+const UPLOAD_CHUNK_BYTES = 1024 * 1024;
+
+/** Base64 of `bytes`, built in slices so no call takes one argument per byte. */
+function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/**
+ * Add `blob` to the blob store in chunks of `UPLOAD_CHUNK_BYTES`
+ * (`begin_blob_upload`, `append_blob_upload`, `finish_blob_upload`), so no IPC
+ * message holds the whole file and only one chunk is read into memory at a time.
+ * A chunk is a raw body on desktop; on Android, whose IPC encodes a byte array
+ * as a JSON array of numbers, it is base64. A failed upload is aborted.
+ */
+export async function uploadBlob(
+  blob: Blob,
+): Promise<{ hash: string; ticket: string }> {
+  const uploadId = await invoke<string>("begin_blob_upload", {
+    size: blob.size,
+  });
+  try {
+    const android = platform() === "android";
+    const headers = { "upload-id": uploadId };
+    for (let offset = 0; offset < blob.size; offset += UPLOAD_CHUNK_BYTES) {
+      const chunk = new Uint8Array(
+        await blob.slice(offset, offset + UPLOAD_CHUNK_BYTES).arrayBuffer(),
+      );
+      await invoke(
+        "append_blob_upload",
+        android ? { chunk: toBase64(chunk) } : chunk,
+        { headers },
+      );
+    }
+    return await invoke("finish_blob_upload", { uploadId });
+  } catch (e) {
+    await invoke("abort_blob_upload", { uploadId }).catch(() => {});
+    throw e;
+  }
+}
+
 /**
  * Add each file to the blob store. Throws before reading any file if one
  * exceeds `MAX_BLOB_SIZE`. If an upload fails, the preview URLs created for
@@ -422,11 +468,7 @@ export async function uploadFiles(
   let completed = false;
   try {
     for (const file of list) {
-      const data = new Uint8Array(await file.arrayBuffer());
-      const result: { hash: string; ticket: string } = await invoke(
-        "add_blob_bytes",
-        { data },
-      );
+      const result = await uploadBlob(file);
       results.push({
         hash: result.hash,
         ticket: result.ticket,

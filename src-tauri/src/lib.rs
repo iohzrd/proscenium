@@ -136,6 +136,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_os::init())
         .manage(DroppedPaths::default())
+        .manage(Uploads::default())
         .on_window_event(record_dropped_paths)
         .setup(|app| {
             #[cfg(not(mobile))]
@@ -172,11 +173,14 @@ pub fn run() {
             get_remote_follows,
             get_remote_followers,
             get_peer_node_ids,
-            add_blob_bytes,
+            abort_blob_upload,
             add_blob_from_path,
-            add_blob_from_rgba,
+            append_blob_upload,
+            begin_blob_upload,
             fetch_blob_bytes,
+            finish_blob_upload,
             refetch_blob_bytes,
+            save_blob_to_file,
             get_node_status,
             send_dm,
             get_conversations,
