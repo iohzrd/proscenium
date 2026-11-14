@@ -182,7 +182,9 @@ impl GossipService {
     /// posts then also stores the non-Public profile, and does not serve the posts as a
     /// mirror. At most `PUSH_CONCURRENCY` connections are open at
     /// once over all pending pushes, and at most `MAX_NODE_IDS_TRIED` NodeIds are tried
-    /// per recipient. A recipient that does not acknowledge receives the content at its next sync.
+    /// per recipient: all of them for a stage announcement or end, else until one
+    /// acknowledges (`push_to_recipient`). A recipient that does not acknowledge receives
+    /// the content at its next sync.
     pub(crate) async fn attempt_push(&self, msg: PushMessage) {
         let _ = self.start_push(msg).await;
     }
@@ -289,17 +291,22 @@ impl FeedNeighbors {
     }
 }
 
-/// Deliver `msg` to the first of the recipient's cached NodeIds that acknowledges it.
+/// Deliver `msg` to the first `MAX_NODE_IDS_TRIED` of the recipient's cached NodeIds, in
+/// list order, one after another. A message with a stage announcement or a stage end goes
+/// to each of them: it is live, and device sync does not copy it to the recipient's other
+/// devices. Any other message stops at the first NodeId that acknowledges it.
 async fn push_to_recipient(
     endpoint: &Endpoint,
     storage: &Storage,
     recipient: &str,
     msg: &PushMessage,
 ) {
+    let to_every_device = msg.stage.is_some() || msg.stage_ended.is_some();
     let node_ids = storage
         .get_peer_transport_node_ids(recipient)
         .await
         .unwrap_or_default();
+    let mut acknowledged = false;
     for node_id in node_ids.iter().take(MAX_NODE_IDS_TRIED) {
         let Ok(target) = node_id.parse() else {
             continue;
@@ -308,11 +315,16 @@ async fn push_to_recipient(
             .await
             .is_ok()
         {
-            return;
+            acknowledged = true;
+            if !to_every_device {
+                return;
+            }
         }
     }
-    log::debug!(
-        "[push] {} did not acknowledge, it receives the content at its next sync",
-        short_id(recipient)
-    );
+    if !acknowledged {
+        log::debug!(
+            "[push] {} did not acknowledge, it receives the content at its next sync",
+            short_id(recipient)
+        );
+    }
 }
