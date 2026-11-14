@@ -151,6 +151,36 @@ impl Storage {
         Ok(approved)
     }
 
+    /// Approve every pending, unexpired request of a user that `me` follows, and record
+    /// each such user as a follower of `me`, in one transaction. Returns their pubkeys.
+    ///
+    /// For a Private user, following a requester approves its request (`follow_user`).
+    /// Device sync merges follows and requests without that rule, so a request stored on
+    /// one device and a follow made on another are approved by this call afterwards.
+    pub async fn approve_pending_requests_of_followed(
+        &self,
+        me: &str,
+        now: u64,
+    ) -> Result<Vec<String>, AppError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let approved: Vec<String> = sqlx::query_scalar(
+            "UPDATE follow_requests SET status='approved', decided_at=?2
+             WHERE status='pending' AND expires_at > ?2
+               AND pubkey IN (SELECT followee FROM social_graph
+                   WHERE follower=?1 AND state='active' AND followed_at IS NOT NULL)
+             RETURNING pubkey",
+        )
+        .bind(me)
+        .bind(now as i64)
+        .fetch_all(&mut *tx)
+        .await?;
+        for pubkey in &approved {
+            Self::upsert_follower_tx(&mut tx, me, pubkey, now).await?;
+        }
+        tx.commit().await?;
+        Ok(approved)
+    }
+
     /// Store `pubkey` as an approved follower of `me` without a pending step, in one
     /// transaction. Used when a Private user receives a request from a user they follow.
     ///

@@ -2709,7 +2709,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.54"
+version = "0.2.55"
 dependencies = [
  "hex",
  "iroh",

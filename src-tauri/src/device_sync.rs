@@ -44,7 +44,7 @@ use proscenium_types::{
     BookmarkEntry, DeviceSyncFrame, DeviceSyncVector, DirectMessage, FollowEntry,
     FollowRequestEntry, LinkedDevicesAnnouncement, MAX_ANNOUNCEMENT_JSON_LEN,
     MAX_DEVICE_SYNC_DM_IDS, MAX_SYNC_TOMBSTONES, ModerationEntry, PEER_ALPN, PeerRequest,
-    StoredMessage, is_valid_id, is_valid_pubkey, now_millis, short_id,
+    StoredMessage, Visibility, is_valid_id, is_valid_pubkey, now_millis, short_id,
     verify_linked_devices_announcement,
 };
 use sha2::{Digest, Sha256};
@@ -600,7 +600,9 @@ impl DeviceSync<'_> {
 ///
 /// A user followed by a merged row is queued for a gossip subscription; for a user that
 /// was followed before a merged row removed the follow, the subscription is closed and
-/// the user's posts are deleted, as `commands::social::unfollow_user` does. Emits
+/// the user's posts are deleted, as `commands::social::unfollow_user` does. If follows or
+/// follow requests were merged, a Private user's pending requests of followed users are
+/// approved (`approve_followed_requests`). Emits
 /// `feed-updated` if interactions or posts were removed, `dm-synced`
 /// (`{ peer, messages }`) for each conversation with imported direct messages, and
 /// `linked-devices-changed` and broadcasts the device announcement if devices were added
@@ -612,6 +614,9 @@ async fn after_sync(
     app_handle: &AppHandle,
     stats: &DeviceSyncStats,
 ) {
+    if !stats.followed.is_empty() || stats.follow_requests_merged > 0 {
+        approve_followed_requests(storage, identity).await;
+    }
     // The reconnect loop subscribes once the user's NodeIds are cached.
     for pubkey in &stats.followed {
         let _ = gossip.reconnect_tx.send(pubkey.clone());
@@ -648,6 +653,35 @@ async fn after_sync(
             }
         }
         Err(e) => log::error!("[device-sync] failed to build device announcement: {e}"),
+    }
+}
+
+/// For a Private local user, approve the pending requests of followed users
+/// (`Storage::approve_pending_requests_of_followed`). The request can be stored on one
+/// device and the follow made on another; neither merge approves it.
+async fn approve_followed_requests(storage: &Storage, identity: &SharedIdentity) {
+    let me = identity.read().await.master_pubkey.clone();
+    match storage.get_visibility(&me).await {
+        Ok(Visibility::Private) => {}
+        Ok(_) => return,
+        Err(e) => {
+            log::error!("[device-sync] failed to read the own visibility: {e}");
+            return;
+        }
+    }
+    match storage
+        .approve_pending_requests_of_followed(&me, now_millis())
+        .await
+    {
+        Ok(approved) => {
+            for pubkey in approved {
+                log::info!(
+                    "[device-sync] approved the pending request of followed {}",
+                    short_id(&pubkey)
+                );
+            }
+        }
+        Err(e) => log::error!("[device-sync] failed to approve requests of followed users: {e}"),
     }
 }
 

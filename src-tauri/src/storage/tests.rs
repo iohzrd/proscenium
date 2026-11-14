@@ -2410,6 +2410,67 @@ async fn follow_request_without_allow_new_inserts_nothing_but_answers_existing_r
 }
 
 #[tokio::test]
+async fn pending_requests_of_followed_users_are_approved() {
+    let s = test_storage().await;
+    // Requests stored on this device; follows merged from another one.
+    for pubkey in ["ann", "bob", "cat"] {
+        s.record_follow_request(pubkey, 1, 1000, 90_000, true)
+            .await
+            .unwrap();
+    }
+    for pubkey in ["ann", "cat"] {
+        s.follow(
+            "me",
+            &SocialGraphEntry {
+                pubkey: pubkey.to_string(),
+                followed_at: 1,
+                first_seen: 0,
+                last_seen: 0,
+                is_online: false,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    s.unfollow("me", "cat").await.unwrap();
+
+    let approved = s
+        .approve_pending_requests_of_followed("me", 2000)
+        .await
+        .unwrap();
+    assert_eq!(approved, vec!["ann".to_string()]);
+    assert!(s.is_approved_follower("ann").await.unwrap());
+    assert!(s.is_follower("me", "ann").await.unwrap());
+    assert!(
+        !s.is_approved_follower("bob").await.unwrap(),
+        "not followed"
+    );
+    assert!(!s.is_approved_follower("cat").await.unwrap(), "unfollowed");
+    // An expired request is not approved.
+    s.record_follow_request("dan", 1, 1000, 1500, true)
+        .await
+        .unwrap();
+    s.follow(
+        "me",
+        &SocialGraphEntry {
+            pubkey: "dan".to_string(),
+            followed_at: 1,
+            first_seen: 0,
+            last_seen: 0,
+            is_online: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        s.approve_pending_requests_of_followed("me", 2000)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn follow_request_direct_approval_writes_request_and_follower() {
     let s = test_storage().await;
     assert_eq!(

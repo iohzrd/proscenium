@@ -106,20 +106,6 @@ pub async fn follow_user(
     };
     state.storage.follow(&my_id, &entry).await?;
 
-    // For a Private user, following is the condition of a mutual follow: a pending
-    // request of the followee is approved now. A Listed user decides on requests itself.
-    if state.storage.get_visibility(&my_id).await? == Visibility::Private
-        && state
-            .storage
-            .approve_follow_request(&my_id, &pubkey, now_millis())
-            .await?
-    {
-        log::info!(
-            "[follow] approved the pending request of {}",
-            short_id(&pubkey)
-        );
-    }
-
     let mut outcome = FollowOutcome::Followed;
     if identity
         .profile
@@ -155,6 +141,21 @@ pub async fn follow_user(
                 return Err(e);
             }
         }
+    }
+
+    // The follow stands. For a Private user, following is the condition of a mutual
+    // follow: a pending request of the followee is approved now. A Listed user decides
+    // on requests itself.
+    if state.storage.get_visibility(&my_id).await? == Visibility::Private
+        && state
+            .storage
+            .approve_follow_request(&my_id, &pubkey, now_millis())
+            .await?
+    {
+        log::info!(
+            "[follow] approved the pending request of {}",
+            short_id(&pubkey)
+        );
     }
 
     state.gossip().follow_user(pubkey.clone(), node_ids).await?;
