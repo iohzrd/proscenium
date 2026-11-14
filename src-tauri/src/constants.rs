@@ -163,6 +163,9 @@ pub const GOSSIP_MAX_RECV_BUFFER: usize = 1024 * 1024;
 /// `CONNECTION_RECEIVE_WINDOW` of unread data.
 pub const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 128;
 pub const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
+/// Minimum time between two syncs that a followed user's subscription queues because it
+/// discarded messages over a sender's budget (`proscenium_types::GossipSenderBudgets`).
+pub const GOSSIP_DISCARD_SYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Interval at which a subscription without neighbors calls `join_peers` again.
 pub const GOSSIP_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 /// First and largest delay before a failed subscription is attempted again.

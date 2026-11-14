@@ -1,17 +1,29 @@
-use crate::constants::GOSSIP_REJOIN_INTERVAL;
+use crate::constants::{GOSSIP_DISCARD_SYNC_INTERVAL, GOSSIP_REJOIN_INTERVAL};
 use crate::error::AppError;
 use crate::state::{AppState, SyncCommand};
 use crate::storage::Storage;
 use futures_lite::StreamExt;
 use iroh::EndpointId;
 use iroh_gossip::api::{Event, GossipSender};
-use proscenium_types::{short_id, user_feed_topic};
+use proscenium_types::{GossipSenderBudgets, short_id, user_feed_topic};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::{AppHandle, Manager};
 
 /// Parse cached transport NodeId strings; entries that do not parse are skipped.
 fn parse_node_ids(node_ids: &[String]) -> Vec<EndpointId> {
     node_ids.iter().filter_map(|id| id.parse().ok()).collect()
+}
+
+/// NodeIds of the cached device list of `pubkey`: their messages on the user's topic have
+/// a budget of their own in `GossipSenderBudgets`.
+async fn author_nodes(storage: &Storage, pubkey: &str) -> HashSet<EndpointId> {
+    let node_ids = storage
+        .get_peer_transport_node_ids(pubkey)
+        .await
+        .unwrap_or_default();
+    parse_node_ids(&node_ids).into_iter().collect()
 }
 
 /// Queue a `SyncCommand::SyncPeer` for `pubkey` on the peer sync task. Does nothing if
@@ -104,6 +116,12 @@ impl super::GossipService {
 
         let handle = tokio::spawn(async move {
             log::info!("[gossip-rx] listener started for {}", short_id(&pk));
+            // Any NodeId on the topic can send; each sender's messages beyond its budget
+            // are discarded before they are parsed and verified.
+            let mut budgets =
+                GossipSenderBudgets::new(author_nodes(&storage, &pk).await, Instant::now());
+            // When the last sync was queued for discarded messages.
+            let mut discard_sync_at: Option<Instant> = None;
             let mut rejoin_timer = tokio::time::interval(GOSSIP_REJOIN_INTERVAL);
             rejoin_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // The first tick of an interval completes immediately; the subscribe call
@@ -113,6 +131,22 @@ impl super::GossipService {
                 tokio::select! {
                     event = receiver.try_next() => match event {
                         Ok(Some(Event::Received(msg))) => {
+                            let now = Instant::now();
+                            if !budgets.take(msg.delivered_from, now) {
+                                // The sync fetches the author's content that was discarded.
+                                if discard_sync_at.is_none_or(|at| {
+                                    now.duration_since(at) >= GOSSIP_DISCARD_SYNC_INTERVAL
+                                }) {
+                                    discard_sync_at = Some(now);
+                                    log::warn!(
+                                        "[gossip-rx] discarding messages of {} on the topic of {}: message rate limit of the sender reached; queueing a sync",
+                                        msg.delivered_from.fmt_short(),
+                                        short_id(&pk)
+                                    );
+                                    queue_sync(&app_handle, &pk);
+                                }
+                                continue;
+                            }
                             Self::handle_follow_message(
                                 &storage,
                                 &pk,
@@ -148,6 +182,7 @@ impl super::GossipService {
                             );
                             feed_neighbors.set(&pk, receiver.neighbors().collect());
                             queue_sync(&app_handle, &pk);
+                            budgets.set_author_nodes(author_nodes(&storage, &pk).await);
                             rejoin(&storage, &sender, &pk).await;
                         }
                         // Events a later iroh-gossip release adds.
@@ -163,6 +198,7 @@ impl super::GossipService {
                     },
                     _ = rejoin_timer.tick() => {
                         if !receiver.is_joined() {
+                            budgets.set_author_nodes(author_nodes(&storage, &pk).await);
                             rejoin(&storage, &sender, &pk).await;
                         }
                     }
