@@ -352,6 +352,8 @@ async fn sync_follows_the_protocol_against_a_peer() {
         harness.content.lock().unwrap().modes.last() == Some(&SyncMode::UpToDate)
     })
     .await;
+    // A completed sync is recorded, so later syncs of the user take the larger pool.
+    assert!(harness.storage.get_last_synced_at(&pk).await.unwrap() > 0);
 
     // The peer deletes p2 and publishes p4. The digests differ, so the peer asks for the
     // id list, then sends the tombstone and the one post the server lacks.

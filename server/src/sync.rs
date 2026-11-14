@@ -5,7 +5,7 @@ use crate::storage::{ChangeError, RegistrationChange};
 use iroh::endpoint::{Connection, RecvStream};
 use proscenium_types::{
     Interaction, MAX_SYNC_IDS, MAX_SYNC_TOMBSTONES, PEER_ALPN, PeerRequest, Post, PostTombstone,
-    SyncFrame, SyncMode, SyncRequest, SyncSummary, is_valid_id, post_ids_digest,
+    SyncFrame, SyncMode, SyncRequest, SyncSummary, is_valid_id, now_millis, post_ids_digest,
     sends_only_newer_interactions, short_id, validate_profile, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
     verify_profile_signature,
@@ -13,7 +13,7 @@ use proscenium_types::{
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 /// Time allowed to connect to one NodeId.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -40,6 +40,77 @@ const MAX_EMPTY_FRAMES: usize = 16;
 /// Items checked between two yields to the scheduler. One signature verification takes
 /// tens of microseconds and one frame can hold tens of thousands of items.
 const VERIFY_CHUNK: usize = 64;
+
+/// Wait before the next sync of a user after its first failed sync; it doubles with each
+/// further failure, up to `SYNC_RETRY_MAX`. Zero in tests, which sync again at once.
+#[cfg(not(test))]
+const SYNC_RETRY_BASE: Duration = Duration::from_secs(5 * 60);
+#[cfg(test)]
+const SYNC_RETRY_BASE: Duration = Duration::ZERO;
+const SYNC_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+/// Time after a sync that exceeded `SYNC_TOTAL_TIMEOUT` during which the user's syncs
+/// wait for the smaller pool of permits, whatever their outcome. A responder that sends
+/// one item per `FRAME_TIMEOUT` holds a permit for `SYNC_TOTAL_TIMEOUT`; this limits how
+/// often it can do that with a permit of the users whose syncs complete.
+const SLOW_SYNC_DEMOTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How a sync of one user ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncOutcome {
+    Completed,
+    Failed,
+    /// The sync exceeded `SYNC_TOTAL_TIMEOUT`.
+    TimedOut,
+}
+
+/// Outcomes of the recent syncs of one user, kept in memory.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SyncHealth {
+    /// Syncs that failed or timed out since the last completed one.
+    failures: u32,
+    /// Earliest start of the next sync after a failure.
+    retry_at: Option<Instant>,
+    /// When a sync last exceeded `SYNC_TOTAL_TIMEOUT`.
+    timed_out_at: Option<Instant>,
+}
+
+impl SyncHealth {
+    /// Apply the outcome of a sync that ended at `now`. A failure delays the next sync
+    /// by `retry_base` doubled per earlier failure, at most `SYNC_RETRY_MAX`.
+    pub(crate) fn record(&mut self, outcome: SyncOutcome, now: Instant, retry_base: Duration) {
+        if outcome == SyncOutcome::Completed {
+            self.failures = 0;
+            self.retry_at = None;
+            return;
+        }
+        self.failures = self.failures.saturating_add(1);
+        let doublings = self.failures.saturating_sub(1).min(16);
+        let delay = retry_base
+            .saturating_mul(1 << doublings)
+            .min(SYNC_RETRY_MAX);
+        self.retry_at = Some(now + delay);
+        if outcome == SyncOutcome::TimedOut {
+            self.timed_out_at = Some(now);
+        }
+    }
+
+    /// Whether a sync may start at `now`.
+    pub(crate) fn is_due(&self, now: Instant) -> bool {
+        self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    /// Whether the user's syncs take a permit of `IngestionManager::sync_permits`: a sync
+    /// completed during the registration (`last_synced_at` > 0), none failed since, and
+    /// none exceeded `SYNC_TOTAL_TIMEOUT` within `SLOW_SYNC_DEMOTION`. Otherwise they take
+    /// one of `IngestionManager::unproven_sync_permits`.
+    pub(crate) fn is_proven(&self, last_synced_at: i64, now: Instant) -> bool {
+        last_synced_at > 0
+            && self.failures == 0
+            && self
+                .timed_out_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= SLOW_SYNC_DEMOTION)
+    }
+}
 
 /// Keep the items for which `is_valid` returns true. Yields to the scheduler after every
 /// `VERIFY_CHUNK` items, so the checks of one frame do not occupy a worker thread
@@ -119,20 +190,77 @@ async fn read_frame(recv: &mut RecvStream) -> anyhow::Result<Option<Vec<u8>>> {
 }
 
 impl IngestionManager {
+    /// The recorded `SyncHealth` of `pubkey`; the default if none is recorded.
+    fn sync_health(&self, pubkey: &str) -> SyncHealth {
+        self.sync_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pubkey)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn record_sync_outcome(&self, pubkey: &str, outcome: SyncOutcome) {
+        self.sync_health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(pubkey.to_string())
+            .or_default()
+            .record(outcome, Instant::now(), SYNC_RETRY_BASE);
+    }
+
     /// Sync `pubkey` from one of its devices and log the result. Returns without
-    /// syncing if a sync of `pubkey` is already queued or running. Waits for one of the
-    /// `sync.max_concurrent_syncs` permits.
+    /// syncing if a sync of `pubkey` is already queued or running, or if its last sync
+    /// failed and the retry delay of `SyncHealth::record` has not passed. Waits for a
+    /// permit of the pool that `SyncHealth::is_proven` selects, then records the outcome.
     pub(crate) async fn sync_user(self: &Arc<Self>, pubkey: &str) {
         let Some(_slot) = SyncSlot::acquire(&self.syncing, pubkey) else {
             return;
         };
-        // The semaphore is never closed.
-        let Ok(_permit) = self.sync_permits.acquire().await else {
+        let health = self.sync_health(pubkey);
+        if !health.is_due(Instant::now()) {
+            return;
+        }
+        let last_synced_at = self
+            .storage
+            .get_last_synced_at(pubkey)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(
+                    "[sync] failed to read the last sync of {}: {e}",
+                    short_id(pubkey)
+                );
+                0
+            });
+        let permits = if health.is_proven(last_synced_at, Instant::now()) {
+            &self.sync_permits
+        } else {
+            &self.unproven_sync_permits
+        };
+        // The semaphores are never closed.
+        let Ok(_permit) = permits.acquire().await else {
             return;
         };
 
         let mut stats = SyncStats::default();
         let result = timeout(SYNC_TOTAL_TIMEOUT, self.sync_from_peer(pubkey, &mut stats)).await;
+        let outcome = match &result {
+            Ok(Ok(())) => SyncOutcome::Completed,
+            Ok(Err(_)) => SyncOutcome::Failed,
+            Err(_) => SyncOutcome::TimedOut,
+        };
+        self.record_sync_outcome(pubkey, outcome);
+        if outcome == SyncOutcome::Completed
+            && let Err(e) = self
+                .storage
+                .record_sync_completed(pubkey, i64::try_from(now_millis()).unwrap_or(i64::MAX))
+                .await
+        {
+            tracing::error!(
+                "[sync] failed to record the sync of {}: {e}",
+                short_id(pubkey)
+            );
+        }
         if stats.posts > 0
             || stats.interactions > 0
             || stats.deleted_posts > 0
@@ -459,5 +587,55 @@ impl IngestionManager {
         stats.interactions += count.stored;
         stats.rejected += count.over_limit;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: Duration = Duration::from_secs(300);
+
+    #[test]
+    fn failures_delay_the_next_sync_and_a_completed_sync_clears_the_delay() {
+        let t0 = Instant::now();
+        let mut health = SyncHealth::default();
+        assert!(health.is_due(t0));
+        assert!(!health.is_proven(0, t0), "never synced");
+        assert!(health.is_proven(1, t0));
+
+        health.record(SyncOutcome::Failed, t0, BASE);
+        assert!(!health.is_due(t0 + BASE - Duration::from_secs(1)));
+        assert!(health.is_due(t0 + BASE));
+        assert!(
+            !health.is_proven(1, t0 + BASE),
+            "failed since the last completed sync"
+        );
+        health.record(SyncOutcome::Failed, t0 + BASE, BASE);
+        assert!(!health.is_due(t0 + BASE * 3 - Duration::from_secs(1)));
+        assert!(health.is_due(t0 + BASE * 3), "the delay doubled");
+        for _ in 0..40 {
+            health.record(SyncOutcome::Failed, t0, BASE);
+        }
+        assert!(
+            health.is_due(t0 + SYNC_RETRY_MAX),
+            "the delay is at most the maximum"
+        );
+
+        health.record(SyncOutcome::Completed, t0, BASE);
+        assert!(health.is_due(t0));
+        assert!(health.is_proven(1, t0));
+    }
+
+    #[test]
+    fn a_timed_out_sync_demotes_the_user_after_later_completed_syncs() {
+        let t0 = Instant::now();
+        let mut health = SyncHealth::default();
+        health.record(SyncOutcome::TimedOut, t0, BASE);
+        health.record(SyncOutcome::Completed, t0 + BASE, BASE);
+        assert!(health.is_due(t0 + BASE));
+        assert!(!health.is_proven(1, t0 + BASE));
+        assert!(!health.is_proven(1, t0 + SLOW_SYNC_DEMOTION - Duration::from_secs(1)));
+        assert!(health.is_proven(1, t0 + SLOW_SYNC_DEMOTION));
     }
 }

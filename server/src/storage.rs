@@ -322,6 +322,10 @@ impl Storage {
             "004_signature_tiebreak",
             include_str!("../migrations/004_signature_tiebreak.sql"),
         ),
+        (
+            "005_last_synced_at",
+            include_str!("../migrations/005_last_synced_at.sql"),
+        ),
     ];
 
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
@@ -450,7 +454,7 @@ impl Storage {
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
                  bio = NULL, avatar_hash = NULL, profile_signature = NULL,
                  transport_node_id = NULL, device_node_ids_json = NULL,
-                 announcement_version = 0, announcement_signature = NULL
+                 announcement_version = 0, announcement_signature = NULL, last_synced_at = 0
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -765,6 +769,29 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// `last_synced_at` of the active registration of `pubkey`; 0 if it has none.
+    pub async fn get_last_synced_at(&self, pubkey: &str) -> anyhow::Result<i64> {
+        let at: Option<i64> = sqlx::query_scalar(
+            "SELECT last_synced_at FROM registrations WHERE pubkey = ?1 AND is_active = 1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(at.unwrap_or(0))
+    }
+
+    /// Record that a sync with a device of `pubkey` completed at `now` (ms).
+    pub async fn record_sync_completed(&self, pubkey: &str, now: i64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE registrations SET last_synced_at = ?2 WHERE pubkey = ?1 AND is_active = 1",
+        )
+        .bind(pubkey)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn get_active_public_pubkeys(&self) -> anyhow::Result<Vec<String>> {

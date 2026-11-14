@@ -4,6 +4,7 @@ use crate::storage::{
     AnnouncementOutcome, ChangeError, ChangeOutcome, RegistrationChange, RegistrationPolicy,
     Storage,
 };
+use crate::sync::SyncHealth;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::Gossip;
@@ -69,9 +70,17 @@ pub struct IngestionManager {
     policy: RegistrationPolicy,
     /// One gossip task per master pubkey with an active public registration.
     subscriptions: Mutex<HashMap<String, Subscription>>,
+    /// Permits of syncs of users for which `SyncHealth::is_proven` holds:
+    /// `sync.max_concurrent_syncs`.
     pub(crate) sync_permits: Semaphore,
+    /// Permits of syncs of the other users: a quarter of `sync.max_concurrent_syncs`, at
+    /// least one. Registrations whose devices do not answer, or answer slowly, cost only
+    /// these.
+    pub(crate) unproven_sync_permits: Semaphore,
     /// Master pubkeys with a sync queued or running.
     pub(crate) syncing: std::sync::Mutex<HashSet<String>>,
+    /// Outcomes of recent syncs per master pubkey with an active public registration.
+    pub(crate) sync_health: std::sync::Mutex<HashMap<String, SyncHealth>>,
 }
 
 /// Messages one sender may deliver on a topic at once, and on average per second, before
@@ -245,7 +254,9 @@ impl IngestionManager {
             },
             subscriptions: Mutex::new(HashMap::new()),
             sync_permits: Semaphore::new(config.sync.max_concurrent_syncs),
+            unproven_sync_permits: Semaphore::new((config.sync.max_concurrent_syncs / 4).max(1)),
             syncing: std::sync::Mutex::new(HashSet::new()),
+            sync_health: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -684,7 +695,9 @@ impl IngestionManager {
 
     /// Every `interval_minutes`: make the gossip task of every active public user and
     /// of every user with a registered task match storage, then sync every active
-    /// public user. At most `sync.max_concurrent_syncs` syncs run at the same time.
+    /// public user whose retry delay has passed (`sync_user`). At most
+    /// `sync.max_concurrent_syncs` syncs of proven users and a quarter of that of other
+    /// users run at the same time.
     pub fn start_periodic_sync(self: &Arc<Self>, interval_minutes: u64) {
         let manager = self.clone();
         tokio::spawn(async move {
@@ -702,6 +715,11 @@ impl IngestionManager {
                 // A task whose user is no longer public remains only if an earlier
                 // storage read in `reconcile_subscription` failed.
                 let public: HashSet<&str> = pubkeys.iter().map(String::as_str).collect();
+                manager
+                    .sync_health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|pubkey, _| public.contains(pubkey.as_str()));
                 let not_public: Vec<String> = manager
                     .subscriptions
                     .lock()
