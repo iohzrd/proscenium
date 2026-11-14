@@ -118,33 +118,40 @@ impl Storage {
         Ok(())
     }
 
-    /// Record that the server `url` accepted the own profile with `updated_at`.
+    /// Record that the server `url` accepted the own profile with `updated_at` at `now`.
     pub async fn mark_server_profile_synced(
         &self,
         url: &str,
         updated_at: u64,
+        now: u64,
     ) -> Result<(), AppError> {
         sqlx::query(
-            "UPDATE servers SET profile_synced_at = MAX(profile_synced_at, ?2) WHERE url = ?1",
+            "UPDATE servers SET profile_synced_at = MAX(profile_synced_at, ?2),
+                 profile_sent_at = ?3
+             WHERE url = ?1",
         )
         .bind(url)
         .bind(i64::try_from(updated_at).unwrap_or(i64::MAX))
+        .bind(i64::try_from(now).unwrap_or(i64::MAX))
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
     /// URLs of the servers the local user is registered with that have not accepted the
-    /// own profile with `updated_at`.
-    pub async fn get_servers_without_profile(
+    /// own profile with `updated_at`, or have accepted none since `sent_before`.
+    pub async fn get_servers_to_send_profile(
         &self,
         updated_at: u64,
+        sent_before: u64,
     ) -> Result<Vec<String>, AppError> {
         let urls = sqlx::query_scalar(
             "SELECT url FROM servers
-             WHERE registered_at IS NOT NULL AND profile_synced_at < ?1 ORDER BY url",
+             WHERE registered_at IS NOT NULL AND (profile_synced_at < ?1 OR profile_sent_at < ?2)
+             ORDER BY url",
         )
         .bind(i64::try_from(updated_at).unwrap_or(i64::MAX))
+        .bind(i64::try_from(sent_before).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
         Ok(urls)

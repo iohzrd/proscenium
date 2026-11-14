@@ -683,6 +683,74 @@ async fn announcement_device_list_is_replaced_by_higher_version_or_greater_signa
 // --- Content ---
 
 #[tokio::test]
+async fn inactive_registrations_expire_and_profile_updates_are_answered_expired() {
+    let storage = storage().await;
+    let public = TestUser::new(1);
+    let listed = TestUser::new(2);
+    let unregistered = TestUser::new(3);
+    register(&storage, &public, 1_000, Visibility::Public)
+        .await
+        .unwrap();
+    register(&storage, &listed, 1_000, Visibility::Listed)
+        .await
+        .unwrap();
+    register(&storage, &unregistered, 1_000, Visibility::Public)
+        .await
+        .unwrap();
+    unregister(&storage, &unregistered, 1_001).await.unwrap();
+    storage
+        .insert_posts(&public.master_pubkey, &[public.post("hello", 100)], 100)
+        .await
+        .unwrap();
+    let now = i64::try_from(now_millis()).unwrap();
+
+    // Active after the cutoff: nothing expires.
+    assert!(
+        storage
+            .expire_inactive_registrations(now - 60_000, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut expired = storage
+        .expire_inactive_registrations(now + 1, now)
+        .await
+        .unwrap();
+    expired.sort();
+    let mut expected = vec![public.master_pubkey.clone(), listed.master_pubkey.clone()];
+    expected.sort();
+    assert_eq!(expired, expected, "the unregistered user was not active");
+    assert_eq!(post_count(&storage, &public.master_pubkey).await, 0);
+
+    let profile = public.profile("name", Visibility::Public, 5);
+    assert_eq!(
+        rejection(put_profile(&storage, &public, 1_002, profile.clone()).await),
+        Rejection::Expired
+    );
+    let other = unregistered.profile("name", Visibility::Public, 5);
+    assert_eq!(
+        rejection(put_profile(&storage, &unregistered, 1_002, other).await),
+        Rejection::NotRegistered
+    );
+
+    // A new registration ends the expiry.
+    let outcome = register(&storage, &public, 1_003, Visibility::Public)
+        .await
+        .unwrap();
+    assert!(!outcome.was_active);
+    put_profile(&storage, &public, 1_004, profile)
+        .await
+        .unwrap();
+    assert!(
+        storage
+            .expire_inactive_registrations(now - 60_000, now)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn posts_are_stored_only_for_active_public_authors() {
     let storage = storage().await;
     let public = TestUser::new(1);

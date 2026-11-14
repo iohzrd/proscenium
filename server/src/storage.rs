@@ -149,6 +149,8 @@ pub enum Rejection {
     Replayed,
     /// No active registration exists for the master pubkey.
     NotRegistered,
+    /// The registration was deactivated for inactivity (`expire_inactive_registrations`).
+    Expired,
     RegistrationClosed,
     UserLimitReached,
     /// Private visibility was requested.
@@ -160,6 +162,7 @@ impl std::fmt::Display for Rejection {
         f.write_str(match self {
             Self::Replayed => "timestamp is not newer than the last accepted request",
             Self::NotRegistered => "user not registered",
+            Self::Expired => "registration expired after inactivity; register again",
             Self::RegistrationClosed => "registration is closed",
             Self::UserLimitReached => "registration limit reached",
             Self::PrivateVisibility => "private users cannot register with servers",
@@ -245,6 +248,7 @@ struct RegistrationRow {
     profile_signature: Option<String>,
     announcement_version: i64,
     announcement_signature: Option<String>,
+    expired: bool,
 }
 
 /// Join that restricts `posts p` to authors with an active public registration.
@@ -325,6 +329,10 @@ impl Storage {
         (
             "005_last_synced_at",
             include_str!("../migrations/005_last_synced_at.sql"),
+        ),
+        (
+            "006_registration_expiry",
+            include_str!("../migrations/006_registration_expiry.sql"),
         ),
     ];
 
@@ -409,7 +417,7 @@ impl Storage {
         sqlx::query_as::<_, RegistrationRow>(
             "SELECT registered_at, is_active, requested_visibility, profile_visibility, visibility,
                     last_request_timestamp, profile_updated_at, profile_signature,
-                    announcement_version, announcement_signature
+                    announcement_version, announcement_signature, expired
              FROM registrations WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -454,7 +462,8 @@ impl Storage {
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
                  bio = NULL, avatar_hash = NULL, profile_signature = NULL,
                  transport_node_id = NULL, device_node_ids_json = NULL,
-                 announcement_version = 0, announcement_signature = NULL, last_synced_at = 0
+                 announcement_version = 0, announcement_signature = NULL, last_synced_at = 0,
+                 expired = 0
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -474,6 +483,36 @@ impl Storage {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Deactivate every active registration whose `last_active_at` (last accepted signed
+    /// request or completed sync) is before `before_ms`, as an unregistration does, and mark
+    /// it expired, in one transaction. Returns their master pubkeys.
+    pub async fn expire_inactive_registrations(
+        &self,
+        before_ms: i64,
+        now: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut tx = self.begin_write().await?;
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT pubkey, visibility FROM registrations
+             WHERE is_active = 1 AND last_active_at < ?1",
+        )
+        .bind(before_ms)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (pubkey, visibility) in &rows {
+            if visibility == "public" {
+                Self::delete_content(&mut tx, pubkey).await?;
+            }
+            Self::deactivate(&mut tx, pubkey, now).await?;
+            sqlx::query("UPDATE registrations SET expired = 1 WHERE pubkey = ?1")
+                .bind(pubkey)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(rows.into_iter().map(|(pubkey, _)| pubkey).collect())
     }
 
     /// Apply one registration, unregistration or profile change in one transaction.
@@ -529,8 +568,9 @@ impl Storage {
                 sqlx::query(
                     "INSERT INTO registrations
                         (pubkey, registered_at, last_seen, is_active, requested_visibility,
-                         visibility, transport_node_id, last_request_timestamp)
-                     VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
+                         visibility, transport_node_id, last_request_timestamp, last_active_at,
+                         expired)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?3, 0)
                      ON CONFLICT(pubkey) DO UPDATE SET
                         registered_at = excluded.registered_at,
                         last_seen = excluded.last_seen,
@@ -538,7 +578,9 @@ impl Storage {
                         requested_visibility = excluded.requested_visibility,
                         visibility = excluded.visibility,
                         transport_node_id = excluded.transport_node_id,
-                        last_request_timestamp = excluded.last_request_timestamp",
+                        last_request_timestamp = excluded.last_request_timestamp,
+                        last_active_at = excluded.last_active_at,
+                        expired = 0",
                 )
                 .bind(pubkey)
                 .bind(registered_at)
@@ -578,14 +620,18 @@ impl Storage {
                 }
             }
             RegistrationChange::UpdateProfile(req) => {
-                let row = row
-                    .filter(|r| r.is_active)
-                    .ok_or(Rejection::NotRegistered)?;
+                let row = match row {
+                    Some(row) if row.is_active => row,
+                    Some(row) if row.expired => return Err(Rejection::Expired.into()),
+                    _ => return Err(Rejection::NotRegistered.into()),
+                };
                 sqlx::query(
-                    "UPDATE registrations SET last_request_timestamp = ?2 WHERE pubkey = ?1",
+                    "UPDATE registrations SET last_request_timestamp = ?2, last_active_at = ?3
+                     WHERE pubkey = ?1",
                 )
                 .bind(pubkey)
                 .bind(to_i64(req.timestamp))
+                .bind(now)
                 .execute(&mut *tx)
                 .await?;
                 Self::apply_profile(&mut tx, pubkey, &row, &req.profile, now).await?
@@ -782,10 +828,12 @@ impl Storage {
         Ok(at.unwrap_or(0))
     }
 
-    /// Record that a sync with a device of `pubkey` completed at `now` (ms).
+    /// Record that a sync with a device of `pubkey` completed at `now` (ms). It also counts
+    /// as activity for `expire_inactive_registrations`.
     pub async fn record_sync_completed(&self, pubkey: &str, now: i64) -> anyhow::Result<()> {
         sqlx::query(
-            "UPDATE registrations SET last_synced_at = ?2 WHERE pubkey = ?1 AND is_active = 1",
+            "UPDATE registrations SET last_synced_at = ?2, last_active_at = ?2
+             WHERE pubkey = ?1 AND is_active = 1",
         )
         .bind(pubkey)
         .bind(now)

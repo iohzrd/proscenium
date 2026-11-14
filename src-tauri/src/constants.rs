@@ -114,6 +114,10 @@ pub const DEVICE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(15);
 pub const DEVICE_SYNC_INTERVAL: Duration = Duration::from_secs(300); // 5 min
 pub const SERVER_PROFILE_SYNC_INITIAL_DELAY: Duration = Duration::from_secs(60);
 pub const SERVER_PROFILE_SYNC_INTERVAL: Duration = Duration::from_secs(600);
+/// A registered server that accepted no profile within this time receives it again. A
+/// server deactivates a registration without a signed request or completed sync for its
+/// `registration_expiry_days` (30 by default).
+pub const SERVER_PROFILE_REFRESH: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Cached device lists of unrelated users older than this are deleted at startup.
 pub const PEER_ANNOUNCEMENT_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 /// Time the content of a user the local user does not follow, synced by a profile view,

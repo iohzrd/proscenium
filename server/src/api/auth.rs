@@ -115,6 +115,8 @@ fn change_error(e: ChangeError) -> ApiError {
             let status = match rejection {
                 Rejection::Replayed => StatusCode::CONFLICT,
                 Rejection::NotRegistered => StatusCode::NOT_FOUND,
+                // The client registers again.
+                Rejection::Expired => StatusCode::GONE,
                 Rejection::RegistrationClosed
                 | Rejection::UserLimitReached
                 | Rejection::PrivateVisibility => StatusCode::FORBIDDEN,
@@ -406,6 +408,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         let (status, _) = change_error(ChangeError::Rejected(Rejection::NotRegistered));
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = change_error(ChangeError::Rejected(Rejection::Expired));
+        assert_eq!(status, StatusCode::GONE);
         let (status, _) = change_error(ChangeError::Rejected(Rejection::UserLimitReached));
         assert_eq!(status, StatusCode::FORBIDDEN);
     }

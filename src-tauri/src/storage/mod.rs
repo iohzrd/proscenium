@@ -193,6 +193,10 @@ impl Storage {
             "025_profile_public_confirmed",
             include_str!("../../migrations/025_profile_public_confirmed.sql"),
         ),
+        (
+            "026_server_profile_sent",
+            include_str!("../../migrations/026_server_profile_sent.sql"),
+        ),
     ];
 
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, AppError> {

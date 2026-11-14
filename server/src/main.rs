@@ -69,20 +69,43 @@ async fn shutdown_signal() {
     }
 }
 
-/// Delete posts and interactions older than `retention_days` (if not 0) and inactive
+/// Delete posts and interactions older than `retention_days` (if not 0), deactivate
+/// registrations inactive for `registration_expiry_days` (if not 0), and delete inactive
 /// registration rows older than `INACTIVE_REGISTRATION_TTL`.
-async fn run_maintenance(storage: &storage::Storage, retention_days: u64) {
+async fn run_maintenance(
+    storage: &storage::Storage,
+    retention_days: u64,
+    registration_expiry_days: u64,
+) {
     let now = proscenium_types::now_millis();
     let cutoff = |age_ms: u64| i64::try_from(now.saturating_sub(age_ms)).unwrap_or(i64::MAX);
+    let days_ms = |days: u64| days.saturating_mul(24 * 60 * 60 * 1000);
 
     if retention_days > 0 {
-        let retention_ms = retention_days.saturating_mul(24 * 60 * 60 * 1000);
-        match storage.prune_older_than(cutoff(retention_ms)).await {
+        match storage
+            .prune_older_than(cutoff(days_ms(retention_days)))
+            .await
+        {
             Ok((0, 0)) => {}
             Ok((posts, interactions)) => tracing::info!(
                 "pruned {posts} posts and {interactions} interactions older than {retention_days} days"
             ),
             Err(e) => tracing::error!("retention pruning failed: {e}"),
+        }
+    }
+
+    if registration_expiry_days > 0 {
+        let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
+        match storage
+            .expire_inactive_registrations(cutoff(days_ms(registration_expiry_days)), now_ms)
+            .await
+        {
+            Ok(expired) if expired.is_empty() => {}
+            Ok(expired) => tracing::info!(
+                "deactivated {} registrations without activity for {registration_expiry_days} days",
+                expired.len()
+            ),
+            Err(e) => tracing::error!("expiry of inactive registrations failed: {e}"),
         }
     }
 
@@ -146,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("trending computation task started");
 
     let retention_days = config.limits.retention_days;
+    let registration_expiry_days = config.limits.registration_expiry_days;
     if retention_days > 0 {
         tracing::info!("retention: {retention_days} days (pruning hourly)");
     } else {
@@ -155,7 +179,12 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(MAINTENANCE_INTERVAL).await;
-            run_maintenance(&maintenance_storage, retention_days).await;
+            run_maintenance(
+                &maintenance_storage,
+                retention_days,
+                registration_expiry_days,
+            )
+            .await;
         }
     });
 

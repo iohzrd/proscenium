@@ -1,9 +1,12 @@
-use crate::constants::{SERVER_PROFILE_SYNC_INITIAL_DELAY, SERVER_PROFILE_SYNC_INTERVAL};
+use crate::constants::{
+    SERVER_PROFILE_REFRESH, SERVER_PROFILE_SYNC_INITIAL_DELAY, SERVER_PROFILE_SYNC_INTERVAL,
+};
 use crate::state::AppState;
 use std::sync::Arc;
 
 /// Send the own profile again to every registered server that has not accepted its
-/// current version, for example after a failed send during a visibility change.
+/// current version, for example after a failed send during a visibility change, or that
+/// accepted none within `SERVER_PROFILE_REFRESH`, so the server keeps the registration.
 pub fn spawn(state: Arc<AppState>) {
     let token = state.shutdown().child_token();
     tokio::spawn(async move {
@@ -33,7 +36,13 @@ async fn sync_unsynced_servers(state: &AppState) {
             return;
         }
     };
-    let urls = match state.storage.get_servers_without_profile(updated_at).await {
+    let refresh_ms = u64::try_from(SERVER_PROFILE_REFRESH.as_millis()).unwrap_or(u64::MAX);
+    let sent_before = proscenium_types::now_millis().saturating_sub(refresh_ms);
+    let urls = match state
+        .storage
+        .get_servers_to_send_profile(updated_at, sent_before)
+        .await
+    {
         Ok(urls) => urls,
         Err(e) => {
             log::error!("[server] failed to read the server list: {e}");

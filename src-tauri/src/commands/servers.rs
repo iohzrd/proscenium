@@ -255,13 +255,13 @@ pub async fn refresh_server_info(
 
 /// Build a signed registration request for the server at `url`.
 async fn build_registration_request(
-    state: &AppState,
+    identity: &crate::state::SharedIdentity,
     url: &str,
     visibility: Visibility,
     action: Option<&str>,
 ) -> RegistrationRequest {
     let (master_pubkey, transport_node_id, master_key) = {
-        let id = state.identity.read().await;
+        let id = identity.read().await;
         (
             id.master_pubkey.clone(),
             id.transport_node_id.clone(),
@@ -288,6 +288,29 @@ async fn build_registration_request(
     }
 }
 
+/// Send a signed registration with `visibility` to the server at `url` and record the
+/// server as registered.
+async fn register_inner(
+    http_client: &reqwest::Client,
+    storage: &Storage,
+    identity: &crate::state::SharedIdentity,
+    url: &str,
+    visibility: Visibility,
+) -> CmdResult<()> {
+    let request = build_registration_request(identity, url, visibility, None).await;
+    let resp = http_client
+        .post(format!("{url}/api/v1/register"))
+        .json(&request)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(format!("registration failed: {}", describe_failure(resp).await).into());
+    }
+    storage
+        .mark_server_registered(url, &visibility.to_string())
+        .await
+}
+
 #[tauri::command]
 pub async fn register_with_server(
     state: State<'_, Arc<AppState>>,
@@ -298,20 +321,14 @@ pub async fn register_with_server(
         .parse()
         .map_err(|_: String| "invalid visibility")?;
     let url = stored_server_url(&state.storage, &url).await?;
-    let request = build_registration_request(&state, &url, vis, None).await;
-    let resp = state
-        .http_client
-        .post(format!("{url}/api/v1/register"))
-        .json(&request)
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        return Err(format!("registration failed: {}", describe_failure(resp).await).into());
-    }
-    state
-        .storage
-        .mark_server_registered(&url, &vis.to_string())
-        .await?;
+    register_inner(
+        &state.http_client,
+        &state.storage,
+        &state.identity,
+        &url,
+        vis,
+    )
+    .await?;
     if let Err(e) =
         sync_profile_to_server_inner(&state.http_client, &state.storage, &state.identity, &url)
             .await
@@ -335,7 +352,7 @@ pub async fn register_with_server(
 pub async fn unregister_from_server(state: State<'_, Arc<AppState>>, url: String) -> CmdResult<()> {
     let url = stored_server_url(&state.storage, &url).await?;
     let request = build_registration_request(
-        &state,
+        &state.identity,
         &url,
         Visibility::Public,
         Some(REGISTRATION_ACTION_UNREGISTER),
@@ -487,13 +504,17 @@ pub async fn sync_profile_to_server(state: State<'_, Arc<AppState>>, url: String
 }
 
 /// Send the stored own profile to a server the user is listed on, as a signed
-/// `ProfileUpdateRequest`, and record its `updated_at` as accepted by that server. Called
-/// from `save_my_profile`, `register_with_server`, the `sync_profile_to_server` command and
-/// the task that retries servers without the current profile.
+/// `ProfileUpdateRequest`, and record its `updated_at` and the time as accepted by that
+/// server. Called from `save_my_profile`, `register_with_server`, the
+/// `sync_profile_to_server` command and the task that sends the profile to servers that
+/// lack its current version or did not receive it within `SERVER_PROFILE_REFRESH`.
 ///
-/// The server answers 404 if it holds no registration and 403 if the profile ended the
-/// registration (a Private profile). Then the server is recorded as not registered, so the
-/// profile is not sent to it again, and an error is returned.
+/// The server answers 410 if it expired the registration for inactivity; then the
+/// registration is sent again with the stored visibility, and the profile after it. It
+/// answers 404 if it holds no registration (also after an unregistration from another
+/// device of the user) and 403 if the profile ended the registration (a Private
+/// profile). Then the server is recorded as not registered, so the profile is not sent to
+/// it again, and an error is returned.
 pub(crate) async fn sync_profile_to_server_inner(
     http_client: &reqwest::Client,
     storage: &Storage,
@@ -501,42 +522,69 @@ pub(crate) async fn sync_profile_to_server_inner(
     url: &str,
 ) -> CmdResult<()> {
     let url = stored_server_url(storage, url).await?;
-    // Signs the stored profile again if its signature does not verify under the master
-    // key.
-    let profile = crate::announcement::build_own_identity_response(storage, identity)
-        .await?
-        .profile
-        .ok_or("no profile to sync")?;
-    let (master_pubkey, master_key) = {
-        let id = identity.read().await;
-        (id.master_pubkey.clone(), id.master_key.clone())
-    };
-    let timestamp = now_millis();
-    let updated_at = profile.updated_at;
-    let signature = sign_profile_update(&master_pubkey, &url, timestamp, &profile, &master_key);
-    let request = ProfileUpdateRequest {
-        master_pubkey,
-        server_url: url.clone(),
-        timestamp,
-        profile,
-        signature,
-    };
+    let mut registered_again = false;
+    loop {
+        // Signs the stored profile again if its signature does not verify under the
+        // master key.
+        let profile = crate::announcement::build_own_identity_response(storage, identity)
+            .await?
+            .profile
+            .ok_or("no profile to sync")?;
+        let (master_pubkey, master_key) = {
+            let id = identity.read().await;
+            (id.master_pubkey.clone(), id.master_key.clone())
+        };
+        let timestamp = now_millis();
+        let updated_at = profile.updated_at;
+        let signature = sign_profile_update(&master_pubkey, &url, timestamp, &profile, &master_key);
+        let request = ProfileUpdateRequest {
+            master_pubkey,
+            server_url: url.clone(),
+            timestamp,
+            profile,
+            signature,
+        };
 
-    let resp = http_client
-        .put(format!("{url}/api/v1/register"))
-        .json(&request)
-        .send()
-        .await?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::FORBIDDEN {
-        let failure = describe_failure(resp).await;
-        storage.mark_server_unregistered(&url).await?;
-        return Err(format!("the server removed the registration: {failure}").into());
+        let resp = http_client
+            .put(format!("{url}/api/v1/register"))
+            .json(&request)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::GONE && !registered_again {
+            let visibility: Visibility = storage
+                .get_server(&url)
+                .await?
+                .ok_or("unknown server")?
+                .visibility
+                .parse()
+                .map_err(|_: String| "invalid stored visibility")?;
+            log::info!("[server] {url} expired the registration; registering again");
+            if let Err(e) = register_inner(http_client, storage, identity, &url, visibility).await {
+                storage.mark_server_unregistered(&url).await?;
+                return Err(format!(
+                    "the server expired the registration and refused a new one: {e}"
+                )
+                .into());
+            }
+            registered_again = true;
+            continue;
+        }
+        if status == reqwest::StatusCode::NOT_FOUND
+            || status == reqwest::StatusCode::FORBIDDEN
+            || status == reqwest::StatusCode::GONE
+        {
+            let failure = describe_failure(resp).await;
+            storage.mark_server_unregistered(&url).await?;
+            return Err(format!("the server removed the registration: {failure}").into());
+        }
+        if !status.is_success() {
+            return Err(format!("profile sync failed: {}", describe_failure(resp).await).into());
+        }
+        return storage
+            .mark_server_profile_synced(&url, updated_at, now_millis())
+            .await;
     }
-    if !status.is_success() {
-        return Err(format!("profile sync failed: {}", describe_failure(resp).await).into());
-    }
-    storage.mark_server_profile_synced(&url, updated_at).await
 }
 
 #[cfg(test)]
@@ -818,5 +866,126 @@ mod tests {
         assert_eq!(checked.len(), 1);
         assert_eq!(checked[0].pubkey, key);
         assert_eq!(checked[0].transport_node_id, None);
+    }
+
+    /// Answer the requests on an ephemeral local port with `responses` in order, one per
+    /// connection, after reading each request with its body. Returns the base URL and the
+    /// methods of the requests received.
+    async fn serve_responses(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = methods.clone();
+        tokio::spawn(async move {
+            for response in responses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let head_end = loop {
+                    if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                let body_len: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |len| len.trim().parse().unwrap());
+                while request.len() < head_end + body_len {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(head.split(' ').next().unwrap().to_uppercase());
+                socket.write_all(&response).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (url, methods)
+    }
+
+    /// A storage with the own profile and the server at `url` recorded as registered.
+    async fn registered_storage(url: &str) -> (Storage, crate::state::SharedIdentity, u64) {
+        let identity = Arc::new(tokio::sync::RwLock::new(crate::state::Identity::new(
+            SecretKey::from_bytes(&[7u8; 32]),
+            SecretKey::from_bytes(&[8u8; 32]),
+        )));
+        let storage = Storage::open_in_memory().await.unwrap();
+        let master_pubkey = identity.read().await.master_pubkey.clone();
+        let profile = proscenium_types::Profile {
+            display_name: "name".to_string(),
+            bio: String::new(),
+            avatar_hash: None,
+            avatar_ticket: None,
+            visibility: Visibility::Public,
+            updated_at: 1_000,
+            signature: String::new(),
+        };
+        storage
+            .save_profile(&master_pubkey, &profile)
+            .await
+            .unwrap();
+        storage.add_server(url, "", "", "").await.unwrap();
+        storage.mark_server_registered(url, "public").await.unwrap();
+        // The profile is signed when it is sent, one millisecond newer.
+        (storage, identity, 1_001)
+    }
+
+    /// A server that expired the registration (410) receives a new registration, then
+    /// the profile.
+    #[tokio::test]
+    async fn expired_registration_is_sent_again_before_the_profile() {
+        let (url, methods) = serve_responses(vec![
+            http_response("410 Gone", true, br#"{"message":"expired"}"#),
+            http_response("201 Created", true, b"{}"),
+            http_response("200 OK", true, b"{}"),
+        ])
+        .await;
+        let (storage, identity, updated_at) = registered_storage(&url).await;
+
+        sync_profile_to_server_inner(&test_client(), &storage, &identity, &url)
+            .await
+            .unwrap();
+        assert_eq!(*methods.lock().unwrap(), vec!["PUT", "POST", "PUT"]);
+        let server = storage.get_server(&url).await.unwrap().unwrap();
+        assert!(server.registered_at.is_some());
+        assert!(
+            storage
+                .get_servers_to_send_profile(updated_at, now_millis() - 60_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the server accepted the current profile now"
+        );
+    }
+
+    /// A server without the registration (404), as after an unregistration from another
+    /// device of the user, is recorded as not registered and receives nothing more.
+    #[tokio::test]
+    async fn missing_registration_is_recorded_as_not_registered() {
+        let (url, methods) = serve_responses(vec![http_response(
+            "404 Not Found",
+            true,
+            br#"{"message":"user not registered"}"#,
+        )])
+        .await;
+        let (storage, identity, _) = registered_storage(&url).await;
+
+        assert!(
+            sync_profile_to_server_inner(&test_client(), &storage, &identity, &url)
+                .await
+                .is_err()
+        );
+        assert_eq!(*methods.lock().unwrap(), vec!["PUT"]);
+        let server = storage.get_server(&url).await.unwrap().unwrap();
+        assert!(server.registered_at.is_none());
     }
 }

@@ -50,6 +50,11 @@ pub struct LimitsConfig {
     /// How long to keep posts and interactions (in days). 0 means keep forever.
     #[serde(default)]
     pub retention_days: u64,
+    /// Days without an accepted signed request or completed sync after which a
+    /// registration is deactivated. Clients send their profile at least weekly. 0 means
+    /// never.
+    #[serde(default = "default_registration_expiry_days")]
+    pub registration_expiry_days: u64,
     /// Maximum number of open HTTP connections.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
@@ -95,7 +100,10 @@ fn default_true() -> bool {
     true
 }
 fn default_max_users() -> u32 {
-    1000
+    10_000
+}
+fn default_registration_expiry_days() -> u64 {
+    30
 }
 fn default_max_posts() -> u32 {
     10000
@@ -132,6 +140,7 @@ impl Default for LimitsConfig {
             max_posts_per_user: default_max_posts(),
             max_interactions_per_user: default_max_interactions(),
             retention_days: 0,
+            registration_expiry_days: default_registration_expiry_days(),
             max_connections: default_max_connections(),
             max_concurrent_requests: default_max_requests(),
             register_requests_per_minute: default_register_rate(),
@@ -248,7 +257,8 @@ mod tests {
         assert!(Config::parse("[server]\npublic_url = \"https://\"\n").is_err());
         let config = Config::parse("[server]\npublic_url = \"https://example.test/\"\n").unwrap();
         assert_eq!(config.server.public_url, "https://example.test");
-        assert_eq!(config.limits.max_registered_users, 1000);
+        assert_eq!(config.limits.max_registered_users, 10_000);
+        assert_eq!(config.limits.registration_expiry_days, 30);
     }
 
     #[test]

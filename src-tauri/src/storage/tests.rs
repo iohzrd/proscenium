@@ -2536,7 +2536,7 @@ async fn server_add_get_and_remove() {
 }
 
 #[tokio::test]
-async fn servers_without_the_current_profile_are_listed_until_they_accept_it() {
+async fn servers_receive_the_profile_until_they_accept_it_and_after_the_refresh_interval() {
     let s = test_storage().await;
     for url in ["https://a.test", "https://b.test", "https://c.test"] {
         s.add_server(url, "", "", "").await.unwrap();
@@ -2549,27 +2549,32 @@ async fn servers_without_the_current_profile_are_listed_until_they_accept_it() {
         .unwrap();
     // c.test is not registered and is never listed.
     assert_eq!(
-        s.get_servers_without_profile(10).await.unwrap(),
+        s.get_servers_to_send_profile(10, 0).await.unwrap(),
         vec!["https://a.test", "https://b.test"]
     );
-    s.mark_server_profile_synced("https://a.test", 10)
+    s.mark_server_profile_synced("https://a.test", 10, 1_000)
         .await
         .unwrap();
     assert_eq!(
-        s.get_servers_without_profile(10).await.unwrap(),
+        s.get_servers_to_send_profile(10, 1_000).await.unwrap(),
         vec!["https://b.test"]
     );
     // An older accepted version does not lower the stored one; a newer profile lists
     // the server again.
-    s.mark_server_profile_synced("https://a.test", 5)
+    s.mark_server_profile_synced("https://a.test", 5, 1_000)
         .await
         .unwrap();
     assert_eq!(
-        s.get_servers_without_profile(10).await.unwrap(),
+        s.get_servers_to_send_profile(10, 1_000).await.unwrap(),
         vec!["https://b.test"]
     );
     assert_eq!(
-        s.get_servers_without_profile(11).await.unwrap(),
+        s.get_servers_to_send_profile(11, 1_000).await.unwrap(),
+        vec!["https://a.test", "https://b.test"]
+    );
+    // A server that accepted the current profile before `sent_before` is listed again.
+    assert_eq!(
+        s.get_servers_to_send_profile(10, 1_001).await.unwrap(),
         vec!["https://a.test", "https://b.test"]
     );
 }
