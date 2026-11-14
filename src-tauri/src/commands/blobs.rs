@@ -110,16 +110,16 @@ fn parse_ticket(s: &str) -> Result<BlobTicket, AppError> {
 /// is given) and loads the user requested (Load, Save As, Refetch). The webview requests
 /// the media of every visible post and message, so without a limit a stranger's messages
 /// with many attachments start that many concurrent 10 MiB downloads; the separate class
-/// keeps a requested load from waiting behind automatic ones. A transfer takes its slot
-/// only after the provider connected and proved the blob size.
+/// keeps a requested load from waiting behind automatic ones. A load takes its slot
+/// before it connects to the provider, so a load that waits holds no connection.
 const MAX_CONCURRENT_TRANSFERS: usize = 4;
 static AUTOMATIC_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
 static REQUESTED_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
-/// Connections to blob providers being opened at the same time, with their size request,
-/// per class as for transfers, so automatic loads do not delay a requested one.
-const MAX_CONCURRENT_CONNECTS: usize = 16;
-static AUTOMATIC_CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_CONNECTS);
-static REQUESTED_CONNECT_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
+/// Automatic loads waiting for a transfer slot or running. A further automatic load fails
+/// at once and the webview offers its Load button, so the media of many messages from
+/// strangers cannot queue loads that keep every other automatic load waiting for hours.
+const MAX_AUTOMATIC_LOADS: usize = 32;
+static AUTOMATIC_LOADS: Semaphore = Semaphore::const_new(MAX_AUTOMATIC_LOADS);
 /// Time a provider whose connection failed is not dialed again.
 const UNREACHABLE_RETRY_AFTER: Duration = Duration::from_secs(60);
 /// Providers remembered as unreachable; the oldest entry is removed when full.
@@ -215,15 +215,14 @@ async fn read_local_blob(blob_store: &FsStore, hash: Hash) -> CmdResult<Option<V
     }
 }
 
-/// Connect to the node named in `ticket` and request the size of the blob, holding a
-/// connect slot of the automatic or the requested class.
+/// Connect to the node named in `ticket` and request the size of the blob. The caller
+/// holds a transfer slot.
 ///
 /// The provider answers with the last chunk and its hash path, which proves the size for
 /// this hash, so a blob above `max_size` is rejected before its content is requested. A
 /// provider that cannot be connected or does not answer the size request in time is
 /// recorded as unreachable. An automatic load (`requested` false) returns an error for a
-/// provider recorded as unreachable, checked before and after the wait for a slot; a load
-/// the user requested dials it anyway.
+/// provider recorded as unreachable; a load the user requested dials it anyway.
 async fn connect_and_check_size(
     endpoint: &Endpoint,
     ticket: &BlobTicket,
@@ -232,24 +231,9 @@ async fn connect_and_check_size(
 ) -> CmdResult<(Connection, u64)> {
     let hash = ticket.hash();
     let provider = ticket.addr().id;
-    let check = || {
-        if requested {
-            Ok(())
-        } else {
-            check_reachable(provider)
-        }
-    };
-    check()?;
-    let slots = if requested {
-        &REQUESTED_CONNECT_SLOTS
-    } else {
-        &AUTOMATIC_CONNECT_SLOTS
-    };
-    let _connect_slot = slots
-        .acquire()
-        .await
-        .map_err(|_| "blob connection limit closed")?;
-    check()?;
+    if !requested {
+        check_reachable(provider)?;
+    }
     let connected = tokio::time::timeout(
         CONNECT_TIMEOUT,
         endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
@@ -431,7 +415,18 @@ async fn blob_bytes(state: &AppState, ticket: &str, max_size: Option<u64>) -> Cm
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
     let requested = max_size.is_none();
-    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit, requested).await?;
+    let provider = ticket.addr().id;
+    let _load = if requested {
+        None
+    } else {
+        // Before the wait, so a load for an unreachable provider waits for nothing.
+        check_reachable(provider)?;
+        Some(
+            AUTOMATIC_LOADS
+                .try_acquire()
+                .map_err(|_| "too many automatic media loads in progress")?,
+        )
+    };
     let (slots, time_limit) = if requested {
         (&REQUESTED_TRANSFER_SLOTS, TRANSFER_TIMEOUT)
     } else {
@@ -443,10 +438,9 @@ async fn blob_bytes(state: &AppState, ticket: &str, max_size: Option<u64>) -> Cm
         .map_err(|_| "blob transfer limit closed")?;
     // Another request may have downloaded the blob while this one waited.
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
-        conn.close(0u32.into(), b"done");
         return Ok(bytes);
     }
-    let provider = ticket.addr().id;
+    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit, requested).await?;
     let downloaded = download_to_store(state.blobs().remote(), conn, hash, size, time_limit).await;
     if let Err(DownloadError::Provider(_)) = &downloaded {
         // Not dialed again by automatic loads for `UNREACHABLE_RETRY_AFTER`: a provider
@@ -512,12 +506,12 @@ pub async fn refetch_blob_bytes(
     let ticket = parse_ticket(&ticket)?;
     let hash = ticket.hash();
     log::info!("[blob] downloading {hash} from remote without using the local store...");
-    let (conn, size) =
-        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64, true).await?;
     let _slot = REQUESTED_TRANSFER_SLOTS
         .acquire()
         .await
         .map_err(|_| "blob transfer limit closed")?;
+    let (conn, size) =
+        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64, true).await?;
     let bytes = download_to_memory(conn, hash, size).await?;
     log::info!("[blob] downloaded {hash} from remote ({size} bytes)");
     Ok(Response::new(bytes))
