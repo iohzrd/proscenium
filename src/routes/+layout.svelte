@@ -14,7 +14,7 @@
   import type {
     NodeStatus,
     Post,
-    StoredMessage,
+    DmReceivedEvent,
     CallEvent,
     CallState,
   } from "#lib/types.ts";
@@ -177,20 +177,24 @@
     return page.url.pathname === path && isWindowActive();
   }
 
-  async function handleDmReceived(payload: {
-    from: string;
-    message: StoredMessage;
-  }) {
+  /** Notify of a message only if the backend allows it (`notify`). The text of a
+   * stranger's message is not shown outside the app. */
+  async function handleDmReceived(payload: DmReceivedEvent) {
     pollUnread();
-    if (!notificationsPermitted || isViewing(`/messages/${payload.from}`)) {
+    if (
+      !payload.notify ||
+      !notificationsPermitted ||
+      isViewing(`/messages/${payload.from}`)
+    ) {
       return;
     }
     const title = await getDisplayName(payload.from, node.pubkey);
     sendNotification({
       title,
-      body:
-        truncate(payload.message.content, NOTIFICATION_BODY_CHARS) ||
-        "Sent a message",
+      body: payload.stranger
+        ? "New message request"
+        : truncate(payload.message.content, NOTIFICATION_BODY_CHARS) ||
+          "Sent a message",
     });
   }
 
@@ -249,8 +253,7 @@
     // Listeners are registered before any await, so no event emitted during
     // the permission request or the identity load is missed.
     const cleanupListeners = useEventListeners({
-      "dm-received": (payload) =>
-        handleDmReceived(payload as { from: string; message: StoredMessage }),
+      "dm-received": (payload) => handleDmReceived(payload as DmReceivedEvent),
       "mentioned-in-post": (payload) => handleMention(payload as Post),
       "notification-received": () => pollUnreadNotifications(),
       "call-state": (payload) => handleCallState(payload as CallEvent),

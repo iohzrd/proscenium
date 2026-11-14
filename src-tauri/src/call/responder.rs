@@ -18,9 +18,9 @@ impl super::CallHandler {
     /// Called when the device `peer_device` of a peer sends a CallOffer. The call's
     /// signals go to that device, and only that device may open its audio connection.
     ///
-    /// An offer rings only if the local user follows the peer or wrote to it in their
-    /// conversation; any other offer is ignored without a reply, so generated
-    /// identities cannot open the call overlay.
+    /// An offer rings only if the peer is no stranger (`Storage::is_stranger`: followed,
+    /// approved as follower, or written to in their conversation); any other offer is
+    /// ignored without a reply, so generated identities cannot open the call overlay.
     pub async fn on_call_offer(&self, call_id: &str, peer_pubkey: &str, peer_device: EndpointId) {
         if !is_valid_id(call_id) {
             log::warn!(
@@ -34,7 +34,7 @@ impl super::CallHandler {
             Ok(false) => {}
             Ok(true) => {
                 log::info!(
-                    "[call] ignoring offer from {}: not followed and never written to",
+                    "[call] ignoring offer from {}: the caller is a stranger",
                     short_id(peer_pubkey)
                 );
                 return;

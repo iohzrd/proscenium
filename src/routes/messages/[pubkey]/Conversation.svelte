@@ -5,7 +5,12 @@
   import ChatHeader from "#lib/messages/ChatHeader.svelte";
   import MessageBubble from "#lib/messages/MessageBubble.svelte";
   import TypingIndicator from "#lib/messages/TypingIndicator.svelte";
-  import type { StoredMessage, Profile, MediaAttachment } from "#lib/types.ts";
+  import type {
+    DmReceivedEvent,
+    StoredMessage,
+    Profile,
+    MediaAttachment,
+  } from "#lib/types.ts";
   import {
     comparePosition,
     dedupeById,
@@ -333,10 +338,7 @@
     const sendCheck = setInterval(checkSendTimeouts, SEND_CHECK_INTERVAL_MS);
     const cleanupListeners = useEventListeners({
       "dm-received": (raw) => {
-        const payload = raw as {
-          from: string;
-          message: StoredMessage;
-        };
+        const payload = raw as DmReceivedEvent;
         if (payload.from !== pubkey) return;
         messages = mergeMessages(messages, [payload.message]);
         // Marks read and sends the receipt only while the window is active;

@@ -295,3 +295,13 @@ export interface StoredMessage {
   delivered: boolean;
   reply_to: string | null;
 }
+
+/** Payload of the `dm-received` event: a message the backend stored. */
+export interface DmReceivedEvent {
+  from: string;
+  message: StoredMessage;
+  /** The sender is a stranger (not followed, not an approved follower, never written to). */
+  stranger: boolean;
+  /** The backend allows an OS notification for this message. */
+  notify: boolean;
+}

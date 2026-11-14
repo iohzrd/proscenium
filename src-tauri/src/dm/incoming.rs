@@ -66,6 +66,10 @@ impl DmHandler {
     /// stored, or for another payload if a conversation with the sender exists or the
     /// sender is followed, so signals from unknown identities add no rows.
     ///
+    /// A stored message is reported with `dm-received`. Its `notify` is set for a message
+    /// of a contact, and for the first message of a new stranger conversation within
+    /// `MAX_STRANGER_NOTIFICATIONS` per `STRANGER_WINDOW`.
+    ///
     /// `Ok(DmAck::Rejected)` means the envelope was refused. `Err` means a local failure
     /// (storage); no answer is sent, so the sender keeps the message queued.
     pub(super) async fn handle_envelope(
@@ -103,10 +107,11 @@ impl DmHandler {
         let mut cache_list = known_sender;
         match envelope.payload {
             DmPayload::Message(msg) => {
-                if !known_sender
-                    && self.storage.is_stranger(&me, &sender).await?
-                    && !self.admit_new_stranger()
-                {
+                let stranger = self.storage.is_stranger(&me, &sender).await?;
+                // A stranger is not followed, so `known_sender` is false only if no
+                // conversation with it exists.
+                let new_stranger_conversation = stranger && !known_sender;
+                if new_stranger_conversation && !self.admit_new_stranger() {
                     log::warn!(
                         "[dm] deferring a new conversation from {}: limit of new conversations with unknown senders reached",
                         short_id(&sender)
@@ -137,11 +142,15 @@ impl DmHandler {
                     ReceivedDm::Stored => {
                         cache_list = true;
                         log::info!("[dm] received message from {}", short_id(&sender));
+                        let notify = !stranger
+                            || (new_stranger_conversation && self.admit_stranger_notification());
                         let _ = self.app_handle.emit(
                             "dm-received",
                             serde_json::json!({
                                 "from": sender,
                                 "message": stored_msg,
+                                "stranger": stranger,
+                                "notify": notify,
                             }),
                         );
                     }

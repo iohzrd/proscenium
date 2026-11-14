@@ -48,8 +48,18 @@ const MAX_DM_FRAME_LEN: usize = MAX_DM_PAYLOAD_LEN + MAX_ANNOUNCEMENT_JSON_LEN +
 const MAX_NEW_STRANGER_CONVERSATIONS: usize = 20;
 const STRANGER_WINDOW: Duration = Duration::from_secs(60 * 60);
 
-/// Incoming DM connections handled at the same time, in total and per remote NodeId.
+/// New stranger conversations per `STRANGER_WINDOW` whose first message is reported with
+/// `notify` set, so the frontend shows an OS notification. Later messages of a stranger
+/// set no `notify`.
+const MAX_STRANGER_NOTIFICATIONS: usize = 3;
+
+/// Incoming DM connections handled at the same time: from devices of contacts (the
+/// NodeId is in the cached device list of a user who is no stranger, see
+/// `Storage::is_stranger`), from other NodeIds, and per remote NodeId. NodeIds cost
+/// nothing to generate, so connections of other NodeIds cannot take the slots of
+/// contacts.
 const DM_MAX_CONNECTIONS: usize = 64;
+const DM_MAX_UNKNOWN_CONNECTIONS: usize = 16;
 const DM_MAX_CONNECTIONS_PER_NODE: usize = 4;
 
 /// Maximum byte length of the answer the sender reads (a `DmAck`).
@@ -84,12 +94,16 @@ pub struct DmHandler {
     /// retry delay has not elapsed.
     outbox_ignore_delay: Arc<AtomicBool>,
     pub(crate) call_signal_tx: mpsc::UnboundedSender<CallSignal>,
-    /// Limits the incoming connections handled at the same time.
+    /// Limits the incoming connections from devices of contacts handled at the same time.
     connection_limit: Arc<Semaphore>,
+    /// Limits the incoming connections from other NodeIds handled at the same time.
+    unknown_connection_limit: Arc<Semaphore>,
     /// Incoming connections currently handled per remote NodeId.
     connections_per_node: Arc<StdMutex<HashMap<EndpointId, usize>>>,
     /// New stranger conversations accepted within `STRANGER_WINDOW`.
     stranger_admissions: Arc<StdMutex<RateWindow>>,
+    /// New stranger conversations reported with `notify` within `STRANGER_WINDOW`.
+    stranger_notifications: Arc<StdMutex<RateWindow>>,
 }
 
 impl std::fmt::Debug for DmHandler {
@@ -115,9 +129,14 @@ impl DmHandler {
             outbox_ignore_delay: Arc::new(AtomicBool::new(false)),
             call_signal_tx,
             connection_limit: Arc::new(Semaphore::new(DM_MAX_CONNECTIONS)),
+            unknown_connection_limit: Arc::new(Semaphore::new(DM_MAX_UNKNOWN_CONNECTIONS)),
             connections_per_node: Arc::new(StdMutex::new(HashMap::new())),
             stranger_admissions: Arc::new(StdMutex::new(RateWindow::new(
                 MAX_NEW_STRANGER_CONVERSATIONS,
+                STRANGER_WINDOW,
+            ))),
+            stranger_notifications: Arc::new(StdMutex::new(RateWindow::new(
+                MAX_STRANGER_NOTIFICATIONS,
                 STRANGER_WINDOW,
             ))),
         }
@@ -130,6 +149,16 @@ impl DmHandler {
             return false;
         };
         admissions.admit(Instant::now())
+    }
+
+    /// Count one notification of a new stranger conversation against
+    /// `MAX_STRANGER_NOTIFICATIONS`. Returns false, and counts nothing, if the limit is
+    /// reached.
+    pub(super) fn admit_stranger_notification(&self) -> bool {
+        let Ok(mut notifications) = self.stranger_notifications.lock() else {
+            return false;
+        };
+        notifications.admit(Instant::now())
     }
 
     /// Take the call signal receiver. Must be called once during setup
@@ -185,19 +214,18 @@ impl DmHandler {
         answer?
     }
 
-    /// Handle one incoming connection: read one `DmEnvelope`, process it, write the
-    /// answer and wait for the peer to close the connection.
-    async fn serve(&self, conn: &Connection, remote: EndpointId) -> Result<(), AppError> {
-        let remote_str = remote.to_string();
-
+    /// Handle one incoming connection from `remote`, whose user is `remote_owner` (the
+    /// NodeId itself if no cached device list lists it): read one `DmEnvelope`, process
+    /// it, write the answer and wait for the peer to close the connection.
+    async fn serve(
+        &self,
+        conn: &Connection,
+        remote: EndpointId,
+        remote_owner: &str,
+    ) -> Result<(), AppError> {
         // Refuse a NodeId that is blocked or belongs to a blocked user before reading
         // anything. The sender of the envelope is checked again after it is verified.
-        let remote_owner = self
-            .storage
-            .get_master_pubkey_for_transport(&remote_str)
-            .await
-            .unwrap_or_else(|| remote_str.clone());
-        if self.storage.is_blocked(&remote_owner).await? {
+        if self.storage.is_blocked(remote_owner).await? {
             return Err(AppError::Other("peer is blocked".into()));
         }
 
@@ -248,15 +276,34 @@ pub(crate) fn validate_direct_message(message: &DirectMessage) -> Result<(), Str
 }
 
 impl ProtocolHandler for DmHandler {
-    /// Serve one incoming envelope. At most `DM_MAX_CONNECTIONS` connections are handled at
-    /// once, and `DM_MAX_CONNECTIONS_PER_NODE` per remote NodeId; others are closed.
+    /// Serve one incoming envelope. At most `DM_MAX_CONNECTIONS` connections from devices
+    /// of contacts and `DM_MAX_UNKNOWN_CONNECTIONS` from other NodeIds are handled at once,
+    /// and `DM_MAX_CONNECTIONS_PER_NODE` per remote NodeId; others are closed.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
-        log::debug!(
-            "[dm] incoming connection from {}",
-            short_id(&remote.to_string())
-        );
-        let Ok(_permit) = self.connection_limit.clone().try_acquire_owned() else {
+        let remote_str = remote.to_string();
+        log::debug!("[dm] incoming connection from {}", short_id(&remote_str));
+        let owner = self
+            .storage
+            .get_master_pubkey_for_transport(&remote_str)
+            .await;
+        let contact = match &owner {
+            Some(master) => {
+                let me = self.identity.read().await.master_pubkey.clone();
+                !self
+                    .storage
+                    .is_stranger(&me, master)
+                    .await
+                    .map_err(AcceptError::from_err)?
+            }
+            None => false,
+        };
+        let limit = if contact {
+            &self.connection_limit
+        } else {
+            &self.unknown_connection_limit
+        };
+        let Ok(_permit) = limit.clone().try_acquire_owned() else {
             conn.close(1u32.into(), b"busy");
             return Err(AcceptError::from_err(std::io::Error::other(
                 "DM connection limit reached",
@@ -272,12 +319,13 @@ impl ProtocolHandler for DmHandler {
                 "per-node DM connection limit reached",
             )));
         };
-        match self.serve(&conn, remote).await {
+        let owner = owner.unwrap_or_else(|| remote_str.clone());
+        match self.serve(&conn, remote, &owner).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 log::warn!(
                     "[dm] connection from {} ended with an error: {e}",
-                    short_id(&remote.to_string())
+                    short_id(&remote_str)
                 );
                 conn.close(1u32.into(), b"error");
                 Err(AcceptError::from_err(e))

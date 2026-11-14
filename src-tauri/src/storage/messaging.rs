@@ -5,18 +5,20 @@ use sqlx::Row;
 
 use super::Storage;
 
-/// Conversations with strangers that are kept: peers the local user does not follow and
-/// has not written to in that conversation. A new one evicts the one with the oldest
-/// last message.
+/// Conversations with strangers that are kept: peers the local user does not follow, has
+/// not approved as follower and has not written to in that conversation. A new one evicts
+/// the one with the oldest last message.
 pub const MAX_STRANGER_CONVERSATIONS: i64 = 100;
 /// Messages of a stranger stored in its conversation before further ones are refused.
 pub const MAX_STRANGER_MESSAGES: i64 = 50;
 
-/// Condition on a conversation `c` and the local user `?1`: the peer is not followed and
-/// the local user wrote no message in it.
+/// Condition on a conversation `c` and the local user `?1`: the peer is not followed, has
+/// no approved follow request, and the local user wrote no message in it.
 const STRANGER_CONVERSATION: &str = "NOT EXISTS (SELECT 1 FROM social_graph s
          WHERE s.follower = ?1 AND s.followee = c.peer_pubkey
            AND s.state = 'active' AND s.followed_at IS NOT NULL)
+     AND NOT EXISTS (SELECT 1 FROM follow_requests fr
+         WHERE fr.pubkey = c.peer_pubkey AND fr.status = 'approved')
      AND NOT EXISTS (SELECT 1 FROM dm_messages m
          WHERE m.conversation_id = c.conversation_id AND m.from_pubkey = ?1)";
 
@@ -409,14 +411,16 @@ impl Storage {
         Ok(result.rows_affected())
     }
 
-    /// True if `peer_pubkey` is a stranger to `me`: `me` does not follow it and wrote no
-    /// message in their conversation.
+    /// True if `peer_pubkey` is a stranger to `me`: `me` does not follow it, has not
+    /// approved it as follower and wrote no message in their conversation.
     pub async fn is_stranger(&self, me: &str, peer_pubkey: &str) -> Result<bool, AppError> {
         let conv_id = Self::conversation_id(me, peer_pubkey);
         let stranger: bool = sqlx::query_scalar(
             "SELECT NOT EXISTS (SELECT 1 FROM social_graph s
                      WHERE s.follower = ?1 AND s.followee = ?2
                        AND s.state = 'active' AND s.followed_at IS NOT NULL)
+                AND NOT EXISTS (SELECT 1 FROM follow_requests fr
+                     WHERE fr.pubkey = ?2 AND fr.status = 'approved')
                 AND NOT EXISTS (SELECT 1 FROM dm_messages m
                      WHERE m.conversation_id = ?3 AND m.from_pubkey = ?1)",
         )
@@ -575,7 +579,9 @@ impl Storage {
                         WHERE c.conversation_id = ?2 AND NOT ({STRANGER_CONVERSATION}))
                     AND NOT EXISTS (SELECT 1 FROM social_graph s
                         WHERE s.follower = ?1 AND s.followee = ?3
-                          AND s.state = 'active' AND s.followed_at IS NOT NULL)"
+                          AND s.state = 'active' AND s.followed_at IS NOT NULL)
+                    AND NOT EXISTS (SELECT 1 FROM follow_requests fr
+                        WHERE fr.pubkey = ?3 AND fr.status = 'approved')"
         )))
         .bind(me)
         .bind(conv_id)

@@ -3762,7 +3762,17 @@ async fn messages_from_strangers_are_bounded() {
     assert!(!s.is_stranger("me", "dave").await.unwrap());
     assert!(receive_message(&s, &id(2_000), "dave", "hi", 1).await);
 
-    // Stranger conversations beyond the limit evict the one with the oldest message.
+    // An approved follower is no stranger; a pending request is no approval.
+    s.record_follow_request("erin", 1, 1, 1_000_000, true)
+        .await
+        .unwrap();
+    assert!(s.is_stranger("me", "erin").await.unwrap());
+    assert!(s.approve_follow_request("me", "erin", 2).await.unwrap());
+    assert!(!s.is_stranger("me", "erin").await.unwrap());
+    assert!(receive_message(&s, &id(3_000), "erin", "hi", 2).await);
+
+    // Stranger conversations beyond the limit evict the one with the oldest message. The
+    // conversation of the approved follower is older than all of them and stays.
     for n in 0..=MAX_STRANGER_CONVERSATIONS as u64 {
         let peer = format!("stranger{n:03}");
         assert!(receive_message(&s, &id(10_000 + n), &peer, "hi", 10_000 + n).await);
@@ -3778,7 +3788,8 @@ async fn messages_from_strangers_are_bounded() {
     assert!(peers.contains(&"stranger001".to_string()));
     assert!(peers.contains(&"bob".to_string()));
     assert!(peers.contains(&"dave".to_string()));
-    assert_eq!(peers.len(), MAX_STRANGER_CONVERSATIONS as usize + 2);
+    assert!(peers.contains(&"erin".to_string()));
+    assert_eq!(peers.len(), MAX_STRANGER_CONVERSATIONS as usize + 3);
 }
 
 #[tokio::test]
