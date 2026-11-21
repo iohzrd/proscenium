@@ -3010,9 +3010,9 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.104.1"
+version = "0.105.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f0c0f527363afa91564f82080fc5d31dd463e1831df0b546ff9594bbfa3cb60"
+checksum = "b9ef502f80b48a0d87bc6b4212a9140ecc2915e2683cb3f2606b9241fec4349a"
 dependencies = [
  "bao-tree",
  "bytes",
@@ -3030,7 +3030,8 @@ dependencies = [
  "iroh-metrics",
  "iroh-tickets",
  "iroh-util",
- "irpc",
+ "irpc 1.0.0",
+ "libc",
  "n0-error",
  "n0-future",
  "nested_enum_utils",
@@ -3046,6 +3047,7 @@ dependencies = [
  "smallvec",
  "tokio",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3085,7 +3087,7 @@ dependencies = [
  "iroh",
  "iroh-base",
  "iroh-metrics",
- "irpc",
+ "irpc 0.17.0",
  "n0-error",
  "n0-future",
  "postcard",
@@ -3254,9 +3256,26 @@ version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3623d6ff582b415904b29bbe6ebcb4a4f9a262ccdee05a45fdd003ef0950c386"
 dependencies = [
+ "futures-util",
+ "irpc-derive 0.17.0",
+ "n0-error",
+ "n0-future",
+ "serde",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "irpc"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fecfcc2a6db86a2a0c1d8138fd58cd83e882e9923cb9e4faf5962ffa2b5a6f7e"
+dependencies = [
+ "derive_more",
  "futures-buffered",
  "futures-util",
- "irpc-derive",
+ "irpc-derive 1.0.0",
  "n0-error",
  "n0-future",
  "noq",
@@ -3279,6 +3298,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "irpc-derive"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c29e19b1a86c662125cdaa33860723dc966c4f50cad207d21ea64b4a14b51aa"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -5266,7 +5296,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium"
-version = "0.2.60"
+version = "0.2.61"
 dependencies = [
  "aec3",
  "base64 0.23.1",
@@ -5319,7 +5349,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.60"
+version = "0.2.61"
 dependencies = [
  "hex",
  "iroh",

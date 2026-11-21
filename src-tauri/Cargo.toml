@@ -25,7 +25,7 @@ futures-lite = "2"
 getrandom = "0.4.1"
 hex = "0.4.3"
 iroh = "1.4.1"
-iroh-blobs = { version = "0.104", features = ["fs-store"] }
+iroh-blobs = { version = "0.105.0", features = ["fs-store"] }
 iroh-gossip = { workspace = true }
 iroh-mainline-address-lookup = "0.6"
 iroh-mdns-address-lookup = "0.6"
