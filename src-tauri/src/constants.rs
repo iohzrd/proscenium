@@ -152,15 +152,8 @@ pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Bytes of a gossip frame reserved for the iroh-gossip header; a payload larger than
 /// `GOSSIP_MAX_MESSAGE_SIZE - GOSSIP_FRAME_OVERHEAD` is not broadcast.
 pub const GOSSIP_FRAME_OVERHEAD: usize = 1024;
-/// Bytes of frame storage that the streams of one gossip connection hold beyond 1 KiB per
-/// stream (iroh-gossip `Builder::max_recv_buffer` of the `[patch.crates-io]` build): 16
-/// frames of `GOSSIP_MAX_MESSAGE_SIZE`. A stream whose next bytes would exceed it is
-/// stopped, and the sender opens a new one for its next message.
-pub const GOSSIP_MAX_RECV_BUFFER: usize = 1024 * 1024;
 /// Incoming gossip connections held at the same time, in total and per remote NodeId
-/// (`proscenium_types::ConnectionLimit`). Each connection holds up to
-/// `GOSSIP_MAX_RECV_BUFFER` plus 1 KiB per stream of frames, and up to
-/// `CONNECTION_RECEIVE_WINDOW` of unread data.
+/// (`proscenium_types::ConnectionLimit`).
 pub const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 128;
 pub const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
 /// Minimum time between two syncs that a followed user's subscription queues because it

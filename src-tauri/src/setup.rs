@@ -311,7 +311,6 @@ async fn build_network_stack(
     log::info!("[setup] binding iroh endpoint...");
     let mut builder = Endpoint::builder(iroh::endpoint::presets::N0)
         .secret_key(transport_secret_key)
-        .transport_config(proscenium_types::quic_transport_config())
         .alpns(vec![
             iroh_blobs::ALPN.to_vec(),
             iroh_gossip::ALPN.to_vec(),
@@ -336,7 +335,7 @@ async fn build_network_stack(
     let blobs = BlobsProtocol::new(&blob_store, None);
     let gossip = Gossip::builder()
         .max_message_size(crate::constants::GOSSIP_MAX_MESSAGE_SIZE)
-        .max_recv_buffer(crate::constants::GOSSIP_MAX_RECV_BUFFER)
+        .max_peer_streams(proscenium_types::GOSSIP_MAX_PEER_STREAMS)
         .spawn(endpoint.clone());
     log::info!("[setup] gossip started");
 

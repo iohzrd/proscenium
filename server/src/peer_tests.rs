@@ -11,7 +11,7 @@ use iroh::endpoint::{Connection, SendStream};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use iroh_gossip::Gossip;
-use iroh_gossip::api::GossipTopic;
+use iroh_gossip::GossipTopic;
 use proscenium_types::{
     GossipMessage, Interaction, LinkedDevicesAnnouncement, MediaAttachment, PEER_ALPN, PeerRequest,
     Post, PostTombstone, Profile, SyncFrame, SyncMode, SyncSummary, Visibility, now_millis,

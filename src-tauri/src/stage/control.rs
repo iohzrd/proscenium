@@ -2,10 +2,7 @@ use crate::error::AppError;
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use iroh::{EndpointId, SecretKey};
-use iroh_gossip::{
-    Gossip,
-    api::{Event, GossipReceiver, GossipSender},
-};
+use iroh_gossip::{Event, Gossip, GossipReceiver, GossipSender};
 use proscenium_types::{
     SignedStageControl, StageControl, VerifiedPresence, is_recent_timestamp, now_millis, short_id,
     sign_stage_control, stage_control_topic, validate_stage_control, verify_presence,

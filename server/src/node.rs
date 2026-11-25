@@ -10,16 +10,8 @@ use std::time::Duration;
 /// a peer drops the stream on which it receives a larger frame.
 pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Bytes of frame storage that the streams of one gossip connection hold beyond 1 KiB per
-/// stream (iroh-gossip `Builder::max_recv_buffer` of the `[patch.crates-io]` build): 16
-/// frames of `GOSSIP_MAX_MESSAGE_SIZE`. A stream whose next bytes would exceed it is
-/// stopped, and the sender opens a new one for its next message.
-const GOSSIP_MAX_RECV_BUFFER: usize = 1024 * 1024;
-
 /// Incoming gossip connections held at the same time, in total and per remote NodeId
-/// (`proscenium_types::ConnectionLimit`). Each connection holds up to
-/// `GOSSIP_MAX_RECV_BUFFER` plus 1 KiB per stream of frames, and up to
-/// `CONNECTION_RECEIVE_WINDOW` of unread data.
+/// (`proscenium_types::ConnectionLimit`).
 const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 256;
 const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
 
@@ -115,7 +107,6 @@ impl Node {
 
         let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
             .secret_key(secret_key)
-            .transport_config(proscenium_types::quic_transport_config())
             .bind()
             .await?;
 
@@ -131,7 +122,7 @@ impl Node {
     pub(crate) fn spawn(endpoint: Endpoint) -> Self {
         let gossip = Gossip::builder()
             .max_message_size(GOSSIP_MAX_MESSAGE_SIZE)
-            .max_recv_buffer(GOSSIP_MAX_RECV_BUFFER)
+            .max_peer_streams(proscenium_types::GOSSIP_MAX_PEER_STREAMS)
             .spawn(endpoint.clone());
 
         let router = Router::builder(endpoint.clone())

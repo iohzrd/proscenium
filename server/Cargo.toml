@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 proscenium-types = { path = "../crates/proscenium-types" }
 iroh = "1.4.1"
-iroh-gossip = "0.102.0"
+iroh-gossip = "0.103.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -29,8 +29,3 @@ getrandom = "0.4"
 maud = { version = "0.27", features = ["axum"] }
 url = "2.5.8"
 
-# iroh-gossip 0.102.0 with the read_lp allocation fix and the per-connection frame storage
-# limit, `Builder::max_recv_buffer` (ef8fac7 on the fork's branch recv-buffer-limit-0.102);
-# remove once a release contains both.
-[patch.crates-io]
-iroh-gossip = { git = "https://github.com/iohzrd/iroh-gossip", rev = "ef8fac735fafbf7b98ac49da7dcdb6c44f09e588" }

@@ -60,7 +60,7 @@ impl MessageBudget {
 }
 
 /// `MessageBudget`s of one topic, per NodeId that delivered a message
-/// (`iroh_gossip::api::Message::delivered_from`), so messages from one sender cannot use
+/// (`iroh_gossip::Message::delivered_from`), so messages from one sender cannot use
 /// up the budget of the others. The author's devices (`author_nodes`) always have their
 /// own budget. Of the other senders, `MAX_BUDGETED_GOSSIP_SENDERS` have one; further
 /// senders share `others`.

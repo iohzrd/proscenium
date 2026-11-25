@@ -11,7 +11,7 @@ use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
 use iroh::{Endpoint, EndpointId};
-use iroh_gossip::{Gossip, api::GossipSender};
+use iroh_gossip::{Gossip, GossipSender};
 use proscenium_types::{Profile, PushMessage, Visibility, short_id};
 use std::collections::HashMap;
 use std::sync::Arc;

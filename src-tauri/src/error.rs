@@ -67,7 +67,7 @@ pub enum AppError {
 
     // -- iroh gossip --
     #[error("{0}")]
-    GossipApi(#[from] iroh_gossip::api::ApiError),
+    GossipApi(#[from] iroh_gossip::Error),
 
     // -- iroh blobs --
     #[error("{0}")]

@@ -8,7 +8,7 @@ use crate::sync::SyncHealth;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::Gossip;
-use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
+use iroh_gossip::{Event, GossipReceiver, GossipSender};
 use proscenium_types::{
     GossipMessage, GossipSenderBudgets, Interaction, Post, Visibility, is_valid_id, now_millis,
     short_id, truncate_chars, user_feed_topic, validate_interaction, validate_post,

@@ -6,7 +6,7 @@ use crate::error::AppError;
 use crate::storage::Storage;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointId};
-use iroh_gossip::api::{Event, GossipReceiver};
+use iroh_gossip::{Event, GossipReceiver};
 use proscenium_types::{VerifiedIdentity, Visibility, now_millis, short_id, user_feed_topic};
 use std::collections::VecDeque;
 use tauri::{AppHandle, Emitter};

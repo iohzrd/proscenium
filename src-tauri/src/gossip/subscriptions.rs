@@ -4,7 +4,7 @@ use crate::state::{AppState, SyncCommand};
 use crate::storage::Storage;
 use futures_lite::StreamExt;
 use iroh::EndpointId;
-use iroh_gossip::api::{Event, GossipSender};
+use iroh_gossip::{Event, GossipSender};
 use proscenium_types::{GossipSenderBudgets, short_id, user_feed_topic};
 use std::collections::HashSet;
 use std::sync::Arc;
