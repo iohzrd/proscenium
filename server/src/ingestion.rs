@@ -10,9 +10,9 @@ use iroh::{Endpoint, EndpointId};
 use iroh_gossip::Gossip;
 use iroh_gossip::{Event, GossipReceiver, GossipSender};
 use proscenium_types::{
-    GossipMessage, GossipSenderBudgets, Interaction, Post, Visibility, is_valid_id, now_millis,
-    short_id, truncate_chars, user_feed_topic, validate_interaction, validate_post,
-    validate_profile, verify_delete_interaction_signature, verify_delete_post_signature,
+    GossipMessage, Interaction, Post, Visibility, is_valid_id, now_millis, short_id,
+    truncate_chars, user_feed_topic, validate_interaction, validate_post, validate_profile,
+    verify_delete_interaction_signature, verify_delete_post_signature,
     verify_interaction_signature, verify_linked_devices_announcement, verify_post_signature,
     verify_profile_signature,
 };
@@ -35,9 +35,6 @@ const RESUBSCRIBE_MIN_DELAY: Duration = Duration::from_secs(1);
 const RESUBSCRIBE_MAX_DELAY: Duration = Duration::from_secs(60);
 /// Minimum time between two syncs requested by one subscription task.
 const EVENT_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(60);
-/// Rejected gossip messages logged per topic per `REJECT_LOG_WINDOW`.
-const REJECT_LOGS_PER_WINDOW: u32 = 5;
-const REJECT_LOG_WINDOW: Duration = Duration::from_secs(60);
 /// Characters of a rejection reason written to the log.
 const REJECT_REASON_LOG_CHARS: usize = 200;
 
@@ -45,7 +42,6 @@ const REJECT_REASON_LOG_CHARS: usize = 200;
 #[derive(Debug, Clone, Copy)]
 pub struct IngestLimits {
     pub max_posts_per_user: u32,
-    pub max_interactions_per_user: u32,
     /// Posts and interactions older than this many milliseconds are not stored.
     /// `None` disables the check.
     pub retention_ms: Option<u64>,
@@ -70,59 +66,12 @@ pub struct IngestionManager {
     policy: RegistrationPolicy,
     /// One gossip task per master pubkey with an active public registration.
     subscriptions: Mutex<HashMap<String, Subscription>>,
-    /// Permits of syncs of users for which `SyncHealth::is_proven` holds:
-    /// `sync.max_concurrent_syncs`.
+    /// Permits of running syncs: `sync.max_concurrent_syncs`.
     pub(crate) sync_permits: Semaphore,
-    /// Permits of syncs of the other users: a quarter of `sync.max_concurrent_syncs`, at
-    /// least one. Registrations whose devices do not answer, or answer slowly, cost only
-    /// these.
-    pub(crate) unproven_sync_permits: Semaphore,
     /// Master pubkeys with a sync queued or running.
     pub(crate) syncing: std::sync::Mutex<HashSet<String>>,
     /// Outcomes of recent syncs per master pubkey with an active public registration.
     pub(crate) sync_health: std::sync::Mutex<HashMap<String, SyncHealth>>,
-}
-
-/// Writes at most `REJECT_LOGS_PER_WINDOW` warn records per window for one topic and
-/// reports the number of unlogged rejections when the next window starts.
-struct RejectLog {
-    window_start: Instant,
-    logged: u32,
-    suppressed: u32,
-}
-
-impl RejectLog {
-    fn new() -> Self {
-        Self {
-            window_start: Instant::now(),
-            logged: 0,
-            suppressed: 0,
-        }
-    }
-
-    fn record(&mut self, topic_owner: &str, reason: &str) {
-        if self.window_start.elapsed() >= REJECT_LOG_WINDOW {
-            if self.suppressed > 0 {
-                tracing::warn!(
-                    "[ingestion] {} more rejected gossip messages for {} not logged",
-                    self.suppressed,
-                    short_id(topic_owner)
-                );
-            }
-            *self = Self::new();
-        }
-        if self.logged < REJECT_LOGS_PER_WINDOW {
-            self.logged += 1;
-            // `{:?}` escapes control characters of peer-supplied text.
-            tracing::warn!(
-                "[ingestion] rejected gossip message for {}: {:?}",
-                short_id(topic_owner),
-                truncate_chars(reason, REJECT_REASON_LOG_CHARS)
-            );
-        } else {
-            self.suppressed += 1;
-        }
-    }
 }
 
 impl IngestionManager {
@@ -139,7 +88,6 @@ impl IngestionManager {
             storage,
             limits: IngestLimits {
                 max_posts_per_user: config.limits.max_posts_per_user,
-                max_interactions_per_user: config.limits.max_interactions_per_user,
                 retention_ms,
             },
             policy: RegistrationPolicy {
@@ -148,7 +96,6 @@ impl IngestionManager {
             },
             subscriptions: Mutex::new(HashMap::new()),
             sync_permits: Semaphore::new(config.sync.max_concurrent_syncs),
-            unproven_sync_permits: Semaphore::new((config.sync.max_concurrent_syncs / 4).max(1)),
             syncing: std::sync::Mutex::new(HashSet::new()),
             sync_health: std::sync::Mutex::new(HashMap::new()),
         })
@@ -298,11 +245,6 @@ impl IngestionManager {
         sender: &GossipSender,
         receiver: &mut GossipReceiver,
     ) {
-        let mut reject_log = RejectLog::new();
-        let mut budgets = GossipSenderBudgets::new(
-            self.stored_node_ids(pubkey).await.into_iter().collect(),
-            std::time::Instant::now(),
-        );
         let mut rejoin_delay = REJOIN_MIN_DELAY;
         let mut rejoin_at = Instant::now() + rejoin_delay;
         let mut last_sync_request: Option<Instant> = None;
@@ -312,12 +254,15 @@ impl IngestionManager {
             tokio::select! {
                 event = receiver.try_next() => match event {
                     Ok(Some(Event::Received(message))) => {
-                        if !budgets.take(message.delivered_from, std::time::Instant::now()) {
-                            reject_log.record(pubkey, "message rate limit of the sender reached");
-                        } else if let Err(reason) =
+                        if let Err(reason) =
                             self.handle_gossip_message(pubkey, &message.content).await
                         {
-                            reject_log.record(pubkey, &reason);
+                            // `{:?}` escapes control characters of peer-supplied text.
+                            tracing::debug!(
+                                "[ingestion] rejected gossip message for {}: {:?}",
+                                short_id(pubkey),
+                                truncate_chars(&reason, REJECT_REASON_LOG_CHARS)
+                            );
                         }
                     }
                     Ok(Some(Event::NeighborUp(_))) => {
@@ -355,7 +300,6 @@ impl IngestionManager {
                 },
                 _ = tokio::time::sleep_until(rejoin_at), if !has_neighbors => {
                     let bootstrap = self.stored_node_ids(pubkey).await;
-                    budgets.set_author_nodes(bootstrap.iter().copied().collect());
                     if !bootstrap.is_empty()
                         && let Err(e) = sender.join_peers(bootstrap).await
                     {
@@ -514,20 +458,12 @@ impl IngestionManager {
             GossipMessage::NewInteraction(interaction) => {
                 self.check_interaction_fields(&interaction, topic_owner)?;
                 verify_interaction_signature(&interaction)?;
-                match self
+                if let Err(e) = self
                     .storage
-                    .insert_interactions(
-                        topic_owner,
-                        std::slice::from_ref(&interaction),
-                        self.limits.max_interactions_per_user,
-                    )
+                    .insert_interactions(topic_owner, std::slice::from_ref(&interaction))
                     .await
                 {
-                    Ok(count) if count.over_limit > 0 => {
-                        return Err("interaction limit of the user is reached".to_string());
-                    }
-                    Ok(_) => {}
-                    Err(e) => storage_error(e),
+                    storage_error(e);
                 }
             }
             GossipMessage::DeleteInteraction {
@@ -590,8 +526,7 @@ impl IngestionManager {
     /// Every `interval_minutes`: make the gossip task of every active public user and
     /// of every user with a registered task match storage, then sync every active
     /// public user whose retry delay has passed (`sync_user`). At most
-    /// `sync.max_concurrent_syncs` syncs of proven users and a quarter of that of other
-    /// users run at the same time.
+    /// `sync.max_concurrent_syncs` syncs run at the same time.
     pub fn start_periodic_sync(self: &Arc<Self>, interval_minutes: u64) {
         let manager = self.clone();
         tokio::spawn(async move {

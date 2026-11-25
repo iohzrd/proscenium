@@ -48,30 +48,22 @@ const SYNC_RETRY_BASE: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
 const SYNC_RETRY_BASE: Duration = Duration::ZERO;
 const SYNC_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
-/// Time after a sync that exceeded `SYNC_TOTAL_TIMEOUT` during which the user's syncs
-/// wait for the smaller pool of permits, whatever their outcome. A responder that sends
-/// one item per `FRAME_TIMEOUT` holds a permit for `SYNC_TOTAL_TIMEOUT`; this limits how
-/// often it can do that with a permit of the users whose syncs complete.
-const SLOW_SYNC_DEMOTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// How a sync of one user ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SyncOutcome {
     Completed,
+    /// The sync failed or exceeded `SYNC_TOTAL_TIMEOUT`.
     Failed,
-    /// The sync exceeded `SYNC_TOTAL_TIMEOUT`.
-    TimedOut,
 }
 
 /// Outcomes of the recent syncs of one user, kept in memory.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SyncHealth {
-    /// Syncs that failed or timed out since the last completed one.
+    /// Syncs that failed since the last completed one.
     failures: u32,
     /// Earliest start of the next sync after a failure.
     retry_at: Option<Instant>,
-    /// When a sync last exceeded `SYNC_TOTAL_TIMEOUT`.
-    timed_out_at: Option<Instant>,
 }
 
 impl SyncHealth {
@@ -89,26 +81,11 @@ impl SyncHealth {
             .saturating_mul(1 << doublings)
             .min(SYNC_RETRY_MAX);
         self.retry_at = Some(now + delay);
-        if outcome == SyncOutcome::TimedOut {
-            self.timed_out_at = Some(now);
-        }
     }
 
     /// Whether a sync may start at `now`.
     pub(crate) fn is_due(&self, now: Instant) -> bool {
         self.retry_at.is_none_or(|at| now >= at)
-    }
-
-    /// Whether the user's syncs take a permit of `IngestionManager::sync_permits`: a sync
-    /// completed during the registration (`last_synced_at` > 0), none failed since, and
-    /// none exceeded `SYNC_TOTAL_TIMEOUT` within `SLOW_SYNC_DEMOTION`. Otherwise they take
-    /// one of `IngestionManager::unproven_sync_permits`.
-    pub(crate) fn is_proven(&self, last_synced_at: i64, now: Instant) -> bool {
-        last_synced_at > 0
-            && self.failures == 0
-            && self
-                .timed_out_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= SLOW_SYNC_DEMOTION)
     }
 }
 
@@ -143,7 +120,6 @@ pub struct SyncStats {
     /// Items not stored: wrong author, failed validation or signature, or over a limit.
     pub rejected: usize,
     received_posts: usize,
-    received_interactions: usize,
     received_tombstones: usize,
 }
 
@@ -212,33 +188,16 @@ impl IngestionManager {
     /// Sync `pubkey` from one of its devices and log the result. Returns without
     /// syncing if a sync of `pubkey` is already queued or running, or if its last sync
     /// failed and the retry delay of `SyncHealth::record` has not passed. Waits for a
-    /// permit of the pool that `SyncHealth::is_proven` selects, then records the outcome.
+    /// permit of `sync_permits`, then records the outcome.
     pub(crate) async fn sync_user(self: &Arc<Self>, pubkey: &str) {
         let Some(_slot) = SyncSlot::acquire(&self.syncing, pubkey) else {
             return;
         };
-        let health = self.sync_health(pubkey);
-        if !health.is_due(Instant::now()) {
+        if !self.sync_health(pubkey).is_due(Instant::now()) {
             return;
         }
-        let last_synced_at = self
-            .storage
-            .get_last_synced_at(pubkey)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::error!(
-                    "[sync] failed to read the last sync of {}: {e}",
-                    short_id(pubkey)
-                );
-                0
-            });
-        let permits = if health.is_proven(last_synced_at, Instant::now()) {
-            &self.sync_permits
-        } else {
-            &self.unproven_sync_permits
-        };
-        // The semaphores are never closed.
-        let Ok(_permit) = permits.acquire().await else {
+        // The semaphore is never closed.
+        let Ok(_permit) = self.sync_permits.acquire().await else {
             return;
         };
 
@@ -246,8 +205,7 @@ impl IngestionManager {
         let result = timeout(SYNC_TOTAL_TIMEOUT, self.sync_from_peer(pubkey, &mut stats)).await;
         let outcome = match &result {
             Ok(Ok(())) => SyncOutcome::Completed,
-            Ok(Err(_)) => SyncOutcome::Failed,
-            Err(_) => SyncOutcome::TimedOut,
+            Ok(Err(_)) | Err(_) => SyncOutcome::Failed,
         };
         self.record_sync_outcome(pubkey, outcome);
         if outcome == SyncOutcome::Completed
@@ -558,21 +516,13 @@ impl IngestionManager {
         Ok(())
     }
 
-    /// Verify the interactions of one frame and insert them. Fails once more than
-    /// `max_interactions_per_user` interactions were received in the sync.
+    /// Verify the interactions of one frame and insert them.
     async fn store_synced_interactions(
         &self,
         pubkey: &str,
         interactions: Vec<Interaction>,
         stats: &mut SyncStats,
     ) -> anyhow::Result<()> {
-        let max_interactions = self.limits.max_interactions_per_user;
-        stats.received_interactions = stats
-            .received_interactions
-            .saturating_add(interactions.len());
-        if stats.received_interactions > max_interactions as usize {
-            anyhow::bail!("peer sent more than {max_interactions} interactions");
-        }
         let received = interactions.len();
         let verified = retain_valid(interactions, |interaction| {
             self.check_interaction_fields(interaction, pubkey).is_ok()
@@ -580,12 +530,7 @@ impl IngestionManager {
         })
         .await;
         stats.rejected += received - verified.len();
-        let count = self
-            .storage
-            .insert_interactions(pubkey, &verified, max_interactions)
-            .await?;
-        stats.interactions += count.stored;
-        stats.rejected += count.over_limit;
+        stats.interactions += self.storage.insert_interactions(pubkey, &verified).await?;
         Ok(())
     }
 }
@@ -601,16 +546,10 @@ mod tests {
         let t0 = Instant::now();
         let mut health = SyncHealth::default();
         assert!(health.is_due(t0));
-        assert!(!health.is_proven(0, t0), "never synced");
-        assert!(health.is_proven(1, t0));
 
         health.record(SyncOutcome::Failed, t0, BASE);
         assert!(!health.is_due(t0 + BASE - Duration::from_secs(1)));
         assert!(health.is_due(t0 + BASE));
-        assert!(
-            !health.is_proven(1, t0 + BASE),
-            "failed since the last completed sync"
-        );
         health.record(SyncOutcome::Failed, t0 + BASE, BASE);
         assert!(!health.is_due(t0 + BASE * 3 - Duration::from_secs(1)));
         assert!(health.is_due(t0 + BASE * 3), "the delay doubled");
@@ -624,18 +563,5 @@ mod tests {
 
         health.record(SyncOutcome::Completed, t0, BASE);
         assert!(health.is_due(t0));
-        assert!(health.is_proven(1, t0));
-    }
-
-    #[test]
-    fn a_timed_out_sync_demotes_the_user_after_later_completed_syncs() {
-        let t0 = Instant::now();
-        let mut health = SyncHealth::default();
-        health.record(SyncOutcome::TimedOut, t0, BASE);
-        health.record(SyncOutcome::Completed, t0 + BASE, BASE);
-        assert!(health.is_due(t0 + BASE));
-        assert!(!health.is_proven(1, t0 + BASE));
-        assert!(!health.is_proven(1, t0 + SLOW_SYNC_DEMOTION - Duration::from_secs(1)));
-        assert!(health.is_proven(1, t0 + SLOW_SYNC_DEMOTION));
     }
 }

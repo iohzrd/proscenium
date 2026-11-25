@@ -294,20 +294,6 @@ impl Storage {
         Ok(taken)
     }
 
-    /// True if `record_pending_link` recorded `node_id` at most `PENDING_LINK_TTL_MS`
-    /// before `now`. Does not delete the record.
-    pub async fn has_pending_link(&self, node_id: &str, now: u64) -> Result<bool, AppError> {
-        let cutoff = i64::try_from(now.saturating_sub(PENDING_LINK_TTL_MS)).unwrap_or(0);
-        let exists: bool = sqlx::query_scalar(
-            "SELECT COUNT(*) > 0 FROM pending_link_devices WHERE node_id = ?1 AND linked_at >= ?2",
-        )
-        .bind(node_id)
-        .bind(cutoff)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(exists)
-    }
-
     /// The row of `node_id` if it is stored as another device of the local user.
     pub async fn get_other_device(&self, node_id: &str) -> Result<Option<DeviceEntry>, AppError> {
         let row = sqlx::query(

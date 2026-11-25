@@ -135,8 +135,6 @@ listen_addr = "127.0.0.1:$port"
 data_dir = "$dir/data"
 public_url = "https://$hostname"
 registration_open = true
-# Every request arrives through Caddy on the same host, which appends X-Forwarded-For.
-trust_forwarded_for = true
 CONFIG
     sudo install -o root -g proscenium -m 0640 "$config" "$dir/config.toml"
     rm -f "$config"

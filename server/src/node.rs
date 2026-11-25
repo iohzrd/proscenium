@@ -10,11 +10,6 @@ use std::time::Duration;
 /// a peer drops the stream on which it receives a larger frame.
 pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 
-/// Incoming gossip connections held at the same time, in total and per remote NodeId
-/// (`proscenium_types::ConnectionLimit`).
-const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 256;
-const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
-
 /// Time allowed for `Router::shutdown` before the process exits anyway.
 const ROUTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -126,14 +121,7 @@ impl Node {
             .spawn(endpoint.clone());
 
         let router = Router::builder(endpoint.clone())
-            .accept(
-                iroh_gossip::ALPN,
-                proscenium_types::ConnectionLimit::new(
-                    gossip.clone(),
-                    GOSSIP_MAX_INCOMING_CONNECTIONS,
-                    GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE,
-                ),
-            )
+            .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
 
         Self {

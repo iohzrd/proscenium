@@ -383,14 +383,7 @@ async fn build_network_stack(
 
     let router = Router::builder(endpoint.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
-        .accept(
-            iroh_gossip::ALPN,
-            proscenium_types::ConnectionLimit::new(
-                gossip,
-                crate::constants::GOSSIP_MAX_INCOMING_CONNECTIONS,
-                crate::constants::GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE,
-            ),
-        )
+        .accept(iroh_gossip::ALPN, gossip)
         .accept(PEER_ALPN, peer_handler.clone())
         .accept(DM_ALPN, dm_handler.clone())
         .accept(CALL_ALPN, call_handler.clone())

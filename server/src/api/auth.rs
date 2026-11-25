@@ -1,12 +1,8 @@
 use super::AppState;
 use crate::config::normalize_url;
-use crate::http::client_ip;
 use crate::storage::{ChangeError, RegistrationChange, Rejection};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::http::header::RETRY_AFTER;
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use proscenium_types::{
@@ -14,8 +10,6 @@ use proscenium_types::{
     is_recent_timestamp, verify_profile_update, verify_registration_signature,
 };
 use serde::Serialize;
-use std::net::SocketAddr;
-use std::time::Instant;
 
 /// Largest accepted request body. A profile update with every field at its maximum
 /// length and every character JSON-escaped is below this.
@@ -204,40 +198,13 @@ async fn update_profile(
     }))
 }
 
-/// Respond 429 if the client address exceeded
-/// `limits.register_requests_per_minute`; otherwise run the handler.
-async fn limit_request_rate(
-    State(state): State<AppState>,
-    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let ip = client_ip(
-        request.headers(),
-        remote_addr,
-        state.config.server.trust_forwarded_for,
-    );
-    if !state.register_limiter.allow(ip, Instant::now()) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(RETRY_AFTER, "60")],
-            Json(MessageResponse {
-                message: "too many requests".to_string(),
-            }),
-        )
-            .into_response();
-    }
-    next.run(request).await
-}
-
-pub fn routes(state: AppState) -> Router<AppState> {
+pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/v1/register",
             post(register).put(update_profile).delete(unregister),
         )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .layer(middleware::from_fn_with_state(state, limit_request_rate))
 }
 
 #[cfg(test)]

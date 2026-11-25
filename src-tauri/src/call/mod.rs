@@ -13,11 +13,7 @@ use proscenium_types::{CallEvent, CallState, short_id};
 use state::{ActiveCall, CONNECT_TIMEOUT, CallPhase};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{Mutex, Semaphore};
-
-/// `CallReject` signals for offers received during a call that may be in transit at one
-/// time. Further offers are ignored without a reply.
-const MAX_PENDING_REJECTS: usize = 4;
+use tokio::sync::Mutex;
 
 #[derive(Clone)]
 pub struct CallHandler {
@@ -26,7 +22,6 @@ pub struct CallHandler {
     pub(crate) dm: DmHandler,
     app_handle: AppHandle,
     pub(crate) active_call: Arc<Mutex<Option<ActiveCall>>>,
-    reject_permits: Arc<Semaphore>,
 }
 
 impl CallHandler {
@@ -42,7 +37,6 @@ impl CallHandler {
             dm,
             app_handle,
             active_call: Arc::new(Mutex::new(None)),
-            reject_permits: Arc::new(Semaphore::new(MAX_PENDING_REJECTS)),
         }
     }
 

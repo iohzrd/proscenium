@@ -28,13 +28,6 @@ enum Delivery {
     Rejected,
 }
 
-/// The error of a device that answered `DmAck::Deferred`.
-fn deferred() -> AppError {
-    AppError::Other(
-        "the recipient deferred the message: its limit of new conversations was reached".into(),
-    )
-}
-
 /// Devices of the recipient a payload is sent to.
 #[derive(Debug, Clone, Copy)]
 enum Target {
@@ -365,8 +358,8 @@ impl DmHandler {
     /// Returns `Acknowledged` as soon as a device answers `DmAck::Ok`; the sends to the
     /// other devices continue in the background. `Target::FirstDevice` tries the devices
     /// in order until one answers `DmAck::Ok`. Returns `Rejected` only if every device
-    /// answered `DmAck::Rejected`; otherwise the error of a device that did not answer or
-    /// answered `DmAck::Deferred`, so a queued payload is sent again later.
+    /// answered `DmAck::Rejected`; otherwise the error of a device that did not answer, so
+    /// a queued payload is sent again later.
     async fn deliver(
         &self,
         peer_master_pubkey: &str,
@@ -399,7 +392,6 @@ impl DmHandler {
                         match self.send_frame(*device, &frame).await {
                             Ok(DmAck::Ok) => return Ok(Delivery::Acknowledged),
                             Ok(DmAck::Rejected) => rejected = true,
-                            Ok(DmAck::Deferred) => last_error = Some(deferred()),
                             Err(e) => last_error = Some(e),
                         }
                     }
@@ -420,7 +412,6 @@ impl DmHandler {
                                 return Ok(Delivery::Acknowledged);
                             }
                             Ok(Ok(DmAck::Rejected)) => rejected = true,
-                            Ok(Ok(DmAck::Deferred)) => last_error = Some(deferred()),
                             Ok(Err(e)) => last_error = Some(e),
                             Err(e) => last_error = Some(AppError::Other(e.to_string())),
                         }

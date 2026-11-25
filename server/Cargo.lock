@@ -2663,7 +2663,6 @@ dependencies = [
  "clap",
  "futures-lite",
  "getrandom 0.4.3",
- "hyper-util",
  "iroh",
  "iroh-gossip",
  "maud",
@@ -2682,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "proscenium-types"
-version = "0.2.62"
+version = "0.2.63"
 dependencies = [
  "hex",
  "iroh",

@@ -288,7 +288,7 @@ async fn unregister_requires_active_registration_and_clears_identifying_columns(
         .await
         .unwrap();
     storage
-        .insert_interactions(pk, &[user.like(&post, 1, 100)], 100)
+        .insert_interactions(pk, &[user.like(&post, 1, 100)])
         .await
         .unwrap();
 
@@ -798,7 +798,7 @@ async fn posts_are_stored_only_for_active_public_authors() {
 }
 
 #[tokio::test]
-async fn post_and_interaction_limits_per_user() {
+async fn post_limit_per_user() {
     let storage = storage().await;
     let user = TestUser::new(1);
     let pk = &user.master_pubkey;
@@ -845,17 +845,6 @@ async fn post_and_interaction_limits_per_user() {
     let cursor = storage.get_sync_cursor(pk, 104, 3).await.unwrap();
     assert_eq!(cursor.since, 104);
     assert_eq!(cursor.post_ids, vec![newer.id.clone(), posts[4].id.clone()]);
-
-    let target = posts.first().unwrap();
-    let likes: Vec<Interaction> = (0..4).map(|n| user.like(target, n, 100)).collect();
-    let stored = storage.insert_interactions(pk, &likes, 2).await.unwrap();
-    assert_eq!(
-        stored,
-        InsertCount {
-            stored: 2,
-            over_limit: 2
-        }
-    );
 }
 
 #[tokio::test]
@@ -874,17 +863,17 @@ async fn deleted_interaction_is_not_stored_again() {
     let like = user.like(&target, 0, 100);
     let other = user.like(&target, 1, 100);
     storage
-        .insert_interactions(pk, std::slice::from_ref(&like), 100)
+        .insert_interactions(pk, std::slice::from_ref(&like))
         .await
         .unwrap();
 
     assert!(storage.delete_interaction(&like.id, pk).await.unwrap());
     // The signed original is sent again, for example by a sync or a gossip relay.
     let stored = storage
-        .insert_interactions(pk, &[like.clone(), other], 100)
+        .insert_interactions(pk, &[like.clone(), other])
         .await
         .unwrap();
-    assert_eq!(stored.stored, 1);
+    assert_eq!(stored, 1);
     assert!(!storage.delete_interaction(&like.id, pk).await.unwrap());
 }
 
@@ -905,20 +894,16 @@ async fn interactions_missing_from_a_device_set_are_deleted_without_tombstone() 
         .await
         .unwrap();
     let likes: Vec<Interaction> = (0..3).map(|n| user.like(&target, n, 100)).collect();
-    storage.insert_interactions(pk, &likes, 100).await.unwrap();
+    storage.insert_interactions(pk, &likes).await.unwrap();
     // Older than the requested window: kept although the set does not name it.
     let old = user.like(&target, 9, 50);
     storage
-        .insert_interactions(pk, std::slice::from_ref(&old), 100)
+        .insert_interactions(pk, std::slice::from_ref(&old))
         .await
         .unwrap();
     let foreign = other_user.like(&target, 0, 100);
     storage
-        .insert_interactions(
-            &other_user.master_pubkey,
-            std::slice::from_ref(&foreign),
-            100,
-        )
+        .insert_interactions(&other_user.master_pubkey, std::slice::from_ref(&foreign))
         .await
         .unwrap();
 
@@ -934,10 +919,10 @@ async fn interactions_missing_from_a_device_set_are_deleted_without_tombstone() 
     // A sync from another device that holds the second like stores it again: no
     // tombstone was recorded. (`delete_interaction`, the signed deletion, records one.)
     let stored = storage
-        .insert_interactions(pk, std::slice::from_ref(&likes[1]), 100)
+        .insert_interactions(pk, std::slice::from_ref(&likes[1]))
         .await
         .unwrap();
-    assert_eq!(stored.stored, 1);
+    assert_eq!(stored, 1);
     assert!(storage.delete_interaction(&likes[0].id, pk).await.unwrap());
     assert!(storage.delete_interaction(&old.id, pk).await.unwrap());
     // Interactions of other authors are kept.
@@ -1044,11 +1029,7 @@ async fn sync_cursor_reports_stored_rows() {
         .await
         .unwrap();
     storage
-        .insert_interactions(
-            pk,
-            &[user.like(&older, 1, 150), user.like(&newer, 2, 250)],
-            100,
-        )
+        .insert_interactions(pk, &[user.like(&older, 1, 150), user.like(&newer, 2, 250)])
         .await
         .unwrap();
 
@@ -1075,7 +1056,7 @@ async fn prune_deletes_old_posts_and_interactions() {
         .await
         .unwrap();
     storage
-        .insert_interactions(pk, &[user.like(&new, 1, 150), user.like(&new, 2, 350)], 100)
+        .insert_interactions(pk, &[user.like(&new, 1, 150), user.like(&new, 2, 350)])
         .await
         .unwrap();
 
@@ -1129,7 +1110,7 @@ async fn read_queries_return_posts_of_active_public_authors_only() {
         .await
         .unwrap();
     storage
-        .insert_interactions(&liker.master_pubkey, &[liker.like(&post, 1, 100)], 100)
+        .insert_interactions(&liker.master_pubkey, &[liker.like(&post, 1, 100)])
         .await
         .unwrap();
     let query = fts_query("searchable").unwrap();
@@ -1198,7 +1179,7 @@ async fn interactions_of_non_public_authors_are_not_returned() {
         .await
         .unwrap();
     storage
-        .insert_interactions(&liker.master_pubkey, &[liker.like(&post, 1, 100)], 100)
+        .insert_interactions(&liker.master_pubkey, &[liker.like(&post, 1, 100)])
         .await
         .unwrap();
 
@@ -1318,9 +1299,9 @@ async fn post_stats_count_distinct_likers_replies_quotes_and_reposts() {
 
     // One author with three Like rows counts as one like.
     let likes: Vec<Interaction> = (0..3).map(|n| other.like(&target, n, 120)).collect();
-    storage.insert_interactions(opk, &likes, 100).await.unwrap();
+    storage.insert_interactions(opk, &likes).await.unwrap();
     storage
-        .insert_interactions(apk, &[author.like(&target, 9, 121)], 100)
+        .insert_interactions(apk, &[author.like(&target, 9, 121)])
         .await
         .unwrap();
 

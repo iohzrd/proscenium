@@ -3,23 +3,19 @@
 
 use crate::api::{AppState, build_router};
 use crate::config::Config;
-use crate::http::RateLimiter;
 use crate::ingestion::IngestionManager;
 use crate::node::Node;
 use crate::storage::Storage;
 use crate::test_util::{TestUser, loopback_endpoint};
 use axum::Router;
 use axum::body::Body;
-use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use iroh::SecretKey;
 use proscenium_types::{REGISTRATION_ACTION_UNREGISTER, Visibility, now_millis};
 use serde::Serialize;
 use serde_json::Value;
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
-use tower::{Layer, Service};
+use tower::Service;
 
 const URL: &str = "https://server.test";
 const REGISTER: &str = "/api/v1/register";
@@ -52,16 +48,11 @@ impl TestApp {
         let storage = Arc::new(Storage::open_in_memory().await.unwrap());
         let node = Node::spawn(loopback_endpoint(SecretKey::from_bytes(&[200u8; 32])).await);
         let manager = IngestionManager::new(&node, storage.clone(), &config);
-        let register_limiter = Arc::new(RateLimiter::new(
-            config.limits.register_requests_per_minute,
-            Duration::from_secs(60),
-        ));
         let router = build_router(AppState {
             storage: storage.clone(),
             config: Arc::new(config),
             ingestion: manager.clone(),
             start_time: std::time::Instant::now(),
-            register_limiter,
         });
         Self {
             router,
@@ -72,10 +63,7 @@ impl TestApp {
     }
 
     async fn send(&self, request: Request<Body>) -> Reply {
-        // `http::serve` adds the peer address the same way.
-        let peer: SocketAddr = "192.0.2.10:5000".parse().unwrap();
-        let mut service = axum::Extension(ConnectInfo(peer)).layer(self.router.clone());
-        let response = service.call(request).await.unwrap();
+        let response = self.router.clone().call(request).await.unwrap();
         let status = response.status();
         let headers = response.headers().clone();
         let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
@@ -111,7 +99,7 @@ impl TestApp {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registration_lifecycle_over_http() {
-    let app = TestApp::new("[limits]\nregister_requests_per_minute = 1000\n").await;
+    let app = TestApp::new("").await;
     let user = TestUser::new(1);
     let pk = &user.master_pubkey;
     let now = now_millis();
@@ -230,9 +218,7 @@ async fn private_profile_update_removes_registration() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registration_limits_over_http() {
-    let app =
-        TestApp::new("[limits]\nmax_registered_users = 1\nregister_requests_per_minute = 4\n")
-            .await;
+    let app = TestApp::new("[limits]\nmax_registered_users = 1\n").await;
     let now = now_millis();
     let first = TestUser::new(1);
     let second = TestUser::new(2);
@@ -261,19 +247,6 @@ async fn registration_limits_over_http() {
         .await;
     assert_eq!(reply.status, StatusCode::UNPROCESSABLE_ENTITY);
 
-    // The fifth request of one address within the window is refused before the handler.
-    let request = second.registration(URL, now + 1, Visibility::Public, None);
-    let reply = app.send_json(Method::POST, REGISTER, &request).await;
-    assert_eq!(
-        reply.status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "{}",
-        reply.body
-    );
-    assert_eq!(reply.headers.get(header::RETRY_AFTER).unwrap(), "60");
-    // Read routes are not counted.
-    assert_eq!(app.get("/api/v1/info").await.status, StatusCode::OK);
-
     app.shutdown().await;
 }
 
@@ -297,7 +270,7 @@ async fn read_routes_validate_input_and_filter_by_visibility() {
         .await
         .unwrap();
     app.storage
-        .insert_interactions(pk, &[user.like(&post, 1, now)], 100)
+        .insert_interactions(pk, &[user.like(&post, 1, now)])
         .await
         .unwrap();
 

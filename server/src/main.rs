@@ -3,7 +3,6 @@ mod api;
 mod api_tests;
 mod config;
 mod content;
-mod http;
 mod ingestion;
 mod node;
 #[cfg(test)]
@@ -25,8 +24,6 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(3600);
 /// Time an inactive registration row (its replay and downgrade floors) is kept after
 /// deactivation.
 const INACTIVE_REGISTRATION_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// Window of the request counter for `/api/v1/register`.
-const REGISTER_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Parser)]
 #[command(name = "proscenium-server", about = "Proscenium discovery server")]
@@ -189,18 +186,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let listen_addr = config.listen_addr(cli.port)?;
-    let serve_limits = http::ServeLimits::new(config.limits.max_connections);
-    let register_limiter = Arc::new(http::RateLimiter::new(
-        config.limits.register_requests_per_minute,
-        REGISTER_RATE_WINDOW,
-    ));
 
     let app_state = api::AppState {
         storage,
         config: Arc::new(config),
         ingestion: ingestion_mgr.clone(),
         start_time: std::time::Instant::now(),
-        register_limiter,
     };
 
     let router = api::build_router(app_state);
@@ -208,7 +199,9 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
     tracing::info!("HTTP server listening on {listen_addr}");
 
-    http::serve(listener, router, serve_limits, shutdown_signal()).await;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
 
     tracing::info!("shutting down");
     ingestion_mgr.shutdown().await;

@@ -11,7 +11,7 @@ mod incoming;
 use crate::error::AppError;
 use crate::state::SharedIdentity;
 use crate::storage::Storage;
-use crate::util::{NodeSlot, RateWindow};
+use crate::util::RateWindow;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::Connection,
@@ -21,7 +21,6 @@ use proscenium_types::{
     DM_ALPN, DirectMessage, DmEnvelope, MAX_ANNOUNCEMENT_JSON_LEN, is_valid_id, short_id,
     validate_media_list,
 };
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -41,11 +40,6 @@ pub(crate) const MAX_DM_PAYLOAD_LEN: usize = 64 * 1024;
 /// bytes. The other fields take under 1 KiB.
 const MAX_DM_FRAME_LEN: usize = MAX_DM_PAYLOAD_LEN + MAX_ANNOUNCEMENT_JSON_LEN + 1024;
 
-/// New conversations with strangers (see `Storage::receive_dm_message`) accepted per
-/// `STRANGER_WINDOW`, over all senders. NodeIds and identities cost nothing to generate,
-/// so a per-sender limit does not stop one sender with many keys from replacing every
-/// stranger conversation; this limit makes that take hours.
-const MAX_NEW_STRANGER_CONVERSATIONS: usize = 20;
 const STRANGER_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 /// New stranger conversations per `STRANGER_WINDOW` whose first message is reported with
@@ -53,14 +47,8 @@ const STRANGER_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// set no `notify`.
 const MAX_STRANGER_NOTIFICATIONS: usize = 3;
 
-/// Incoming DM connections handled at the same time: from devices of contacts (the
-/// NodeId is in the cached device list of a user who is no stranger, see
-/// `Storage::is_stranger`), from other NodeIds, and per remote NodeId. NodeIds cost
-/// nothing to generate, so connections of other NodeIds cannot take the slots of
-/// contacts.
+/// Incoming DM connections handled at the same time.
 const DM_MAX_CONNECTIONS: usize = 64;
-const DM_MAX_UNKNOWN_CONNECTIONS: usize = 16;
-const DM_MAX_CONNECTIONS_PER_NODE: usize = 4;
 
 /// Maximum byte length of the answer the sender reads (a `DmAck`).
 const MAX_DM_ANSWER_LEN: usize = 64;
@@ -94,14 +82,8 @@ pub struct DmHandler {
     /// retry delay has not elapsed.
     outbox_ignore_delay: Arc<AtomicBool>,
     pub(crate) call_signal_tx: mpsc::UnboundedSender<CallSignal>,
-    /// Limits the incoming connections from devices of contacts handled at the same time.
+    /// Incoming connections handled at the same time (`DM_MAX_CONNECTIONS`).
     connection_limit: Arc<Semaphore>,
-    /// Limits the incoming connections from other NodeIds handled at the same time.
-    unknown_connection_limit: Arc<Semaphore>,
-    /// Incoming connections currently handled per remote NodeId.
-    connections_per_node: Arc<StdMutex<HashMap<EndpointId, usize>>>,
-    /// New stranger conversations accepted within `STRANGER_WINDOW`.
-    stranger_admissions: Arc<StdMutex<RateWindow>>,
     /// New stranger conversations reported with `notify` within `STRANGER_WINDOW`.
     stranger_notifications: Arc<StdMutex<RateWindow>>,
 }
@@ -129,26 +111,11 @@ impl DmHandler {
             outbox_ignore_delay: Arc::new(AtomicBool::new(false)),
             call_signal_tx,
             connection_limit: Arc::new(Semaphore::new(DM_MAX_CONNECTIONS)),
-            unknown_connection_limit: Arc::new(Semaphore::new(DM_MAX_UNKNOWN_CONNECTIONS)),
-            connections_per_node: Arc::new(StdMutex::new(HashMap::new())),
-            stranger_admissions: Arc::new(StdMutex::new(RateWindow::new(
-                MAX_NEW_STRANGER_CONVERSATIONS,
-                STRANGER_WINDOW,
-            ))),
             stranger_notifications: Arc::new(StdMutex::new(RateWindow::new(
                 MAX_STRANGER_NOTIFICATIONS,
                 STRANGER_WINDOW,
             ))),
         }
-    }
-
-    /// Count one new stranger conversation against `MAX_NEW_STRANGER_CONVERSATIONS`.
-    /// Returns false, and counts nothing, if the limit is reached.
-    pub(super) fn admit_new_stranger(&self) -> bool {
-        let Ok(mut admissions) = self.stranger_admissions.lock() else {
-            return false;
-        };
-        admissions.admit(Instant::now())
     }
 
     /// Count one notification of a new stranger conversation against
@@ -276,49 +243,22 @@ pub(crate) fn validate_direct_message(message: &DirectMessage) -> Result<(), Str
 }
 
 impl ProtocolHandler for DmHandler {
-    /// Serve one incoming envelope. At most `DM_MAX_CONNECTIONS` connections from devices
-    /// of contacts and `DM_MAX_UNKNOWN_CONNECTIONS` from other NodeIds are handled at once,
-    /// and `DM_MAX_CONNECTIONS_PER_NODE` per remote NodeId; others are closed.
+    /// Serve one incoming envelope. At most `DM_MAX_CONNECTIONS` connections are handled
+    /// at once; others are closed.
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         let remote = conn.remote_id();
         let remote_str = remote.to_string();
         log::debug!("[dm] incoming connection from {}", short_id(&remote_str));
-        let owner = self
-            .storage
-            .get_master_pubkey_for_transport(&remote_str)
-            .await;
-        let contact = match &owner {
-            Some(master) => {
-                let me = self.identity.read().await.master_pubkey.clone();
-                !self
-                    .storage
-                    .is_stranger(&me, master)
-                    .await
-                    .map_err(AcceptError::from_err)?
-            }
-            None => false,
-        };
-        let limit = if contact {
-            &self.connection_limit
-        } else {
-            &self.unknown_connection_limit
-        };
-        let Ok(_permit) = limit.clone().try_acquire_owned() else {
+        let Ok(_permit) = self.connection_limit.clone().try_acquire_owned() else {
             conn.close(1u32.into(), b"busy");
             return Err(AcceptError::from_err(std::io::Error::other(
                 "DM connection limit reached",
             )));
         };
-        let Some(_node_slot) = NodeSlot::acquire(
-            &self.connections_per_node,
-            remote,
-            DM_MAX_CONNECTIONS_PER_NODE,
-        ) else {
-            conn.close(1u32.into(), b"busy");
-            return Err(AcceptError::from_err(std::io::Error::other(
-                "per-node DM connection limit reached",
-            )));
-        };
+        let owner = self
+            .storage
+            .get_master_pubkey_for_transport(&remote_str)
+            .await;
         let owner = owner.unwrap_or_else(|| remote_str.clone());
         match self.serve(&conn, remote, &owner).await {
             Ok(()) => Ok(()),

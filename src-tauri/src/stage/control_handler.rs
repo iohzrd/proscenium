@@ -1,6 +1,6 @@
 use super::control::VerifiedControl;
-use super::state::{ActiveStage, HostState, MixedStreamServer, Moderation, Participant, RoomRoles};
-use super::{CLOSE_BANNED, CLOSE_NORMAL, Outcome};
+use super::state::{ActiveStage, Moderation, Participant};
+use super::{CLOSE_BANNED, Outcome};
 use proscenium_types::{
     MAX_STAGE_PARTICIPANTS, StageControl, StageEvent, StageRole, now_millis, short_id,
 };
@@ -29,13 +29,9 @@ impl ActiveStage {
 
         let actor = match (&signed.control, presence) {
             (StageControl::Presence { .. }, Some(presence)) => {
-                let (my_pubkey, roles) = (&self.my_pubkey, &self.roles);
-                let (serving, host) = (self.serving.as_ref(), self.host.as_ref());
-                let protected =
-                    |pubkey: &str| is_protected(pubkey, my_pubkey, roles, serving, host);
-                if roles.is_banned(&presence.master_pubkey)
+                if self.roles.is_banned(&presence.master_pubkey)
                     || self.kicked.is_kicked(&presence.master_pubkey, now_millis())
-                    || !self.senders.admit(&presence.master_pubkey, protected)
+                    || !self.senders.admit(&presence.master_pubkey)
                 {
                     return Outcome::Continue;
                 }
@@ -105,9 +101,7 @@ impl ActiveStage {
                 }
             }
             StageControl::Reaction { emoji } => {
-                if let Some(p) = self.participants.get_mut(&actor)
-                    && p.reaction_limit.allow(now_millis())
-                {
+                if self.participants.contains_key(&actor) {
                     self.emit(StageEvent::Reaction {
                         pubkey: actor,
                         emoji,
@@ -115,9 +109,7 @@ impl ActiveStage {
                 }
             }
             StageControl::Chat { text } => {
-                if let Some(p) = self.participants.get_mut(&actor)
-                    && p.chat_limit.allow(now_millis())
-                {
+                if self.participants.contains_key(&actor) {
                     self.emit(StageEvent::Chat {
                         pubkey: actor,
                         text,
@@ -166,9 +158,8 @@ impl ActiveStage {
         Outcome::Continue
     }
 
-    /// Record a verified `Presence` of `actor`. Adds the participant if it is new. At the
-    /// participant limit the least recently seen participant that `is_protected` rejects
-    /// is removed first; if every participant is protected, `actor` is not added.
+    /// Record a verified `Presence` of `actor`. Adds the participant if it is new and the
+    /// participant limit is not reached.
     async fn handle_presence(&mut self, actor: String) {
         let now = now_millis();
         if let Some(p) = self.participants.get_mut(&actor) {
@@ -176,18 +167,7 @@ impl ActiveStage {
             return;
         }
         if self.participants.len() >= MAX_STAGE_PARTICIPANTS {
-            let (my_pubkey, roles) = (&self.my_pubkey, &self.roles);
-            let (serving, host) = (self.serving.as_ref(), self.host.as_ref());
-            let evicted = self
-                .participants
-                .values()
-                .filter(|p| !is_protected(&p.pubkey, my_pubkey, roles, serving, host))
-                .min_by_key(|p| p.last_seen_ms)
-                .map(|p| p.pubkey.clone());
-            let Some(evicted) = evicted else {
-                return;
-            };
-            self.remove_participant(&evicted, CLOSE_NORMAL).await;
+            return;
         }
         self.participants
             .insert(actor.clone(), Participant::new(actor.clone(), now));
@@ -290,19 +270,4 @@ impl ActiveStage {
         );
         self.start_listener(source_node_id);
     }
-}
-
-/// True if `pubkey` keeps its participant and sender entries when the tables are full:
-/// the local user, holders of a role other than Listener (the host included), and
-/// identities with an audio connection to this node.
-fn is_protected(
-    pubkey: &str,
-    my_pubkey: &str,
-    roles: &RoomRoles,
-    serving: Option<&MixedStreamServer>,
-    host: Option<&HostState>,
-) -> bool {
-    pubkey == my_pubkey
-        || roles.role_of(pubkey) != StageRole::Listener
-        || super::serving::has_audio_connection(serving, host, pubkey)
 }

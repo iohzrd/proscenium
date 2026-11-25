@@ -23,27 +23,15 @@ pub const SYNC_MAX_INTERACTIONS_PER_RUN: usize = 100_000;
 pub const SYNC_RETURNED_POSTS_MAX: usize = 200;
 /// Tombstones per `Tombstones` frame sent by a responder.
 pub const SYNC_TOMBSTONE_BATCH: usize = 1_000;
-/// Sync requests served at the same time to known NodeIds (other devices of the local
-/// user, and NodeIds mapped to an identity), and separately to other NodeIds. One NodeId
-/// is served one at a time.
+/// Sync requests served at the same time.
 pub const SYNC_SERVER_CONCURRENCY: usize = 4;
-pub const SYNC_SERVER_UNKNOWN_CONCURRENCY: usize = 4;
 /// Time limit for serving one sync request. A requester stops after `SYNC_PEER_TIMEOUT`
 /// too.
 pub const SYNC_SERVE_TIMEOUT: Duration = SYNC_PEER_TIMEOUT;
-/// Time limit for serving one sync request to a NodeId that is not known (see
-/// `PeerHandler::accept`), so that generated NodeIds hold the permits of that class only
-/// briefly. A requester that did not finish continues at its next sync.
-pub const SYNC_SERVE_UNKNOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 // Peer protocol (accept side)
-/// Connections on the peer ALPN handled at the same time from known NodeIds (other devices
-/// of the local user, and NodeIds mapped to an identity), from other NodeIds, and per
-/// remote NodeId. NodeIds cost nothing to generate, so unknown NodeIds have their own
-/// limit and cannot take the connections of known ones.
+/// Connections on the peer ALPN handled at the same time.
 pub const PEER_MAX_CONNECTIONS: usize = 64;
-pub const PEER_MAX_UNKNOWN_CONNECTIONS: usize = 32;
-pub const PEER_MAX_CONNECTIONS_PER_NODE: usize = 4;
 /// Time allowed for the remote to open the request stream.
 pub const PEER_ACCEPT_STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 /// Time allowed to receive one request body.
@@ -93,13 +81,6 @@ pub const MAX_PUSH_TOMBSTONES: usize = 200;
 pub const FOLLOW_REQUEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000; // 30 days
 /// Pending follow requests stored at the same time.
 pub const MAX_PENDING_FOLLOW_REQUESTS: u64 = 500;
-/// New pending follow requests stored per `FOLLOW_REQUEST_WINDOW`, over all requesters
-/// the local user does not follow. Identities cost nothing to generate; with this limit,
-/// requests from generated identities take 25 hours to evict the oldest of the
-/// `MAX_PENDING_FOLLOW_REQUESTS` rows and produce at most this many notifications per
-/// window.
-pub const MAX_NEW_FOLLOW_REQUESTS: usize = 20;
-pub const FOLLOW_REQUEST_WINDOW: Duration = Duration::from_secs(60 * 60);
 
 // Peer sync task
 pub const RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -152,26 +133,11 @@ pub const GOSSIP_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 /// Bytes of a gossip frame reserved for the iroh-gossip header; a payload larger than
 /// `GOSSIP_MAX_MESSAGE_SIZE - GOSSIP_FRAME_OVERHEAD` is not broadcast.
 pub const GOSSIP_FRAME_OVERHEAD: usize = 1024;
-/// Incoming gossip connections held at the same time, in total and per remote NodeId
-/// (`proscenium_types::ConnectionLimit`).
-pub const GOSSIP_MAX_INCOMING_CONNECTIONS: usize = 128;
-pub const GOSSIP_MAX_INCOMING_CONNECTIONS_PER_NODE: usize = 2;
-/// Minimum time between two syncs that a followed user's subscription queues because it
-/// discarded messages over a sender's budget (`proscenium_types::GossipSenderBudgets`).
-pub const GOSSIP_DISCARD_SYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Interval at which a subscription without neighbors calls `join_peers` again.
 pub const GOSSIP_REJOIN_INTERVAL: Duration = Duration::from_secs(30);
 /// First and largest delay before a failed subscription is attempted again.
 pub const GOSSIP_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(5);
 pub const GOSSIP_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
-
-// Own feed (followers joining the local user's topic)
-/// Identity queries for new neighbors running at the same time, and neighbors waiting for one.
-pub const OWN_FEED_RESOLVE_CONCURRENCY: usize = 8;
-pub const OWN_FEED_RESOLVE_QUEUE: usize = 64;
-/// New follower rows (and "follower" notifications) recorded per window.
-pub const OWN_FEED_NEW_FOLLOWERS_PER_WINDOW: u32 = 30;
-pub const OWN_FEED_FOLLOWER_WINDOW: Duration = Duration::from_secs(600);
 
 // Network health (gossip)
 pub const HEALTH_TICK_INTERVAL: Duration = Duration::from_secs(5);

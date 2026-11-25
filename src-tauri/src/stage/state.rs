@@ -23,17 +23,6 @@ pub(super) const LISTENER_CAPACITY: usize = 64;
 /// Extra listener connections the host accepts above `LISTENER_CAPACITY`. Covers the
 /// upstream connections of relays, which the topology manager does not count.
 pub(super) const LISTENER_CAPACITY_RESERVE: usize = MAX_STAGE_SPEAKERS;
-/// Listener connections accepted per master pubkey (one per device).
-pub(super) const MAX_LISTENER_CONNS_PER_IDENTITY: usize = 4;
-/// Relay NodeIds a listener stops using after they failed.
-pub(super) const MAX_FAILED_UPSTREAMS: usize = 32;
-
-/// Chat messages accepted per participant: burst size and milliseconds per refill.
-const CHAT_BURST: u32 = 5;
-const CHAT_REFILL_MS: u64 = 2_000;
-/// Reactions accepted per participant: burst size and milliseconds per refill.
-const REACTION_BURST: u32 = 10;
-const REACTION_REFILL_MS: u64 = 500;
 
 // ---- Role rules ---------------------------------------------------------
 
@@ -230,26 +219,13 @@ impl SenderTable {
     /// Largest number of senders tracked.
     const MAX_ENTRIES: usize = 2 * MAX_STAGE_PARTICIPANTS;
 
-    /// Admit `sender`. If the table is full, the entry with the lowest last timestamp
-    /// that `protected` rejects is removed first, so keys generated to fill the table
-    /// cannot lock out a new participant. Returns false if every entry is protected.
-    pub(super) fn admit(&mut self, sender: &str, protected: impl Fn(&str) -> bool) -> bool {
+    /// Admit `sender`. Returns false if the table is full.
+    pub(super) fn admit(&mut self, sender: &str) -> bool {
         if self.last_timestamps.contains_key(sender) {
             return true;
         }
         if self.last_timestamps.len() >= Self::MAX_ENTRIES {
-            let evicted = self
-                .last_timestamps
-                .iter()
-                .filter(|(key, _)| !protected(key))
-                .min_by_key(|(_, last)| **last)
-                .map(|(key, _)| key.clone());
-            match evicted {
-                Some(key) => {
-                    self.last_timestamps.remove(&key);
-                }
-                None => return false,
-            }
+            return false;
         }
         self.last_timestamps.insert(sender.to_string(), 0);
         true
@@ -282,45 +258,6 @@ impl SenderTable {
     }
 }
 
-// ---- Rate limiting ------------------------------------------------------
-
-/// Token bucket: `capacity` tokens, one token added every `refill_ms`.
-pub(super) struct RateLimiter {
-    tokens: u32,
-    capacity: u32,
-    refill_ms: u64,
-    last_refill_ms: u64,
-}
-
-impl RateLimiter {
-    pub(super) fn new(capacity: u32, refill_ms: u64, now_ms: u64) -> Self {
-        Self {
-            tokens: capacity,
-            capacity,
-            refill_ms: refill_ms.max(1),
-            last_refill_ms: now_ms,
-        }
-    }
-
-    /// Take one token. Returns false if none is available.
-    pub(super) fn allow(&mut self, now_ms: u64) -> bool {
-        let elapsed = now_ms.saturating_sub(self.last_refill_ms);
-        let refill = elapsed / self.refill_ms;
-        if refill > 0 {
-            self.tokens = self.capacity.min(
-                self.tokens
-                    .saturating_add(u32::try_from(refill).unwrap_or(u32::MAX)),
-            );
-            self.last_refill_ms += refill * self.refill_ms;
-        }
-        if self.tokens == 0 {
-            return false;
-        }
-        self.tokens -= 1;
-        true
-    }
-}
-
 // ---- Participant tracking -----------------------------------------------
 
 /// Live participant entry, created by a verified `Presence` and keyed by master pubkey.
@@ -330,8 +267,6 @@ pub(super) struct Participant {
     pub(super) hand_raised: bool,
     pub(super) self_muted: bool,
     pub(super) last_seen_ms: u64,
-    pub(super) chat_limit: RateLimiter,
-    pub(super) reaction_limit: RateLimiter,
 }
 
 impl Participant {
@@ -341,8 +276,6 @@ impl Participant {
             hand_raised: false,
             self_muted: false,
             last_seen_ms: now_ms,
-            chat_limit: RateLimiter::new(CHAT_BURST, CHAT_REFILL_MS, now_ms),
-            reaction_limit: RateLimiter::new(REACTION_BURST, REACTION_REFILL_MS, now_ms),
         }
     }
 }
@@ -363,9 +296,6 @@ pub(super) struct MixedStreamServer {
     pub(super) fanout: Arc<Fanout>,
     /// Maximum number of entries in `conns`.
     pub(super) capacity: usize,
-    /// Entries of `capacity` that only identities with a speaking role (relay
-    /// candidates) may use. 0 on a relay.
-    pub(super) reserved_for_roles: usize,
     /// Transport NodeId -> connection. One connection per NodeId.
     pub(super) conns: HashMap<String, ListenerConn>,
     /// Relay only: stops the task that reads the mixed stream from the host.
@@ -373,11 +303,10 @@ pub(super) struct MixedStreamServer {
 }
 
 impl MixedStreamServer {
-    pub(super) fn new(fanout: Arc<Fanout>, capacity: usize, reserved_for_roles: usize) -> Self {
+    pub(super) fn new(fanout: Arc<Fanout>, capacity: usize) -> Self {
         Self {
             fanout,
             capacity,
-            reserved_for_roles: reserved_for_roles.min(capacity),
             conns: HashMap::new(),
             upstream_cancel: None,
         }
@@ -706,9 +635,9 @@ mod tests {
         assert!(!table.accept_timestamp("master-a", 100));
         assert!(!table.contains("master-a"));
 
-        assert!(table.admit("master-a", |_| false));
+        assert!(table.admit("master-a"));
         assert!(table.contains("master-a"));
-        assert!(table.admit("master-a", |_| false));
+        assert!(table.admit("master-a"));
 
         assert!(table.accept_timestamp("master-a", 100));
         // Same message again.
@@ -717,17 +646,17 @@ mod tests {
         assert!(!table.accept_timestamp("master-a", 99));
         assert!(table.accept_timestamp("master-a", 101));
         // Admitting again keeps the last timestamp.
-        assert!(table.admit("master-a", |_| false));
+        assert!(table.admit("master-a"));
         assert!(!table.accept_timestamp("master-a", 101));
     }
 
     #[test]
     fn sender_table_is_bounded_and_prunes_departed_senders() {
         let mut table = SenderTable::default();
-        let nobody = |_: &str| false;
         for i in 0..SenderTable::MAX_ENTRIES {
-            assert!(table.admit(&format!("master-{i}"), nobody));
+            assert!(table.admit(&format!("master-{i}")));
         }
+        assert!(!table.admit("master-full"));
 
         let now = 10 * MAX_TIMESTAMP_DRIFT_MS;
         assert!(table.accept_timestamp("master-0", now));
@@ -735,41 +664,6 @@ mod tests {
         assert!(table.contains("master-0"));
         assert!(table.contains("master-1"));
         assert!(!table.contains("master-2"));
-        assert!(table.admit("master-x", nobody));
-    }
-
-    #[test]
-    fn full_sender_table_evicts_the_least_recent_unprotected_sender() {
-        let mut table = SenderTable::default();
-        let nobody = |_: &str| false;
-        for i in 0..SenderTable::MAX_ENTRIES {
-            let sender = format!("master-{i}");
-            assert!(table.admit(&sender, nobody));
-            assert!(table.accept_timestamp(&sender, 1_000 + i as u64));
-        }
-        // master-0 has the lowest timestamp but is protected; master-1 is evicted.
-        assert!(table.admit("master-x", |s| s == "master-0"));
-        assert!(table.contains("master-x"));
-        assert!(table.contains("master-0"));
-        assert!(!table.contains("master-1"));
-        // Every entry protected: the newcomer is refused.
-        assert!(!table.admit("master-y", |_| true));
-        assert!(!table.contains("master-y"));
-    }
-
-    #[test]
-    fn rate_limiter_allows_burst_then_refills() {
-        let mut limiter = RateLimiter::new(3, 1_000, 0);
-        assert!(limiter.allow(0));
-        assert!(limiter.allow(0));
-        assert!(limiter.allow(10));
-        assert!(!limiter.allow(999));
-        assert!(limiter.allow(1_000));
-        assert!(!limiter.allow(1_500));
-        // A long pause refills to the capacity, not beyond it.
-        assert!(limiter.allow(100_000));
-        assert!(limiter.allow(100_000));
-        assert!(limiter.allow(100_000));
-        assert!(!limiter.allow(100_000));
+        assert!(table.admit("master-x"));
     }
 }

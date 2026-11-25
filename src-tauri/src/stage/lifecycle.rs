@@ -182,7 +182,7 @@ impl StageActor {
         let mut participants = HashMap::new();
         participants.insert(my_pubkey.clone(), Participant::new(my_pubkey.clone(), now));
         let mut senders = SenderTable::default();
-        senders.admit(&my_pubkey, |_| false);
+        senders.admit(&my_pubkey);
 
         self.active = Some(ActiveStage {
             rt: self.runtime(),
@@ -216,7 +216,6 @@ impl StageActor {
             serving: Some(MixedStreamServer::new(
                 fanout,
                 LISTENER_CAPACITY + LISTENER_CAPACITY_RESERVE,
-                LISTENER_CAPACITY_RESERVE,
             )),
             speaker: None,
             listener_upstream_id: None,
@@ -348,8 +347,8 @@ impl StageActor {
         // The ticket names the host, so host messages are accepted before the host's
         // Presence arrives.
         let mut senders = SenderTable::default();
-        senders.admit(&ticket.host_pubkey, |_| false);
-        senders.admit(&my_pubkey, |_| false);
+        senders.admit(&ticket.host_pubkey);
+        senders.admit(&my_pubkey);
 
         let mut stage = ActiveStage {
             rt: self.runtime(),

@@ -1,53 +1,17 @@
-use crate::constants::{
-    OWN_FEED_FOLLOWER_WINDOW, OWN_FEED_NEW_FOLLOWERS_PER_WINDOW, OWN_FEED_RESOLVE_CONCURRENCY,
-    OWN_FEED_RESOLVE_QUEUE,
-};
 use crate::error::AppError;
 use crate::storage::Storage;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, EndpointId};
 use iroh_gossip::{Event, GossipReceiver};
 use proscenium_types::{VerifiedIdentity, Visibility, now_millis, short_id, user_feed_topic};
-use std::collections::VecDeque;
 use tauri::{AppHandle, Emitter};
 use tokio::task::JoinSet;
-use tokio::time::Instant;
-
-/// Counts new follower rows per `OWN_FEED_FOLLOWER_WINDOW`.
-struct NewFollowerLimit {
-    window_start: Instant,
-    count: u32,
-}
-
-impl NewFollowerLimit {
-    fn new() -> Self {
-        Self {
-            window_start: Instant::now(),
-            count: 0,
-        }
-    }
-
-    /// Returns `true` and counts one new follower if fewer than
-    /// `OWN_FEED_NEW_FOLLOWERS_PER_WINDOW` were counted in the current window.
-    fn try_take(&mut self) -> bool {
-        if self.window_start.elapsed() >= OWN_FEED_FOLLOWER_WINDOW {
-            self.window_start = Instant::now();
-            self.count = 0;
-        }
-        if self.count >= OWN_FEED_NEW_FOLLOWERS_PER_WINDOW {
-            return false;
-        }
-        self.count += 1;
-        true
-    }
-}
 
 type Resolution = (EndpointId, Result<VerifiedIdentity, AppError>);
 
 /// Receives neighbor events of the local user's own feed topic.
 ///
-/// A neighbor is a follower's device. Its identity is queried in a separate task, at most
-/// `OWN_FEED_RESOLVE_CONCURRENCY` at a time with `OWN_FEED_RESOLVE_QUEUE` waiting, so a
+/// A neighbor is a follower's device. Its identity is queried in a separate task, so a
 /// node that does not answer does not delay other events. Messages received on the topic
 /// are ignored: content of the local user is never taken from the network.
 async fn run_own_feed_listener(
@@ -59,24 +23,20 @@ async fn run_own_feed_listener(
 ) {
     log::info!("[gossip-own] listener started for own feed neighbors");
     let mut resolutions: JoinSet<Resolution> = JoinSet::new();
-    let mut waiting: VecDeque<EndpointId> = VecDeque::new();
-    let mut new_followers = NewFollowerLimit::new();
 
     loop {
         tokio::select! {
             event = receiver.try_next() => match event {
                 Ok(Some(Event::NeighborUp(endpoint_id))) => {
-                    if waiting.len() >= OWN_FEED_RESOLVE_QUEUE {
-                        log::warn!(
-                            "[gossip-own] identity query queue full, ignoring neighbor {}",
-                            endpoint_id.fmt_short()
-                        );
-                    } else if !waiting.contains(&endpoint_id) {
-                        waiting.push_back(endpoint_id);
-                    }
+                    let endpoint = endpoint.clone();
+                    resolutions.spawn(async move {
+                        (
+                            endpoint_id,
+                            crate::peer::query_identity(&endpoint, endpoint_id).await,
+                        )
+                    });
                 }
                 Ok(Some(Event::NeighborDown(endpoint_id))) => {
-                    waiting.retain(|id| *id != endpoint_id);
                     let transport_id = endpoint_id.to_string();
                     // An unresolved neighbor has no follower row.
                     if let Some(pubkey) =
@@ -106,24 +66,10 @@ async fn run_own_feed_listener(
                         &my_id,
                         endpoint_id,
                         result,
-                        &mut new_followers,
                     )
                     .await;
                 }
             }
-        }
-
-        while resolutions.len() < OWN_FEED_RESOLVE_CONCURRENCY {
-            let Some(endpoint_id) = waiting.pop_front() else {
-                break;
-            };
-            let endpoint = endpoint.clone();
-            resolutions.spawn(async move {
-                (
-                    endpoint_id,
-                    crate::peer::query_identity(&endpoint, endpoint_id).await,
-                )
-            });
         }
     }
 }
@@ -131,16 +77,13 @@ async fn run_own_feed_listener(
 /// Store the verified identity of a neighbor and record it as a follower.
 ///
 /// A neighbor whose identity does not verify, or that is a device of the local user, is
-/// not recorded. A master pubkey that is not yet a follower is recorded only while
-/// `new_followers` allows it; that bounds the rows and "follower" notifications that
-/// nodes joining the topic can create.
+/// not recorded.
 async fn record_follower(
     storage: &Storage,
     app_handle: &AppHandle,
     my_id: &str,
     endpoint_id: EndpointId,
     result: Result<VerifiedIdentity, AppError>,
-    new_followers: &mut NewFollowerLimit,
 ) {
     let identity = match result {
         Ok(identity) => identity,
@@ -163,20 +106,6 @@ async fn record_follower(
             log::error!("[gossip-own] moderation lookup failed: {e}");
             return;
         }
-    }
-    let known = match storage.is_follower(my_id, &pubkey).await {
-        Ok(known) => known,
-        Err(e) => {
-            log::error!("[gossip-own] follower lookup failed: {e}");
-            return;
-        }
-    };
-    if !known && !new_followers.try_take() {
-        log::warn!(
-            "[gossip-own] new follower limit reached, not recording {}",
-            short_id(&pubkey)
-        );
-        return;
     }
     if let Err(e) = storage.cache_peer_identity(&identity).await {
         log::warn!(
@@ -263,20 +192,5 @@ impl super::GossipService {
             return Ok(());
         }
         self.start_own_feed_unconditional().await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_follower_limit_stops_at_the_window_cap() {
-        let mut limit = NewFollowerLimit::new();
-        for _ in 0..OWN_FEED_NEW_FOLLOWERS_PER_WINDOW {
-            assert!(limit.try_take());
-        }
-        assert!(!limit.try_take());
-        assert!(!limit.try_take());
     }
 }

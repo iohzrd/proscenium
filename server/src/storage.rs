@@ -1,7 +1,7 @@
 use futures_lite::Stream;
 use proscenium_types::{
-    Interaction, InteractionKind, LinkedDevicesAnnouncement, MAX_SYNC_TOMBSTONES, Post, Profile,
-    ProfileUpdateRequest, RegistrationRequest, Visibility, announcement_replaces, now_millis,
+    Interaction, InteractionKind, LinkedDevicesAnnouncement, Post, Profile, ProfileUpdateRequest,
+    RegistrationRequest, Visibility, announcement_replaces, now_millis,
 };
 use serde::Serialize;
 use sqlx::sqlite::{
@@ -462,8 +462,7 @@ impl Storage {
              SET is_active = 0, last_seen = ?2, profile_visibility = NULL, display_name = NULL,
                  bio = NULL, avatar_hash = NULL, profile_signature = NULL,
                  transport_node_id = NULL, device_node_ids_json = NULL,
-                 announcement_version = 0, announcement_signature = NULL, last_synced_at = 0,
-                 expired = 0
+                 announcement_version = 0, announcement_signature = NULL, expired = 0
              WHERE pubkey = ?1",
         )
         .bind(pubkey)
@@ -817,19 +816,8 @@ impl Storage {
         Ok(row)
     }
 
-    /// `last_synced_at` of the active registration of `pubkey`; 0 if it has none.
-    pub async fn get_last_synced_at(&self, pubkey: &str) -> anyhow::Result<i64> {
-        let at: Option<i64> = sqlx::query_scalar(
-            "SELECT last_synced_at FROM registrations WHERE pubkey = ?1 AND is_active = 1",
-        )
-        .bind(pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(at.unwrap_or(0))
-    }
-
-    /// Record that a sync with a device of `pubkey` completed at `now` (ms). It also counts
-    /// as activity for `expire_inactive_registrations`.
+    /// Record that a sync with a device of `pubkey` completed at `now` (ms): sets
+    /// `last_synced_at`, and `last_active_at` for `expire_inactive_registrations`.
     pub async fn record_sync_completed(&self, pubkey: &str, now: i64) -> anyhow::Result<()> {
         sqlx::query(
             "UPDATE registrations SET last_synced_at = ?2, last_active_at = ?2
@@ -840,6 +828,18 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// `last_synced_at` of the active registration of `pubkey`; 0 if it has none.
+    #[cfg(test)]
+    pub async fn get_last_synced_at(&self, pubkey: &str) -> anyhow::Result<i64> {
+        let value: Option<i64> = sqlx::query_scalar(
+            "SELECT last_synced_at FROM registrations WHERE pubkey = ?1 AND is_active = 1",
+        )
+        .bind(pubkey)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(value.unwrap_or(0))
     }
 
     pub async fn get_active_public_pubkeys(&self) -> anyhow::Result<Vec<String>> {
@@ -967,9 +967,7 @@ impl Storage {
     /// Record that `author` deleted the posts `ids`, and delete those posts, in one
     /// transaction. Returns the number of posts deleted.
     ///
-    /// Nothing is changed unless `author` has an active public registration. At most
-    /// `MAX_SYNC_TOMBSTONES` tombstones are kept per author; beyond that the post is
-    /// still deleted but no tombstone is added.
+    /// Nothing is changed unless `author` has an active public registration.
     pub async fn apply_tombstones(&self, author: &str, ids: &[&str]) -> anyhow::Result<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -979,25 +977,17 @@ impl Storage {
         if !Self::is_active_public(&mut tx, author).await? {
             return Ok(0);
         }
-        let mut tombstones: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM post_tombstones WHERE author = ?1")
-                .bind(author)
-                .fetch_one(&mut *tx)
-                .await?;
         let mut deleted = 0;
         for id in ids {
-            if tombstones < MAX_SYNC_TOMBSTONES as i64 {
-                let result = sqlx::query(
-                    "INSERT OR IGNORE INTO post_tombstones (author, id, deleted_at)
-                     VALUES (?1, ?2, ?3)",
-                )
-                .bind(author)
-                .bind(id)
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
-                tombstones += to_i64(result.rows_affected());
-            }
+            sqlx::query(
+                "INSERT OR IGNORE INTO post_tombstones (author, id, deleted_at)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(author)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
             deleted += sqlx::query("DELETE FROM posts WHERE author = ?1 AND id = ?2")
                 .bind(author)
                 .bind(id)
@@ -1199,34 +1189,23 @@ impl Storage {
     /// Insert verified interactions of `author` in one transaction.
     ///
     /// Nothing is inserted unless `author` has an active public registration. An
-    /// interaction is skipped if its author differs from `author`, it is already stored, a
-    /// deletion of it is stored, or `author` already has `max_interactions` interactions.
+    /// interaction is skipped if its author differs from `author`, it is already stored, or
+    /// a deletion of it is stored. Returns the number of rows inserted.
     pub async fn insert_interactions(
         &self,
         author: &str,
         interactions: &[Interaction],
-        max_interactions: u32,
-    ) -> anyhow::Result<InsertCount> {
-        let mut count = InsertCount::default();
+    ) -> anyhow::Result<usize> {
+        let mut stored = 0;
         if interactions.is_empty() {
-            return Ok(count);
+            return Ok(stored);
         }
         let now = to_i64(now_millis());
         let mut tx = self.begin_write().await?;
         if !Self::is_active_public(&mut tx, author).await? {
-            return Ok(count);
+            return Ok(stored);
         }
-        let mut stored_total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM interactions WHERE author = ?1")
-                .bind(author)
-                .fetch_one(&mut *tx)
-                .await?;
-
         for interaction in interactions.iter().filter(|i| i.author == author) {
-            if stored_total >= i64::from(max_interactions) {
-                count.over_limit += 1;
-                continue;
-            }
             let result = sqlx::query(
                 "INSERT OR IGNORE INTO interactions
                     (id, author, kind, target_post_id, target_author, timestamp, signature, indexed_at)
@@ -1246,20 +1225,17 @@ impl Storage {
             .execute(&mut *tx)
             .await?;
             if result.rows_affected() > 0 {
-                stored_total += 1;
-                count.stored += 1;
+                stored += 1;
             }
         }
         tx.commit().await?;
-        Ok(count)
+        Ok(stored)
     }
 
     /// Record that `author` deleted the interaction `id`, and delete it, in one
     /// transaction. Returns `true` if a stored interaction was deleted.
     ///
-    /// Nothing is changed unless `author` has an active public registration. At most
-    /// `MAX_SYNC_TOMBSTONES` deletions are kept per author; beyond that the interaction is
-    /// still deleted but no deletion is recorded.
+    /// Nothing is changed unless `author` has an active public registration.
     pub async fn delete_interaction(&self, id: &str, author: &str) -> anyhow::Result<bool> {
         let mut tx = self.begin_write().await?;
         if !Self::is_active_public(&mut tx, author).await? {
@@ -1267,13 +1243,11 @@ impl Storage {
         }
         sqlx::query(
             "INSERT OR IGNORE INTO interaction_tombstones (author, id, deleted_at)
-             SELECT ?1, ?2, ?3
-             WHERE (SELECT COUNT(*) FROM interaction_tombstones WHERE author = ?1) < ?4",
+             VALUES (?1, ?2, ?3)",
         )
         .bind(author)
         .bind(id)
         .bind(to_i64(now_millis()))
-        .bind(MAX_SYNC_TOMBSTONES as i64)
         .execute(&mut *tx)
         .await?;
         let result = sqlx::query("DELETE FROM interactions WHERE id = ?1 AND author = ?2")

@@ -30,10 +30,6 @@ pub enum DmAck {
     /// The payload was not applied: the sender is blocked, or the envelope or its payload
     /// is invalid. Sending again gives the same answer.
     Rejected,
-    /// The payload was not applied because a rate limit of the recipient was reached.
-    /// The sender keeps it queued and sends it again later. A sender that does not know
-    /// this variant fails to parse it and also sends again.
-    Deferred,
 }
 
 // -- Payload (inside `DmEnvelope`) --

@@ -764,7 +764,7 @@ async fn social_mutual() {
     s.upsert_follower("me", "peer", 2000).await.unwrap();
     assert!(!s.is_mutual("me", "peer").await.unwrap());
 
-    s.record_follow_request("peer", 1, 2000, 9000, true)
+    s.record_follow_request("peer", 1, 2000, 9000)
         .await
         .unwrap();
     assert!(s.approve_follow_request("me", "peer", 2000).await.unwrap());
@@ -960,7 +960,7 @@ async fn social_remote_list_skips_invalid_pubkeys_and_is_absent_before_fetch() {
 async fn social_push_recipients_follow_visibility() {
     let s = test_storage().await;
     for requester in ["approved_followed", "approved_only", "pending", "blocked"] {
-        s.record_follow_request(requester, 1, 1000, 9000, true)
+        s.record_follow_request(requester, 1, 1000, 9000)
             .await
             .unwrap();
     }
@@ -2224,7 +2224,7 @@ async fn device_list_of_another_master_does_not_take_over_a_node() {
 async fn follow_request_insert_and_list() {
     let s = test_storage().await;
     let outcome = s
-        .record_follow_request("requester_a", 1000, 1001, 9999, true)
+        .record_follow_request("requester_a", 1000, 1001, 9999)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::NewPending);
@@ -2237,7 +2237,7 @@ async fn follow_request_insert_and_list() {
 
     // A repeated request leaves the row unchanged.
     let outcome = s
-        .record_follow_request("requester_a", 2000, 2001, 19999, true)
+        .record_follow_request("requester_a", 2000, 2001, 19999)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::StillPending);
@@ -2250,7 +2250,7 @@ async fn follow_request_insert_and_list() {
 #[tokio::test]
 async fn follow_request_approve() {
     let s = test_storage().await;
-    s.record_follow_request("r1", 1000, 1001, 9999, true)
+    s.record_follow_request("r1", 1000, 1001, 9999)
         .await
         .unwrap();
     assert!(!s.is_approved_follower("r1").await.unwrap());
@@ -2269,7 +2269,7 @@ async fn follow_request_approve() {
 #[tokio::test]
 async fn follow_request_deny() {
     let s = test_storage().await;
-    s.record_follow_request("r1", 1000, 1001, 9999, true)
+    s.record_follow_request("r1", 1000, 1001, 9999)
         .await
         .unwrap();
 
@@ -2281,14 +2281,14 @@ async fn follow_request_deny() {
 #[tokio::test]
 async fn follow_request_denied_stays_denied_until_expiry() {
     let s = test_storage().await;
-    s.record_follow_request("r1", 1000, 1001, 9999, true)
+    s.record_follow_request("r1", 1000, 1001, 9999)
         .await
         .unwrap();
     assert!(s.deny_follow_request("r1", 1002).await.unwrap());
 
     // A repeated request does not return the row to pending.
     let outcome = s
-        .record_follow_request("r1", 2000, 2001, 19999, true)
+        .record_follow_request("r1", 2000, 2001, 19999)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::Denied);
@@ -2304,7 +2304,7 @@ async fn follow_request_denied_stays_denied_until_expiry() {
 
     // After the denial expired the row is deleted and a new request is pending.
     let outcome = s
-        .record_follow_request("r1", 10_000, 10_000, 20_000, true)
+        .record_follow_request("r1", 10_000, 10_000, 20_000)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::NewPending);
@@ -2313,20 +2313,20 @@ async fn follow_request_denied_stays_denied_until_expiry() {
 #[tokio::test]
 async fn follow_request_skip_if_approved() {
     let s = test_storage().await;
-    s.record_follow_request("r1", 1000, 1001, 9999, true)
+    s.record_follow_request("r1", 1000, 1001, 9999)
         .await
         .unwrap();
     s.approve_follow_request("me", "r1", 1002).await.unwrap();
 
     let outcome = s
-        .record_follow_request("r1", 2000, 2001, 9999, true)
+        .record_follow_request("r1", 2000, 2001, 9999)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::Approved);
 
     // An approved row does not expire.
     let outcome = s
-        .record_follow_request("r1", 50_000, 50_000, 60_000, true)
+        .record_follow_request("r1", 50_000, 50_000, 60_000)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::Approved);
@@ -2337,7 +2337,7 @@ async fn follow_request_skip_if_approved() {
 #[tokio::test]
 async fn follow_request_expired_pending_is_not_listed_or_approvable() {
     let s = test_storage().await;
-    s.record_follow_request("r1", 1000, 1001, 5000, true)
+    s.record_follow_request("r1", 1000, 1001, 5000)
         .await
         .unwrap();
 
@@ -2348,7 +2348,7 @@ async fn follow_request_expired_pending_is_not_listed_or_approvable() {
     assert!(!s.is_approved_follower("r1").await.unwrap());
 
     // The next request from anyone deletes the expired row.
-    s.record_follow_request("r2", 6000, 6000, 9000, true)
+    s.record_follow_request("r2", 6000, 6000, 9000)
         .await
         .unwrap();
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM follow_requests")
@@ -2364,13 +2364,13 @@ async fn follow_request_pending_rows_are_capped_by_removing_the_oldest() {
     let max = crate::constants::MAX_PENDING_FOLLOW_REQUESTS;
     for i in 0..max {
         let outcome = s
-            .record_follow_request(&format!("requester_{i}"), 1, 1000 + i, 90_000, true)
+            .record_follow_request(&format!("requester_{i}"), 1, 1000 + i, 90_000)
             .await
             .unwrap();
         assert_eq!(outcome, FollowRequestOutcome::NewPending);
     }
     let outcome = s
-        .record_follow_request("one_more", 1, 1000 + max, 90_000, true)
+        .record_follow_request("one_more", 1, 1000 + max, 90_000)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::NewPending);
@@ -2382,7 +2382,7 @@ async fn follow_request_pending_rows_are_capped_by_removing_the_oldest() {
     );
     // The oldest request was removed; the others are answered from their rows.
     let outcome = s
-        .record_follow_request("requester_1", 1, 1000 + max, 90_000, true)
+        .record_follow_request("requester_1", 1, 1000 + max, 90_000)
         .await
         .unwrap();
     assert_eq!(outcome, FollowRequestOutcome::StillPending);
@@ -2391,30 +2391,11 @@ async fn follow_request_pending_rows_are_capped_by_removing_the_oldest() {
 }
 
 #[tokio::test]
-async fn follow_request_without_allow_new_inserts_nothing_but_answers_existing_rows() {
-    let s = test_storage().await;
-    let outcome = s
-        .record_follow_request("r1", 1, 1000, 90_000, false)
-        .await
-        .unwrap();
-    assert_eq!(outcome, FollowRequestOutcome::Refused);
-    assert_eq!(s.get_pending_follow_request_count(1000).await.unwrap(), 0);
-    s.record_follow_request("r2", 1, 1000, 90_000, true)
-        .await
-        .unwrap();
-    let outcome = s
-        .record_follow_request("r2", 2, 2000, 90_000, false)
-        .await
-        .unwrap();
-    assert_eq!(outcome, FollowRequestOutcome::StillPending);
-}
-
-#[tokio::test]
 async fn pending_requests_of_followed_users_are_approved() {
     let s = test_storage().await;
     // Requests stored on this device; follows merged from another one.
     for pubkey in ["ann", "bob", "cat"] {
-        s.record_follow_request(pubkey, 1, 1000, 90_000, true)
+        s.record_follow_request(pubkey, 1, 1000, 90_000)
             .await
             .unwrap();
     }
@@ -2447,9 +2428,7 @@ async fn pending_requests_of_followed_users_are_approved() {
     );
     assert!(!s.is_approved_follower("cat").await.unwrap(), "unfollowed");
     // An expired request is not approved.
-    s.record_follow_request("dan", 1, 1000, 1500, true)
-        .await
-        .unwrap();
+    s.record_follow_request("dan", 1, 1000, 1500).await.unwrap();
     s.follow(
         "me",
         &SocialGraphEntry {
@@ -2490,7 +2469,7 @@ async fn follow_request_direct_approval_writes_request_and_follower() {
     );
 
     // A pending row is approved by the same call.
-    s.record_follow_request("r2", 1000, 1001, 9999, true)
+    s.record_follow_request("r2", 1000, 1001, 9999)
         .await
         .unwrap();
     assert_eq!(
@@ -3744,7 +3723,7 @@ async fn evicted_requester_leaves_no_cached_identity() {
     s.save_profile(&requester, &make_profile("first"))
         .await
         .unwrap();
-    s.record_follow_request(&requester, 1, 1, u64::MAX, true)
+    s.record_follow_request(&requester, 1, 1, u64::MAX)
         .await
         .unwrap();
     // A followed requester keeps its cached rows when its request is evicted.
@@ -3756,7 +3735,7 @@ async fn evicted_requester_leaves_no_cached_identity() {
     )
     .await
     .unwrap();
-    s.record_follow_request(&followed.master_pubkey, 1, 2, u64::MAX, true)
+    s.record_follow_request(&followed.master_pubkey, 1, 2, u64::MAX)
         .await
         .unwrap();
 
@@ -3766,7 +3745,7 @@ async fn evicted_requester_leaves_no_cached_identity() {
             seed[..8].copy_from_slice(&i.to_le_bytes());
             seed
         });
-        s.record_follow_request(&key.public().to_string(), 1, 10 + i, u64::MAX, true)
+        s.record_follow_request(&key.public().to_string(), 1, 10 + i, u64::MAX)
             .await
             .unwrap();
     }
@@ -3829,7 +3808,7 @@ async fn messages_from_strangers_are_bounded() {
     assert!(receive_message(&s, &id(2_000), "dave", "hi", 1).await);
 
     // An approved follower is no stranger; a pending request is no approval.
-    s.record_follow_request("erin", 1, 1, 1_000_000, true)
+    s.record_follow_request("erin", 1, 1, 1_000_000)
         .await
         .unwrap();
     assert!(s.is_stranger("me", "erin").await.unwrap());
@@ -3887,13 +3866,10 @@ async fn devices_learned_by_device_sync_sort_after_stored_devices() {
 }
 
 #[tokio::test]
-async fn pending_link_is_known_until_taken_or_expired() {
+async fn pending_link_is_taken_once() {
     let s = test_storage().await;
     s.record_pending_link("new", 1_000).await.unwrap();
-    assert!(s.has_pending_link("new", 2_000).await.unwrap());
-    assert!(!s.has_pending_link("other", 2_000).await.unwrap());
-    let eight_days = 8 * 24 * 60 * 60 * 1000;
-    assert!(!s.has_pending_link("new", 1_000 + eight_days).await.unwrap());
+    assert!(!s.take_pending_link("other", 2_000).await.unwrap());
     assert!(s.take_pending_link("new", 2_000).await.unwrap());
-    assert!(!s.has_pending_link("new", 2_000).await.unwrap());
+    assert!(!s.take_pending_link("new", 2_000).await.unwrap());
 }

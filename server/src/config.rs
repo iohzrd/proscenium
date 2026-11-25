@@ -29,10 +29,6 @@ pub struct ServerConfig {
     pub public_url: String,
     #[serde(default = "default_true")]
     pub registration_open: bool,
-    /// Take the client address for rate limiting from the last `X-Forwarded-For` entry.
-    /// Set only when every request passes through a reverse proxy that appends it.
-    #[serde(default)]
-    pub trust_forwarded_for: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -44,9 +40,6 @@ pub struct LimitsConfig {
     /// Maximum number of posts stored per user.
     #[serde(default = "default_max_posts")]
     pub max_posts_per_user: u32,
-    /// Maximum number of interactions stored per user.
-    #[serde(default = "default_max_interactions")]
-    pub max_interactions_per_user: u32,
     /// How long to keep posts and interactions (in days). 0 means keep forever.
     #[serde(default)]
     pub retention_days: u64,
@@ -55,15 +48,9 @@ pub struct LimitsConfig {
     /// never.
     #[serde(default = "default_registration_expiry_days")]
     pub registration_expiry_days: u64,
-    /// Maximum number of open HTTP connections.
-    #[serde(default = "default_max_connections")]
-    pub max_connections: usize,
     /// Maximum number of HTTP requests handled at the same time.
     #[serde(default = "default_max_requests")]
     pub max_concurrent_requests: usize,
-    /// Maximum number of requests to `/api/v1/register` per client address per minute.
-    #[serde(default = "default_register_rate")]
-    pub register_requests_per_minute: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,17 +95,8 @@ fn default_registration_expiry_days() -> u64 {
 fn default_max_posts() -> u32 {
     10000
 }
-fn default_max_interactions() -> u32 {
-    50000
-}
-fn default_max_connections() -> usize {
-    1024
-}
 fn default_max_requests() -> usize {
     256
-}
-fn default_register_rate() -> u32 {
-    10
 }
 fn default_sync_interval() -> u64 {
     5
@@ -138,12 +116,9 @@ impl Default for LimitsConfig {
         Self {
             max_registered_users: default_max_users(),
             max_posts_per_user: default_max_posts(),
-            max_interactions_per_user: default_max_interactions(),
             retention_days: 0,
             registration_expiry_days: default_registration_expiry_days(),
-            max_connections: default_max_connections(),
             max_concurrent_requests: default_max_requests(),
-            register_requests_per_minute: default_register_rate(),
         }
     }
 }
@@ -204,14 +179,9 @@ impl Config {
         self.server.public_url = url;
 
         let at_least_one = [
-            ("limits.max_connections", self.limits.max_connections as u64),
             (
                 "limits.max_concurrent_requests",
                 self.limits.max_concurrent_requests as u64,
-            ),
-            (
-                "limits.register_requests_per_minute",
-                u64::from(self.limits.register_requests_per_minute),
             ),
             (
                 "sync.max_concurrent_syncs",

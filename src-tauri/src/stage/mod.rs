@@ -26,10 +26,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh_gossip::Gossip;
 use proscenium_types::{StageEvent, StageParticipant, StageState, short_id};
 use state::{ActiveStage, Moderation};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tauri::{AppHandle, Emitter};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 /// Connection type byte: sent as first byte of the bi-stream by the initiating side.
 pub(super) const CONN_TYPE_SPEAKER: u8 = 0x01;
@@ -45,10 +44,6 @@ pub(super) const CLOSE_FULL: u32 = 2;
 pub(super) const CLOSE_REJECTED: u32 = 3;
 /// A newer connection from the same node or identity replaced this one.
 pub(super) const CLOSE_REPLACED: u32 = 4;
-
-/// Incoming connections whose hello is being read at one time. Further connections are
-/// closed until one of them completes.
-const MAX_PENDING_HELLOS: usize = 64;
 
 /// What the actor does with the active stage after a control message or command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +70,6 @@ pub(super) struct StageActor {
     /// Source of connection ids and mixer input ids. Never reused, so a late
     /// `*ConnClosed` command cannot match a newer connection.
     next_conn_id: u64,
-    pending_hellos: Arc<Semaphore>,
 }
 
 impl StageActor {
@@ -98,7 +92,6 @@ impl StageActor {
             app_handle,
             active: None,
             next_conn_id: 0,
-            pending_hellos: Arc::new(Semaphore::new(MAX_PENDING_HELLOS)),
         }
     }
 
@@ -297,15 +290,10 @@ impl StageActor {
             conn.close(CLOSE_REJECTED.into(), b"not accepting connections");
             return;
         };
-        let Ok(permit) = self.pending_hellos.clone().try_acquire_owned() else {
-            conn.close(CLOSE_FULL.into(), b"busy");
-            return;
-        };
         let stage_id = stage.stage_id.clone();
         let cancel = stage.cancel.child_token();
         let cmd_tx = self.cmd_tx();
         tokio::spawn(async move {
-            let _permit = permit;
             let closer = conn.clone();
             let accepted = tokio::select! {
                 _ = cancel.cancelled() => return,

@@ -2,7 +2,7 @@ use crate::error::{AppError, CmdResult};
 use crate::state::AppState;
 use futures_lite::StreamExt;
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh::{Endpoint, EndpointAddr};
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::api::remote::{GetProgressItem, Remote};
 use iroh_blobs::get::request::{get_blob, get_verified_size};
@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::ipc::Response;
 use tauri::{AppHandle, Manager, State};
 use tauri_plugin_fs::{FilePath, FsExt, OpenOptions, SafeFilePath};
@@ -23,13 +23,8 @@ use tokio::sync::Semaphore;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Time limit for the size request that precedes a download.
 const SIZE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-/// A download into the store is aborted if it does not receive `MIN_PROGRESS_BYTES` more
-/// within this time.
+/// A download into the store is aborted if it receives no data within this time.
 const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bytes a download must add within `TRANSFER_IDLE_TIMEOUT`. A progress report with fewer
-/// new bytes does not extend the idle time, so a provider that sends a few bytes per
-/// report cannot hold a transfer slot until the time limit.
-const MIN_PROGRESS_BYTES: u64 = 64 * 1024;
 /// Time limit for one download the user requested.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Time limit for one automatic download (a size limit is given), which a stranger's
@@ -115,44 +110,6 @@ fn parse_ticket(s: &str) -> Result<BlobTicket, AppError> {
 const MAX_CONCURRENT_TRANSFERS: usize = 4;
 static AUTOMATIC_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
 static REQUESTED_TRANSFER_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_TRANSFERS);
-/// Automatic loads waiting for a transfer slot or running. A further automatic load fails
-/// at once and the webview offers its Load button, so the media of many messages from
-/// strangers cannot queue loads that keep every other automatic load waiting for hours.
-const MAX_AUTOMATIC_LOADS: usize = 32;
-static AUTOMATIC_LOADS: Semaphore = Semaphore::const_new(MAX_AUTOMATIC_LOADS);
-/// Time a provider whose connection failed is not dialed again.
-const UNREACHABLE_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// Providers remembered as unreachable; the oldest entry is removed when full.
-const MAX_UNREACHABLE_PROVIDERS: usize = 256;
-
-/// Providers whose connection failed, and when.
-static UNREACHABLE_PROVIDERS: Mutex<VecDeque<(EndpointId, Instant)>> = Mutex::new(VecDeque::new());
-
-/// Error if a connection to or a transfer from `provider` failed less than
-/// `UNREACHABLE_RETRY_AFTER` ago.
-fn check_reachable(provider: EndpointId) -> CmdResult<()> {
-    let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() else {
-        return Ok(());
-    };
-    list.retain(|(_, failed_at)| failed_at.elapsed() < UNREACHABLE_RETRY_AFTER);
-    if list.iter().any(|(id, _)| *id == provider) {
-        return Err("the blob provider was unreachable less than a minute ago".into());
-    }
-    Ok(())
-}
-
-/// Remember that a connection to or a transfer from `provider` failed.
-fn record_unreachable(provider: EndpointId) {
-    let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() else {
-        return;
-    };
-    list.retain(|(id, _)| *id != provider);
-    if list.len() >= MAX_UNREACHABLE_PROVIDERS {
-        list.pop_front();
-    }
-    list.push_back((provider, Instant::now()));
-}
-
 /// Address of `endpoint` for a blob ticket: its NodeId and home relay URL, without direct
 /// addresses. Tickets end up in signed posts and avatars that followers and discovery
 /// servers store and serve, and direct addresses would publish the device's LAN and public
@@ -219,115 +176,60 @@ async fn read_local_blob(blob_store: &FsStore, hash: Hash) -> CmdResult<Option<V
 /// holds a transfer slot.
 ///
 /// The provider answers with the last chunk and its hash path, which proves the size for
-/// this hash, so a blob above `max_size` is rejected before its content is requested. A
-/// provider that cannot be connected or does not answer the size request in time is
-/// recorded as unreachable. An automatic load (`requested` false) returns an error for a
-/// provider recorded as unreachable; a load the user requested dials it anyway.
+/// this hash, so a blob above `max_size` is rejected before its content is requested.
 async fn connect_and_check_size(
     endpoint: &Endpoint,
     ticket: &BlobTicket,
     max_size: u64,
-    requested: bool,
 ) -> CmdResult<(Connection, u64)> {
     let hash = ticket.hash();
-    let provider = ticket.addr().id;
-    if !requested {
-        check_reachable(provider)?;
-    }
-    let connected = tokio::time::timeout(
+    let conn = tokio::time::timeout(
         CONNECT_TIMEOUT,
         endpoint.connect(ticket.addr().clone(), iroh_blobs::ALPN),
     )
-    .await;
-    let conn = match connected {
-        Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => {
-            record_unreachable(provider);
-            return Err(e.into());
-        }
-        Err(_) => {
-            record_unreachable(provider);
-            return Err("timed out connecting to the blob provider".into());
-        }
-    };
+    .await
+    .map_err(|_| "timed out connecting to the blob provider")??;
     let (size, _stats) =
-        match tokio::time::timeout(SIZE_REQUEST_TIMEOUT, get_verified_size(&conn, &hash)).await {
-            Ok(result) => result?,
-            Err(_) => {
-                record_unreachable(provider);
-                return Err("timed out requesting the blob size".into());
-            }
-        };
+        tokio::time::timeout(SIZE_REQUEST_TIMEOUT, get_verified_size(&conn, &hash))
+            .await
+            .map_err(|_| "timed out requesting the blob size")??;
     check_size_limit(size, max_size)?;
     Ok((conn, size))
 }
 
-/// Why `download_to_store` stopped before the blob was complete.
-#[derive(Debug)]
-enum DownloadError {
-    /// The transfer exceeded its time limit while it received at least
-    /// `MIN_PROGRESS_BYTES` per `TRANSFER_IDLE_TIMEOUT`.
-    TimeLimit,
-    /// Fewer than `MIN_PROGRESS_BYTES` new bytes arrived within `TRANSFER_IDLE_TIMEOUT`,
-    /// the provider sent more payload than the blob size, or the transfer failed.
-    Provider(AppError),
-}
-
-impl From<DownloadError> for AppError {
-    fn from(e: DownloadError) -> Self {
-        match e {
-            DownloadError::TimeLimit => {
-                AppError::Other("blob download exceeded its time limit".into())
-            }
-            DownloadError::Provider(e) => e,
-        }
-    }
-}
-
 /// Download the parts of the blob that the local store lacks, from `conn` into the store.
 ///
-/// Returns an error, which stops the transfer, if fewer than `MIN_PROGRESS_BYTES` new
-/// bytes arrive within `TRANSFER_IDLE_TIMEOUT`, if the whole transfer exceeds `limit`, or
-/// if the provider sends more payload than `size`.
+/// Returns an error, which stops the transfer, if no data arrives within
+/// `TRANSFER_IDLE_TIMEOUT`, if the whole transfer exceeds `limit`, or if the provider
+/// sends more payload than `size`.
 async fn download_to_store(
     remote: &Remote,
     conn: Connection,
     hash: Hash,
     size: u64,
     limit: Duration,
-) -> Result<(), DownloadError> {
+) -> CmdResult<()> {
     let progress = remote.fetch(conn, HashAndFormat::raw(hash));
     let mut stream = std::pin::pin!(progress.stream());
-    let now = tokio::time::Instant::now();
-    let deadline = now + limit;
-    let mut idle_deadline = now + TRANSFER_IDLE_TIMEOUT;
-    // Received byte count when the idle deadline was last set.
-    let mut mark: u64 = 0;
-    let provider_error = |message: &str| DownloadError::Provider(AppError::Other(message.into()));
+    let deadline = tokio::time::Instant::now() + limit;
     loop {
+        let idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
         let Ok(item) = tokio::time::timeout_at(deadline.min(idle_deadline), stream.next()).await
         else {
             return Err(if deadline < idle_deadline {
-                DownloadError::TimeLimit
+                "blob download exceeded its time limit".into()
             } else {
-                provider_error("blob provider sent too little data in time")
+                "blob provider sent no data in time".into()
             });
         };
         match item {
             Some(GetProgressItem::Progress(received)) if received > size => {
-                return Err(provider_error(
-                    "blob provider sent more data than the blob size",
-                ));
+                return Err("blob provider sent more data than the blob size".into());
             }
-            Some(GetProgressItem::Progress(received)) => {
-                if received >= mark.saturating_add(MIN_PROGRESS_BYTES) {
-                    mark = received;
-                    idle_deadline = tokio::time::Instant::now() + TRANSFER_IDLE_TIMEOUT;
-                }
-            }
+            Some(GetProgressItem::Progress(_)) => {}
             Some(GetProgressItem::Done(_)) => return Ok(()),
-            Some(GetProgressItem::Error(e)) => return Err(DownloadError::Provider(e.into())),
-            None => return Err(provider_error("blob download ended without a result")),
+            Some(GetProgressItem::Error(e)) => return Err(e.into()),
+            None => return Err("blob download ended without a result".into()),
         }
     }
 }
@@ -415,18 +317,6 @@ async fn blob_bytes(state: &AppState, ticket: &str, max_size: Option<u64>) -> Cm
     log::info!("[blob] fetching {hash} from remote...");
     let limit = max_size.map_or(MAX_BLOB_SIZE as u64, |max| max.min(MAX_BLOB_SIZE as u64));
     let requested = max_size.is_none();
-    let provider = ticket.addr().id;
-    let _load = if requested {
-        None
-    } else {
-        // Before the wait, so a load for an unreachable provider waits for nothing.
-        check_reachable(provider)?;
-        Some(
-            AUTOMATIC_LOADS
-                .try_acquire()
-                .map_err(|_| "too many automatic media loads in progress")?,
-        )
-    };
     let (slots, time_limit) = if requested {
         (&REQUESTED_TRANSFER_SLOTS, TRANSFER_TIMEOUT)
     } else {
@@ -440,15 +330,8 @@ async fn blob_bytes(state: &AppState, ticket: &str, max_size: Option<u64>) -> Cm
     if let Some(bytes) = read_local_blob(&state.blob_store(), hash).await? {
         return Ok(bytes);
     }
-    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit, requested).await?;
-    let downloaded = download_to_store(state.blobs().remote(), conn, hash, size, time_limit).await;
-    if let Err(DownloadError::Provider(_)) = &downloaded {
-        // Not dialed again by automatic loads for `UNREACHABLE_RETRY_AFTER`: a provider
-        // that stalls a transfer would otherwise take the next slot at once. A transfer
-        // that made progress until the time limit says nothing against the provider.
-        record_unreachable(provider);
-    }
-    downloaded?;
+    let (conn, size) = connect_and_check_size(&state.endpoint(), &ticket, limit).await?;
+    download_to_store(state.blobs().remote(), conn, hash, size, time_limit).await?;
     let bytes = read_local_blob(&state.blob_store(), hash)
         .await?
         .ok_or("blob is incomplete after download")?;
@@ -511,7 +394,7 @@ pub async fn refetch_blob_bytes(
         .await
         .map_err(|_| "blob transfer limit closed")?;
     let (conn, size) =
-        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64, true).await?;
+        connect_and_check_size(&state.endpoint(), &ticket, MAX_BLOB_SIZE as u64).await?;
     let bytes = download_to_memory(conn, hash, size).await?;
     log::info!("[blob] downloaded {hash} from remote ({size} bytes)");
     Ok(Response::new(bytes))
@@ -539,25 +422,6 @@ mod tests {
         // The oldest entry was removed to stay within the cap.
         assert!(!dropped.contains(Path::new("/tmp/a")));
         assert!(dropped.contains(Path::new("/tmp/file0")));
-    }
-
-    #[test]
-    fn unreachable_provider_is_not_dialed_again_for_a_minute() {
-        let provider = iroh::SecretKey::from_bytes(&[201u8; 32]).public();
-        let other = iroh::SecretKey::from_bytes(&[202u8; 32]).public();
-        assert!(check_reachable(provider).is_ok());
-        record_unreachable(provider);
-        assert!(check_reachable(provider).is_err());
-        assert!(check_reachable(other).is_ok());
-        // An entry older than the retry time is dropped.
-        if let Ok(mut list) = UNREACHABLE_PROVIDERS.lock() {
-            for (_, failed_at) in list.iter_mut() {
-                if let Some(earlier) = failed_at.checked_sub(UNREACHABLE_RETRY_AFTER) {
-                    *failed_at = earlier;
-                }
-            }
-        }
-        assert!(check_reachable(provider).is_ok());
     }
 
     #[test]
@@ -626,13 +490,13 @@ mod tests {
 
         // A limit one byte below the blob size: rejected, and nothing is stored.
         assert!(
-            connect_and_check_size(&fetcher, &ticket, size - 1, false)
+            connect_and_check_size(&fetcher, &ticket, size - 1)
                 .await
                 .is_err()
         );
         assert!(read_local_blob(&store, hash).await.unwrap().is_none());
 
-        let (conn, proven_size) = connect_and_check_size(&fetcher, &ticket, size, false)
+        let (conn, proven_size) = connect_and_check_size(&fetcher, &ticket, size)
             .await
             .unwrap();
         assert_eq!(proven_size, size);

@@ -16,8 +16,6 @@ pub enum FollowRequestOutcome {
     Approved,
     /// The local user denied this requester and the denial has not expired.
     Denied,
-    /// No row existed and `allow_new` was false. Nothing was inserted.
-    Refused,
 }
 
 /// Result of `approve_follower_directly`.
@@ -56,8 +54,7 @@ impl Storage {
     ///
     /// Runs in one write transaction. Pending and denied rows whose `expires_at` is not
     /// after `now` are deleted first. An approved or denied row is never changed, so a
-    /// denied requester stays denied until the denial expires. A pending row is inserted
-    /// only if `allow_new`. With `MAX_PENDING_FOLLOW_REQUESTS` pending rows, the oldest
+    /// denied requester stays denied until the denial expires. With `MAX_PENDING_FOLLOW_REQUESTS` pending rows, the oldest
     /// pending row is deleted before the new one is inserted, so requests from generated
     /// identities cannot block new requests. The cached identities of deleted rows are
     /// deleted unless something else refers to them.
@@ -67,7 +64,6 @@ impl Storage {
         timestamp: u64,
         now: u64,
         expires_at: u64,
-        allow_new: bool,
     ) -> Result<FollowRequestOutcome, AppError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
@@ -89,7 +85,6 @@ impl Storage {
             Some("approved") => FollowRequestOutcome::Approved,
             Some("denied") => FollowRequestOutcome::Denied,
             Some(_) => FollowRequestOutcome::StillPending,
-            None if !allow_new => FollowRequestOutcome::Refused,
             None => {
                 let pending: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM follow_requests WHERE status='pending'",

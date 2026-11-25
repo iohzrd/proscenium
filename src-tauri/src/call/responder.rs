@@ -69,16 +69,12 @@ impl super::CallHandler {
                 );
                 // Sent by a separate task: the caller of this function processes all
                 // call signals and must not wait for the delivery.
-                let Ok(permit) = self.reject_permits.clone().try_acquire_owned() else {
-                    return;
-                };
                 let handler = self.clone();
                 let peer_pubkey = peer_pubkey.to_string();
                 let reject = DmPayload::CallReject {
                     call_id: call_id.to_string(),
                 };
                 tokio::spawn(async move {
-                    let _permit = permit;
                     let _ = handler
                         .send_signal(&peer_pubkey, Some(peer_device), reject)
                         .await;

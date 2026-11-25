@@ -8,7 +8,6 @@ use proscenium_types::{
     FollowRequest, FollowResponse, VerifiedIdentity, Visibility, now_millis, short_id,
     verify_follow_request,
 };
-use std::time::Instant;
 use tauri::Emitter;
 
 use super::{PeerHandler, reject};
@@ -21,10 +20,7 @@ impl PeerHandler {
     /// back, so two Private users who follow each other become mutuals in either order.
     /// Listed, and Private from any other requester: a pending row is stored for the local
     /// user to approve or deny (for Private, following the requester approves it); an
-    /// approved requester is answered `Approved`, a denied one `Denied`. A new pending row
-    /// from a requester the local user does not follow counts against
-    /// `MAX_NEW_FOLLOW_REQUESTS` per `FOLLOW_REQUEST_WINDOW`; beyond it nothing is stored
-    /// and the answer is `RateLimited`.
+    /// approved requester is answered `Approved`, a denied one `Denied`.
     pub(super) async fn handle_follow_request(
         &self,
         remote_str: &str,
@@ -98,36 +94,14 @@ impl PeerHandler {
                 approval != DirectApproval::Denied
             }
             Visibility::Listed | Visibility::Private => {
-                // Held until the row is written, so concurrent requests cannot exceed the
-                // limit.
-                let mut admissions = self.follow_request_admissions.lock().await;
-                let at = Instant::now();
-                let counted = !follows_requester;
                 let outcome = self
                     .storage
-                    .record_follow_request(
-                        requester,
-                        req.timestamp,
-                        now,
-                        expires_at,
-                        !counted || admissions.has_room(at),
-                    )
+                    .record_follow_request(requester, req.timestamp, now, expires_at)
                     .await
                     .map_err(AcceptError::from_err)?;
-                if counted && outcome == FollowRequestOutcome::NewPending {
-                    admissions.admit(at);
-                }
-                drop(admissions);
                 match outcome {
                     FollowRequestOutcome::Approved => true,
                     FollowRequestOutcome::Denied => false,
-                    FollowRequestOutcome::Refused => {
-                        log::info!(
-                            "[follow-req] not storing the request of {}: new request limit reached",
-                            short_id(requester)
-                        );
-                        return Self::respond(send, conn, &FollowResponse::RateLimited).await;
-                    }
                     FollowRequestOutcome::NewPending | FollowRequestOutcome::StillPending => {
                         // The identity is stored so the requester can be reached and
                         // verified after approval.

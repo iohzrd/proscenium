@@ -6,7 +6,6 @@ mod trending;
 mod users;
 
 use crate::config::Config;
-use crate::http::RateLimiter;
 use crate::ingestion::IngestionManager;
 use crate::storage::Storage;
 use axum::Router;
@@ -30,8 +29,6 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub ingestion: Arc<IngestionManager>,
     pub start_time: std::time::Instant,
-    /// Request counter per client address for `/api/v1/register`.
-    pub register_limiter: Arc<RateLimiter>,
 }
 
 /// Clamp a `limit` query parameter to `1..=max`; `default` if absent.
@@ -68,7 +65,7 @@ pub fn build_router(state: AppState) -> Router {
     // cross-origin POST, PUT or DELETE with a JSON body to them.
     Router::new()
         .merge(read_api)
-        .merge(auth::routes(state.clone()))
+        .merge(auth::routes())
         .merge(crate::web::routes())
         .layer(SetResponseHeaderLayer::overriding(
             X_CONTENT_TYPE_OPTIONS,

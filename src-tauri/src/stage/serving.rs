@@ -4,8 +4,7 @@ use super::fanout::Fanout;
 use super::pipeline::{self, ConnKind, IncomingAudio};
 use super::relay::{RelayConfig, run_relay_upstream};
 use super::state::{
-    ActiveStage, HostState, LISTENER_CAPACITY, ListenerConn, MAX_FAILED_UPSTREAMS,
-    MAX_LISTENER_CONNS_PER_IDENTITY, MixedStreamServer, SpeakerConn,
+    ActiveStage, HostState, LISTENER_CAPACITY, ListenerConn, MixedStreamServer, SpeakerConn,
 };
 use super::{CLOSE_BANNED, CLOSE_FULL, CLOSE_NORMAL, CLOSE_REJECTED, CLOSE_REPLACED, StageCommand};
 use crate::audio::PCM_CHANNEL_CAPACITY;
@@ -68,10 +67,8 @@ impl ActiveStage {
     }
 
     /// Serve the mixed stream to a listener connection.
-    /// One connection per NodeId (a new one replaces the old one), at most
-    /// `MAX_LISTENER_CONNS_PER_IDENTITY` per master pubkey, at most `capacity` in total.
-    /// An identity without a speaking role may not use the last `reserved_for_roles`
-    /// entries, which are kept for the upstream connections of relays.
+    /// One connection per NodeId (a new one replaces the old one), at most `capacity` in
+    /// total.
     fn admit_listener(&mut self, incoming: IncomingAudio, conn_id: u64) {
         let IncomingAudio {
             conn,
@@ -89,17 +86,7 @@ impl ActiveStage {
             old.cancel.cancel();
             old.conn.close(CLOSE_REPLACED.into(), b"replaced");
         }
-        let same_identity = server
-            .conns
-            .values()
-            .filter(|c| c.master_pubkey == master_pubkey)
-            .count();
-        let limit = if self.roles.role_of(&master_pubkey) == StageRole::Listener {
-            server.capacity - server.reserved_for_roles
-        } else {
-            server.capacity
-        };
-        if same_identity >= MAX_LISTENER_CONNS_PER_IDENTITY || server.conns.len() >= limit {
+        if server.conns.len() >= server.capacity {
             log::info!(
                 "[stage] rejected listener {}: no free slot",
                 short_id(&node_id)
@@ -305,9 +292,7 @@ impl ActiveStage {
         if self.listener_upstream_id.as_deref() == Some(node_id.as_str()) {
             self.listener_upstream_id = Some(self.host_node_id.clone());
         }
-        if self.failed_upstreams.len() < MAX_FAILED_UPSTREAMS {
-            self.failed_upstreams.insert(node_id);
-        }
+        self.failed_upstreams.insert(node_id);
     }
 
     // ---- Relay ------------------------------------------------------------
@@ -342,7 +327,7 @@ impl ActiveStage {
                     fanout: fanout.clone(),
                     cancel: cancel.clone(),
                 }));
-                let mut server = MixedStreamServer::new(fanout, capacity, 0);
+                let mut server = MixedStreamServer::new(fanout, capacity);
                 server.upstream_cancel = Some(cancel);
                 self.serving = Some(server);
             }

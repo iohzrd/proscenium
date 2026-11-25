@@ -128,14 +128,6 @@ pub async fn follow_user(
                 state.storage.unfollow(&my_id, &pubkey).await?;
                 return Ok(FollowOutcome::Denied);
             }
-            Ok(FollowResponse::RateLimited) => {
-                state.storage.unfollow(&my_id, &pubkey).await?;
-                return Err(format!(
-                    "{} receives too many follow requests now; try again later",
-                    short_id(&pubkey)
-                )
-                .into());
-            }
             Err(e) => {
                 state.storage.unfollow(&my_id, &pubkey).await?;
                 return Err(e);

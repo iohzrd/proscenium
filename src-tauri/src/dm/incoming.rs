@@ -111,13 +111,6 @@ impl DmHandler {
                 // A stranger is not followed, so `known_sender` is false only if no
                 // conversation with it exists.
                 let new_stranger_conversation = stranger && !known_sender;
-                if new_stranger_conversation && !self.admit_new_stranger() {
-                    log::warn!(
-                        "[dm] deferring a new conversation from {}: limit of new conversations with unknown senders reached",
-                        short_id(&sender)
-                    );
-                    return Ok(DmAck::Deferred);
-                }
                 let now = now_millis();
                 let stored_msg = StoredMessage {
                     id: msg.id.clone(),

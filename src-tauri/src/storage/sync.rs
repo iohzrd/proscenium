@@ -21,8 +21,7 @@ impl Storage {
     /// The caller has verified each signature with `verify_delete_post_signature` and each
     /// id with `is_valid_id`; entries whose `author` differs from the argument are skipped.
     /// Tombstone insert, post delete and the delete of the post's notifications run in one
-    /// write transaction. At most `MAX_SYNC_TOMBSTONES` tombstones are kept per author;
-    /// the ones with the lowest `deleted_at` are removed beyond that.
+    /// write transaction.
     pub async fn apply_post_tombstones(
         &self,
         author: &str,
@@ -57,15 +56,11 @@ impl Storage {
                 Self::delete_post_dependents(&mut tx, &tombstone.id).await?;
             }
         }
-        if outcome.tombstones_added > 0 {
-            Self::trim_post_tombstones(&mut tx, author).await?;
-        }
         tx.commit().await?;
         Ok(outcome)
     }
 
-    /// Store the signed deletion of the own post `(author, id)` in `tx`, keeping at most
-    /// `MAX_SYNC_TOMBSTONES` deletions of `author`.
+    /// Store the signed deletion of the own post `(author, id)` in `tx`.
     pub(super) async fn insert_post_tombstone(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         author: &str,
@@ -80,23 +75,6 @@ impl Storage {
         .bind(id)
         .bind(signature)
         .bind(proscenium_types::now_millis() as i64)
-        .execute(&mut **tx)
-        .await?;
-        Self::trim_post_tombstones(tx, author).await
-    }
-
-    /// Keep the newest `MAX_SYNC_TOMBSTONES` deletions of `author`.
-    async fn trim_post_tombstones(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        author: &str,
-    ) -> Result<(), AppError> {
-        sqlx::query(
-            "DELETE FROM post_tombstones WHERE author=?1 AND id NOT IN
-                (SELECT id FROM post_tombstones WHERE author=?1
-                 ORDER BY deleted_at DESC, id ASC LIMIT ?2)",
-        )
-        .bind(author)
-        .bind(MAX_SYNC_TOMBSTONES as i64)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -180,37 +158,21 @@ impl Storage {
 
     /// Store a verified deletion of the interaction `(author, id)`. The caller deletes the
     /// interaction row afterwards; once the tombstone exists the row is not stored again.
-    /// At most `MAX_SYNC_TOMBSTONES` tombstones are kept per author.
     pub async fn record_interaction_tombstone(
         &self,
         author: &str,
         id: &str,
         now: u64,
     ) -> Result<(), AppError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let inserted = sqlx::query(
+        sqlx::query(
             "INSERT OR IGNORE INTO interaction_tombstones (author, id, deleted_at)
              VALUES (?1, ?2, ?3)",
         )
         .bind(author)
         .bind(id)
         .bind(now as i64)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected()
-            > 0;
-        if inserted {
-            sqlx::query(
-                "DELETE FROM interaction_tombstones WHERE author=?1 AND id NOT IN
-                    (SELECT id FROM interaction_tombstones WHERE author=?1
-                     ORDER BY deleted_at DESC, id ASC LIMIT ?2)",
-            )
-            .bind(author)
-            .bind(MAX_SYNC_TOMBSTONES as i64)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -513,29 +475,6 @@ mod tests {
         assert_eq!(listed[0].signature, "sig-p2");
         assert_eq!(listed[0].author, "a");
         assert_eq!(s.get_post_tombstones("a", 2).await.unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn post_tombstones_per_author_are_capped() {
-        let s = storage().await;
-        let first: Vec<PostTombstone> = (0..MAX_SYNC_TOMBSTONES)
-            .map(|i| tombstone(&format!("old{i}"), "a"))
-            .collect();
-        s.apply_post_tombstones("a", &first, 100).await.unwrap();
-        assert_eq!(
-            s.count_post_tombstones("a").await.unwrap(),
-            MAX_SYNC_TOMBSTONES as u64
-        );
-
-        s.apply_post_tombstones("a", &[tombstone("new", "a")], 200)
-            .await
-            .unwrap();
-        assert_eq!(
-            s.count_post_tombstones("a").await.unwrap(),
-            MAX_SYNC_TOMBSTONES as u64
-        );
-        // The newest tombstone is kept.
-        assert!(s.is_post_tombstoned("a", "new").await.unwrap());
     }
 
     #[tokio::test]
